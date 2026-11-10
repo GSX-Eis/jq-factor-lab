@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "factors": {
+    "DemoMomentum": {
+      "requirements": {
+        "daily": {"min_days": 6, "fields": ["close", "factor"]}
+      }
+    }
+  }
+}

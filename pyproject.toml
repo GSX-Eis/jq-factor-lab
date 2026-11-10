@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jq-factor-lab"
+version = "0.1.0"
+description = "JoinQuant and local multi-factor research framework"
+readme = "README.md"
+license = {file = "LICENSE"}
+requires-python = ">=3.11"
+dependencies = [
+  "numpy>=1.24,<3",
+  "pandas>=2.0,<3",
+  "scipy>=1.10,<2",
+  "alphalens-reloaded>=0.4,<0.5",
+  "duckdb==1.5.3",
+  "pyarrow>=14",
+  "python-dateutil>=2.8",
+  "scikit-learn>=1.3,<1.8",
+  "dcor>=0.6,<0.7",
+  "threadpoolctl>=3",
+  "joblib>=1.3",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+synthesis = ["lightgbm>=4,<5"]
+qlib = ["pyqlib>=0.9.6,<0.10", "filelock>=3"]
+acceleration = ["numba>=0.59"]
+
+[project.scripts]
+jq-factor-lab = "tools.agent_harness.cli:main"
+factorpilot = "tools.agent_harness.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["backtest_and_analysis*", "utils*", "tools*", "examples*", "factor_synthesis*", "data_pipeline*", "scripts*", "config"]
+exclude = ["*.tests", "*.tests.*"]
+
+[tool.setuptools.package-data]
+config = ["data_access.json"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests", "factor_synthesis", "data_pipeline/loaders/tests"]
+pythonpath = ["."]
+
+[tool.setuptools]
+license-files = ["LICENSE", "NOTICE"]

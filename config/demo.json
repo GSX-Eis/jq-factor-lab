@@ -1,0 +1,14 @@
+{
+  "input_csv": "../data/demo.csv",
+  "factor_file": "../examples/momentum.py",
+  "factor_class": "DemoMomentum",
+  "output_dir": "../outputs/demo",
+  "periods": [
+    1,
+    5,
+    10
+  ],
+  "execution_lag": 1,
+  "n_quantiles": 5,
+  "calendar_file": "demo_calendar.json"
+}

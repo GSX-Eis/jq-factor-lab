@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "price_aliases": {
+    "price_data": "daily",
+    "price_data_daily": "daily",
+    "price_data_5m": "5m"
+  },
+  "price_tables": {
+    "daily": "price_data_daily",
+    "5m": "price_data_5m"
+  },
+  "factor_table": "factor_data",
+  "tables": {
+    "price_data_daily": {
+      "date_column": "date",
+      "stock_column": "stock_code",
+      "parquet_subdir": "price_data_daily",
+      "default_fields": [
+        "open",
+        "close",
+        "high",
+        "low",
+        "volume",
+        "money"
+      ]
+    },
+    "price_data_5m": {
+      "date_column": "date",
+      "stock_column": "stock_code",
+      "parquet_subdir": "price_data_5m",
+      "default_fields": [
+        "open",
+        "close",
+        "high",
+        "low",
+        "volume",
+        "money"
+      ]
+    },
+    "factor_data": {
+      "date_column": "date",
+      "stock_column": "stock_code",
+      "parquet_subdir": "factor_data",
+      "default_fields": null
+    },
+    "index_constituents": {
+      "date_column": "date",
+      "stock_column": "stock_code",
+      "parquet_subdir": "index_constituents",
+      "default_fields": null
+    }
+  },
+  "index_constituents": {
+    "table": "index_constituents",
+    "index_column": "index_code"
+  }
+}

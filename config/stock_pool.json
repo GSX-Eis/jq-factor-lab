@@ -1,0 +1,18 @@
+{
+  "schedules": {
+    "weekly": {"unit": "week", "interval": 1, "session": 3, "short_period": "last_session", "boundary": "query_window", "include_previous": false},
+    "monthly": {"unit": "month", "interval": 1, "session": 1, "short_period": "last_session", "boundary": "complete_period", "include_previous": true},
+    "report_based": {"unit": "month", "interval": 1, "session": 1, "months": [5, 9, 11], "short_period": "last_session", "boundary": "complete_period", "include_previous": true}
+  },
+  "selection": {
+    "fundamental_prefixes": ["val_", "valuation_", "income_", "indicator_", "balance_", "cashflow_", "fin_"],
+    "fundamental_fields": ["is_new_stock"],
+    "state_field_aliases": {"close": "open"},
+    "missing_previous": "same_day",
+    "source_priority": {
+      "state": ["fundamental", "price"],
+      "percentile": ["price", "fundamental"],
+      "sort": ["fundamental", "price"]
+    }
+  }
+}
