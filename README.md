@@ -44,11 +44,11 @@ python -m pip install -e '.[dev,synthesis]'
 
 # Generate synthetic prices and evaluate a sample factor
 python -m examples.generate_data --output data/demo.csv
-python -m tools.agent_harness.cli single-factor-analysis \
+python -m tools.demo_cli single-factor-analysis \
   --config config/demo.json --output-dir outputs/first-analysis
 
 # Run the fixed-weight synthesis example
-python -m tools.agent_harness.cli factor-synthesis-demo \
+python -m tools.demo_cli factor-synthesis-demo \
   --method weighted_sum --output-dir outputs/first-synthesis
 ```
 
@@ -68,7 +68,7 @@ import subprocess
 import sys
 
 process = subprocess.run(
-    [sys.executable, "-m", "tools.agent_harness.cli", "single-factor-analysis",
+    [sys.executable, "-m", "tools.demo_cli", "single-factor-analysis",
      "--config", "config/demo.json", "--output-dir", "outputs/harness-job-001"],
     check=True,
     capture_output=True,

@@ -3,7 +3,7 @@
 命令：
 
 ```bash
-python -m tools.agent_harness.cli single-factor-analysis --config config/demo.json --output-dir outputs/my-analysis
+python -m tools.demo_cli single-factor-analysis --config config/demo.json --output-dir outputs/my-analysis
 ```
 
 配置采用 UTF-8 JSON 对象。相对 `--config` 路径从当前工作目录解析；配置内所有路径相对该配置文件所在目录解析。绝对路径保持其含义。

@@ -7,7 +7,7 @@ import pytest
 
 from examples.generate_data import make_prices
 from examples.momentum import DemoMomentum
-from tools.agent_harness.cli import analyze, read_prices
+from tools.demo_cli import analyze, read_prices
 from utils.pit import apply_pit_adjustment
 from backtest_and_analysis.forward_returns_calculator import ForwardReturnsCalculator
 
@@ -81,7 +81,7 @@ def test_demo_signal_does_not_read_future_rows():
 
 
 def test_cli_rejects_constant_factor_without_publishing_results(tmp_path, capsys):
-    from tools.agent_harness.cli import main
+    from tools.demo_cli import main
 
     make_prices(sessions=80).to_csv(tmp_path / 'input.csv', index=False)
     factor_file = tmp_path / 'constant.py'
@@ -114,7 +114,7 @@ def test_cli_rejects_constant_factor_without_publishing_results(tmp_path, capsys
     ({'input_csv': 'a', 'factor_file': 'b', 'output_dir': 'out'}, 'factor_class'),
 ])
 def test_cli_config_errors_are_actionable_without_tracebacks(tmp_path, capsys, payload, expected):
-    from tools.agent_harness.cli import main
+    from tools.demo_cli import main
     config = tmp_path/'bad.json'
     config.write_text(json.dumps(payload))
     with pytest.raises(SystemExit) as error:
@@ -125,7 +125,7 @@ def test_cli_config_errors_are_actionable_without_tracebacks(tmp_path, capsys, p
 
 
 def test_cli_stdout_is_one_json_document(tmp_path, capsys):
-    from tools.agent_harness.cli import main
+    from tools.demo_cli import main
     frame = make_prices(sessions=80)
     frame.to_csv(tmp_path/'input.csv', index=False)
     source = tmp_path/'noisy.py'
@@ -152,7 +152,7 @@ def test_generate_existing_file_has_short_error(tmp_path):
 
 
 def test_cli_rejects_constant_returns_without_publishing_results(tmp_path, capsys):
-    from tools.agent_harness.cli import main
+    from tools.demo_cli import main
 
     prices = make_prices(sessions=80)
     prices['close'] = prices['stock_code'].map(

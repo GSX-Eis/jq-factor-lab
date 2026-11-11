@@ -45,11 +45,11 @@ python -m pip install -e '.[dev,synthesis]'
 
 # 生成教学行情，运行本地单因子评估
 python -m examples.generate_data --output data/demo.csv
-python -m tools.agent_harness.cli single-factor-analysis \
+python -m tools.demo_cli single-factor-analysis \
   --config config/demo.json --output-dir outputs/first-analysis
 
 # 运行固定权重合成示例
-python -m tools.agent_harness.cli factor-synthesis-demo \
+python -m tools.demo_cli factor-synthesis-demo \
   --method weighted_sum --output-dir outputs/first-synthesis
 ```
 
@@ -69,7 +69,7 @@ import subprocess
 import sys
 
 process = subprocess.run(
-    [sys.executable, "-m", "tools.agent_harness.cli", "single-factor-analysis",
+    [sys.executable, "-m", "tools.demo_cli", "single-factor-analysis",
      "--config", "config/demo.json", "--output-dir", "outputs/harness-job-001"],
     check=True,
     capture_output=True,

@@ -8,7 +8,7 @@
 
 ```bash
 python -m pip install -e '.[dev,synthesis]'
-python -m tools.agent_harness.cli factor-synthesis-demo --method weighted_sum --output-dir outputs/synthesis-weighted
+python -m tools.demo_cli factor-synthesis-demo --method weighted_sum --output-dir outputs/synthesis-weighted
 ```
 
 `weighted_sum` 是默认方法；省略 `--method` 也能运行。本随机特征示例只运行 `weighted_sum`。它构造12个虚构标的、100个工作日、4列随机特征；固定权重方法不训练，保留一期信号延迟，写出 scores.csv、summary.json 和本次权重描述。必须使用新的输出目录。

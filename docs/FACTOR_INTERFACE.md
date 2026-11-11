@@ -38,7 +38,7 @@
 
 `get_factor_values_unfiltered()` 的性能记录为已执行阶段保留耗时，包括失败阶段；总耗时覆盖提前返回和异常退出。未执行阶段不填充为零。`pit_seconds` 表示复权函数调用耗时，不是成功复权标志。
 
-先按 [README](../README.md) 运行教学示例。接入自定义因子时，复制示例分析配置，修改 `factor_file`、`factor_class`、`input_csv` 和 `output_dir`，再通过 `python -m tools.agent_harness.cli single-factor-analysis --config <配置路径>` 调用。配置内路径相对配置文件解析；命令行 `--output-dir` 相对当前工作目录解析。输出目录必须尚不存在。
+先按 [README](../README.md) 运行教学示例。接入自定义因子时，复制示例分析配置，修改 `factor_file`、`factor_class`、`input_csv` 和 `output_dir`，再通过 `python -m tools.demo_cli single-factor-analysis --config <配置路径>` 调用。配置内路径相对配置文件解析；命令行 `--output-dir` 相对当前工作目录解析。输出目录必须尚不存在。
 
 ## requirements 声明
 

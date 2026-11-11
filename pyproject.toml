@@ -28,14 +28,16 @@ dev = ["pytest>=7"]
 synthesis = ["lightgbm>=4,<5"]
 qlib = ["pyqlib>=0.9.6,<0.10", "filelock>=3"]
 acceleration = ["numba>=0.59"]
+backtest = ["vectorbt>=0.26"]
+mining = ["torch>=2.0"]
 
 [project.scripts]
-jq-factor-lab = "tools.agent_harness.cli:main"
-factorpilot = "tools.agent_harness.cli:main"
+jq-factor-lab = "tools.demo_cli:main"
+factorpilot = "tools.demo_cli:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["backtest_and_analysis*", "utils*", "tools*", "examples*", "factor_synthesis*", "data_pipeline*", "scripts*", "config"]
+include = ["backtest_and_analysis*", "utils*", "tools*", "examples*", "factor_synthesis*", "factor_mining*", "jq_strategies*", "data_pipeline*", "scripts*", "config"]
 exclude = ["*.tests", "*.tests.*"]
 
 [tool.setuptools.package-data]
@@ -47,3 +49,4 @@ pythonpath = ["."]
 
 [tool.setuptools]
 license-files = ["LICENSE", "NOTICE"]
+py-modules = ["run_analysis_main", "run_factor_synthesis", "run_symbolic_factor_mining"]

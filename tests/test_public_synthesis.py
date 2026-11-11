@@ -7,7 +7,7 @@ import pandas as pd
 import pytest
 
 from examples.synthesis_demo import METHODS, run_demo, synthetic_panel
-from tools.agent_harness.cli import main
+from tools.demo_cli import main
 
 
 @pytest.mark.parametrize("method", METHODS)

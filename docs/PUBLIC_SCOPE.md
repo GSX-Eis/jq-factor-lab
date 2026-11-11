@@ -4,11 +4,22 @@
 
 合成部分保留：LASSO、Ridge、ElasticNet、Quantile ElasticNet、PCA、LightGBM、固定权重、动态混合、市值条件合成；因子预筛选、特征与目标预处理、样本加权、交叉验证、诊断和组合权重接口。详见 [合成算法](SYNTHESIS.md)。
 
-不包含：已有研究因子、个人实验配置、研究结果和已训练模型、专项实验脚本、真实行情、生产策略、自动登录上传及 dashboard。合成目录中绑定具体研究项目的脚本也不导出。
+不包含：已有研究因子、个人合成实验配置、研究结果和已训练模型、专项实验脚本、真实行情、生产策略、自动登录上传及 dashboard。合成目录中绑定具体研究项目的脚本也不导出。
 
 示例因子、合成数据和演示参数是公开版教学材料；保留测试中的小型合成输入与测试参数用于验证算法，不是个人实验配置。原配置目录完全排除，公开 config 仅含教学用 demo.json、factor_requirements.json 和通用 cloud_api_mapping.json。
 
 教学示例的执行范围为单因子 CLI 和固定权重合成。合成示例使用同日人工响应，其余六种方法缺少严格隔离所需的真实退出上下文，会在创建输出和进入 pipeline 前抛出 `LabelIsolationError`；不为该响应伪造下一交易日退出。所保留算法的回归测试与导出边界测试另行验收，不能把算法接口仍然存在解释为这六种教学调用已通过。Qlib 原生运行时、MPS 加速、真实数据接入、完整交易回测和云端执行没有在本版本中验收。
+
+## 研究后端
+
+公开版同时包含外部编排器（例如 Task Manager）调用的研究后端：
+
+- `tools/agent_harness/cli.py`：结构化 JSON 包装，覆盖 `single-factor-analysis`、`factor-synthesis`、`symbolic-factor-mining`、`quanta-alpha-realize`、`parent-factor-screen`、`alignment-run`、`monitor-refresh` 和 `outputs-gc`。教学 CLI 位于 `tools/demo_cli.py`。
+- `run_analysis_main.py`、`run_factor_synthesis.py`、`run_symbolic_factor_mining.py` 及其依赖的 `backtest_and_analysis`、`factor_synthesis`（含 VectorBT 适配）、`factor_mining/symbolic`。
+- `scripts/alignment/`、`jq_strategies/cloud_factor_dumper.py` 等云端/本地对齐工具，以及其余审阅过的 `data_pipeline/loaders`。
+- 后端的默认门槛和参数按源码原样公开。
+
+后端需要调用者自备 DuckDB 数据库、因子文件和运行配置；数据库默认路径为 `./data/duckdb/`。VectorBT 回测与 DSO 符号挖掘分别需要可选依赖 `backtest` 与 `mining`。对齐流程的浏览器上传、下载辅助脚本不在本仓库中。Regime 研究命令不公开。
 
 数据导入部分见 [本地数据导入](DATA_IMPORT.md)。只保留经过审阅的 loaders；批量下载器、登录、JQData 本地 SDK 和旧在线复权类不包含在公开版本中。
 

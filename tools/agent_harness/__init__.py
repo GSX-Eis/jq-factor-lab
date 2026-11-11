@@ -1,1 +1,2 @@
-"""Public single-factor execution interface."""
+"""Agent-native harness wrappers for quantation_factor_database."""
+

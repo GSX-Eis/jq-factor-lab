@@ -8,8 +8,8 @@
 python -m pip install -e '.[dev,synthesis]'
 python -m pytest -q
 python -m examples.generate_data --output data/demo.csv
-python -m tools.agent_harness.cli single-factor-analysis --config config/demo.json --output-dir outputs/contribution-analysis
-python -m tools.agent_harness.cli factor-synthesis-demo --output-dir outputs/contribution-synthesis
+python -m tools.demo_cli single-factor-analysis --config config/demo.json --output-dir outputs/contribution-analysis
+python -m tools.demo_cli factor-synthesis-demo --output-dir outputs/contribution-synthesis
 ```
 
 输出目录必须尚不存在。影响标签、日历、预处理或选模的修改应覆盖错误路径与边界，并说明行为变化；不能关闭退出日隔离校验来让测试或示例通过。提交时列出实际通过的检查和未验证环境，更新相关文档及 [CHANGELOG](CHANGELOG.md)。云端运行和完整交易回测仍需独立验证。
