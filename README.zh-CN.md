@@ -146,3 +146,5 @@ python -m scripts.build_jq_strategy \
 开发环境安装后可运行 `python -m pytest -q`。贡献要求见 [CONTRIBUTING](CONTRIBUTING.md)，漏洞报告见 [SECURITY](SECURITY.md)，版本记录见 [CHANGELOG](CHANGELOG.md)。
 
 本项目采用 [Apache License 2.0](LICENSE)，版权声明见 [NOTICE](NOTICE)。第三方依赖保留各自的许可证。
+
+分钟 Bar 契约、DuckDB 导入与时序/截面双模式评估：[TIME_SERIES_CONTRACT](docs/TIME_SERIES_CONTRACT.md)。

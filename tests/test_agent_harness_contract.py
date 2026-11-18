@@ -26,6 +26,7 @@ def _payload(proc: subprocess.CompletedProcess[str]) -> dict:
 
 def test_dry_run_shape_for_all_commands(tmp_path: Path) -> None:
     commands = [
+        ["time-series-analysis", "--dry-run", "--config", "missing.json"],
         ["single-factor-analysis", "--dry-run", "--factor", "factors/exp/example.py"],
         ["factor-synthesis", "--dry-run", "--config", "missing.json"],
         ["monitor-refresh", "--dry-run"],

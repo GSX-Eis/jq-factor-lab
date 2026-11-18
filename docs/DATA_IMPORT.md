@@ -266,6 +266,14 @@ finally:
 
 Import an independently verified calendar into the input DuckDB before using stock-pool schedules, forward returns or Qlib exports. Price observations do not define exchange sessions. See [Trading calendar](TRADING_CALENDAR.md) for the import receipt, coverage, version bindings and Parquet-only usage.
 
+## 分钟 Bar 导入与读取
+
+`data_pipeline.loaders.market_bar_importer.import_market_bars(connection, bars, metadata)` 使用调用方提供的 DuckDB 连接，在同一事务内导入 `instrument_metadata` 和 `market_bars`；重复键或任何写入失败都会回滚。输入须明确 UTC Bar 开始时间、频率、来源和数据版本；期货须为单一到期合约并声明乘数，不接受连续/主力合约。
+
+外部文件先用 `ExternalBarSourceSpec` / `adapt_external_bars` 显式声明源时区、开始/结束时间戳语义、区间/Session 累计成交量和列映射，再提交标准结构。不要自行猜测时区、复权或累计量含义。
+
+`utils.market_bar_reader.MarketBarReader(connection=...)` 借用连接，`MarketBarReader(duckdb_path=...)` 只读打开文件并可作为 context manager。`read_bars` 依照 `SessionCalendar` 筛选 ETH/RTH，并保留原始覆盖和逐标的日历身份；缺 Bar 不填价。旧表通过 `read_legacy_price_table` 读取，不迁移或覆盖原表。完整字段、转换校验、旧表预设与双模式评估见 [分钟研究契约](TIME_SERIES_CONTRACT.md)。
+
 ## 已退役的滚动复权中间列接口
 
 2026-10-26 移除 `utils.pit_adjustment.add_rolling_pit_columns()` 及其导出，不保留兼容包装。

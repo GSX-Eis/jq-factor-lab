@@ -953,7 +953,243 @@ def _common_artifacts(output_dir: Path) -> List[Dict[str, Any]]:
     return [{"artifact_type": "summary", "path": str(output_dir / "summary.json")}]
 
 
+def _validate_bar_output_paths(db_path: Path, output_dir: Path, json_out: str,
+                               evaluation_dir: Path | None = None) -> None:
+    from utils.bar_evaluation_store import BarEvaluationPreconditionError
+
+    targets = [output_dir / "summary.json", output_dir / "config/resolved.json",
+               output_dir / "output_bindings.json"]
+    if output_dir.parent.name == "attempts":
+        targets.append(output_dir.parent.parent / "summary.json")
+    if json_out:
+        targets.append(Path(json_out).expanduser())
+    if evaluation_dir is not None:
+        targets.extend(evaluation_dir / name for name in
+                       ("summary.json", "per_bar_labels.csv", "ic_by_horizon.csv", "quantile_stats.csv"))
+    db_path = db_path.resolve()
+    for target in targets:
+        target = target.resolve()
+        if (db_path == target or db_path in target.parents or target in db_path.parents
+                or (db_path.exists() and target.exists() and db_path.samefile(target))):
+            raise BarEvaluationPreconditionError(
+                f"results_db path overlaps an output path: {db_path} / {target}")
+
+
+def _handle_time_series_analysis(args: argparse.Namespace) -> HarnessResult:
+    from tools.agent_harness.time_series_analysis import load_config
+    from utils.bar_evaluation_store import (
+        BarEvaluationConflictError,
+        BarEvaluationIntegrityError,
+        BarEvaluationPreconditionError,
+        _validate_db_target_path,
+        ingest_evaluation,
+    )
+    from utils.output_paths import execution_environment
+
+    action = args.command
+    output_dir = _output_dir("time-series-analysis", _resolve_args_output_root(args.output_root), args.run_id)
+    harness_summary_dirs = {output_dir}
+    if output_dir.parent.name == "attempts":
+        harness_summary_dirs.add(output_dir.parent.parent)
+    destination = output_dir / "evaluation"
+    command = [sys.executable, "-m", "tools.agent_harness.time_series_analysis"]
+    started_at = _utc_now()
+    common = dict(action=action, output_dir=output_dir, run_id=args.run_id,
+                  started_at=started_at, command=command)
+    phase = "preflight"
+    config_error = None
+    try:
+        config = load_config(_resolve_repo_relative_path(args.config)) if args.config else {}
+    except Exception as exc:
+        config, config_error = {}, exc
+    guard_config = config
+    if config_error is not None:
+        try:
+            guard_config = _safe_read_json(_resolve_repo_relative_path(args.config))
+        except (OSError, ValueError, TypeError):
+            pass
+    try:
+        raw_db = getattr(args, "results_db", None)
+        if raw_db is None:
+            raw_db = guard_config.get("results_db")
+            guarded_db = _resolve_repo_relative_path(raw_db) if isinstance(raw_db, str) and raw_db.strip() else None
+        else:
+            guarded_db = Path(raw_db).expanduser().resolve() if raw_db.strip() else None
+        if guarded_db is not None:
+            guarded_destination = (Path(args.output_dir).expanduser().resolve() if args.output_dir else
+                                   _resolve_repo_relative_path(guard_config["output_dir"])
+                                   if guard_config.get("output_dir") else destination)
+            if guarded_destination in harness_summary_dirs:
+                guarded_destination = destination
+            _validate_bar_output_paths(guarded_db, output_dir, args.json_out, guarded_destination)
+    except (OSError, ValueError, TypeError) as exc:
+        # A collision failure must never write a Harness/error mirror or clear a marker.
+        result = _failure_result(**common, mode="preflight",
+            reason="bar_evaluation_store_precondition_failed", exit_code=EXIT_PRECONDITION,
+            metrics={"error": str(exc)}, artifacts=[])
+        result.error["message"] = str(exc)
+        return result
+    if args.fake_result:
+        return _fake_result(**common, fake_result=args.fake_result, json_out=args.json_out)
+    if args.dry_run:
+        dry_metrics: Dict[str, Any] = {"planned_config": args.config}
+        if getattr(args, "results_db", None) is not None:
+            dry_metrics["planned_results_db"] = str(Path(args.results_db).expanduser().resolve())
+        return _complete_result(_success_result(**common, mode="dry_run", reason="dry_run",
+            metrics=dry_metrics, artifacts=_common_artifacts(output_dir)), args.json_out)
+
+    try:
+        # Clear an explicit retry's marker even if config loading itself fails.
+        if args.output_dir:
+            destination = Path(args.output_dir).expanduser().resolve()
+            if destination in harness_summary_dirs:
+                destination = output_dir / "evaluation"
+            (destination / "summary.json").unlink(missing_ok=True)
+        if config_error is not None:
+            raise config_error
+        if not args.output_dir and config.get("output_dir"):
+            destination = _resolve_repo_relative_path(config["output_dir"])
+            if destination in harness_summary_dirs:
+                destination = output_dir / "evaluation"
+            (destination / "summary.json").unlink(missing_ok=True)
+        config_results_db = config.pop("results_db", None)
+        results_db_path: Path | None = None
+        cli_results_db = getattr(args, "results_db", None)
+        if cli_results_db is not None:
+            if not isinstance(cli_results_db, str) or not cli_results_db.strip():
+                raise BarEvaluationPreconditionError("--results-db must be a nonempty path")
+            results_db_path = _validate_db_target_path(Path(cli_results_db).expanduser().resolve())
+        elif config_results_db is not None:
+            if not isinstance(config_results_db, str) or not config_results_db.strip():
+                raise BarEvaluationPreconditionError("config results_db must be a nonempty path")
+            results_db_path = _validate_db_target_path(_resolve_repo_relative_path(config_results_db))
+
+        for name in ("bars_csv", "factors_csv", "analysis_mode", "view", "calendar",
+                     "entry_offset_bars", "n_quantiles"):
+            value = getattr(args, name)
+            if value is not None:
+                config[name] = value
+        if args.horizons is not None:
+            config["horizons"] = [int(h.strip()) for h in args.horizons.split(",")]
+        if args.calendar is not None:
+            config.pop("calendar_by_instrument", None)
+        if args.json_out and Path(args.json_out).expanduser().resolve() in {
+            destination / filename for filename in ("summary.json", "per_bar_labels.csv",
+                                                    "ic_by_horizon.csv", "quantile_stats.csv")
+        }:
+            # The error mirror must not recreate the rejected completion marker.
+            args.json_out = ""
+            raise ValueError("--json-out must differ from evaluation artifact paths")
+        output_dir.mkdir(parents=True, exist_ok=True)
+        resolved_config = output_dir / "config" / "resolved.json"
+        _write_json(resolved_config, config)
+        command.extend([str(resolved_config), str(destination)])
+        phase = "subprocess"
+        with execution_environment(output_dir) as (environment, leases):
+            proc = subprocess.run(command, cwd=REPO_ROOT, env=environment, pass_fds=leases,
+                capture_output=True, text=True, timeout=args.timeout_sec, check=False)
+        try:
+            payload = json.loads(proc.stdout)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"Bar evaluation worker returned invalid JSON (exit {proc.returncode}): "
+                               f"{_tail(proc.stderr or proc.stdout)}") from exc
+        if not payload["ok"]:
+            result = _failure_result(**common, mode="subprocess", reason=payload["error"]["code"],
+                exit_code=payload["exit_code"], metrics={}, artifacts=_common_artifacts(output_dir))
+            result.error = payload["error"]
+        elif proc.returncode != 0:
+            raise RuntimeError(f"Bar evaluation worker exited {proc.returncode}: {proc.stderr}")
+        else:
+            metrics_out = dict(payload["metrics"])
+            if results_db_path is not None:
+                phase = "results_db"
+                receipt = ingest_evaluation(
+                    results_db_path,
+                    evaluation_dir=destination,
+                    artifacts=payload["artifacts"],
+                    run_id=args.run_id,
+                )
+                metrics_out["results_db"] = {
+                    "path": str(receipt.db_path),
+                    "identity_hash": receipt.identity_hash,
+                    "status": receipt.status,
+                }
+            result = _success_result(**common, mode="subprocess", metrics=metrics_out,
+                artifacts=_common_artifacts(output_dir) + payload["artifacts"])
+    except Exception as exc:
+        if phase == "results_db":
+            if isinstance(exc, BarEvaluationConflictError):
+                reason = "bar_evaluation_store_conflict"
+                exit_code = EXIT_QUALITY_GATE
+            elif isinstance(exc, (BarEvaluationPreconditionError, BarEvaluationIntegrityError, ValueError, FileNotFoundError)):
+                reason = "bar_evaluation_store_precondition_failed"
+                exit_code = EXIT_PRECONDITION
+            else:
+                reason = "bar_evaluation_store_write_failed"
+                exit_code = EXIT_EXECUTION
+            result = _failure_result(
+                **common,
+                mode="results_db",
+                reason=reason,
+                exit_code=exit_code,
+                metrics={"exception_type": type(exc).__name__, "error": str(exc)},
+                artifacts=_common_artifacts(output_dir),
+            )
+            result.error["message"] = str(exc)
+        else:
+            precondition = phase == "preflight" and isinstance(exc, (OSError, ValueError, TypeError))
+            reason = (
+                "bar_evaluation_store_precondition_failed"
+                if isinstance(exc, BarEvaluationPreconditionError)
+                else ("time_series_precondition_failed" if precondition else "time_series_execution_failed")
+            )
+            result = _failure_result(**common, mode="preflight" if precondition else "subprocess",
+                reason=reason,
+                exit_code=EXIT_PRECONDITION if precondition else EXIT_EXECUTION,
+                metrics={"exception_type": type(exc).__name__, "error": str(exc)},
+                artifacts=_common_artifacts(output_dir))
+            result.error["message"] = str(exc)
+    if not result.ok:
+        try:
+            (destination / "summary.json").unlink(missing_ok=True)
+        except OSError as exc:
+            result.error["details"]["completion_cleanup_error"] = str(exc)
+    return _complete_result(result, args.json_out)
+
+
 def _handle_single_factor_analysis(args: argparse.Namespace) -> HarnessResult:
+    if args.bars_csv is not None or args.analysis_mode == "time_series":
+        return _handle_time_series_analysis(args)
+    if args.config:
+        config = _safe_read_json(_resolve_repo_relative_path(args.config))
+        if ("bars_csv" in config or "time_series_analysis" in config or "continuous_futures" in config
+                or config.get("analysis_mode") == "time_series"):
+            return _handle_time_series_analysis(args)
+    if getattr(args, "results_db", None) is not None:
+        action = "single-factor-analysis"
+        output_dir = _output_dir(
+            action, _resolve_args_output_root(args.output_root), args.run_id
+        )
+        started_at = _utc_now()
+        result = _failure_result(
+            action=action,
+            mode="preflight",
+            output_dir=output_dir,
+            run_id=args.run_id,
+            command=[sys.executable, str(REPO_ROOT / "run_analysis_main.py")],
+            started_at=started_at,
+            reason="results_db_unsupported_for_daily",
+            exit_code=EXIT_PRECONDITION,
+            metrics={"results_db": str(args.results_db)},
+            artifacts=_common_artifacts(output_dir),
+        )
+        try:
+            _validate_bar_output_paths(Path(args.results_db).expanduser(), output_dir, args.json_out)
+        except (OSError, ValueError, TypeError) as exc:
+            result.artifacts = []
+            result.error["message"] = str(exc)
+            return result
+        return _complete_result(result, json_out=args.json_out)
     action = "single-factor-analysis"
     output_dir = _output_dir(
         action, _resolve_args_output_root(args.output_root), args.run_id
@@ -1582,6 +1818,8 @@ def _handle_parent_factor_screen(args: argparse.Namespace) -> HarnessResult:
 
 
 def _duckdb_count_tables(db_path: Path, *, bindings=None) -> Dict[str, Any]:
+    from utils.bar_evaluation_store import summarize_bar_evaluation_connection
+
     try:
         from utils.data_store import connect_read_only
     except Exception:
@@ -1594,8 +1832,9 @@ def _duckdb_count_tables(db_path: Path, *, bindings=None) -> Dict[str, Any]:
     conn = connect_read_only(db_path, bindings=bindings, allow_labels=True)
     try:
         tables = conn.execute("SHOW TABLES").fetchall()
+        table_names = {row[0] for row in tables}
         factor_count = 0
-        if any(row[0] == "factor_analysis_results" for row in tables):
+        if "factor_analysis_results" in table_names:
             factor_count = int(
                 conn.execute("SELECT COUNT(*) FROM factor_analysis_results").fetchone()[
                     0
@@ -1606,9 +1845,101 @@ def _duckdb_count_tables(db_path: Path, *, bindings=None) -> Dict[str, Any]:
             "available": True,
             "table_count": len(tables),
             "factor_count": factor_count,
+            "bar_evaluation": summarize_bar_evaluation_connection(conn, table_names=table_names),
         }
     finally:
         conn.close()
+
+
+def _handle_read_bar_evaluations(args: argparse.Namespace) -> HarnessResult:
+    from utils.bar_evaluation_store import (
+        BarEvaluationPreconditionError,
+        query_bar_evaluations,
+    )
+
+    action = "read-bar-evaluations"
+    output_dir = _output_dir(
+        action, _resolve_args_output_root(args.output_root), args.run_id
+    )
+    started_at = _utc_now()
+    db_path = Path(args.results_db).expanduser().resolve()
+    command = [action, "--results-db", str(db_path)]
+    artifacts = _common_artifacts(output_dir)
+    common = dict(
+        action=action,
+        output_dir=output_dir,
+        run_id=args.run_id,
+        command=command,
+        started_at=started_at,
+        artifacts=artifacts,
+    )
+    try:
+        _validate_bar_output_paths(db_path, output_dir, args.json_out)
+    except (OSError, ValueError, TypeError) as exc:
+        result = _failure_result(**{**common, "artifacts": []}, mode="preflight",
+            reason="bar_evaluation_read_precondition_failed", exit_code=EXIT_PRECONDITION,
+            metrics={"results_db": str(db_path), "error": str(exc)})
+        result.error["message"] = str(exc)
+        return result
+    if args.fake_result:
+        return _fake_result(
+            action=action,
+            fake_result=args.fake_result,
+            output_dir=output_dir,
+            run_id=args.run_id,
+            started_at=started_at,
+            command=command,
+            json_out=args.json_out,
+        )
+    if args.dry_run:
+        return _complete_result(
+            _success_result(
+                **common,
+                mode="dry_run",
+                reason="dry_run",
+                metrics={"results_db": str(db_path)},
+            ),
+            json_out=args.json_out,
+        )
+
+    try:
+        payload = query_bar_evaluations(
+            db_path,
+            identity_hash=args.identity_hash,
+            analysis_mode=args.analysis_mode,
+            frequency=args.frequency,
+            calendar_id=args.calendar_id,
+            start_utc=args.start_utc,
+            end_utc=args.end_utc,
+        )
+        return _complete_result(
+            _success_result(
+                **common,
+                mode="local",
+                metrics={"results_db": str(db_path), **payload},
+            ),
+            json_out=args.json_out,
+        )
+    except (BarEvaluationPreconditionError, FileNotFoundError, ValueError) as exc:
+        result = _failure_result(
+            **common,
+            mode="preflight",
+            reason="bar_evaluation_read_precondition_failed",
+            exit_code=EXIT_PRECONDITION,
+            metrics={"results_db": str(db_path), "error": str(exc)},
+        )
+        result.error["message"] = str(exc)
+        return _complete_result(result, json_out=args.json_out)
+    except Exception as exc:
+        result = _failure_result(
+            **common,
+            mode="local",
+            reason="bar_evaluation_read_failed",
+            exit_code=EXIT_EXECUTION,
+            metrics={"results_db": str(db_path), "error": str(exc)},
+        )
+        result.error["message"] = str(exc)
+        return _complete_result(result, json_out=args.json_out)
 
 
 def _handle_monitor_refresh(args: argparse.Namespace) -> HarnessResult:
@@ -1791,6 +2122,319 @@ def _handle_alignment_run(args):
 
 
 
+def _handle_bar_storage(args: argparse.Namespace) -> HarnessResult:
+    import duckdb
+    from utils.bar_builder import audit_bars, build_bars
+
+    action, started = args.command, _utc_now()
+    output = _output_dir(action, _resolve_args_output_root(args.output_root), args.run_id)
+    common = dict(action=action, mode='local', output_dir=output, run_id=args.run_id,
+                  command=[action, '--db', args.db], started_at=started, artifacts=[])
+    try:
+        path = Path(args.db).expanduser().resolve()
+        if not path.is_file() and action != 'import-bars':
+            raise ValueError(f'Database does not exist: {path}')
+        if args.dry_run:
+            metrics = dict(database=str(path), write=not getattr(args, 'check_only', False))
+        else:
+            with duckdb.connect(str(path), read_only=getattr(args, 'check_only', False)) as connection:
+                instruments = args.instruments.split(',') if args.instruments else None
+                if action == 'audit-bars':
+                    metrics = audit_bars(connection, instruments=instruments, start=args.start,
+                                         end=args.end, bucket_strategy=args.bucket_strategy)
+                elif action == 'build-bars':
+                    metrics = build_bars(connection, source=args.source, targets=args.targets.split(','),
+                        instruments=instruments, start=args.start, end=args.end,
+                        bucket_strategy=args.bucket_strategy, check_only=args.check_only)
+                elif action == 'build-roll-schedule':
+                    from utils.futures_roll import build_roll_schedule
+                    metrics = build_roll_schedule(connection, product_roots=args.product_roots.split(','),
+                        start=args.start, end=args.end, rule=args.rule, confirm_days=args.confirm_days,
+                        forward_only=args.forward_only)
+                else:
+                    import pandas as pd
+                    from backtest_and_analysis.time_series.csv_reader import read_bar_csv
+                    from data_pipeline.loaders.market_bar_importer import import_market_bars
+                    bars = read_bar_csv(args.bars)
+                    metadata = pd.DataFrame(json.loads(Path(args.metadata).read_text(encoding='utf-8')))
+                    count = import_market_bars(connection, bars, metadata,
+                        bucket_strategy=args.bucket_strategy,
+                        derive=tuple(args.derive.split(',')) if args.derive else (),
+                        legacy_compatibility=False)
+                    metrics = dict(imported_bars=count)
+        result = _success_result(**common, metrics=metrics)
+    except (ValueError, LookupError, OSError, duckdb.Error) as exc:
+        result = _failure_result(**common, reason='bar_storage_precondition_failed',
+                                 exit_code=EXIT_PRECONDITION, metrics={'message': str(exc)})
+    return _complete_result(result, json_out=args.json_out)
+
+
+def _parse_strict_utc_csv_column(series: Any, name: str) -> Any:
+    import pandas as pd
+    pattern = r'\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?(?:Z|\+00:00|\+0000)'
+    text = series.astype('string')
+    if not text.str.fullmatch(pattern).fillna(False).all():
+        raise ValueError(f'{name} must explicitly specify UTC (Z, +00:00 or +0000)')
+    return pd.to_datetime(text, format='ISO8601', utc=True).astype('datetime64[ns, UTC]')
+
+
+def _handle_factor_values_store(args: argparse.Namespace) -> HarnessResult:
+    import datetime as dt
+    import uuid
+    import duckdb
+    import pandas as pd
+    import pyarrow as pa
+    from backtest_and_analysis.time_series.contracts import sha256_file
+    from backtest_and_analysis.time_series.csv_reader import read_factor_csv
+    from utils.code_version import resolve_code_version
+    from utils.market_factor_store import (
+        FactorValueConflictError,
+        MarketFactorValueStore,
+        TABLE_COLUMNS,
+        build_identity_record,
+        compute_factor_identity_hash,
+    )
+    from utils.session_calendar import SessionCalendar
+    from utils.time_axis import BarSchedule, Frequency
+
+    action, started = args.command, _utc_now()
+    output = _output_dir(action, _resolve_args_output_root(args.output_root), args.run_id)
+    store_path = Path(args.factor_values_store).expanduser().resolve()
+    command = [action, '--factor-values-store', str(store_path)]
+    common = dict(action=action, output_dir=output, run_id=args.run_id,
+                  command=command, started_at=started, artifacts=[])
+
+    if args.fake_result:
+        return _fake_result(
+            action=action, fake_result=args.fake_result, output_dir=output,
+            run_id=args.run_id, started_at=started, command=command, json_out=args.json_out,
+        )
+
+    if args.dry_run:
+        plan_metrics: dict[str, Any] = {
+            'dry_run': True,
+            'factor_values_store': str(store_path),
+        }
+        if action == 'write-factor-values':
+            plan_metrics['input'] = str(Path(args.input).expanduser().resolve())
+            if args.factor_id:
+                plan_metrics['factor_id'] = args.factor_id
+            if args.frequency:
+                plan_metrics['frequency'] = args.frequency
+        return _complete_result(
+            _success_result(**common, mode='dry_run', reason='dry_run', metrics=plan_metrics),
+            json_out=args.json_out,
+        )
+
+    try:
+        store = MarketFactorValueStore(store_path)
+        if action == 'verify-factor-values':
+            if not store_path.is_dir():
+                raise FileNotFoundError(f'Factor values store does not exist: {store_path}')
+            report = store.verify_store()
+            if report['ok']:
+                result = _success_result(**common, mode='local', metrics=report)
+            else:
+                result = _failure_result(
+                    **common, mode='local', reason='factor_store_verification_failed',
+                    exit_code=EXIT_QUALITY_GATE, metrics=report,
+                )
+            return _complete_result(result, json_out=args.json_out)
+
+        if action == 'read-factor-values':
+            if not store_path.is_dir():
+                raise FileNotFoundError(f'Factor values store does not exist: {store_path}')
+            instruments = [item.strip() for item in args.instruments.split(',') if item.strip()] if args.instruments else None
+            metrics: dict[str, Any] = {'factor_values_store': str(store_path)}
+            artifacts: list[dict[str, Any]] = []
+            if args.list_identities:
+                identities_df = store.list_identities(factor_id=args.factor_id, frequency=args.frequency)
+                metrics['identity_count'] = int(len(identities_df))
+                identities_out = identities_df.copy()
+                identities_out['created_at'] = identities_out['created_at'].dt.strftime('%Y-%m-%dT%H:%M:%S.%fZ')
+                metrics['identities'] = identities_out.to_dict('records')
+            has_row_filters = any(
+                getattr(args, name) is not None
+                for name in ('factor_id', 'factor_identity_hash', 'frequency', 'session_view',
+                             'instruments', 'start_utc', 'end_utc', 'session_start', 'session_end', 'out')
+            )
+            if has_row_filters or not args.list_identities:
+                frame = store.read_factor_values(
+                    factor_id=args.factor_id,
+                    factor_identity_hash=args.factor_identity_hash,
+                    frequency=args.frequency,
+                    session_view=args.session_view,
+                    instruments=instruments,
+                    start_utc=args.start_utc,
+                    end_utc=args.end_utc,
+                    session_start=args.session_start,
+                    session_end=args.session_end,
+                )
+                plan = store.last_read_plan
+                metrics['row_count'] = int(len(frame))
+                if plan is not None:
+                    metrics['resolved_factor_ids'] = list(plan.resolved_factor_ids)
+                    metrics['resolved_frequencies'] = list(plan.resolved_frequencies)
+                    metrics['scanned_shards'] = [str(p.relative_to(store.parquet_root)) for p in plan.shard_paths]
+                if args.limit and args.limit > 0:
+                    preview = frame.head(args.limit).copy()
+                    preview['timestamp_utc'] = preview['timestamp_utc'].dt.strftime('%Y-%m-%dT%H:%M:%S.%fZ')
+                    preview['created_at'] = preview['created_at'].dt.strftime('%Y-%m-%dT%H:%M:%S.%fZ')
+                    metrics['preview'] = preview.to_dict('records')
+                if args.out:
+                    out_path = Path(args.out).expanduser().resolve()
+                    out_path.parent.mkdir(parents=True, exist_ok=True)
+                    if out_path.suffix.lower() == '.parquet':
+                        frame.to_parquet(out_path, index=False)
+                    else:
+                        export_df = frame.copy()
+                        export_df['timestamp_utc'] = export_df['timestamp_utc'].dt.strftime('%Y-%m-%dT%H:%M:%S.%fZ')
+                        export_df['created_at'] = export_df['created_at'].dt.strftime('%Y-%m-%dT%H:%M:%S.%fZ')
+                        export_df.to_csv(out_path, index=False)
+                    artifacts.append({'artifact_type': 'factor_values_export', 'path': str(out_path)})
+            result = _success_result(
+                action=action, mode='local', output_dir=output, run_id=args.run_id,
+                command=command, started_at=started, metrics=metrics, artifacts=artifacts,
+            )
+            return _complete_result(result, json_out=args.json_out)
+
+        # write-factor-values
+        input_path = Path(args.input).expanduser().resolve()
+        if not input_path.is_file():
+            raise FileNotFoundError(f'Input file does not exist: {input_path}')
+
+        cal_obj: SessionCalendar | None = None
+        if args.calendar:
+            cal_obj = SessionCalendar(
+                args.calendar,
+                args.calendar_start,
+                args.calendar_end,
+                rth_reference_calendar=args.rth_reference_calendar,
+            )
+        if cal_obj is None:
+            raise ValueError('--calendar is required for write-factor-values to verify session_id')
+
+        if input_path.suffix.lower() == '.parquet':
+            raw_df = pd.read_parquet(input_path)
+            is_full_schema = set(TABLE_COLUMNS).issubset(raw_df.columns)
+        else:
+            header_cols = list(pd.read_csv(input_path, nrows=0).columns)
+            is_full_schema = set(TABLE_COLUMNS).issubset(header_cols)
+            if is_full_schema:
+                raw_df = pd.read_csv(input_path, dtype={'factor_id': 'string', 'factor_identity_hash': 'string',
+                                                      'frequency': 'string', 'session_view': 'string',
+                                                      'instrument_id': 'string', 'timestamp_utc': 'string',
+                                                      'session_id': 'string', 'source_build_id': 'string',
+                                                      'calendar_hash': 'string', 'code_version': 'string',
+                                                      'created_at': 'string', 'batch_id': 'string'})
+                raw_df['timestamp_utc'] = _parse_strict_utc_csv_column(raw_df['timestamp_utc'], 'timestamp_utc')
+                raw_df['created_at'] = _parse_strict_utc_csv_column(raw_df['created_at'], 'created_at')
+            else:
+                raw_df = read_factor_csv(input_path)
+
+        identity_rec = None
+        if is_full_schema:
+            batch_df = raw_df
+        else:
+            if not args.factor_id or not args.frequency or not args.analysis_mode or not args.source_build_id:
+                raise ValueError(
+                    '--factor-id, --frequency, --analysis-mode, and --source-build-id are required '
+                    'when input does not contain full market_factor_values schema'
+                )
+            if cal_obj is None:
+                raise ValueError('--calendar is required when input does not contain full market_factor_values schema')
+            parsed_freq = Frequency.parse(args.frequency)
+            if not parsed_freq.is_valid or parsed_freq.canonical is None:
+                raise ValueError(f'Invalid frequency: {args.frequency!r}')
+            canonical_freq = parsed_freq.canonical
+            strategy = BarSchedule(
+                cal_obj, canonical_freq, view=args.session_view, bucket_strategy=args.bucket_strategy
+            ).bucket_strategy
+            params = json.loads(args.params_json) if args.params_json else {}
+            code_ver, code_ver_src = resolve_code_version()
+            source_sha = sha256_file(input_path)
+            fhash, payload = compute_factor_identity_hash(
+                factor_id=args.factor_id,
+                factor_class=args.factor_class,
+                source_sha256=source_sha,
+                params=params,
+                frequency=canonical_freq,
+                session_view=args.session_view,
+                analysis_mode=args.analysis_mode,
+                bucket_strategy=strategy,
+                calendar_hash=cal_obj.calendar_hash,
+                source_build_id=args.source_build_id,
+                data_version=args.data_version,
+                rth_reference_calendar=cal_obj.rth_reference_calendar,
+                continuous_adjust=args.adjust,
+                code_version=code_ver,
+            )
+            now_dt = dt.datetime.now(dt.timezone.utc)
+            now_iso = now_dt.isoformat()
+            identity_rec = build_identity_record(
+                factor_identity_hash=fhash,
+                payload=payload,
+                code_version_source=code_ver_src,
+                created_at=now_iso,
+            )
+            sessions = []
+            for ts in raw_df['timestamp_utc']:
+                owner = cal_obj.session_at(ts, args.session_view)
+                if owner is None:
+                    raise ValueError(f'timestamp_utc {ts} is outside any open {args.session_view} session')
+                sessions.append(owner.session_date)
+            batch_df = raw_df.assign(
+                factor_id=args.factor_id,
+                factor_identity_hash=fhash,
+                frequency=canonical_freq,
+                session_view=args.session_view,
+                session_id=sessions,
+                source_build_id=args.source_build_id,
+                calendar_hash=cal_obj.calendar_hash,
+                code_version=code_ver,
+                created_at=pd.Timestamp(now_dt),
+                batch_id=uuid.uuid4().hex,
+            ).loc[:, list(TABLE_COLUMNS)]
+
+        receipt = store.append_factor_values(
+            batch_df,
+            identity_record=identity_rec,
+            calendar=cal_obj,
+        )
+        result = _success_result(**common, mode='local', metrics=receipt.to_dict())
+    except FactorValueConflictError as exc:
+        result = _failure_result(
+            **common,
+            mode='local',
+            reason='factor_value_conflict',
+            exit_code=EXIT_QUALITY_GATE,
+            metrics={
+                'message': str(exc),
+                'factor_id': exc.factor_id,
+                'factor_identity_hash': exc.factor_identity_hash,
+                'conflict_count': exc.conflict_count,
+                'examples': exc.examples,
+            },
+        )
+    except (duckdb.Error, pa.lib.ArrowException, RuntimeError) as exc:
+        result = _failure_result(
+            **common,
+            mode='local',
+            reason='factor_store_execution_failed',
+            exit_code=EXIT_EXECUTION,
+            metrics={'message': str(exc)},
+        )
+    except (ValueError, TypeError, LookupError, OSError, json.JSONDecodeError) as exc:
+        result = _failure_result(
+            **common,
+            mode='local',
+            reason='factor_store_precondition_failed',
+            exit_code=EXIT_PRECONDITION,
+            metrics={'message': str(exc)},
+        )
+    return _complete_result(result, json_out=args.json_out)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Agent-native harness wrappers for quantation_factor_database"
@@ -1838,6 +2482,69 @@ def build_parser() -> argparse.ArgumentParser:
             help="Subprocess timeout in seconds",
         )
 
+    for name in ('build-bars', 'audit-bars', 'import-bars', 'build-roll-schedule'):
+        storage = subparsers.add_parser(name, help='Explicit local Bar storage operation')
+        add_common(storage)
+        storage.add_argument('--db', required=True, help='Explicit owned DuckDB destination')
+        storage.add_argument('--bucket-strategy', choices=('segment_anchored', 'session_clock', 'session'))
+        if name != 'import-bars':
+            storage.add_argument('--instruments', required=name == 'build-bars', help='Comma-separated concrete IDs')
+            storage.add_argument('--start', required=name in ('build-bars', 'build-roll-schedule'))
+            storage.add_argument('--end', required=name in ('build-bars', 'build-roll-schedule'))
+        else:
+            storage.set_defaults(instruments=None)
+            storage.add_argument('--bars', required=True, help='Canonical UTC Bar CSV')
+            storage.add_argument('--metadata', required=True, help='Instrument metadata JSON array')
+            storage.add_argument('--derive', default='', help='Optional comma-separated target frequencies')
+        if name == 'build-bars':
+            storage.add_argument('--source', required=True)
+            storage.add_argument('--targets', required=True)
+            storage.add_argument('--check-only', action='store_true')
+        if name == 'build-roll-schedule':
+            storage.add_argument('--product-roots', required=True, help='Comma-separated futures product roots')
+            storage.add_argument('--rule', choices=('max_oi',), default='max_oi')
+            storage.add_argument('--confirm-days', type=int, default=1)
+            storage.add_argument('--forward-only', action=argparse.BooleanOptionalAction, default=True)
+
+    write_fv = subparsers.add_parser('write-factor-values', help='Append minute/bar factor values to Scheme B store')
+    add_common(write_fv)
+    write_fv.add_argument('--factor-values-store', required=True, help='Explicit Scheme B store directory')
+    write_fv.add_argument('--input', required=True, help='Factor values CSV or Parquet file')
+    write_fv.add_argument('--factor-id', default=None)
+    write_fv.add_argument('--frequency', default=None)
+    write_fv.add_argument('--session-view', choices=('ETH', 'RTH'), default='ETH')
+    write_fv.add_argument('--analysis-mode', choices=('time_series', 'cross_sectional'), default=None)
+    write_fv.add_argument('--bucket-strategy', choices=('segment_anchored', 'session_clock', 'session'), default=None)
+    write_fv.add_argument('--calendar', default=None)
+    write_fv.add_argument('--calendar-start', default=None)
+    write_fv.add_argument('--calendar-end', default=None)
+    write_fv.add_argument('--rth-reference-calendar', default=None)
+    write_fv.add_argument('--source-build-id', default=None)
+    write_fv.add_argument('--data-version', default=None)
+    write_fv.add_argument('--params-json', default='{}')
+    write_fv.add_argument('--factor-class', default='external_cli')
+    write_fv.add_argument('--adjust', choices=('none', 'ratio_back_adjust', 'diff_back_adjust'), default=None)
+
+    read_fv = subparsers.add_parser('read-factor-values', help='Read-only query over committed Scheme B factor store')
+    add_common(read_fv)
+    read_fv.add_argument('--factor-values-store', required=True, help='Explicit Scheme B store directory')
+    read_fv.add_argument('--factor-id', default=None)
+    read_fv.add_argument('--factor-identity-hash', default=None)
+    read_fv.add_argument('--frequency', default=None)
+    read_fv.add_argument('--session-view', choices=('ETH', 'RTH'), default=None)
+    read_fv.add_argument('--instruments', default=None, help='Comma-separated instrument IDs')
+    read_fv.add_argument('--start-utc', default=None)
+    read_fv.add_argument('--end-utc', default=None)
+    read_fv.add_argument('--session-start', default=None)
+    read_fv.add_argument('--session-end', default=None)
+    read_fv.add_argument('--list-identities', action='store_true')
+    read_fv.add_argument('--out', default=None, help='Optional CSV or Parquet export path')
+    read_fv.add_argument('--limit', type=int, default=0, help='Optional preview row count in JSON metrics')
+
+    verify_fv = subparsers.add_parser('verify-factor-values', help='Read-only integrity check on Scheme B factor store')
+    add_common(verify_fv)
+    verify_fv.add_argument('--factor-values-store', required=True, help='Explicit Scheme B store directory')
+
     alignment = subparsers.add_parser(
         "alignment-run",
         help="Build, replay and compare factor or frozen-strategy alignment",
@@ -1881,6 +2588,34 @@ def build_parser() -> argparse.ArgumentParser:
     analyze.add_argument(
         "--pool", action="append", default=[], help="Append a dynamic pool name"
     )
+
+    bar_analysis = subparsers.add_parser("time-series-analysis", help="Evaluate CSV Bar factors in an explicit mode")
+    add_common(bar_analysis)
+    bar_analysis.add_argument("--config", default="", help="Bar analysis JSON config")
+    for subparser in (bar_analysis, analyze):
+        subparser.add_argument("--bars-csv")
+        subparser.add_argument("--factors-csv")
+        subparser.add_argument("--analysis-mode", help="time_series or cross_sectional (required for Bars)")
+        subparser.add_argument("--view", help="ETH or RTH")
+        subparser.add_argument("--calendar", help="Session calendar name, e.g. NQ or XSHG")
+        subparser.add_argument("--horizons", help="Comma-separated positive Bar counts")
+        subparser.add_argument("--entry-offset-bars", type=int)
+        subparser.add_argument("--n-quantiles", type=int)
+        subparser.add_argument("--output-dir", help="Evaluation artifact directory")
+        subparser.add_argument("--results-db", default=None, help="Explicit DuckDB results database path")
+
+    read_bar_eval = subparsers.add_parser(
+        "read-bar-evaluations",
+        help="Read-only query over ingested Bar evaluation results",
+    )
+    add_common(read_bar_eval)
+    read_bar_eval.add_argument("--results-db", required=True, help="Explicit DuckDB results database path")
+    read_bar_eval.add_argument("--identity-hash", default=None)
+    read_bar_eval.add_argument("--analysis-mode", choices=("time_series", "cross_sectional"), default=None)
+    read_bar_eval.add_argument("--frequency", default=None)
+    read_bar_eval.add_argument("--calendar-id", default=None)
+    read_bar_eval.add_argument("--start-utc", default=None, help="Inclusive UTC start timestamp or YYYY-MM-DD")
+    read_bar_eval.add_argument("--end-utc", default=None, help="Inclusive UTC end timestamp or YYYY-MM-DD")
 
     symbolic = subparsers.add_parser(
         "symbolic-factor-mining", help="Wrap run_symbolic_factor_mining.py"
@@ -1967,8 +2702,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             return subprocess.run(command, check=False).returncode
         except OSError as exc:
             parser.error(str(exc))
-    if args.command == "alignment-run":
+    if args.command in ('build-bars', 'audit-bars', 'import-bars', 'build-roll-schedule'):
+        result = _handle_bar_storage(args)
+    elif args.command in ('write-factor-values', 'read-factor-values', 'verify-factor-values'):
+        result = _handle_factor_values_store(args)
+    elif args.command == "alignment-run":
         result = _handle_alignment_run(args)
+    elif args.command == "time-series-analysis":
+        result = _handle_time_series_analysis(args)
+    elif args.command == "read-bar-evaluations":
+        result = _handle_read_bar_evaluations(args)
     elif args.command == "single-factor-analysis":
         if args.materialize_only and not args.factor:
             parser.error("--materialize-only requires --factor")

@@ -116,6 +116,13 @@ class FactorBase:
         source_policy: Optional[str] = None,
         calendar_duckdb_path: Optional[str] = None,
         pool_schedule: Optional[dict] = None,
+        analysis_mode: Optional[str] = None,
+        session_view: str = 'ETH',
+        output_frequency: Optional[str] = None,
+        label_config: Optional[dict] = None,
+        data_version: Optional[str] = None,
+        session_calendar=None,
+        source_revision: Optional[str] = None,
     ):
         """初始化因子基类
         
@@ -177,6 +184,27 @@ class FactorBase:
         self.fundamental_table = fundamental_table
         self.price_table = price_table
         self.data_frequency = data_frequency
+        self.analysis_mode = analysis_mode
+        self.session_view = session_view
+        self.output_frequency = output_frequency or data_frequency
+        self.label_config = dict(label_config or {})
+        self.data_version = data_version
+        self.session_calendar = session_calendar
+        self.source_revision = source_revision
+        from utils.time_axis.frequency import FactorFrequencyRoute, Frequency
+        self._frequency_route = FactorFrequencyRoute.resolve(data_frequency, analysis_mode)
+        if analysis_mode is not None and analysis_mode not in ('time_series', 'cross_sectional'):
+            raise ValueError('analysis_mode must be time_series or cross_sectional')
+        if self._frequency_route.explicit_interface and analysis_mode is None:
+            raise ValueError('analysis_mode must be explicit for the new Bar interface')
+        if session_view not in ('ETH', 'RTH'):
+            raise ValueError('session_view must be ETH or RTH')
+        if self._frequency_route.bar_grid:
+            if self.output_frequency in ('daily', '1d'):
+                if analysis_mode != 'cross_sectional':
+                    raise ValueError('daily Session output requires cross_sectional analysis_mode')
+            elif Frequency.parse(self.output_frequency).canonical != self._frequency_route.frequency.canonical:
+                raise ValueError('Bar output_frequency must match data_frequency or be daily/1d')
         # 动态股票池应用位置：'raw'（仅原始数据阶段）、'factor'（仅结果阶段）、'both'
         allowed_modes = ('raw', 'factor', 'both')
         if dynamic_pool_mode not in allowed_modes:
@@ -206,7 +234,7 @@ class FactorBase:
         self.dynamic_pool_manager = None
         try:
             # 初始化 DuckDB 适配器 (如果配置为使用)
-            if self.duckdb_path or self.parquet_dir or self.data_bindings or os.environ.get('QUANT_DATA_BINDINGS', '{}') not in ('', '{}', 'null'):
+            if not self._frequency_route.bar_grid and (self.duckdb_path or self.parquet_dir or self.data_bindings or os.environ.get('QUANT_DATA_BINDINGS', '{}') not in ('', '{}', 'null')):
                 self._duckdb_adapter = self._init_duckdb_adapter()
                 if self._duckdb_adapter:
                     self.duckdb_path = str(self._duckdb_adapter.duckdb_path) if self._duckdb_adapter.duckdb_path else None
@@ -503,13 +531,27 @@ class FactorBase:
         is_price = table_name.startswith('price_data')
         if self._duckdb_adapter is not None and date_field == 'date' and code_field == 'stock_code' and not additional_condition:
             return self._fetch_raw_data_duckdb(fields, table_name)
+        if is_price:
+            from utils.bar_source import BarSource
+            if not isinstance(fields, (list, tuple)):
+                raise ValueError('fields must be a list or tuple of column names')
+            selected = list(fields)
+            if self.pit_enabled and self.pit_factor_column not in selected:
+                selected.append(self.pit_factor_column)
+            frame = BarSource.read_panel(self.all_stocks, self.data_frequency,
+                self.start_date, self.end_date, selected, config=self._get_local_data_config(),
+                connection=self.db_connection, adapter=self._duckdb_adapter,
+                date_field=date_field, code_field=code_field, additional_condition=additional_condition)
+            if self.use_dynamic_pool and self.dynamic_pool_mode in ('raw', 'both'):
+                frame = self._filter_data_by_pools(frame)
+            return frame
         connection = self._duckdb_adapter._get_connection() if self._duckdb_adapter is not None else self.db_connection
         import duckdb
         if not isinstance(connection, duckdb.DuckDBPyConnection):
             raise TypeError("Supply a DuckDB connection, duckdb_path, Parquet directory, or data binding")
         quote = lambda value: '"' + value.replace('"', '""') + '"'
         config = self._get_local_data_config()
-        dataset = config.price(self.data_frequency) if is_price else config.dataset(
+        dataset = config.dataset(
             config.factor_table if table_name == 'factor_data' else table_name)
         physical_table = dataset.table
         if date_field == 'date':
@@ -520,8 +562,6 @@ class FactorBase:
             raise ValueError('fields must be a list or tuple of column names')
         excluded = {date_field, code_field, 'date', 'stock_code', 'code'}
         selected = list(dict.fromkeys(f for f in fields if f not in excluded))
-        if is_price and self.pit_enabled and self.pit_factor_column not in selected:
-            selected.append(self.pit_factor_column)
         from utils.data_access_config import Dataset
         from utils.data_store import table_name as quote_table
         selected = list(Dataset(physical_table, date_field, code_field).fields(selected))
@@ -574,20 +614,19 @@ class FactorBase:
         query_fields = list(fields)
         if is_price_table and self.pit_enabled and self.pit_factor_column not in query_fields:
             query_fields.append(self.pit_factor_column)
-        if is_price_table and self.data_frequency == 'daily' and 'money' in query_fields and 'paused' not in query_fields:
+        if is_price_table and self.data_frequency in ('daily', '1d') and 'money' in query_fields and 'paused' not in query_fields:
             query_fields.append('paused')
         
         if is_price_table:
             # 价格数据查询
-            df = self._duckdb_adapter.fetch_price_data(
-                stocks=self.all_stocks,
-                start_date=self.start_date,
-                end_date=self.end_date,
-                fields=query_fields,
-                frequency=self.data_frequency
-            )
+            from utils.bar_source import BarSource
+            df = BarSource.read_panel(self.all_stocks, self.data_frequency,
+                self.start_date, self.end_date, query_fields, config=self._get_local_data_config(),
+                adapter=self._duckdb_adapter)
             from utils.pit import normalize_price_money
-            df = normalize_price_money(df, source='local', frequency=self.data_frequency)
+            frequency = self._frequency_route.frequency
+            money_frequency = 'daily' if frequency.kind == 'session' else '1m' if frequency.minutes == 1 else '5m'
+            df = normalize_price_money(df, source='local', frequency=money_frequency)
             if 'paused' not in fields and 'paused' in df:
                 df = df.drop(columns='paused')
         else:
@@ -610,6 +649,141 @@ class FactorBase:
             
         return df
     
+    def _fetch_market_bars(self) -> pd.DataFrame:
+        """Read UTC Bar starts; start/end dates denote calendar Session dates.
+
+        No daily PIT transformation is applied: minute factors consume the
+        explicitly versioned source prices, including unadjusted futures.
+        """
+        from utils.bar_source import BarSource
+        from utils.session_calendar import SessionCalendar
+        from backtest_and_analysis.time_series.factor_bridge import session_grid
+
+        if not self._frequency_route.bar_grid:
+            raise ValueError('market Bars require a minute data_frequency and explicit analysis_mode')
+        frequency = self._frequency_route.frequency.canonical
+        with BarSource(self.db_connection, legacy_snapshot=True,
+                config=self._get_local_data_config().as_dict(), duckdb_path=(
+                None if self.db_connection is not None else self.duckdb_path)) as reader:
+            metadata = reader.get_instrument_metadata(self.all_stocks)
+            calendars = self.session_calendar
+            if calendars is None:
+                from data_pipeline.loaders.market_bar_importer import calendar_name
+                calendars = {row['instrument_id']: SessionCalendar(
+                    calendar_name(row), self.start_date, self.end_date,
+                    rth_reference_calendar=row['rth_reference_calendar'])
+                    for row in metadata.to_dict('records')}
+            elif isinstance(calendars, SessionCalendar):
+                calendars = {instrument: calendars for instrument in self.all_stocks}
+            if not isinstance(calendars, dict) or any(
+                    not isinstance(calendars.get(instrument), SessionCalendar) for instrument in self.all_stocks):
+                raise ValueError('session_calendar must supply a SessionCalendar for every instrument')
+            calendars = {instrument: calendars[instrument] for instrument in self.all_stocks}
+            parts, coverage = [], {}
+            for instrument, calendar in calendars.items():
+                if not calendar.start <= pd.Timestamp(self.start_date) <= pd.Timestamp(self.end_date) <= calendar.end:
+                    raise ValueError('session_calendar must cover the requested Session date range')
+                # Each market has its own overnight UTC bounds; never let another
+                # market's opening pull uncovered previous sessions into a read.
+                times = pd.DatetimeIndex([], tz='UTC')
+                for day in calendar.sessions():
+                    if self.start_date <= day.strftime('%Y-%m-%d') <= self.end_date:
+                        times = times.append(calendar.expected_bar_opens(day.strftime('%Y-%m-%d'), frequency))
+                start = times.min() if len(times) else pd.Timestamp(self.start_date, tz='UTC')
+                end = times.max() if len(times) else start
+                part = reader.read([instrument], frequency, view=self.session_view, start=start, end=end)
+                parts.append(part)
+                for name in ('raw_coverage_by_instrument', 'raw_coverage_by_key'):
+                    coverage.setdefault(name, {}).update(part.attrs.get(name, {}))
+            bars = pd.concat(parts, ignore_index=True)
+            bounds = list(coverage['raw_coverage_by_instrument'].values())
+            bars.attrs = dict(coverage, session_view=self.session_view,
+                calendar_hash={instrument: calendar.calendar_hash for instrument, calendar in calendars.items()},
+                raw_coverage_start_utc=min((a for a, _ in bounds), default=pd.NaT),
+                raw_coverage_end_utc=max((b for _, b in bounds), default=pd.NaT))
+        keep = []
+        sessions = []
+        for row in bars.itertuples():
+            session = calendars[row.instrument_id].session_at(row.timestamp_utc, self.session_view)
+            day = session.session_date
+            keep.append(self.start_date <= day <= self.end_date)
+            sessions.append(day)
+        bars['session_id'] = sessions
+        bars = bars.loc[keep].reset_index(drop=True)
+        if self.data_version is not None and not bars.data_version.eq(self.data_version).all():
+            raise ValueError('market Bars do not match the requested data_version')
+        self.instrument_metadata = metadata
+        self.market_calendars = calendars
+        self.calendar_hash = {instrument: calendar.calendar_hash for instrument, calendar in calendars.items()}
+        self.rth_reference_calendar = dict(zip(metadata.instrument_id, metadata.rth_reference_calendar))
+        bars.attrs['instrument_metadata'] = metadata.to_dict('records')
+        self.market_bars = bars
+        self.market_bar_grid = session_grid(bars, calendars, frequency, view=self.session_view,
+                                            start_date=self.start_date, end_date=self.end_date)
+        return self.market_bar_grid
+
+    def session_rolling(self, data: pd.DataFrame, column: str, window: int, **kwargs) -> pd.Series:
+        """Roll the expected grid returned by _fetch_market_bars, preserving gaps."""
+        from backtest_and_analysis.time_series.factor_bridge import session_rolling
+        return session_rolling(data, column, window, **kwargs)
+
+    def _get_market_factor_values(self, force_recalculate: bool = False) -> pd.DataFrame:
+        from backtest_and_analysis.time_series.factor_bridge import bar_factor_frame, session_daily_frame
+
+        raw = self._fetch_market_bars()
+        self.last_raw_data = raw
+        key = self._get_cache_key(raw) if self.cache_dir else None
+        if key and not force_recalculate:
+            cached = self._load_from_cache(key)
+            if cached is not None:
+                return cached
+        values = bar_factor_frame(self.calculate_factor(raw))
+        expected = raw[['timestamp_utc', 'instrument_id']]
+        checked = values.merge(expected, on=['timestamp_utc', 'instrument_id'], how='left', indicator=True)
+        if (checked._merge.eq('left_only') & checked.factor_value.notna()).any():
+            raise ValueError('factor output contains keys outside the Session grid')
+        # Reinsert omitted/absent slots instead of compressing rolling history.
+        values = expected.merge(values, on=['timestamp_utc', 'instrument_id'], how='left',
+                                validate='one_to_one')
+        values.loc[~raw.observed.to_numpy(), 'factor_value'] = np.nan
+        if self.output_frequency in ('daily', '1d'):
+            wide = session_daily_frame(values, raw)
+        else:
+            wide = values.pivot(index='timestamp_utc', columns='instrument_id', values='factor_value')
+            wide.index.name = 'date'  # Existing disk-cache wide-frame contract.
+        if key:
+            self._save_to_cache(wide, key)
+        return wide
+
+    def get_bar_factor_frame(self, force_recalculate: bool = False) -> pd.DataFrame:
+        """Return UTC (timestamp_utc, instrument_id, factor_value), retaining NaNs."""
+        from backtest_and_analysis.time_series.factor_bridge import bar_factor_frame
+        if not self._frequency_route.bar_grid or self.output_frequency in ('daily', '1d'):
+            raise ValueError('get_bar_factor_frame requires minute Bar output')
+        values = bar_factor_frame(self._get_market_factor_values(force_recalculate))
+        return self.market_bar_grid[['timestamp_utc', 'instrument_id']].merge(
+            values, on=['timestamp_utc', 'instrument_id'], how='left', validate='one_to_one'
+        ).sort_values(['timestamp_utc', 'instrument_id']).reset_index(drop=True)
+
+    def get_session_daily_pricing(self) -> pd.Series:
+        """Return MultiIndex(asset, date) prices bound to the Session calendar."""
+        from backtest_and_analysis.time_series.factor_bridge import session_daily_pricing
+        if not self._frequency_route.bar_grid:
+            raise ValueError('Session pricing requires minute Bar input')
+        if not hasattr(self, 'market_bar_grid'):
+            self._fetch_market_bars()
+        return session_daily_pricing(self.market_bar_grid, self.market_calendars)
+
+    def evaluate_bar_factor(self, **evaluator_options):
+        """Label and evaluate using the same read snapshot and explicit mode."""
+        from backtest_and_analysis.time_series.labels import BarReturnLabeler
+        from backtest_and_analysis.time_series.evaluator import TimeSeriesEvaluator, BarCrossSectionalEvaluator
+        factors = self.get_bar_factor_frame()
+        labels = BarReturnLabeler(self.market_calendars, view=self.session_view,
+                                  **self.label_config).label(self.market_bars, factors)
+        evaluator = TimeSeriesEvaluator if self.analysis_mode == 'time_series' else BarCrossSectionalEvaluator
+        return evaluator(analysis_mode=self.analysis_mode, **evaluator_options).evaluate(labels, factors)
+
     def calculate_factor(self, data: pd.DataFrame) -> pd.DataFrame:
         """计算因子值的接口方法
         
@@ -696,6 +870,8 @@ class FactorBase:
         Returns:
             因子值DataFrame，行为日期，列为股票代码
         """
+        if getattr(getattr(self, '_frequency_route', None), 'bar_grid', False):
+            return self._get_market_factor_values(force_recalculate)
         # Read first: mutable files and borrowed connections have no immutable
         # version token. Cache calculations only after identifying actual inputs.
         raw_data = self._get_raw_data_for_factor()
@@ -764,6 +940,8 @@ class FactorBase:
             日期×股票的因子值 DataFrame，不按动态池成员有效期过滤；
             实际行列取决于当前股票范围、可用数据及因子计算结果。
         """
+        if getattr(getattr(self, '_frequency_route', None), 'bar_grid', False):
+            return self._get_market_factor_values(force_recalculate)
         started = time.perf_counter()
         self.last_performance_metrics = {}
         # 保存原有的 all_stocks，稍后恢复
@@ -1277,6 +1455,15 @@ class FactorBase:
             )
             parameters = {name: getattr(self, name) for name in fields}
             parameters["pool_schedule"] = getattr(self, "pool_schedule", None)
+            for name in ('analysis_mode', 'output_frequency', 'session_view', 'label_config',
+                         'data_version', 'source_revision', 'calendar_hash', 'rth_reference_calendar'):
+                parameters[name] = getattr(self, name, None)
+            metadata = getattr(self, 'instrument_metadata', None)
+            parameters['instrument_metadata'] = frame_digest(metadata) if isinstance(metadata, pd.DataFrame) else metadata
+            calendars = getattr(self, 'session_calendar', None)
+            if calendars is not None:
+                parameters['session_calendar'] = (calendars.calendar_hash if hasattr(calendars, 'calendar_hash')
+                    else {instrument: calendar.calendar_hash for instrument, calendar in calendars.items()})
             if self._duckdb_adapter is not None or self.db_connection is not None:
                 parameters["data_access"] = self._get_local_data_config().as_dict()
                 parameters["source_policy"] = self.source_policy
@@ -1296,11 +1483,18 @@ class FactorBase:
             sources = []
             implementations = [cls for cls in type(self).__mro__ if cls is not object]
             implementations.append(apply_pit_adjustment)
+            if getattr(getattr(self, '_frequency_route', None), 'bar_grid', False):
+                from backtest_and_analysis.time_series.factor_bridge import session_grid
+                implementations.append(session_grid)
             for implementation in implementations:
                 source_file = inspect.getsourcefile(implementation)
                 if not source_file:
                     raise ValueError("Cannot identify source for " + implementation.__qualname__)
-                sources.append(hashlib.sha256(Path(source_file).read_bytes()).hexdigest())
+                if implementation is FactorBase and not getattr(getattr(self, '_frequency_route', None), 'bar_grid', False):
+                    from utils.legacy_cache_identity import factor_base_digest
+                    sources.append(factor_base_digest(source_file))
+                else:
+                    sources.append(hashlib.sha256(Path(source_file).read_bytes()).hexdigest())
             identity = json.dumps({"schema": 3, "class": type(self).__qualname__,
                                    "source": sources, "parameters": parameters,
                                    "runtime": [pd.__version__, np.__version__],

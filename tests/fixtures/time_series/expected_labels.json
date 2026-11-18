@@ -1,0 +1,807 @@
+{
+  "source": "SYNTHETIC",
+  "data_version": "SYNTHETIC_NERE704_v1",
+  "cases": [
+    {
+      "id": "valid_five",
+      "bars": "SYNTHETIC_valid_bars.csv",
+      "factors": "SYNTHETIC_factors.csv",
+      "entry_offset_bars": 1,
+      "horizon_bars": 5,
+      "signal_timestamps": [
+        "2026-12-01T14:30:00Z"
+      ],
+      "records_by_view": {
+        "RTH": [
+          {
+            "instrument_id": "NQZ26",
+            "frequency": "1min",
+            "entry_offset_bars": 1,
+            "horizon_bars": 5,
+            "signal_timestamp": "2026-12-01T14:30:00Z",
+            "signal_available_at": "2026-12-01T14:31:00Z",
+            "entry_timestamp": "2026-12-01T14:31:00Z",
+            "exit_bar_timestamp": "2026-12-01T14:35:00Z",
+            "exit_timestamp": "2026-12-01T14:36:00Z",
+            "entry_price": 101,
+            "exit_price": 106,
+            "price_change_points": 5,
+            "return_pct": 4.9504950495049505,
+            "status": "valid",
+            "exclusion_reason": null
+          }
+        ]
+      },
+      "reasons_by_view": {
+        "RTH": [
+          []
+        ]
+      }
+    },
+    {
+      "id": "rth_boundary",
+      "bars": "SYNTHETIC_rth_boundary_bars.csv",
+      "factors": "SYNTHETIC_factors.csv",
+      "entry_offset_bars": 1,
+      "horizon_bars": 5,
+      "signal_timestamps": [
+        "2026-12-01T20:57:00Z"
+      ],
+      "records_by_view": {
+        "RTH": [
+          {
+            "instrument_id": "NQZ26",
+            "frequency": "1min",
+            "entry_offset_bars": 1,
+            "horizon_bars": 5,
+            "signal_timestamp": "2026-12-01T20:57:00Z",
+            "signal_available_at": "2026-12-01T20:58:00Z",
+            "entry_timestamp": null,
+            "exit_bar_timestamp": null,
+            "exit_timestamp": null,
+            "entry_price": null,
+            "exit_price": null,
+            "price_change_points": null,
+            "return_pct": null,
+            "status": "excluded",
+            "exclusion_reason": "session_boundary"
+          }
+        ]
+      },
+      "reasons_by_view": {
+        "RTH": [
+          [
+            "session_boundary"
+          ]
+        ]
+      }
+    },
+    {
+      "id": "eth_boundary",
+      "bars": "SYNTHETIC_eth_boundary_bars.csv",
+      "factors": "SYNTHETIC_factors.csv",
+      "entry_offset_bars": 1,
+      "horizon_bars": 5,
+      "signal_timestamps": [
+        "2026-12-01T21:57:00Z"
+      ],
+      "records_by_view": {
+        "ETH": [
+          {
+            "instrument_id": "NQZ26",
+            "frequency": "1min",
+            "entry_offset_bars": 1,
+            "horizon_bars": 5,
+            "signal_timestamp": "2026-12-01T21:57:00Z",
+            "signal_available_at": "2026-12-01T21:58:00Z",
+            "entry_timestamp": null,
+            "exit_bar_timestamp": null,
+            "exit_timestamp": null,
+            "entry_price": null,
+            "exit_price": null,
+            "price_change_points": null,
+            "return_pct": null,
+            "status": "excluded",
+            "exclusion_reason": "session_boundary"
+          }
+        ]
+      },
+      "reasons_by_view": {
+        "ETH": [
+          [
+            "session_boundary"
+          ]
+        ]
+      }
+    },
+    {
+      "id": "missing_bar",
+      "bars": "SYNTHETIC_missing_bars.csv",
+      "factors": "SYNTHETIC_factors.csv",
+      "entry_offset_bars": 1,
+      "horizon_bars": 5,
+      "signal_timestamps": [
+        "2026-12-01T14:30:00Z"
+      ],
+      "records_by_view": {
+        "RTH": [
+          {
+            "instrument_id": "NQZ26",
+            "frequency": "1min",
+            "entry_offset_bars": 1,
+            "horizon_bars": 5,
+            "signal_timestamp": "2026-12-01T14:30:00Z",
+            "signal_available_at": "2026-12-01T14:31:00Z",
+            "entry_timestamp": null,
+            "exit_bar_timestamp": null,
+            "exit_timestamp": null,
+            "entry_price": null,
+            "exit_price": null,
+            "price_change_points": null,
+            "return_pct": null,
+            "status": "excluded",
+            "exclusion_reason": "missing_bar"
+          }
+        ]
+      },
+      "reasons_by_view": {
+        "RTH": [
+          [
+            "missing_bar"
+          ]
+        ]
+      }
+    },
+    {
+      "id": "invalid_zero",
+      "bars": "SYNTHETIC_zero_bars.csv",
+      "factors": "SYNTHETIC_factors.csv",
+      "entry_offset_bars": 1,
+      "horizon_bars": 5,
+      "signal_timestamps": [
+        "2026-12-01T14:30:00Z"
+      ],
+      "records_by_view": {
+        "RTH": [
+          {
+            "instrument_id": "NQZ26",
+            "frequency": "1min",
+            "entry_offset_bars": 1,
+            "horizon_bars": 5,
+            "signal_timestamp": "2026-12-01T14:30:00Z",
+            "signal_available_at": "2026-12-01T14:31:00Z",
+            "entry_timestamp": null,
+            "exit_bar_timestamp": null,
+            "exit_timestamp": null,
+            "entry_price": null,
+            "exit_price": null,
+            "price_change_points": null,
+            "return_pct": null,
+            "status": "excluded",
+            "exclusion_reason": "invalid_price"
+          }
+        ]
+      },
+      "reasons_by_view": {
+        "RTH": [
+          [
+            "invalid_price"
+          ]
+        ]
+      }
+    },
+    {
+      "id": "invalid_nan",
+      "bars": "SYNTHETIC_nan_bars.csv",
+      "factors": "SYNTHETIC_factors.csv",
+      "entry_offset_bars": 1,
+      "horizon_bars": 5,
+      "signal_timestamps": [
+        "2026-12-01T14:30:00Z"
+      ],
+      "records_by_view": {
+        "RTH": [
+          {
+            "instrument_id": "NQZ26",
+            "frequency": "1min",
+            "entry_offset_bars": 1,
+            "horizon_bars": 5,
+            "signal_timestamp": "2026-12-01T14:30:00Z",
+            "signal_available_at": "2026-12-01T14:31:00Z",
+            "entry_timestamp": null,
+            "exit_bar_timestamp": null,
+            "exit_timestamp": null,
+            "entry_price": null,
+            "exit_price": null,
+            "price_change_points": null,
+            "return_pct": null,
+            "status": "excluded",
+            "exclusion_reason": "invalid_price"
+          }
+        ]
+      },
+      "reasons_by_view": {
+        "RTH": [
+          [
+            "invalid_price"
+          ]
+        ]
+      }
+    },
+    {
+      "id": "insufficient_history",
+      "bars": "SYNTHETIC_tail_bars.csv",
+      "factors": "SYNTHETIC_factors.csv",
+      "entry_offset_bars": 1,
+      "horizon_bars": 5,
+      "signal_timestamps": [
+        "2026-12-01T14:30:00Z",
+        "2026-12-01T14:31:00Z",
+        "2026-12-01T14:32:00Z",
+        "2026-12-01T14:33:00Z"
+      ],
+      "records_by_view": {
+        "RTH": [
+          {
+            "instrument_id": "NQZ26",
+            "frequency": "1min",
+            "entry_offset_bars": 1,
+            "horizon_bars": 5,
+            "signal_timestamp": "2026-12-01T14:30:00Z",
+            "signal_available_at": "2026-12-01T14:31:00Z",
+            "entry_timestamp": null,
+            "exit_bar_timestamp": null,
+            "exit_timestamp": null,
+            "entry_price": null,
+            "exit_price": null,
+            "price_change_points": null,
+            "return_pct": null,
+            "status": "excluded",
+            "exclusion_reason": "insufficient_history"
+          },
+          {
+            "instrument_id": "NQZ26",
+            "frequency": "1min",
+            "entry_offset_bars": 1,
+            "horizon_bars": 5,
+            "signal_timestamp": "2026-12-01T14:31:00Z",
+            "signal_available_at": "2026-12-01T14:32:00Z",
+            "entry_timestamp": null,
+            "exit_bar_timestamp": null,
+            "exit_timestamp": null,
+            "entry_price": null,
+            "exit_price": null,
+            "price_change_points": null,
+            "return_pct": null,
+            "status": "excluded",
+            "exclusion_reason": "insufficient_history"
+          },
+          {
+            "instrument_id": "NQZ26",
+            "frequency": "1min",
+            "entry_offset_bars": 1,
+            "horizon_bars": 5,
+            "signal_timestamp": "2026-12-01T14:32:00Z",
+            "signal_available_at": "2026-12-01T14:33:00Z",
+            "entry_timestamp": null,
+            "exit_bar_timestamp": null,
+            "exit_timestamp": null,
+            "entry_price": null,
+            "exit_price": null,
+            "price_change_points": null,
+            "return_pct": null,
+            "status": "excluded",
+            "exclusion_reason": "insufficient_history"
+          },
+          {
+            "instrument_id": "NQZ26",
+            "frequency": "1min",
+            "entry_offset_bars": 1,
+            "horizon_bars": 5,
+            "signal_timestamp": "2026-12-01T14:33:00Z",
+            "signal_available_at": "2026-12-01T14:34:00Z",
+            "entry_timestamp": null,
+            "exit_bar_timestamp": null,
+            "exit_timestamp": null,
+            "entry_price": null,
+            "exit_price": null,
+            "price_change_points": null,
+            "return_pct": null,
+            "status": "excluded",
+            "exclusion_reason": "insufficient_history"
+          }
+        ]
+      },
+      "reasons_by_view": {
+        "RTH": [
+          [
+            "insufficient_history"
+          ],
+          [
+            "insufficient_history"
+          ],
+          [
+            "insufficient_history"
+          ],
+          [
+            "insufficient_history"
+          ]
+        ]
+      }
+    },
+    {
+      "id": "factor_nan",
+      "bars": "SYNTHETIC_valid_bars.csv",
+      "factors": "SYNTHETIC_nan_factors.csv",
+      "entry_offset_bars": 1,
+      "horizon_bars": 5,
+      "signal_timestamps": [
+        "2026-12-01T14:30:00Z"
+      ],
+      "records_by_view": {
+        "RTH": [
+          {
+            "instrument_id": "NQZ26",
+            "frequency": "1min",
+            "entry_offset_bars": 1,
+            "horizon_bars": 5,
+            "signal_timestamp": "2026-12-01T14:30:00Z",
+            "signal_available_at": "2026-12-01T14:31:00Z",
+            "entry_timestamp": null,
+            "exit_bar_timestamp": null,
+            "exit_timestamp": null,
+            "entry_price": null,
+            "exit_price": null,
+            "price_change_points": null,
+            "return_pct": null,
+            "status": "excluded",
+            "exclusion_reason": "factor_missing"
+          }
+        ]
+      },
+      "reasons_by_view": {
+        "RTH": [
+          [
+            "factor_missing"
+          ]
+        ]
+      }
+    },
+    {
+      "id": "factor_absent",
+      "bars": "SYNTHETIC_valid_bars.csv",
+      "factors": "SYNTHETIC_absent_factors.csv",
+      "entry_offset_bars": 1,
+      "horizon_bars": 5,
+      "signal_timestamps": [
+        "2026-12-01T14:30:00Z"
+      ],
+      "records_by_view": {
+        "RTH": [
+          {
+            "instrument_id": "NQZ26",
+            "frequency": "1min",
+            "entry_offset_bars": 1,
+            "horizon_bars": 5,
+            "signal_timestamp": "2026-12-01T14:30:00Z",
+            "signal_available_at": "2026-12-01T14:31:00Z",
+            "entry_timestamp": null,
+            "exit_bar_timestamp": null,
+            "exit_timestamp": null,
+            "entry_price": null,
+            "exit_price": null,
+            "price_change_points": null,
+            "return_pct": null,
+            "status": "excluded",
+            "exclusion_reason": "factor_missing"
+          }
+        ]
+      },
+      "reasons_by_view": {
+        "RTH": [
+          [
+            "factor_missing"
+          ]
+        ]
+      }
+    },
+    {
+      "id": "factor_and_gap",
+      "bars": "SYNTHETIC_missing_bars.csv",
+      "factors": "SYNTHETIC_nan_factors.csv",
+      "entry_offset_bars": 1,
+      "horizon_bars": 5,
+      "signal_timestamps": [
+        "2026-12-01T14:30:00Z"
+      ],
+      "records_by_view": {
+        "RTH": [
+          {
+            "instrument_id": "NQZ26",
+            "frequency": "1min",
+            "entry_offset_bars": 1,
+            "horizon_bars": 5,
+            "signal_timestamp": "2026-12-01T14:30:00Z",
+            "signal_available_at": "2026-12-01T14:31:00Z",
+            "entry_timestamp": null,
+            "exit_bar_timestamp": null,
+            "exit_timestamp": null,
+            "entry_price": null,
+            "exit_price": null,
+            "price_change_points": null,
+            "return_pct": null,
+            "status": "excluded",
+            "exclusion_reason": "factor_missing"
+          }
+        ]
+      },
+      "reasons_by_view": {
+        "RTH": [
+          [
+            "factor_missing",
+            "missing_bar"
+          ]
+        ]
+      }
+    },
+    {
+      "id": "tail_and_boundary",
+      "bars": "SYNTHETIC_tail_boundary_bars.csv",
+      "factors": "SYNTHETIC_factors.csv",
+      "entry_offset_bars": 1,
+      "horizon_bars": 5,
+      "signal_timestamps": [
+        "2026-12-01T21:57:00Z"
+      ],
+      "records_by_view": {
+        "ETH": [
+          {
+            "instrument_id": "NQZ26",
+            "frequency": "1min",
+            "entry_offset_bars": 1,
+            "horizon_bars": 5,
+            "signal_timestamp": "2026-12-01T21:57:00Z",
+            "signal_available_at": "2026-12-01T21:58:00Z",
+            "entry_timestamp": null,
+            "exit_bar_timestamp": null,
+            "exit_timestamp": null,
+            "entry_price": null,
+            "exit_price": null,
+            "price_change_points": null,
+            "return_pct": null,
+            "status": "excluded",
+            "exclusion_reason": "insufficient_history"
+          }
+        ]
+      },
+      "reasons_by_view": {
+        "ETH": [
+          [
+            "insufficient_history",
+            "session_boundary"
+          ]
+        ]
+      }
+    },
+    {
+      "id": "view_difference",
+      "bars": "SYNTHETIC_view_bars.csv",
+      "factors": "SYNTHETIC_factors.csv",
+      "entry_offset_bars": 1,
+      "horizon_bars": 5,
+      "signal_timestamps": [
+        "2026-12-01T14:27:00Z",
+        "2026-12-01T14:28:00Z",
+        "2026-12-01T14:29:00Z",
+        "2026-12-01T14:30:00Z",
+        "2026-12-01T14:31:00Z",
+        "2026-12-01T14:32:00Z",
+        "2026-12-01T14:33:00Z",
+        "2026-12-01T14:34:00Z",
+        "2026-12-01T14:35:00Z"
+      ],
+      "records_by_view": {
+        "ETH": [
+          {
+            "instrument_id": "NQZ26",
+            "frequency": "1min",
+            "entry_offset_bars": 1,
+            "horizon_bars": 5,
+            "signal_timestamp": "2026-12-01T14:27:00Z",
+            "signal_available_at": "2026-12-01T14:28:00Z",
+            "entry_timestamp": "2026-12-01T14:28:00Z",
+            "exit_bar_timestamp": "2026-12-01T14:32:00Z",
+            "exit_timestamp": "2026-12-01T14:33:00Z",
+            "entry_price": 101,
+            "exit_price": 106,
+            "price_change_points": 5,
+            "return_pct": 4.9504950495049505,
+            "status": "valid",
+            "exclusion_reason": null
+          },
+          {
+            "instrument_id": "NQZ26",
+            "frequency": "1min",
+            "entry_offset_bars": 1,
+            "horizon_bars": 5,
+            "signal_timestamp": "2026-12-01T14:28:00Z",
+            "signal_available_at": "2026-12-01T14:29:00Z",
+            "entry_timestamp": "2026-12-01T14:29:00Z",
+            "exit_bar_timestamp": "2026-12-01T14:33:00Z",
+            "exit_timestamp": "2026-12-01T14:34:00Z",
+            "entry_price": 101,
+            "exit_price": 106,
+            "price_change_points": 5,
+            "return_pct": 4.9504950495049505,
+            "status": "valid",
+            "exclusion_reason": null
+          },
+          {
+            "instrument_id": "NQZ26",
+            "frequency": "1min",
+            "entry_offset_bars": 1,
+            "horizon_bars": 5,
+            "signal_timestamp": "2026-12-01T14:29:00Z",
+            "signal_available_at": "2026-12-01T14:30:00Z",
+            "entry_timestamp": "2026-12-01T14:30:00Z",
+            "exit_bar_timestamp": "2026-12-01T14:34:00Z",
+            "exit_timestamp": "2026-12-01T14:35:00Z",
+            "entry_price": 101,
+            "exit_price": 106,
+            "price_change_points": 5,
+            "return_pct": 4.9504950495049505,
+            "status": "valid",
+            "exclusion_reason": null
+          },
+          {
+            "instrument_id": "NQZ26",
+            "frequency": "1min",
+            "entry_offset_bars": 1,
+            "horizon_bars": 5,
+            "signal_timestamp": "2026-12-01T14:30:00Z",
+            "signal_available_at": "2026-12-01T14:31:00Z",
+            "entry_timestamp": "2026-12-01T14:31:00Z",
+            "exit_bar_timestamp": "2026-12-01T14:35:00Z",
+            "exit_timestamp": "2026-12-01T14:36:00Z",
+            "entry_price": 101,
+            "exit_price": 106,
+            "price_change_points": 5,
+            "return_pct": 4.9504950495049505,
+            "status": "valid",
+            "exclusion_reason": null
+          },
+          {
+            "instrument_id": "NQZ26",
+            "frequency": "1min",
+            "entry_offset_bars": 1,
+            "horizon_bars": 5,
+            "signal_timestamp": "2026-12-01T14:31:00Z",
+            "signal_available_at": "2026-12-01T14:32:00Z",
+            "entry_timestamp": null,
+            "exit_bar_timestamp": null,
+            "exit_timestamp": null,
+            "entry_price": null,
+            "exit_price": null,
+            "price_change_points": null,
+            "return_pct": null,
+            "status": "excluded",
+            "exclusion_reason": "insufficient_history"
+          },
+          {
+            "instrument_id": "NQZ26",
+            "frequency": "1min",
+            "entry_offset_bars": 1,
+            "horizon_bars": 5,
+            "signal_timestamp": "2026-12-01T14:32:00Z",
+            "signal_available_at": "2026-12-01T14:33:00Z",
+            "entry_timestamp": null,
+            "exit_bar_timestamp": null,
+            "exit_timestamp": null,
+            "entry_price": null,
+            "exit_price": null,
+            "price_change_points": null,
+            "return_pct": null,
+            "status": "excluded",
+            "exclusion_reason": "insufficient_history"
+          },
+          {
+            "instrument_id": "NQZ26",
+            "frequency": "1min",
+            "entry_offset_bars": 1,
+            "horizon_bars": 5,
+            "signal_timestamp": "2026-12-01T14:33:00Z",
+            "signal_available_at": "2026-12-01T14:34:00Z",
+            "entry_timestamp": null,
+            "exit_bar_timestamp": null,
+            "exit_timestamp": null,
+            "entry_price": null,
+            "exit_price": null,
+            "price_change_points": null,
+            "return_pct": null,
+            "status": "excluded",
+            "exclusion_reason": "insufficient_history"
+          },
+          {
+            "instrument_id": "NQZ26",
+            "frequency": "1min",
+            "entry_offset_bars": 1,
+            "horizon_bars": 5,
+            "signal_timestamp": "2026-12-01T14:34:00Z",
+            "signal_available_at": "2026-12-01T14:35:00Z",
+            "entry_timestamp": null,
+            "exit_bar_timestamp": null,
+            "exit_timestamp": null,
+            "entry_price": null,
+            "exit_price": null,
+            "price_change_points": null,
+            "return_pct": null,
+            "status": "excluded",
+            "exclusion_reason": "insufficient_history"
+          },
+          {
+            "instrument_id": "NQZ26",
+            "frequency": "1min",
+            "entry_offset_bars": 1,
+            "horizon_bars": 5,
+            "signal_timestamp": "2026-12-01T14:35:00Z",
+            "signal_available_at": "2026-12-01T14:36:00Z",
+            "entry_timestamp": null,
+            "exit_bar_timestamp": null,
+            "exit_timestamp": null,
+            "entry_price": null,
+            "exit_price": null,
+            "price_change_points": null,
+            "return_pct": null,
+            "status": "excluded",
+            "exclusion_reason": "insufficient_history"
+          }
+        ],
+        "RTH": [
+          {
+            "instrument_id": "NQZ26",
+            "frequency": "1min",
+            "entry_offset_bars": 1,
+            "horizon_bars": 5,
+            "signal_timestamp": "2026-12-01T14:30:00Z",
+            "signal_available_at": "2026-12-01T14:31:00Z",
+            "entry_timestamp": "2026-12-01T14:31:00Z",
+            "exit_bar_timestamp": "2026-12-01T14:35:00Z",
+            "exit_timestamp": "2026-12-01T14:36:00Z",
+            "entry_price": 101,
+            "exit_price": 106,
+            "price_change_points": 5,
+            "return_pct": 4.9504950495049505,
+            "status": "valid",
+            "exclusion_reason": null
+          },
+          {
+            "instrument_id": "NQZ26",
+            "frequency": "1min",
+            "entry_offset_bars": 1,
+            "horizon_bars": 5,
+            "signal_timestamp": "2026-12-01T14:31:00Z",
+            "signal_available_at": "2026-12-01T14:32:00Z",
+            "entry_timestamp": null,
+            "exit_bar_timestamp": null,
+            "exit_timestamp": null,
+            "entry_price": null,
+            "exit_price": null,
+            "price_change_points": null,
+            "return_pct": null,
+            "status": "excluded",
+            "exclusion_reason": "insufficient_history"
+          },
+          {
+            "instrument_id": "NQZ26",
+            "frequency": "1min",
+            "entry_offset_bars": 1,
+            "horizon_bars": 5,
+            "signal_timestamp": "2026-12-01T14:32:00Z",
+            "signal_available_at": "2026-12-01T14:33:00Z",
+            "entry_timestamp": null,
+            "exit_bar_timestamp": null,
+            "exit_timestamp": null,
+            "entry_price": null,
+            "exit_price": null,
+            "price_change_points": null,
+            "return_pct": null,
+            "status": "excluded",
+            "exclusion_reason": "insufficient_history"
+          },
+          {
+            "instrument_id": "NQZ26",
+            "frequency": "1min",
+            "entry_offset_bars": 1,
+            "horizon_bars": 5,
+            "signal_timestamp": "2026-12-01T14:33:00Z",
+            "signal_available_at": "2026-12-01T14:34:00Z",
+            "entry_timestamp": null,
+            "exit_bar_timestamp": null,
+            "exit_timestamp": null,
+            "entry_price": null,
+            "exit_price": null,
+            "price_change_points": null,
+            "return_pct": null,
+            "status": "excluded",
+            "exclusion_reason": "insufficient_history"
+          },
+          {
+            "instrument_id": "NQZ26",
+            "frequency": "1min",
+            "entry_offset_bars": 1,
+            "horizon_bars": 5,
+            "signal_timestamp": "2026-12-01T14:34:00Z",
+            "signal_available_at": "2026-12-01T14:35:00Z",
+            "entry_timestamp": null,
+            "exit_bar_timestamp": null,
+            "exit_timestamp": null,
+            "entry_price": null,
+            "exit_price": null,
+            "price_change_points": null,
+            "return_pct": null,
+            "status": "excluded",
+            "exclusion_reason": "insufficient_history"
+          },
+          {
+            "instrument_id": "NQZ26",
+            "frequency": "1min",
+            "entry_offset_bars": 1,
+            "horizon_bars": 5,
+            "signal_timestamp": "2026-12-01T14:35:00Z",
+            "signal_available_at": "2026-12-01T14:36:00Z",
+            "entry_timestamp": null,
+            "exit_bar_timestamp": null,
+            "exit_timestamp": null,
+            "entry_price": null,
+            "exit_price": null,
+            "price_change_points": null,
+            "return_pct": null,
+            "status": "excluded",
+            "exclusion_reason": "insufficient_history"
+          }
+        ]
+      },
+      "reasons_by_view": {
+        "ETH": [
+          [],
+          [],
+          [],
+          [],
+          [
+            "insufficient_history"
+          ],
+          [
+            "insufficient_history"
+          ],
+          [
+            "insufficient_history"
+          ],
+          [
+            "insufficient_history"
+          ],
+          [
+            "insufficient_history"
+          ]
+        ],
+        "RTH": [
+          [],
+          [
+            "insufficient_history"
+          ],
+          [
+            "insufficient_history"
+          ],
+          [
+            "insufficient_history"
+          ],
+          [
+            "insufficient_history"
+          ],
+          [
+            "insufficient_history"
+          ]
+        ]
+      }
+    }
+  ]
+}

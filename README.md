@@ -149,3 +149,5 @@ The detailed reference guides below are currently written in Chinese.
 Run `python -m pytest -q` in the development environment. See [CONTRIBUTING](CONTRIBUTING.md), [SECURITY](SECURITY.md), and [CHANGELOG](CHANGELOG.md) for contribution guidelines, vulnerability reporting, and changes.
 
 Licensed under the [Apache License 2.0](LICENSE). See [NOTICE](NOTICE) for attribution. Third-party components retain their own licenses.
+
+Minute Bar contracts, DuckDB import and both evaluation modes: [TIME_SERIES_CONTRACT](docs/TIME_SERIES_CONTRACT.md).

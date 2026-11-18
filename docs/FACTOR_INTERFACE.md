@@ -53,7 +53,7 @@
 
 不提供通用研究窗口或表现阈值。长度应覆盖算法的滞后和预热需求；声明不会自动实现滚动计算，也不能保证数据足够或无前瞻。涉及基类按名称读取窗口的路径时，更新仓库 `config/factor_requirements.json`；聚宽构建时通过 `--requirements` 显式传入配置。构建器会据此计算取数窗口并检查频率，细节见 [聚宽打包](JOINQUANT.md)。
 
-本模板只覆盖日频价格输入。5 分钟、多源或财务因子需要分别验证频率、数据可知时点和字段映射；公开单因子 CLI 不提供通用高频评估入口。复权、金额与成交量、缺失值及窗口约定见 [数据语义](SEMANTICS.md)。
+本模板只覆盖日频价格输入。分钟 Bar 可通过 `FactorBase.get_bar_factor_frame()` 与 `evaluate_bar_factor()` 接入，并通过 Harness `time-series-analysis` 显式选择 `time_series` 或 `cross_sectional` 评估。`1min`/`5min` 的交易时段、完整网格、预热、Session 日频聚合与标签定义见 [分钟研究契约](TIME_SERIES_CONTRACT.md)；旧 `5m` 路径应与新 Bar 接口分别验证。多源或财务因子仍需核验数据可知时点和字段映射。复权、金额与成交量、缺失值及窗口约定见 [数据语义](SEMANTICS.md)。
 
 本地基类使用 DuckDB：可提供 `duckdb_path`、版本化数据绑定，或内存 `duckdb.DuckDBPyConnection`。默认 `db_backend="duckdb"`；旧 `auto` 仅作为 DuckDB 别名，不做后端回退。`get_price_data()` 使用同一数据源。聚宽云端取数仍由 adapter 接管，不要求云端安装 DuckDB。
 

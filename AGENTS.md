@@ -6,6 +6,8 @@
 |---|---|
 | 串联本地 CSV、DuckDB、合成与聚宽打包 | [完整教学流程](docs/LOCAL_WORKFLOW.md) |
 | 配置单因子分析、选择输出目录 | [配置参考](docs/CONFIG.md) |
+| 分钟 Bar 时序/截面因子、交易时段、按 Bar 标签与评估 | [分钟研究契约](docs/TIME_SERIES_CONTRACT.md) |
+| 调用 Harness、检查 attempt 与评估完成标记 | [公开后端与输出布局](docs/PUBLIC_SCOPE.md) |
 | 实现因子、声明数据需求 | [因子接口](docs/FACTOR_INTERFACE.md) |
 | 从空白骨架开始、检查合成输入 | [最小因子模板](docs/FACTOR_TEMPLATE.md) |
 | 日期、股票键、复权、缺失值与窗口 | [数据语义](docs/SEMANTICS.md) |
