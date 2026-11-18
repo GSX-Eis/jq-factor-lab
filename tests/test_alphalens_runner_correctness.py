@@ -41,6 +41,20 @@ def test_tied_values_retain_raw_spearman_ic():
     pd.testing.assert_series_equal(result.dropna(), expected, check_names=False)
 
 
+def test_daily_ic_keeps_cross_sections_with_two_nonconstant_pairs() -> None:
+    days = pd.bdate_range('2024-01-02', periods=32, name='date')
+    factor = pd.DataFrame({'S1': 1., 'S2': 2.}, index=days[:30])
+    steps = np.arange(len(days))
+    prices = pd.DataFrame({'S1': 100 * 1.01**steps, 'S2': 100 * 1.02**steps}, index=days)
+    pricing = prices.rename_axis(columns='asset').stack()
+    pricing.attrs['trading_calendar'] = TradingCalendar(days, days.min(), days.max())
+    result = AlphalensRunner(n_quantiles=2, periods=(1,)).run(factor, pricing)
+
+    ic = result['ic']['1D']
+    assert ic.index.tolist() == factor.index.tolist()
+    np.testing.assert_allclose(ic, 1.0, rtol=0, atol=1e-14)
+
+
 def test_price_order_and_index_layout_do_not_change_results():
     prices, signal, canonical = panel()
     shuffled = prices.stack().sample(frac=1, random_state=123)
