@@ -19,7 +19,7 @@
 - [13. 时序统计接口](#13-时序统计接口)
 - [14. 训练与样本外评测接口](#14-训练与样本外评测接口)
 - [15. 统一评测入口](#15-统一评测入口)
-- [16. S7 Jerry 与 NQ 1min 验收](#16-s7-jerry-与-nq-1min-验收)
+- [16. S7 时序诊断与 NQ 1min 验收](#16-s7-时序诊断与-nq-1min-验收)
 
 ## 1. 前瞻收益标签
 
@@ -316,7 +316,7 @@ Holm (`holm`) 在原始 p 值有效时控制族错误率（FWER），允许检�
 | 日频 NumPy 无符号入场偏移（旧缺陷修复） | 旧版位移计算可使 `np.uint8(1)` 取负回绕为 255，使用错误的入场价或错误的有效信号键。 | 日频先验证偏移，再转为 Python 整数，使位移和成交端点使用同一个偏移。旧缓存键无法区分相同数值的偏移类型，新计算使用 `forward_returns.v4` 缓存键。 |
 | 截面分桶收益口径 | 旧日频主路径默认减当日截面均值，手工回退用原始均值 | 第 3 节明确两种口径，结果声明所用口径。 |
 | 时序分桶 | Bar v1 沿用全样本描述性分桶 | 统一引擎有训练/OOS 切分时使用训练冻结分位，见第 4 节。 |
-| 时序非重叠诊断 | Bar v1 在按时间排序的候选序列上保留第 0 相位 | 统一推断和 Jerry 报告按应有网格检查全部 $h$ 个起始偏移与实际持仓区间，见第 4 节。 |
+| 时序非重叠诊断 | Bar v1 在按时间排序的候选序列上保留第 0 相位 | 统一推断和时序诊断报告按应有网格检查全部 $h$ 个起始偏移与实际持仓区间，见第 4 节。 |
 
 ## 9. 夹具索引
 
@@ -344,7 +344,7 @@ S0-B 的数值反例见 [`tests/test_eval_engine_s0_counterexamples.py`](../test
 | S4 | [日频标签端点冻结值](../tests/fixtures/eval_engine/baseline/s4_forward_returns.json)。 |
 | S5 | [无前视篡改测试](../tests/test_eval_engine_s5_no_lookahead.py)。 |
 | S6 | [统一入口与旧适配器](../tests/test_eval_engine_s6a_adapters.py)、[Harness 和聚宽构建回归](../tests/test_eval_engine_s6_zero_regression.py)。 |
-| S7 | [Jerry 与合成 NQ 验收](../tests/test_eval_engine_s7_jerry_nq_acceptance.py)、[冻结夹具](../tests/fixtures/eval_engine/jerry_contract/README.md)。 |
+| S7 | [时序诊断与合成 NQ 验收](../tests/test_eval_engine_s7_ts_diagnostics_nq_acceptance.py)、[冻结夹具](../tests/fixtures/eval_engine/ts_diagnostics_contract/README.md)。 |
 
 ## 10. 性能基线
 
@@ -646,14 +646,14 @@ runner 的显式回退开关返回原始逐桶均值和旧版宽表。Bar v1 产
 沿用百分数收益、按有效标签分桶和连续编号。时序 v1 显示各品种已有标签
 网格的第 0 相位，保留描述性分位标记。
 
-## 16. S7 Jerry 与 NQ 1min 验收
+## 16. S7 时序诊断与 NQ 1min 验收
 
-Jerry 夹具以仓库内已确认的输入行、Bar v1 输出字段和数学预期为依据。
-`time-series-analysis --config <path> --jerry-report` 通过 Harness
-发布 `jerry_time_series.v1`、`jerry_report.csv` 和 `jerry_report.md`，
+时序诊断夹具以仓库内已确认的输入行、Bar v1 输出字段和数学预期为依据。
+`time-series-analysis --config <path> --diagnostics-report` 通过 Harness
+发布 `time_series_diagnostics.v1`、`diagnostics_report.csv` 和 `diagnostics_report.md`，
 同时保留四个 Bar v1 文件。测试核对文件哈希、退出时间、剔除守恒、
 同一时序组的条件收益、方向计数、全部网格相位和移动块重排名。
-报告字段与发布时序见 [时序研究契约](TIME_SERIES_CONTRACT.md#jerry-时序报告)。
+报告字段与发布时序见 [时序研究契约](TIME_SERIES_CONTRACT.md#时序深度诊断报告)。
 
 NQ 1min 的 S7 结果来自固定种子的**合成工程验收**，报告标记
 `real_market_data_used=false`。训练为 2020–2025 年，OOS 为 2026 年。
@@ -669,6 +669,6 @@ NQ 1min 的 S7 结果来自固定种子的**合成工程验收**，报告标记
 
 合成年界处于休市间隔，`same_session` 标签的实际跨界清除数为 0。
 独立边界夹具覆盖退出等于首个 OOS 可用信号时刻时保留、晚一根时清除。
-[合成报告生成器](../tests/fixtures/eval_engine/jerry_contract/nq_1min.py)
+[合成报告生成器](../tests/fixtures/eval_engine/ts_diagnostics_contract/nq_1min.py)
 输出 JSON 和 Markdown，并记录数据及拟合身份。
 真实 NQ 1min 在外置盘挂载、数据覆盖核验后，按已冻结的边界和评测政策补跑。

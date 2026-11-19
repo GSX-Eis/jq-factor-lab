@@ -49,15 +49,15 @@ def _csv_table(frame: pd.DataFrame) -> pd.DataFrame:
     return table
 
 
-JERRY_CSV = 'jerry_report.csv'
-JERRY_MARKDOWN = 'jerry_report.md'
+DIAGNOSTICS_CSV = 'diagnostics_report.csv'
+DIAGNOSTICS_MARKDOWN = 'diagnostics_report.md'
 
 
 def write_evaluation_artifacts(evaluation_result: EvaluationResult, output_dir: str | Path, *,
                                result_identity: ResultIdentity,
                                config: Mapping[str, Any] | None = None,
                                code_version_source: str | None = None,
-                               jerry_report: Mapping[str, Any] | None = None) -> dict[str, Path]:
+                               diagnostics_report: Mapping[str, Any] | None = None) -> dict[str, Path]:
     """Stage the evaluation files on the destination filesystem, publish summary last.
 
     Each rename is atomic. Readers must require summary.json; a failed retry
@@ -99,8 +99,8 @@ def write_evaluation_artifacts(evaluation_result: EvaluationResult, output_dir: 
         cross_sections=result.cross_sections.to_dict('records'))
     if code_version_source is not None:
         payload['result_identity']['code_version_source'] = code_version_source
-    if jerry_report is not None:
-        payload['jerry_report'] = jerry_report
+    if diagnostics_report is not None:
+        payload['diagnostics_report'] = diagnostics_report
     try:
         payload = _json_value(payload)
         summary = json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False) + '\n'
@@ -109,23 +109,24 @@ def write_evaluation_artifacts(evaluation_result: EvaluationResult, output_dir: 
     tables = {'per_bar_labels': result.per_bar_labels, 'ic_by_horizon': result.ic_by_horizon,
               'quantile_stats': result.quantile_stats}
     paths = {name: destination / f'{name}.csv' for name in tables}
-    if jerry_report is not None:
-        paths.update(jerry_report_csv=destination / JERRY_CSV, jerry_report_markdown=destination / JERRY_MARKDOWN)
+    if diagnostics_report is not None:
+        paths.update(diagnostics_report_csv=destination / DIAGNOSTICS_CSV,
+                     diagnostics_report_markdown=destination / DIAGNOSTICS_MARKDOWN)
     paths['summary'] = summary_path
     # Publication staging is retained only inside this synchronous transaction.
     with TemporaryDirectory(prefix='.bar-evaluation-', dir=destination) as staging:
         staged = Path(staging)
         for name, table in tables.items():
             _csv_table(table).to_csv(staged / paths[name].name, index=False)
-        if jerry_report is not None:
-            from .jerry_report import JERRY_CSV_COLUMNS, jerry_rows, render_jerry_markdown
-            report = payload['jerry_report']
-            rows = jerry_rows(report)
-            with (staged / JERRY_CSV).open('w', encoding='utf-8', newline='') as stream:
-                writer = csv.DictWriter(stream, fieldnames=JERRY_CSV_COLUMNS)
+        if diagnostics_report is not None:
+            from .diagnostics_report import DIAGNOSTICS_CSV_COLUMNS, diagnostics_rows, render_diagnostics_markdown
+            report = payload['diagnostics_report']
+            rows = diagnostics_rows(report)
+            with (staged / DIAGNOSTICS_CSV).open('w', encoding='utf-8', newline='') as stream:
+                writer = csv.DictWriter(stream, fieldnames=DIAGNOSTICS_CSV_COLUMNS)
                 writer.writeheader()
                 writer.writerows(rows)
-            (staged / JERRY_MARKDOWN).write_text(render_jerry_markdown(report, rows), encoding='utf-8')
+            (staged / DIAGNOSTICS_MARKDOWN).write_text(render_diagnostics_markdown(report, rows), encoding='utf-8')
         (staged / 'summary.json').write_text(summary, encoding='utf-8')
         try:
             for path in paths.values():

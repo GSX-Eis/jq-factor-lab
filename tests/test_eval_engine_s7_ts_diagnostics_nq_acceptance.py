@@ -16,12 +16,12 @@ from backtest_and_analysis.time_series.artifacts import _json_value
 from test_time_series_cli_end_to_end import run_cli
 
 
-FIXTURES = Path(__file__).parent / 'fixtures' / 'eval_engine' / 'jerry_contract'
+FIXTURES = Path(__file__).parent / 'fixtures' / 'eval_engine' / 'ts_diagnostics_contract'
 FROZEN = json.loads((FIXTURES / 'expected.json').read_text(encoding='utf-8'))
 STATISTICS = dict(block_length=5, seed=791, n_boot=9, min_valid_replicates=2)
 
 
-def _jerry_config(path):
+def _diagnostics_config(path):
     return dict(
         bars_csv=str(path), analysis_mode='time_series',
         start_date='2026-12-01', end_date='2026-12-01',
@@ -29,10 +29,10 @@ def _jerry_config(path):
     )
 
 
-def test_jerry_harness_json_and_csv_contract(tmp_path):
+def test_diagnostics_harness_json_and_csv_contract(tmp_path):
     expected = FROZEN['harness']
     path = FIXTURES / 'bars.csv'
-    config = _jerry_config(path)
+    config = _diagnostics_config(path)
     payload = run_cli(tmp_path, config)
     assert payload['ok'], payload
     artifacts = {item['artifact_type']: item for item in payload['artifacts']}
@@ -56,7 +56,7 @@ def test_jerry_harness_json_and_csv_contract(tmp_path):
     assert identity['calendar_hash'] == summary['calendar_identity']['calendar_hash']
     assert summary['calendar_identity']['calendar_id'] == 'CME Globex Equity'
     assert summary['data_identity']['sources'] == ['SYNTHETIC']
-    assert summary['data_identity']['data_versions'] == ['SYNTHETIC_NERE828_JERRY_v1']
+    assert summary['data_identity']['data_versions'] == ['SYNTHETIC_NERE828_TS_DIAGNOSTICS_v1']
 
     tables = {}
     for name, columns in expected['csv_columns'].items():
@@ -146,9 +146,9 @@ def _check_direction_and_distribution(row, oracle):
     _check_values([dist[k] for k in ('mean_le_p5', 'mean_le_p25', 'mean_ge_p75', 'mean_ge_p95')], oracle['tails'])
 
 
-def test_jerry_opt_in_cli_publishes_frozen_json_csv_and_markdown(tmp_path):
-    expected = FROZEN['jerry_cli']
-    payload = run_cli(tmp_path, _jerry_config(FIXTURES / 'bars.csv'), '--jerry-report')
+def test_diagnostics_opt_in_cli_publishes_frozen_json_csv_and_markdown(tmp_path):
+    expected = FROZEN['diagnostics_cli']
+    payload = run_cli(tmp_path, _diagnostics_config(FIXTURES / 'bars.csv'), '--diagnostics-report')
     assert payload['ok'], payload
     artifacts = {item['artifact_type']: item for item in payload['artifacts']}
     expected_files = FROZEN['harness']['artifacts'] | expected['artifacts']
@@ -164,13 +164,13 @@ def test_jerry_opt_in_cli_publishes_frozen_json_csv_and_markdown(tmp_path):
     assert offset_one.factor_value.corr(offset_one.return_pct, method='spearman') == 1
     summary = json.loads(paths['evaluation_summary'].read_text(encoding='utf-8'))
     assert summary['result_schema_version'] == FROZEN['harness']['evaluation_schema']
-    report = summary['jerry_report']
-    assert report == payload['metrics']['jerry_report']
+    report = summary['diagnostics_report']
+    assert report == payload['metrics']['diagnostics_report']
     assert report['schema'] == expected['schema']
     assert report['return_unit'] == 'percent'
     assert report['quantile_scope'] == 'full_sample_descriptive_only'
 
-    with paths['jerry_report_csv'].open(newline='', encoding='utf-8') as stream:
+    with paths['diagnostics_report_csv'].open(newline='', encoding='utf-8') as stream:
         reader = csv.DictReader(stream)
         assert reader.fieldnames == expected['csv_columns'].split(',')
         csv_rows = {(r['horizon_bars'], r['scope'], r['index']): r for r in reader}
@@ -218,19 +218,19 @@ def test_jerry_opt_in_cli_publishes_frozen_json_csv_and_markdown(tmp_path):
                 else:
                     assert actual == str(value)
     assert not csv_rows
-    markdown = paths['jerry_report_markdown'].read_text(encoding='utf-8').splitlines()
+    markdown = paths['diagnostics_report_markdown'].read_text(encoding='utf-8').splitlines()
     assert [line for line in markdown if line.startswith('#')] == expected['markdown_headings']
     assert all(row in markdown for row in expected['markdown_rows'])
 
 
-def test_jerry_cli_keeps_missing_minutes_in_the_phase_grid(tmp_path):
+def test_diagnostics_cli_keeps_missing_minutes_in_the_phase_grid(tmp_path):
     rows = (FIXTURES / 'bars.csv').read_text(encoding='utf-8').splitlines()
     bars = tmp_path / 'gapped.csv'
     bars.write_text('\n'.join(row for row in rows if '14:35:00Z' not in row) + '\n', encoding='utf-8')
-    config = _jerry_config(bars) | {'horizons': [2], 'jerry_report': True}
+    config = _diagnostics_config(bars) | {'horizons': [2], 'diagnostics_report': True}
     payload = run_cli(tmp_path, config)
     assert payload['ok'], payload
-    row, = payload['metrics']['jerry_report']['horizons']
+    row, = payload['metrics']['diagnostics_report']['horizons']
     assert row['bootstrap']['grid_size'] == 9 and row['counts']['total_count'] == 8
     assert {k: v['sample_count'] for k, v in row['non_overlapping_ic'].items()} == {'0': 3, '1': 1}
     assert row['non_overlapping_ic']['0']['spearman_ic'] == 1.0
@@ -238,37 +238,39 @@ def test_jerry_cli_keeps_missing_minutes_in_the_phase_grid(tmp_path):
 
 
 @pytest.fixture(scope='module')
-def published_jerry_report(tmp_path_factory):
-    root = tmp_path_factory.mktemp('published_jerry')
+def published_diagnostics_report(tmp_path_factory):
+    root = tmp_path_factory.mktemp('published_diagnostics')
     destination = root / 'evaluation'
-    payload = run_cli(root, _jerry_config(FIXTURES / 'bars.csv'), '--jerry-report',
+    payload = run_cli(root, _diagnostics_config(FIXTURES / 'bars.csv'), '--diagnostics-report',
                       '--output-dir', str(destination))
     assert payload['ok'], payload
     assert {path.name for path in destination.iterdir()} == {
-        *FROZEN['harness']['artifacts'].values(), *FROZEN['jerry_cli']['artifacts'].values(),
+        *FROZEN['harness']['artifacts'].values(), *FROZEN['diagnostics_cli']['artifacts'].values(),
     }
     return destination
 
 
-@pytest.mark.parametrize('filename', ['jerry_report.csv', 'jerry_report.md'])
+@pytest.mark.parametrize('filename', ['diagnostics_report.csv', 'diagnostics_report.md'])
 @pytest.mark.parametrize('mode, extra', [
     ('dry_run', ('--dry-run',)),
     ('fake', ('--fake-result', 'success')),
     ('invalid_horizons', ('--horizons', '1,nope')),
     ('live', ()),
-    ('dry_run_without_jerry', ('--dry-run',)),
+    ('dry_run_without_diagnostics', ('--dry-run',)),
 ])
-def test_jerry_cli_rejects_json_mirror_collision(tmp_path, published_jerry_report, filename, mode, extra):
+def test_diagnostics_cli_rejects_json_mirror_collision(
+    tmp_path, published_diagnostics_report, filename, mode, extra,
+):
     destination = tmp_path / 'evaluation'
-    copytree(published_jerry_report, destination)
+    copytree(published_diagnostics_report, destination)
     before = {path.name: path.read_bytes() for path in destination.iterdir()}
-    config = _jerry_config(FIXTURES / 'bars.csv')
+    config = _diagnostics_config(FIXTURES / 'bars.csv')
     if mode in ('fake', 'invalid_horizons'):
-        config = {'time_series_analysis': config | {'output_dir': str(destination), 'jerry_report': True}}
+        config = {'time_series_analysis': config | {'output_dir': str(destination), 'diagnostics_report': True}}
     else:
         extra += ('--output-dir', str(destination))
-        if mode != 'dry_run_without_jerry':
-            extra += ('--jerry-report',)
+        if mode != 'dry_run_without_diagnostics':
+            extra += ('--diagnostics-report',)
     payload = run_cli(tmp_path, config, *extra, '--json-out', str(destination / filename))
     after = {path.name: path.read_bytes() for path in destination.iterdir()}
     changed = sorted(name for name in before.keys() | after.keys() if before.get(name) != after.get(name))
@@ -288,7 +290,7 @@ def _intervals(times, horizons):
                 exit_timestamps={h: entry + np.timedelta64(h, 'm') for h in horizons})
 
 
-def test_jerry_direction_and_conditional_return_distribution():
+def test_diagnostics_direction_and_conditional_return_distribution():
     fixture = FROZEN['direction_and_returns']
     times = pd.date_range('2025-12-31T14:30Z', periods=10, freq='min')
     panel = _panel(fixture['factor'], {1: fixture['return_pct']}, times)
@@ -314,7 +316,7 @@ def test_jerry_direction_and_conditional_return_distribution():
         assert row.direction_by_bucket[bucket].reason == 'no_directional_samples'
 
 
-def test_jerry_all_expected_grid_offsets_are_non_overlapping():
+def test_diagnostics_all_expected_grid_offsets_are_non_overlapping():
     fixture = FROZEN['offsets']
     first = pd.date_range('2025-12-30T14:30Z', periods=6, freq='min')
     times = first.append(first + pd.Timedelta(days=1))
@@ -336,7 +338,7 @@ def test_jerry_all_expected_grid_offsets_are_non_overlapping():
         engine.evaluate(panel, **options)
 
 
-def test_jerry_moving_block_bootstrap_reranks_each_replicate():
+def test_diagnostics_moving_block_bootstrap_reranks_each_replicate():
     fixture = FROZEN['bootstrap']
     times = pd.date_range('2025-12-31T14:30Z', periods=9, freq='min')
     panel = _panel(fixture['factor'], {2: fixture['return_pct']}, times)
@@ -352,7 +354,7 @@ def test_jerry_moving_block_bootstrap_reranks_each_replicate():
     assert [interval.lower, interval.upper] == pytest.approx(fixture['bounds'], abs=1e-12)
 
 
-def test_jerry_split_purges_late_exit_and_keeps_touching_exit():
+def test_diagnostics_split_purges_late_exit_and_keeps_touching_exit():
     times = pd.date_range('2025-12-31T23:50Z', periods=20, freq='min')
     signal = times + pd.Timedelta(minutes=1)
     intervals = _intervals(times, [2, 5])

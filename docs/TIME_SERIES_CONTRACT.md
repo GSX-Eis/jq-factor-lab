@@ -638,7 +638,8 @@ Bar 模式始终必须显式指定；缺失/非法分别返回 `missing_analysis
 避免覆盖任一级包装器摘要。目标为普通文件或完成标记为目录时返回结构化前置错误
 （退出码 2），不删除用户文件或递归删除目录；清理异常记录在 `error.details` 中。
 预演、模拟及实际执行均在写摘要前校验 `--json-out`。指向评估产物时返回退出码 2，
-保留已有产物与完成标记。保留路径包括 Jerry CSV 和 Markdown，即使本次未启用 Jerry 报告。
+保留已有产物与完成标记。即使本次未启用时序诊断报告，
+`diagnostics_report.csv` 和 `diagnostics_report.md` 也受路径校验保护。
 默认 Harness 摘要和运行级导航遵循 `docs/PUBLIC_SCOPE.md 的 Harness 输出布局`。
 
 | 标准文件 | 内容 / Harness artifact_type |
@@ -654,17 +655,19 @@ SHA256，核心摘要复制到 Harness `metrics`。评估 `summary.json` 最后�
 清理显式目标的旧完成标记。即使配置解析失败，也会清理 `--output-dir` 显式指定的标记。
 执行失败或超时会撤销完成标记。旧 CSV 可留作诊断，须配合当前完成标记消费。
 
-### Jerry 时序报告
+### 时序深度诊断报告
 
-使用 `time-series-analysis --config <path> --jerry-report`，或设置 JSON 布尔字段
-`"jerry_report": true`。该选项适用于 `time_series`。默认仍发布四个 Bar v1 产物。
-启用后，评估 `summary.json` 和 Harness `metrics` 包含 `jerry_report` 对象，
-其子契约为 `jerry_time_series.v1`。同一次评估还发布 `jerry_report.csv`
-和 `jerry_report.md`，两份文件均登记 SHA256，并在完成标记之前发布。读取时以当前摘要的 `jerry_report` 和产物登记为准。
+使用 `time-series-analysis --config <path> --diagnostics-report`，或设置 JSON 布尔字段
+`"diagnostics_report": true`。该选项适用于 `time_series`。默认仍发布四个 Bar v1 产物。
+启用后，评估 `summary.json` 和 Harness `metrics` 包含 `diagnostics_report` 对象，
+其子契约为 `time_series_diagnostics.v1`。同一次评估还发布 `diagnostics_report.csv`
+和 `diagnostics_report.md`，Harness 的 `artifact_type` 分别为
+`diagnostics_report_csv` 和 `diagnostics_report_markdown`。两份文件均登记 SHA256，
+并在完成标记之前发布。读取时以当前摘要的 `diagnostics_report` 和产物登记为准。
 CSV 的 `scope` 为 `overall`、`bucket` 或 `offset`，
 `index` 依次为空、从 1 开始的桶号或从 0 开始的网格偏移。
 JSON 用 null、CSV 用空字段、Markdown 用破折号表示不可计算的数值。
-显式 `--results-db` 持久化 Bar v1 的字段，Jerry 明细保存在报告产物中。
+显式 `--results-db` 持久化 Bar v1 的字段，时序诊断明细保存在报告产物中。
 
 对每组标的和频率，所选视图的应有网格从首个到末个候选信号，包含中间缺 Bar 的槽位。
 各持有期在该网格上报告全部 `0..h-1` 个偏移的有效样本数、Spearman IC 与状态，
@@ -673,7 +676,7 @@ JSON 用 null、CSV 用空字段、Markdown 用破折号表示不可计算的数
 默认种子 0、999 次抽样、至少 900 次有效重复、双侧 95% 区间。
 全局及各描述性分位桶均报告方向命中数、分母、上涨基准率、提升，
 以及条件收益 P5/P25/P50/P75/P95 和四个尾部均值，收益单位为百分数。
-该入口使用全样本描述性分桶。训练/OOS 验收见[统一评测引擎第 16 节](EVALUATION_ENGINE.md#16-s7-jerry-与-nq-1min-验收)。
+该入口使用全样本描述性分桶。训练/OOS 验收见[统一评测引擎第 16 节](EVALUATION_ENGINE.md#16-s7-时序诊断与-nq-1min-验收)。
 S7 的 NQ 1min 报告标记 `real_market_data_used=false`。真实 NQ 1min 在外置盘挂载后补跑。
 
 ### 训练切分与统计推断

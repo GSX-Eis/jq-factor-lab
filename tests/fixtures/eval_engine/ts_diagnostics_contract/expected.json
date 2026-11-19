@@ -22,11 +22,11 @@
       "5": {"valid": 4, "ic": 0.8, "phase_zero_count": 1, "phase_zero_ic": null, "quantiles": [[2, 1, 1, 0.5], [2, 7, 7, 1.0]]}
     }
   },
-  "jerry_cli": {
-    "schema": "jerry_time_series.v1",
-    "artifacts": {"jerry_report_csv": "jerry_report.csv", "jerry_report_markdown": "jerry_report.md"},
+  "diagnostics_cli": {
+    "schema": "time_series_diagnostics.v1",
+    "artifacts": {"diagnostics_report_csv": "diagnostics_report.csv", "diagnostics_report_markdown": "diagnostics_report.md"},
     "csv_columns": "instrument_id,frequency,horizon_bars,scope,index,total_count,valid_count,excluded_count,excluded_factor_missing,excluded_insufficient_history,excluded_session_boundary,excluded_missing_bar,excluded_invalid_price,ic_sample_count,ic_spearman_ic,ic_reason,bootstrap_grid_size,bootstrap_block_length,bootstrap_seed,bootstrap_n_boot,bootstrap_valid_replicates,bootstrap_min_valid_replicates,bootstrap_alpha,bootstrap_lower,bootstrap_upper,bootstrap_reason,direction_hits,direction_denominator,direction_up_count,direction_accuracy,direction_up_baseline,direction_lift,direction_reason,return_n_samples,return_mean,return_standard_error,return_p5,return_p25,return_p50,return_p75,return_p95,return_mean_le_p5,return_mean_le_p25,return_mean_ge_p75,return_mean_ge_p95,return_reason",
-    "markdown_headings": ["# Jerry time-series report", "## Counts and Spearman IC", "## Bootstrap Spearman intervals", "## Direction accuracy", "## Conditional return distribution", "## Non-overlapping offsets"],
+    "markdown_headings": ["# Time-series diagnostics report", "## Counts and Spearman IC", "## Bootstrap Spearman intervals", "## Direction accuracy", "## Conditional return distribution", "## Non-overlapping offsets"],
     "markdown_rows": [
       "| NQZ26 | 1min | 2 | 1 | 3 | 1 | — |",
       "| NQZ26 | 1min | 2 | bucket | 1 | 2 | 3 | 1 | 0.66666667 | 0.33333333 | 0.33333333 | — |",

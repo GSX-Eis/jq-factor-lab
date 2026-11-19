@@ -1,9 +1,9 @@
-# Jerry 时序验收夹具
+# 时序诊断验收夹具
 
 本夹具依据仓库中已确认的 `docs/TIME_SERIES_CONTRACT.md`、`tests/fixtures/time_series/`
 和 `docs/EVALUATION_ENGINE.md`。Bar v1 的 CLI 契约包括摘要 JSON 和三张 CSV。
-启用 `time-series-analysis --jerry-report` 后，同一次执行发布增强 JSON、CSV 与 Markdown。
-`expected.json` 的 `jerry_cli` 固定该发布契约。训练/OOS 专项报告由本目录的合成验收脚本生成。
+启用 `time-series-analysis --diagnostics-report` 后，同一次执行发布增强 JSON、CSV 与 Markdown。
+`expected.json` 的 `diagnostics_cli` 固定该发布契约。训练/OOS 专项报告由本目录的合成验收脚本生成。
 
 ## 手算样例
 
@@ -17,7 +17,7 @@
   4、−2、6、8，收益秩为 2、1、3、4，IC 为 0.8，仅一个 phase-zero 样本使该 IC 为 null。
 - 同一 CSV 中 2 Bar 偏移 1 的有效信号为 14:31、14:33、14:35，收益为 0、4、6，
   因子为 −1、1、3，因此有效样本数为 3，Spearman IC 为 1。应有网格不压缩缺口。
-- Jerry CLI 区间用独立 SciPy 计算。9 个槽位每次有放回选两个长度为 5 的块并截到 9 个槽，
+- 时序诊断 CLI 区间用独立 SciPy 计算。9 个槽位每次有放回选两个长度为 5 的块并截到 9 个槽，
   全部重抽使用种子 0。1 Bar 在 999 次抽样均可估计，95% 区间下界为 −0.11655430348287174。
   5 Bar 仅 748 次可估计，低于 900 次门槛，区间端点为空。
 - `direction_and_returns` 的零信号用于收益分布，但不计入方向分母。
@@ -39,7 +39,7 @@
 
 ```sh
 PYTHONPATH=. OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 VECLIB_MAXIMUM_THREADS=1 \
-  python tests/fixtures/eval_engine/jerry_contract/nq_1min.py \
+  python tests/fixtures/eval_engine/ts_diagnostics_contract/nq_1min.py \
     --probe work/NERE-828/data_probe.json \
     --output reports/NERE-791/nq_1min_eval_20261119.json
 ```
