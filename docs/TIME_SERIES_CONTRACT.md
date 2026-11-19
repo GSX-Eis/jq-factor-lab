@@ -2,7 +2,7 @@
 
 ## 阶段 6.6：Bar 评估结果入库（`bar_evaluation_*`、`--results-db`、只读查询与监控）
 
-由模块 [`utils/bar_evaluation_store.py`](../utils/bar_evaluation_store.py) 与只读监控页 [`utils/bar_evaluation_app.py`](../utils/bar_evaluation_app.py) 实现。零引入 SQLite，零改动日频 `factor_analysis_results`、`factor_values`、`price_data_daily`、`price_data_5m` 及既有缓存键。
+由模块 [`utils/bar_evaluation_store.py`](../utils/bar_evaluation_store.py) 与只读监控页 `utils/bar_evaluation_app.py`（私有监控入口） 实现。零引入 SQLite，零改动日频 `factor_analysis_results`、`factor_values`、`price_data_daily`、`price_data_5m` 及既有缓存键。
 
 ### 表结构与双模式兼容性
 
@@ -240,12 +240,12 @@ CSV 读取仅加载调用方指定文件，不执行研究任务、不修改数�
 
 ## 新旧模块边界
 
-时序模块独立于现有横截面分析。`AlphalensRunner`、
-`ForwardReturnsCalculator` 保持独立；股票日频 `TradingCalendar` 已接入同一日历核心，
-保留原接口及冻结 fingerprint，详见 `TRADING_CALENDAR.md`。
-后续入口必须显式指定 `analysis_mode`，不得根据资产数量推断模式。
-时序研究即使有多个资产，也须逐资产计算时间序列 IC，不能合并成横截面 IC。
-当前已实现日历、交易时段、标准 CSV、按 Bar 标签器、双模式评估器及 Harness CLI。
+`AlphalensRunner`、`TimeSeriesEvaluator` 与 `BarCrossSectionalEvaluator` 是
+[统一评测引擎](EVALUATION_ENGINE.md)的兼容入口。`ForwardReturnsCalculator`
+在统一标签层选择日频收盘到收盘约定，Bar 使用开盘到收盘约定。股票日频
+`TradingCalendar` 沿用原接口与冻结 fingerprint，见[交易日历](TRADING_CALENDAR.md)。
+评测入口显式指定 `analysis_mode`。时序研究逐品种沿时间计算 IC，截面研究
+在同一信号时刻沿资产计算 IC。
 
 ## Bar、因子值与时间
 
@@ -569,7 +569,7 @@ records = labeler.label_records(bars, factors, signal_timestamps=['2026-12-01T14
 
 `TimeSeriesEvaluator(analysis_mode='time_series')` 按标的、频率、持有长度独立计算
 Spearman IC（平均秩处理同值），再汇总各资产 IC 的均值和中位数。
-`non_overlapping_ic` 先按候选信号时间排序、每隔 h 根取样，再筛选有效记录；
+Bar v1 的 `non_overlapping_ic` 先按候选信号时间排序、每隔 h 根取样，再筛选有效记录；
 不能先删除剔除行再取步长。默认 `min_ic_samples=3`，常数因子、常数收益及样本不足
 分别报告 `constant_factor`、`constant_return`、`insufficient_samples`，IC 为空。
 全样本 `qcut(..., duplicates='drop')` 不打散同值，报告实际组数，分组固定标为
@@ -637,7 +637,9 @@ Bar 模式始终必须显式指定；缺失/非法分别返回 `missing_analysis
 可覆盖，若与 Harness attempt 或其运行级目录相同，则仍使用 attempt 的 `evaluation/`，
 避免覆盖任一级包装器摘要。目标为普通文件或完成标记为目录时返回结构化前置错误
 （退出码 2），不删除用户文件或递归删除目录；清理异常记录在 `error.details` 中。
-`--json-out` 不得指向四个评估文件。默认 Harness 摘要和运行级导航遵循 `docs/PUBLIC_SCOPE.md 的 Harness 输出布局`。
+预演、模拟及实际执行均在写摘要前校验 `--json-out`。指向评估产物时返回退出码 2，
+保留已有产物与完成标记。保留路径包括 Jerry CSV 和 Markdown，即使本次未启用 Jerry 报告。
+默认 Harness 摘要和运行级导航遵循 `docs/PUBLIC_SCOPE.md 的 Harness 输出布局`。
 
 | 标准文件 | 内容 / Harness artifact_type |
 |---|---|
@@ -648,9 +650,51 @@ Bar 模式始终必须显式指定；缺失/非法分别返回 `missing_analysis
 
 CSV 时间为 ISO8601 UTC `Z`，JSON 不可算数值为 null。四文件各自登记绝对路径与
 SHA256，核心摘要复制到 Harness `metrics`。评估 `summary.json` 最后原子发布，作为唯一
-完成标记；与 Harness 顶层 `summary.json` 分离。真实重试在读取配置/CSV 前清理显式目标的
-旧完成标记，任何失败/超时均撤销该标记，不登记成功评估产物；旧 CSV 可留作诊断，
-不能脱离完成标记消费。配置中才声明的目标在配置成功解析后清理。
+完成标记；与 Harness 顶层 `summary.json` 分离。通过路径校验后，真实重试在读取 CSV 前
+清理显式目标的旧完成标记。即使配置解析失败，也会清理 `--output-dir` 显式指定的标记。
+执行失败或超时会撤销完成标记。旧 CSV 可留作诊断，须配合当前完成标记消费。
+
+### Jerry 时序报告
+
+使用 `time-series-analysis --config <path> --jerry-report`，或设置 JSON 布尔字段
+`"jerry_report": true`。该选项适用于 `time_series`。默认仍发布四个 Bar v1 产物。
+启用后，评估 `summary.json` 和 Harness `metrics` 包含 `jerry_report` 对象，
+其子契约为 `jerry_time_series.v1`。同一次评估还发布 `jerry_report.csv`
+和 `jerry_report.md`，两份文件均登记 SHA256，并在完成标记之前发布。读取时以当前摘要的 `jerry_report` 和产物登记为准。
+CSV 的 `scope` 为 `overall`、`bucket` 或 `offset`，
+`index` 依次为空、从 1 开始的桶号或从 0 开始的网格偏移。
+JSON 用 null、CSV 用空字段、Markdown 用破折号表示不可计算的数值。
+显式 `--results-db` 持久化 Bar v1 的字段，Jerry 明细保存在报告产物中。
+
+对每组标的和频率，所选视图的应有网格从首个到末个候选信号，包含中间缺 Bar 的槽位。
+各持有期在该网格上报告全部 `0..h-1` 个偏移的有效样本数、Spearman IC 与状态，
+并核对实际持仓区间在各偏移内互不重叠。候选及剔除计数沿用 Bar v1 的标签分类。
+块 bootstrap 在网格上重采样，按有效配对重新排名，采用最长持有期为块长，
+默认种子 0、999 次抽样、至少 900 次有效重复、双侧 95% 区间。
+全局及各描述性分位桶均报告方向命中数、分母、上涨基准率、提升，
+以及条件收益 P5/P25/P50/P75/P95 和四个尾部均值，收益单位为百分数。
+该入口使用全样本描述性分桶。训练/OOS 验收见[统一评测引擎第 16 节](EVALUATION_ENGINE.md#16-s7-jerry-与-nq-1min-验收)。
+S7 的 NQ 1min 报告标记 `real_market_data_used=false`。真实 NQ 1min 在外置盘挂载后补跑。
+
+### 训练切分与统计推断
+
+统一引擎的截面 `QuantileScheme` 为 `per_cross_section`。分桶只读取信号时刻可用
+的因子与资产池，退出价缺失只减少当前持有期的收益样本。时序切分采用
+`fitted_on_train`，冻结各品种分位边界、方向及可选标准化参数，训练与 OOS
+报告记录同一份 `fit_identity`。样本外极端值进入端点桶，空桶保留编号。
+
+每个持有期按实际退出时间清除训练标签。以首个 OOS 应有信号的
+`signal_available_at` 为边界，退出恰好相等时保留，退出更晚时清除。
+日频使用退出交易日实际收盘，Bar 使用退出 Bar 实际结束。高周期特征仅在
+Bar 已收盘且已发布时可用。边界与前视篡改用例见
+[统一评测引擎](EVALUATION_ENGINE.md#14-训练与样本外评测接口)。
+
+截面 IC 均值用保留网格缺口的 Bartlett HAC，时序 Spearman 用连续块重采样并
+在每次复制中重排成对有效样本。持有期为 `h` 时，最低要求为 HAC 滞后
+`h - 1` 与块长 `h`。区间覆盖率须按依赖结构和缺失机制预先校准。
+比较多个因子或持有期之前，以 `TrialLedger` 登记整个候选族并完成多重检验校正。
+规则和校准证据见[评测政策](EVAL_POLICY.md#unified-evaluation-engine)和
+[统一评测引擎第 6 节](EVALUATION_ENGINE.md#6-重叠收益反例与区间校准)。
 
 ### 身份绑定
 
@@ -868,15 +912,12 @@ warmup_sessions=0, warmup_bars=0, aggregation='mean')` 在桥接模块中也可�
    `signal_available_at` 已知；绝不能只按 `signal_timestamp` 切训练/验证/测试。
 
 **Purging（重叠清除）**：把样本信息区间视为
-`[signal_available_at, exit_timestamp)`，验证/测试保护区间从其最早
-`signal_timestamp` 起，直到该折最大实际 `exit_timestamp`。任何训练样本信息区间
-与保护区间相交都必须清除。对于验证段之前的训练样本，要求
-`train.exit_timestamp <= val_first_signal_timestamp`；例如
-`train.exit_timestamp > val_first_signal_timestamp`，或等价地
-`val.signal_timestamp < train_last_exit_timestamp` 时，清除产生重叠的训练样本，
-而不是删除验证样本。若交叉验证允许验证段之后的训练样本，也必须清除它们与
-验证实际标签退出区间的重叠。所有比较使用 UTC 的实际退出时间，不能拿名义
-`h × frequency` 替代跨午休/维护休市的退出时间。
+`[signal_available_at, exit_timestamp)`。验证/测试保护区间从首个应有信号
+的可用时刻开始，结束于该折最大实际退出时间。清除信息区间与保护区间相交
+的训练标签。对于验证段之前的训练样本，逐持有期保留
+`train.exit_timestamp <= val_first_signal_available_at` 的有效标签。
+若交叉验证允许验证段之后的训练样本，也须检查它们与上述保护区间的相交。
+使用 UTC 实际退出时间，跨午休或维护时段时按交易日历取退出 Bar 的结束时刻。
 
 **Embargo（隔离带）**：验证/测试最后信号之后，先等待该折最大实际
 `exit_timestamp`，再施加不少于配置 `embargo_bars` 的应有 Bar 隔离，或明确配置

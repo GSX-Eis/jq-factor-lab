@@ -184,8 +184,8 @@ def calculate_forward_returns(
     
     # 扩展日期范围获取价格数据
     from utils.trading_calendar import load_trading_calendar
-    from backtest_and_analysis.forward_returns_calculator import ForwardReturnsCalculator
-    ForwardReturnsCalculator._validate_horizons((period,), 0)
+    from backtest_and_analysis.evaluation.labels import ExecutionConvention, validate_daily_horizons
+    (period,) = validate_daily_horizons((period,), 0)
     calendar = load_trading_calendar(price_conn)
     calendar.validate_coverage(dates.min(), dates.max())
     extended_start = dates.min()
@@ -264,7 +264,8 @@ def calculate_forward_returns(
         factor_wide = price_df.pivot(index='date', columns='stock_code', values='factor').sort_index()
         close_wide = apply_pit_adjustment_factor_end_df(close_wide, factor_wide, log)
     close_wide = calendar.align(close_wide, extended_start, extended_end)
-    forward_returns_long = (close_wide.shift(-period) / close_wide - 1).stack()
+    rule = ExecutionConvention.CLOSE_TO_CLOSE.value
+    forward_returns_long = rule.returns(close_wide, close_wide.shift(-rule.exit_offset(period))).stack()
     forward_returns_long.index.names = ['date', 'stock_code']
     forward_return_series = forward_returns_long.reindex(factor_df.index).dropna()
     forward_return_series.name = 'forward_return'

@@ -3,3 +3,12 @@ Copyright 2026 JQ Factor Lab contributors
 
 Licensed under the Apache License, Version 2.0.
 Third-party components retain their respective licenses and attribution notices.
+
+The test-only excerpts in tests/reference/alphalens_ref are from the
+alphalens-reloaded 0.4.6 wheel (alphalens/utils.py and alphalens/performance.py).
+Copyright 2017, 2018 Quantopian, Inc.
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+Source release: https://pypi.org/project/alphalens-reloaded/0.4.6/
+The excerpts preserve the original copyright and license headers.
+They are used only in tests to verify the independent evaluation implementation.
+Upstream repository: https://github.com/stefan-jansen/alphalens-reloaded

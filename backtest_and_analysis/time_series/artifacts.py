@@ -1,6 +1,7 @@
 """Publish Bar evaluation tables, with summary.json as the completion marker."""
 from __future__ import annotations
 
+import csv
 import json
 import math
 import os
@@ -48,11 +49,16 @@ def _csv_table(frame: pd.DataFrame) -> pd.DataFrame:
     return table
 
 
+JERRY_CSV = 'jerry_report.csv'
+JERRY_MARKDOWN = 'jerry_report.md'
+
+
 def write_evaluation_artifacts(evaluation_result: EvaluationResult, output_dir: str | Path, *,
                                result_identity: ResultIdentity,
                                config: Mapping[str, Any] | None = None,
-                               code_version_source: str | None = None) -> dict[str, Path]:
-    """Stage all four files on the destination filesystem, publish summary last.
+                               code_version_source: str | None = None,
+                               jerry_report: Mapping[str, Any] | None = None) -> dict[str, Path]:
+    """Stage the evaluation files on the destination filesystem, publish summary last.
 
     Each rename is atomic. Readers must require summary.json; a failed retry
     removes that completion marker even if older CSV files remain for diagnosis.
@@ -93,18 +99,33 @@ def write_evaluation_artifacts(evaluation_result: EvaluationResult, output_dir: 
         cross_sections=result.cross_sections.to_dict('records'))
     if code_version_source is not None:
         payload['result_identity']['code_version_source'] = code_version_source
+    if jerry_report is not None:
+        payload['jerry_report'] = jerry_report
     try:
-        summary = json.dumps(_json_value(payload), ensure_ascii=False, indent=2, allow_nan=False) + '\n'
+        payload = _json_value(payload)
+        summary = json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False) + '\n'
     except (ValueError, TypeError) as exc:
         raise ContractValidationError(f'Evaluation metadata must be JSON serializable: {exc}') from exc
     tables = {'per_bar_labels': result.per_bar_labels, 'ic_by_horizon': result.ic_by_horizon,
               'quantile_stats': result.quantile_stats}
-    paths = {name: destination / f'{name}.csv' for name in tables} | {'summary': summary_path}
+    paths = {name: destination / f'{name}.csv' for name in tables}
+    if jerry_report is not None:
+        paths.update(jerry_report_csv=destination / JERRY_CSV, jerry_report_markdown=destination / JERRY_MARKDOWN)
+    paths['summary'] = summary_path
     # Publication staging is retained only inside this synchronous transaction.
     with TemporaryDirectory(prefix='.bar-evaluation-', dir=destination) as staging:
         staged = Path(staging)
         for name, table in tables.items():
             _csv_table(table).to_csv(staged / paths[name].name, index=False)
+        if jerry_report is not None:
+            from .jerry_report import JERRY_CSV_COLUMNS, jerry_rows, render_jerry_markdown
+            report = payload['jerry_report']
+            rows = jerry_rows(report)
+            with (staged / JERRY_CSV).open('w', encoding='utf-8', newline='') as stream:
+                writer = csv.DictWriter(stream, fieldnames=JERRY_CSV_COLUMNS)
+                writer.writeheader()
+                writer.writerows(rows)
+            (staged / JERRY_MARKDOWN).write_text(render_jerry_markdown(report, rows), encoding='utf-8')
         (staged / 'summary.json').write_text(summary, encoding='utf-8')
         try:
             for path in paths.values():

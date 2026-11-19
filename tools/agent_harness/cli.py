@@ -953,8 +953,16 @@ def _common_artifacts(output_dir: Path) -> List[Dict[str, Any]]:
     return [{"artifact_type": "summary", "path": str(output_dir / "summary.json")}]
 
 
+def _bar_artifact_paths(evaluation_dir: Path, jerry_report: bool) -> set[Path]:
+    names = ("summary.json", "per_bar_labels.csv", "ic_by_horizon.csv", "quantile_stats.csv")
+    if jerry_report:
+        from backtest_and_analysis.time_series.artifacts import JERRY_CSV, JERRY_MARKDOWN
+        names += (JERRY_CSV, JERRY_MARKDOWN)
+    return {evaluation_dir / name for name in names}
+
+
 def _validate_bar_output_paths(db_path: Path, output_dir: Path, json_out: str,
-                               evaluation_dir: Path | None = None) -> None:
+                               evaluation_dir: Path | None = None, *, jerry_report: bool = False) -> None:
     from utils.bar_evaluation_store import BarEvaluationPreconditionError
 
     targets = [output_dir / "summary.json", output_dir / "config/resolved.json",
@@ -964,8 +972,7 @@ def _validate_bar_output_paths(db_path: Path, output_dir: Path, json_out: str,
     if json_out:
         targets.append(Path(json_out).expanduser())
     if evaluation_dir is not None:
-        targets.extend(evaluation_dir / name for name in
-                       ("summary.json", "per_bar_labels.csv", "ic_by_horizon.csv", "quantile_stats.csv"))
+        targets.extend(_bar_artifact_paths(evaluation_dir, jerry_report))
     db_path = db_path.resolve()
     for target in targets:
         target = target.resolve()
@@ -1008,7 +1015,24 @@ def _handle_time_series_analysis(args: argparse.Namespace) -> HarnessResult:
             guard_config = _safe_read_json(_resolve_repo_relative_path(args.config))
         except (OSError, ValueError, TypeError):
             pass
+    jerry_requested = bool(getattr(args, 'jerry_report', False) or guard_config.get('jerry_report') is True)
+    guard_reason = "time_series_precondition_failed"
     try:
+        guarded_destination = destination
+        if args.output_dir:
+            guarded_destination = Path(args.output_dir).expanduser().resolve()
+        elif guard_config.get("output_dir"):
+            guarded_destination = _resolve_repo_relative_path(guard_config["output_dir"])
+        if guarded_destination in harness_summary_dirs:
+            guarded_destination = destination
+
+        # A retry can target a previously published Jerry report without requesting a new one.
+        if args.json_out and Path(args.json_out).expanduser().resolve() in {
+            path.resolve() for path in _bar_artifact_paths(guarded_destination, jerry_report=True)
+        }:
+            raise ValueError("--json-out must differ from evaluation artifact paths")
+
+        guard_reason = "bar_evaluation_store_precondition_failed"
         raw_db = getattr(args, "results_db", None)
         if raw_db is None:
             raw_db = guard_config.get("results_db")
@@ -1016,16 +1040,12 @@ def _handle_time_series_analysis(args: argparse.Namespace) -> HarnessResult:
         else:
             guarded_db = Path(raw_db).expanduser().resolve() if raw_db.strip() else None
         if guarded_db is not None:
-            guarded_destination = (Path(args.output_dir).expanduser().resolve() if args.output_dir else
-                                   _resolve_repo_relative_path(guard_config["output_dir"])
-                                   if guard_config.get("output_dir") else destination)
-            if guarded_destination in harness_summary_dirs:
-                guarded_destination = destination
-            _validate_bar_output_paths(guarded_db, output_dir, args.json_out, guarded_destination)
-    except (OSError, ValueError, TypeError) as exc:
-        # A collision failure must never write a Harness/error mirror or clear a marker.
+            _validate_bar_output_paths(guarded_db, output_dir, args.json_out, guarded_destination,
+                                       jerry_report=jerry_requested)
+    except (OSError, ValueError, TypeError, RuntimeError) as exc:
+        # Report path failures on stdout before writing any summary or clearing a marker.
         result = _failure_result(**common, mode="preflight",
-            reason="bar_evaluation_store_precondition_failed", exit_code=EXIT_PRECONDITION,
+            reason=guard_reason, exit_code=EXIT_PRECONDITION,
             metrics={"error": str(exc)}, artifacts=[])
         result.error["message"] = str(exc)
         return result
@@ -1039,19 +1059,12 @@ def _handle_time_series_analysis(args: argparse.Namespace) -> HarnessResult:
             metrics=dry_metrics, artifacts=_common_artifacts(output_dir)), args.json_out)
 
     try:
-        # Clear an explicit retry's marker even if config loading itself fails.
-        if args.output_dir:
-            destination = Path(args.output_dir).expanduser().resolve()
-            if destination in harness_summary_dirs:
-                destination = output_dir / "evaluation"
+        # Clear an explicit CLI retry's marker even if config loading itself fails.
+        if args.output_dir or (config_error is None and config.get("output_dir")):
+            destination = guarded_destination
             (destination / "summary.json").unlink(missing_ok=True)
         if config_error is not None:
             raise config_error
-        if not args.output_dir and config.get("output_dir"):
-            destination = _resolve_repo_relative_path(config["output_dir"])
-            if destination in harness_summary_dirs:
-                destination = output_dir / "evaluation"
-            (destination / "summary.json").unlink(missing_ok=True)
         config_results_db = config.pop("results_db", None)
         results_db_path: Path | None = None
         cli_results_db = getattr(args, "results_db", None)
@@ -1073,13 +1086,8 @@ def _handle_time_series_analysis(args: argparse.Namespace) -> HarnessResult:
             config["horizons"] = [int(h.strip()) for h in args.horizons.split(",")]
         if args.calendar is not None:
             config.pop("calendar_by_instrument", None)
-        if args.json_out and Path(args.json_out).expanduser().resolve() in {
-            destination / filename for filename in ("summary.json", "per_bar_labels.csv",
-                                                    "ic_by_horizon.csv", "quantile_stats.csv")
-        }:
-            # The error mirror must not recreate the rejected completion marker.
-            args.json_out = ""
-            raise ValueError("--json-out must differ from evaluation artifact paths")
+        if getattr(args, 'jerry_report', False):
+            config['jerry_report'] = True
         output_dir.mkdir(parents=True, exist_ok=True)
         resolved_config = output_dir / "config" / "resolved.json"
         _write_json(resolved_config, config)
@@ -2592,6 +2600,8 @@ def build_parser() -> argparse.ArgumentParser:
     bar_analysis = subparsers.add_parser("time-series-analysis", help="Evaluate CSV Bar factors in an explicit mode")
     add_common(bar_analysis)
     bar_analysis.add_argument("--config", default="", help="Bar analysis JSON config")
+    bar_analysis.add_argument("--jerry-report", action="store_true",
+                              help="Publish full time-series diagnostics in JSON, CSV and Markdown")
     for subparser in (bar_analysis, analyze):
         subparser.add_argument("--bars-csv")
         subparser.add_argument("--factors-csv")

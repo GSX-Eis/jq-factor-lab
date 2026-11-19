@@ -1,0 +1,148 @@
+"""Single entry point for daily and Bar panel statistics."""
+
+from collections.abc import Hashable, Mapping
+from dataclasses import dataclass
+import re
+from typing import Any, Literal
+
+import numpy as np
+import numpy.typing as npt
+import pandas as pd
+
+from .cross_section import evaluate_cross_section
+from .kernels import _positive_int
+from .panel import EvaluationPanel
+from .quantiles import QuantileFit, QuantileScheme, Standardization
+from .split import SplitConfig, SplitEvaluation, evaluate_splits
+from .time_series import evaluate_time_series
+from .types import ReturnMode
+
+AnalysisMode = Literal["cross_sectional", "time_series"]
+Frequency = Literal["daily", "bar"]
+
+
+@dataclass(frozen=True)
+class EngineResult:
+    analysis_mode: AnalysisMode
+    frequency: Frequency
+    return_mode: ReturnMode
+    splits: dict[str, SplitEvaluation]
+
+
+@dataclass(frozen=True)
+class EvaluationEngine:
+    analysis_mode: AnalysisMode
+    frequency: Frequency = "daily"
+
+    def __post_init__(self) -> None:
+        if self.analysis_mode not in ("cross_sectional", "time_series"):
+            raise ValueError("analysis_mode must be 'cross_sectional' or 'time_series'")
+        if self.frequency not in ("daily", "bar"):
+            raise ValueError("frequency must be 'daily' or 'bar'")
+
+    def evaluate(
+        self,
+        panel: EvaluationPanel,
+        *,
+        split: SplitConfig | Mapping[str, str | pd.Timestamp] | None = None,
+        quantile_scheme: QuantileScheme | None = None,
+        quantile_fit: QuantileFit | None = None,
+        return_mode: ReturnMode = "raw",
+        signal_available_at: pd.DatetimeIndex | None = None,
+        entry_timestamps: Mapping[Hashable, npt.ArrayLike] | None = None,
+        exit_timestamps: Mapping[Hashable, npt.ArrayLike] | None = None,
+        signal_valid: npt.ArrayLike | None = None,
+        expected_grid: npt.ArrayLike | None = None,
+        n_quantiles: int = 5,
+        direction: int = 1,
+        standardization: Standardization | None = None,
+        **statistics_options: Any,
+    ) -> EngineResult:
+        """Evaluate one labeled panel on its original return scale.
+
+        Pass the signal clock and scheduled exits for a split. Time-series
+        inference also needs entries and uses integer horizons in grid steps.
+        Forward mode-specific options to the S3 statistics layer, such as
+        `hac_lag` or the bootstrap settings.
+        """
+        cross_sectional = self.analysis_mode == "cross_sectional"
+        if return_mode not in ("raw", "cross_section_excess"):
+            raise ValueError("return_mode must be 'raw' or 'cross_section_excess'")
+        if not cross_sectional and return_mode != "raw":
+            raise ValueError("cross_section_excess requires cross_sectional analysis")
+        if quantile_fit is not None and (cross_sectional or split is not None):
+            raise ValueError("quantile_fit requires full-sample time_series analysis")
+        scheme: QuantileScheme | None = (
+            "per_cross_section" if cross_sectional else
+            "fitted_on_train" if split is not None or quantile_fit is not None else None
+        )
+        if quantile_scheme is not None and quantile_scheme != scheme:
+            raise ValueError("Use per_cross_section for cross_sectional analysis or "
+                             "fitted_on_train for time_series with a split or frozen quantile_fit")
+        if standardization is not None and (cross_sectional or split is None):
+            raise ValueError("standardization requires a time_series train/oos split")
+
+        if cross_sectional:
+            minimum_lag = _positive_int(statistics_options.pop("hac_lag", 0), "hac_lag", minimum=0)
+            lags = {}
+            for horizon in panel.returns:
+                steps = horizon
+                if self.frequency == "daily" and isinstance(horizon, str):
+                    if re.fullmatch(r"[0-9]+[dD]", horizon):
+                        steps = int(horizon[:-1])
+                if statistics_options.get("_legacy_ic_rounding") and not isinstance(steps, (int, np.integer)):
+                    # Legacy daily dictionaries can include extra label keys and expose no HAC results.
+                    lags[horizon] = minimum_lag
+                else:
+                    steps = _positive_int(steps, f"horizon {horizon!r}")
+                    lags[horizon] = max(minimum_lag, steps - 1)
+            statistics_options.update(frequency=self.frequency, return_mode=return_mode, hac_lag=lags)
+        else:
+            statistics_options.setdefault("block_length", max(panel.returns))
+            statistics_options.setdefault("seed", 0)
+            statistics_options.setdefault("n_boot", 999)
+            statistics_options.setdefault("min_valid_replicates", 900)
+
+        if split is not None:
+            if signal_available_at is None or exit_timestamps is None:
+                raise ValueError("A split requires signal_available_at and exit_timestamps")
+            splits = evaluate_splits(
+                panel, split, mode="cross_section" if cross_sectional else "time_series",
+                signal_available_at=signal_available_at, exit_timestamps=exit_timestamps,
+                entry_timestamps=entry_timestamps, signal_valid=signal_valid, expected_grid=expected_grid,
+                n_quantiles=n_quantiles, direction=direction, standardization=standardization,
+                **statistics_options,
+            )
+            return EngineResult(self.analysis_mode, self.frequency, return_mode, splits)
+
+        eligible = np.isfinite(panel.factor)
+        for name, mask in (("signal_valid", signal_valid), ("expected_grid", expected_grid)):
+            if mask is not None:
+                mask = np.asarray(mask)
+                if mask.dtype.kind != "b" or mask.shape != eligible.shape:
+                    raise ValueError(f"{name} must be a boolean mask with the panel shape")
+                eligible &= mask
+
+        if cross_sectional:
+            statistics = evaluate_cross_section(
+                panel, signal_valid=eligible, n_quantiles=n_quantiles, direction=direction,
+                **statistics_options,
+            )
+        else:
+            if (entry_timestamps is None) != (exit_timestamps is None):
+                raise ValueError("Provide both entry_timestamps and exit_timestamps for time_series")
+            intervals = None
+            if entry_timestamps is not None and exit_timestamps is not None:
+                if entry_timestamps.keys() != panel.returns.keys() or exit_timestamps.keys() != panel.returns.keys():
+                    raise ValueError("Entry and exit timestamps must contain the same horizons as the panel")
+                intervals = {h: (entry_timestamps[h], exit_timestamps[h]) for h in panel.returns}
+            statistics = evaluate_time_series(
+                panel, intervals, signal_valid=eligible, expected_grid=expected_grid,
+                n_quantiles=n_quantiles, direction=direction, quantile_fit=quantile_fit, **statistics_options,
+            )
+        valid = {h: panel.valid[h] & eligible & np.isfinite(values) for h, values in panel.returns.items()}
+        splits = {"full": SplitEvaluation(
+            statistics, valid, dict.fromkeys(panel.returns, 0), scheme,
+            None if quantile_fit is None else quantile_fit.identity(),
+        )}
+        return EngineResult(self.analysis_mode, self.frequency, return_mode, splits)

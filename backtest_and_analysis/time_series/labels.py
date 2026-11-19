@@ -8,6 +8,8 @@ from typing import TYPE_CHECKING
 import numpy as np
 import pandas as pd
 
+from backtest_and_analysis.evaluation.labels import ExecutionConvention
+
 from .contracts import (
     ContractValidationError, LabelRecord, _numeric_column,
     invalid_price_mask, primary_exclusion_reasons, validate_bar_frame,
@@ -21,14 +23,15 @@ if TYPE_CHECKING:
     from utils.continuous_bars import ContinuousBarSource
 
 
+_BAR = ExecutionConvention.OPEN_TO_CLOSE.value
 LABEL_COLUMNS = tuple(LabelRecord.__dataclass_fields__)
 TIME_OUTPUTS = ('entry_timestamp', 'exit_bar_timestamp', 'exit_timestamp')
 VALUE_OUTPUTS = ('entry_price', 'exit_price', 'price_change_points', 'return_pct')
 
 
-def _positive_integer(value: int, name: str) -> int:
-    if isinstance(value, (bool, np.bool_)) or not isinstance(value, Integral) or value < 1:
-        raise ContractValidationError(f'{name} must be an integer >= 1')
+def _positive_integer(value: int, name: str, minimum: int = 1) -> int:
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, Integral) or value < minimum:
+        raise ContractValidationError(f'{name} must be an integer >= {minimum}')
     return int(value)
 
 
@@ -72,11 +75,12 @@ class BarReturnLabeler:
                  entry_offset_bars: int = 1, horizons: Sequence[int] | int = (1, 5, 15, 60),
                  view: View = 'ETH', boundary_policy: str = 'same_session',
                  bucket_strategy: str | None = None,
-                 continuous_source: ContinuousBarSource | None = None) -> None:
+                 continuous_source: ContinuousBarSource | None = None,
+                 include_scheduled_exit: bool = False) -> None:
         # The calendar imports contracts through this package during initialization.
         from utils.session_calendar import SessionCalendar
 
-        self.entry_offset_bars = _positive_integer(entry_offset_bars, 'entry_offset_bars')
+        self.entry_offset_bars = _positive_integer(entry_offset_bars, 'entry_offset_bars', _BAR.min_entry_offset)
         if isinstance(horizons, Integral):
             horizons = (horizons,)
         if not isinstance(horizons, Sequence) or isinstance(horizons, (str, bytes)) or not horizons:
@@ -101,6 +105,7 @@ class BarReturnLabeler:
         self.bucket_strategy = bucket_strategy
         self.boundary_policy = boundary_policy
         self.continuous_source = continuous_source
+        self.include_scheduled_exit = include_scheduled_exit
 
     def label(self, bars: pd.DataFrame, factors: pd.DataFrame | None = None, *,
               signal_timestamps: Sequence | None = None) -> pd.DataFrame:
@@ -149,12 +154,14 @@ class BarReturnLabeler:
                 raise ContractValidationError(f'Missing raw coverage for {(instrument, frequency)}')
             tables.extend(self._label_group(group, factor_index, signals, calendar,
                                             coverage[(instrument, frequency)], instrument, frequency))
+        scheduled = ('scheduled_exit_timestamp',) if self.include_scheduled_exit else ()
+        columns = (*LABEL_COLUMNS, *scheduled)
         if not tables:
-            result = pd.DataFrame(columns=LABEL_COLUMNS)
-            for name in ('signal_timestamp', 'signal_available_at', *TIME_OUTPUTS):
+            result = pd.DataFrame(columns=columns)
+            for name in ('signal_timestamp', 'signal_available_at', *TIME_OUTPUTS, *scheduled):
                 result[name] = pd.Series(dtype='datetime64[ns, UTC]')
             return result
-        return pd.concat(tables, ignore_index=True).loc[:, LABEL_COLUMNS].sort_values(
+        return pd.concat(tables, ignore_index=True).loc[:, columns].sort_values(
             ['instrument_id', 'frequency', 'signal_timestamp', 'horizon_bars'],
             kind='stable').reset_index(drop=True)
 
@@ -199,8 +206,9 @@ class BarReturnLabeler:
         entries = positions + self.entry_offset_bars
         tables = []
         for horizon in self.horizons:
-            exits = entries + horizon - 1
-            eth_exits = eth_positions + self.entry_offset_bars + horizon - 1
+            exit_offset = _BAR.exit_offset(horizon)
+            exits = entries + exit_offset
+            eth_exits = eth_positions + self.entry_offset_bars + exit_offset
             boundary = ((exits >= len(grid))
                         | ((self.boundary_policy == 'same_session')
                            & (owners[positions] != owners[np.minimum(exits, len(grid) - 1)])))
@@ -225,21 +233,23 @@ class BarReturnLabeler:
                 'exit_timestamp': ends.take(np.minimum(exits, len(grid) - 1)),
                 'status': np.where(valid, 'valid', 'excluded'), 'exclusion_reason': reasons,
             })
+            if self.include_scheduled_exit:
+                table['scheduled_exit_timestamp'] = table.exit_timestamp.where(~boundary)
             table.loc[~valid, list(TIME_OUTPUTS)] = pd.NaT
             table.loc[:, list(VALUE_OUTPUTS)] = np.nan
-            opening = observed.open.to_numpy(dtype=float, na_value=np.nan)[entries[valid]]
-            close = observed.close.to_numpy(dtype=float, na_value=np.nan)[exits[valid]]
+            opening = observed[_BAR.entry_price_field].to_numpy(dtype=float, na_value=np.nan)[entries[valid]]
+            close = observed[_BAR.exit_price_field].to_numpy(dtype=float, na_value=np.nan)[exits[valid]]
             table.loc[valid, 'entry_price'] = opening
             table.loc[valid, 'exit_price'] = close
             table.loc[valid, 'price_change_points'] = close - opening
-            table.loc[valid, 'return_pct'] = (close / opening - 1) * 100
+            table.loc[valid, 'return_pct'] = _BAR.returns(opening, close)
             tables.append(table)
         return tables
 
     def label_records(self, bars: pd.DataFrame, factors: pd.DataFrame | None = None, *,
                       signal_timestamps: Sequence | None = None) -> list[LabelRecord]:
         """Serialize the computed table; NaT/NaN output fields become None."""
-        table = self.label(bars, factors, signal_timestamps=signal_timestamps)
+        table = self.label(bars, factors, signal_timestamps=signal_timestamps).loc[:, LABEL_COLUMNS]
         records = table.astype(object).where(table.notna(), None).to_dict('records')
         result = []
         schedules = {}

@@ -684,6 +684,7 @@ class FactorComposer:
                     if pd.notna(actual_return):
                         aligned_data.append({
                             "date": date,
+                            "stock": stock,
                             "factor_value": factor_value,
                             "actual_return": actual_return
                         })
@@ -697,14 +698,15 @@ class FactorComposer:
         metrics = {}
         
         if "ic" in self.config.performance_metrics or "ir" in self.config.performance_metrics:
-            daily_ic = []
-            for _, day in eval_df.groupby("date", sort=False):
-                if (len(day) >= 2 and day["factor_value"].nunique() > 1
-                        and day["actual_return"].nunique() > 1):
-                    ic = day["factor_value"].corr(day["actual_return"], method="spearman")
-                    if pd.notna(ic):
-                        daily_ic.append(ic)
-            valid_ic = pd.Series(daily_ic, dtype=float)
+            from backtest_and_analysis.evaluation.kernels import spearman
+
+            paired = eval_df.set_index(["date", "stock"])
+            dates = eval_df["date"].unique()
+            # Each legacy Series.corr converted its own input to float64.
+            factor = paired["factor_value"].unstack().reindex(dates).to_numpy(dtype=float)
+            returns = paired["actual_return"].unstack().reindex(dates).to_numpy(dtype=float)
+            ranked = spearman(factor, returns, min_samples=2, _legacy_covariance=True)
+            valid_ic = pd.Series(ranked.values).dropna().reset_index(drop=True)
             mean_ic = valid_ic.mean()
             if "ic" in self.config.performance_metrics:
                 metrics["ic"] = mean_ic

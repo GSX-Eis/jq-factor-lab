@@ -183,7 +183,7 @@ class ContinuousBarSource(BarSource):
             concrete_labeler = BarReturnLabeler(calendar, view=labeler.view,
                 horizons=labeler.horizons, entry_offset_bars=labeler.entry_offset_bars,
                 boundary_policy=labeler.boundary_policy, bucket_strategy=labeler.bucket_strategy,
-                continuous_source=self)
+                continuous_source=self, include_scheduled_exit=labeler.include_scheduled_exit)
             # Raw Bars deliberately drop the continuous marker to prevent recursive dispatch.
             raw = raw.drop(columns='contract_id', errors='ignore')
             tables.append(concrete_labeler.label(raw, factors, signal_timestamps=signals))

@@ -1,0 +1,95 @@
+{
+  "harness": {
+    "evaluation_schema": "bar_evaluation.v1",
+    "metric_fields": ["analysis_mode", "exclusion_summary", "ic_by_horizon", "quantile_stats", "cross_sections", "result_identity"],
+    "summary_fields": ["result_schema_version", "analysis_mode", "config", "data_identity", "calendar_identity", "result_identity", "ic_by_horizon", "quantile_stats", "exclusion_summary", "cross_sections"],
+    "identity_fields": ["config_hash", "input_file_hashes", "calendar_hash", "code_version", "result_schema_version", "identity_hash", "code_version_source"],
+    "artifacts": {
+      "evaluation_summary": "summary.json",
+      "per_bar_labels": "per_bar_labels.csv",
+      "ic_by_horizon": "ic_by_horizon.csv",
+      "quantile_stats": "quantile_stats.csv"
+    },
+    "csv_columns": {
+      "per_bar_labels": "instrument_id,frequency,entry_offset_bars,horizon_bars,signal_timestamp,signal_available_at,entry_timestamp,exit_bar_timestamp,exit_timestamp,entry_price,exit_price,price_change_points,return_pct,status,exclusion_reason,factor_value",
+      "ic_by_horizon": "scope,instrument_id,frequency,horizon_bars,total_count,valid_count,excluded_count,exclusion_counts,nonzero_exclusion_counts,spearman_ic,ic_status,non_overlapping_ic,non_overlapping_count,non_overlapping_status,requested_quantiles,actual_quantiles,quantile_status,quantile_scope,descriptive_only,mean_spearman_ic,median_spearman_ic,mean_non_overlapping_ic,median_non_overlapping_ic,instrument_count,valid_instrument_count,valid_non_overlapping_instrument_count",
+      "quantile_stats": "instrument_id,frequency,horizon_bars,quantile,requested_quantiles,actual_quantiles,quantile_status,quantile_scope,descriptive_only,sample_count,mean_return_pct,median_return_pct,positive_ratio"
+    },
+    "exclusion_counts": {"factor_missing": 6, "insufficient_history": 4, "session_boundary": 0, "missing_bar": 0, "invalid_price": 0},
+    "horizons": {
+      "1": {"valid": 7, "ic": 0.8468812149338255, "phase_zero_count": 7, "phase_zero_ic": 0.8468812149338255, "quantiles": [[4, -1, -1, 0.25], [3, 4, 6, 0.6666666666666666]]},
+      "2": {"valid": 6, "ic": 1.0, "phase_zero_count": 3, "phase_zero_ic": 1.0, "quantiles": [[3, 0, 0, 0.3333333333333333], [3, 6, 6, 1.0]]},
+      "5": {"valid": 4, "ic": 0.8, "phase_zero_count": 1, "phase_zero_ic": null, "quantiles": [[2, 1, 1, 0.5], [2, 7, 7, 1.0]]}
+    }
+  },
+  "jerry_cli": {
+    "schema": "jerry_time_series.v1",
+    "artifacts": {"jerry_report_csv": "jerry_report.csv", "jerry_report_markdown": "jerry_report.md"},
+    "csv_columns": "instrument_id,frequency,horizon_bars,scope,index,total_count,valid_count,excluded_count,excluded_factor_missing,excluded_insufficient_history,excluded_session_boundary,excluded_missing_bar,excluded_invalid_price,ic_sample_count,ic_spearman_ic,ic_reason,bootstrap_grid_size,bootstrap_block_length,bootstrap_seed,bootstrap_n_boot,bootstrap_valid_replicates,bootstrap_min_valid_replicates,bootstrap_alpha,bootstrap_lower,bootstrap_upper,bootstrap_reason,direction_hits,direction_denominator,direction_up_count,direction_accuracy,direction_up_baseline,direction_lift,direction_reason,return_n_samples,return_mean,return_standard_error,return_p5,return_p25,return_p50,return_p75,return_p95,return_mean_le_p5,return_mean_le_p25,return_mean_ge_p75,return_mean_ge_p95,return_reason",
+    "markdown_headings": ["# Jerry time-series report", "## Counts and Spearman IC", "## Bootstrap Spearman intervals", "## Direction accuracy", "## Conditional return distribution", "## Non-overlapping offsets"],
+    "markdown_rows": [
+      "| NQZ26 | 1min | 2 | 1 | 3 | 1 | — |",
+      "| NQZ26 | 1min | 2 | bucket | 1 | 2 | 3 | 1 | 0.66666667 | 0.33333333 | 0.33333333 | — |",
+      "| NQZ26 | 1min | 2 | bucket | 2 | 2 | 7 | 1 | 6.1 | 6.5 | 7 | 7.5 | 7.9 | 6 | 6 | 8 | 8 | — |",
+      "| NQZ26 | 1min | 1 | 9 | 5 | 0 | 999 | 999 | 900 | 0.05 | -0.1165543 | 1 | — |"
+    ],
+    "horizons": {
+      "1": {
+        "bootstrap": [999, -0.11655430348287174, 1, null],
+        "offsets": [[7, 0.8468812149338255, null]],
+        "overall": {"samples": 7, "direction": [5, 6, 3], "percentiles": [-3.4, -2, 0, 4, 7.4], "tails": [-4, -2.6666666666666665, 7, 8]},
+        "buckets": {
+          "1": {"samples": 4, "direction": [3, 3, 1], "percentiles": [-3.7, -2.5, -1, 0.5, 1.7], "tails": [-4, -4, 2, 2]},
+          "2": {"samples": 3, "direction": [2, 3, 2], "percentiles": [-1.2, 2, 6, 7, 7.8], "tails": [-2, -2, 8, 8]}
+        }
+      },
+      "2": {
+        "bootstrap": [999, 1, 1, null],
+        "offsets": [[3, 1, null], [3, 1, null]],
+        "overall": {"samples": 6, "direction": [4, 5, 3], "percentiles": [-1.5, 0.5, 3, 5.5, 7.5], "tails": [-2, -1, 7, 8]},
+        "buckets": {
+          "1": {"samples": 4, "direction": [2, 3, 1], "percentiles": [-1.7, -0.5, 1, 2.5, 3.7], "tails": [-2, -2, 4, 4]},
+          "2": {"samples": 2, "direction": [2, 2, 2], "percentiles": [6.1, 6.5, 7, 7.5, 7.9], "tails": [6, 6, 8, 8]}
+        }
+      },
+      "5": {
+        "bootstrap": [748, null, null, "insufficient_bootstrap_replicates"],
+        "offsets": [[1, null, "insufficient_samples"], [1, null, "insufficient_samples"], [1, null, "insufficient_samples"], [1, null, "insufficient_samples"], [0, null, "insufficient_samples"]],
+        "overall": {"samples": 4, "direction": [2, 3, 2], "percentiles": [-1.1, 2.5, 5, 6.5, 7.7], "tails": [-2, -2, 8, 8]},
+        "buckets": {
+          "1": {"samples": 4, "direction": [2, 3, 2], "percentiles": [-1.1, 2.5, 5, 6.5, 7.7], "tails": [-2, -2, 8, 8]},
+          "2": {"samples": 0, "direction": [0, 0, 0], "percentiles": [null, null, null, null, null], "tails": [null, null, null, null]}
+        }
+      }
+    }
+  },
+  "direction_and_returns": {
+    "factor": [-2, -1, 0, 1, 2, 3, 4, 5, 6, 7],
+    "return_pct": [-4, -2, 0, 2, 4, -2, 6, 8, null, 999],
+    "bucket": [1, 1, 1, 1, 1, 2, 2, 2, 3, 4],
+    "masked_row": 9,
+    "expected": {
+      "all": {"counts": [6, 7, 4], "accuracy": [0.8571428571428571, 0.5714285714285714, 0.2857142857142857], "percentiles": [-3.3, -2, 1, 4.5, 7.3], "tails": [-4, -2.6666666666666665, 7, 8]},
+      "1": {"counts": [4, 4, 2], "accuracy": [1, 0.5, 0.5], "percentiles": [-3.6, -2, 0, 2, 3.6], "tails": [-4, -3, 3, 4]},
+      "2": {"counts": [2, 3, 2], "accuracy": [0.6666666666666666, 0.6666666666666666, 0], "percentiles": [-1.2, 2, 6, 7, 7.8], "tails": [-2, -2, 8, 8]}
+    }
+  },
+  "offsets": {
+    "factor": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+    "return_pct": [10, 1, null, 2, 9, null, 8, 3, null, 4, 7, null],
+    "sample_keys": [[0, 4, 6, 10], [1, 3, 7, 9]],
+    "ic": [-1, 1]
+  },
+  "bootstrap": {
+    "factor": [1, 2, 3, 5, 8, 13, 13, 34, 55],
+    "return_pct": [8, 3, -9, 0, null, 2, 7, 7, -2],
+    "masked_row": 2,
+    "settings": {"block_length": 4, "seed": 17, "n_boot": 64, "min_valid_replicates": 2, "alpha": 0.2},
+    "valid_replicates": 64,
+    "bounds": [-0.6842105263157895, 0.8249579113843054]
+  },
+  "markdown": {
+    "headings": ["# NQ 1min 时序验收", "## 数据来源与身份", "## 交易日历与训练切分", "## ETH", "### train", "### oos", "## RTH", "### train", "### oos", "## 完整统计"],
+    "columns": "持有 Bar | 有效 / 候选 | 跨界清除 | Spearman IC | 区间下界 / 上界 | 方向命中 / 分母 | 上涨基准率 | 非重叠偏移数"
+  }
+}

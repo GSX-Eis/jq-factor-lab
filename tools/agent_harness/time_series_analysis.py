@@ -43,6 +43,9 @@ def evaluate(config: dict[str, Any], destination: Path) -> dict[str, Any]:
     if mode not in ('time_series', 'cross_sectional'):
         raise AnalysisPreconditionError('invalid_analysis_mode',
             'analysis_mode must be time_series or cross_sectional')
+    jerry_requested = config.get('jerry_report', False)
+    if not isinstance(jerry_requested, bool) or (jerry_requested and mode != 'time_series'):
+        raise ValueError('jerry_report must be a boolean and requires time_series when enabled')
     paths = {}
     continuous = config.get('continuous_futures')
     if continuous is not None:
@@ -107,6 +110,11 @@ def evaluate(config: dict[str, Any], destination: Path) -> dict[str, Any]:
         result = evaluate_bars(bars, factors, labeler, analysis_mode=mode,
             n_quantiles=config.get('n_quantiles', 5), min_ic_samples=config.get('min_ic_samples', 3),
             min_cross_section_size=config.get('min_cross_section_size', 3))
+    jerry_report = None
+    if jerry_requested:
+        from backtest_and_analysis.time_series.jerry_report import evaluate_jerry
+        jerry_report = evaluate_jerry(result, labeler, n_quantiles=config.get('n_quantiles', 5),
+                                      min_samples=config.get('min_ic_samples', 3))
     # A changing source must not be bound to the digest from before it was read.
     if hashes != {str(path): sha256_file(path) for path in paths.values()}:
         raise ValueError('Input CSV changed during evaluation')
@@ -118,11 +126,13 @@ def evaluate(config: dict[str, Any], destination: Path) -> dict[str, Any]:
         input_file_hashes=hashes, calendar_hash=result.calendar_identity['calendar_hash'],
         code_version=code_version, result_schema_version=RESULT_SCHEMA_VERSION)
     outputs = write_evaluation_artifacts(result, destination, result_identity=identity, config=config,
-                                         code_version_source=code_version_source)
+                                         code_version_source=code_version_source, jerry_report=jerry_report)
     summary = json.loads(outputs['summary'].read_text(encoding='utf-8'))
-    return dict(ok=True, exit_code=0,
-        metrics={key: summary[key] for key in ('analysis_mode', 'exclusion_summary', 'ic_by_horizon',
-            'quantile_stats', 'cross_sections', 'result_identity')},
+    metrics = {key: summary[key] for key in ('analysis_mode', 'exclusion_summary', 'ic_by_horizon',
+                                            'quantile_stats', 'cross_sections', 'result_identity')}
+    if jerry_requested:
+        metrics['jerry_report'] = summary['jerry_report']
+    return dict(ok=True, exit_code=0, metrics=metrics,
         artifacts=[dict(artifact_type='evaluation_summary' if name == 'summary' else name,
                         path=str(path), sha256=sha256_file(path)) for name, path in outputs.items()])
 

@@ -98,3 +98,23 @@ def test_daily_ic_and_ir_contract(rows):
     if not std>0: assert np.isnan(m['ir'])
     else: assert m['ir']==expected/std
     assert m['ic_version']=='daily_cross_section_v1'
+
+
+@pytest.mark.parametrize("kind", ["decimal_returns", "boolean_factors"])
+def test_daily_ic_and_ir_accept_legacy_numeric_types(kind):
+    from decimal import Decimal
+
+    c, _, _ = composer(performance_metrics=["ic", "ir"])
+    dates = pd.date_range("2024-01-01", periods=2)
+    cols = list("ABCD")
+    x = pd.DataFrame([[1., 2., 3., 4.]] * 2, index=dates, columns=cols)
+    y = pd.DataFrame([[.01, .02, .03, .04], [.01, .03, .02, .04]], index=dates, columns=cols)
+    if kind == "decimal_returns":
+        y = y.map(lambda value: Decimal(str(value)))
+    else:
+        x = x.gt(2)
+    c.synthesis_results["test"] = {"factor_data": x}
+    metrics = c.evaluate_performance("test", y)
+    daily = pd.Series([x.loc[day].corr(y.loc[day], method="spearman") for day in dates])
+    assert metrics["ic"] == pytest.approx(daily.mean(), abs=1e-12, rel=0)
+    assert metrics["ir"] == pytest.approx(daily.mean() / daily.std(), abs=1e-12, rel=0)

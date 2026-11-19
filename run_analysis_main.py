@@ -15,6 +15,8 @@ from backtest_and_analysis.config import CONFIG
 from backtest_and_analysis.factor_loader import FactorLoader
 from backtest_and_analysis.price_fetcher import PriceFetcher
 from backtest_and_analysis.alphalens_runner import AlphalensRunner
+from backtest_and_analysis.evaluation.kernels import spearman
+from backtest_and_analysis.evaluation.panel import EvaluationPanel
 from backtest_and_analysis.result_writer import ResultWriter
 from backtest_and_analysis.forward_returns_calculator import ForwardReturnsCalculator
 from utils.config_loader import load_and_parse_config, load_pit_config
@@ -516,16 +518,14 @@ def _compute_mining_only_ic(
         execution_lag=runner.execution_lag,
     )
     clean = runner._prepare_factor_data_with_precomputed_returns(factor_series, forward_returns)
-    return pd.DataFrame(
-        {
-            column: clean.groupby(level=0, observed=True).apply(
-                lambda group, return_column=column: group["factor"].corr(
-                    group[return_column], method="spearman"
-                )
-            )
-            for column in (f"{period}D" for period in periods)
-        }
-    )
+    columns = list(dict.fromkeys(f"{period}D" for period in periods))
+    panel = EvaluationPanel.from_long(clean[["factor", *columns]].astype(float))
+    return pd.DataFrame({
+        column: spearman(panel.factor, panel.returns[column], min_samples=2,
+                         valid=panel.valid[column], _legacy_covariance=True).values
+        for column in columns
+    }, index=panel.datetimes)
+
 
 def analyze_factor_static(factor, price_fetcher, runner, writer, monthly_writer, config, forward_returns=None):
     """

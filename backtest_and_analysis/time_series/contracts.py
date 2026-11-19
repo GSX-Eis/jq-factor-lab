@@ -122,14 +122,8 @@ def _frame_columns(frame: pd.DataFrame, columns: tuple[str, ...]) -> None:
 
 
 def _text_column(series: pd.Series) -> None:
-    # String operations mark non-strings as missing without coercing input values.
-    if infer_dtype(series, skipna=True) not in ('string', 'unicode', 'empty'):
-        raise ContractValidationError(f'{series.name} must contain nonempty strings')
-    try:
-        valid = series.str.strip().str.len().gt(0)
-    except (AttributeError, TypeError) as exc:
-        raise ContractValidationError(f'{series.name} must contain nonempty strings') from exc
-    if series.isna().any() or not valid.fillna(False).all():
+    if (infer_dtype(series, skipna=True) not in ('string', 'unicode', 'empty')
+            or any(not isinstance(value, str) or not value.strip() for value in series.unique())):
         raise ContractValidationError(f'{series.name} must contain nonempty strings')
 
 

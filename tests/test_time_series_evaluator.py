@@ -387,3 +387,91 @@ def test_invalid_evaluation_inputs(damage):
         frame.loc[0, 'horizon_bars'] = 0
     with pytest.raises(ContractValidationError):
         ts(frame)
+
+
+@pytest.mark.parametrize("mode", ["time_series", "cross_sectional"])
+def test_bar_adapter_keeps_canonical_labels_and_sparse_statistics(mode, monkeypatch):
+    from backtest_and_analysis.evaluation import cross_section
+
+    evaluator = (TimeSeriesEvaluator if mode == "time_series" else BarCrossSectionalEvaluator)(analysis_mode=mode)
+    frame = pd.concat([
+        labels([1., 2., 3.], instrument=asset, horizon=horizon)
+        for asset in ("C", "B", "A")
+        for horizon in (2, 1)
+    ], ignore_index=True)
+    frame = frame.drop([1, 9]).reset_index(drop=True)
+    frame.loc[0, ["status", "exclusion_reason"]] = ["excluded", "missing_bar"]
+    order = ["instrument_id", "frequency", "horizon_bars", "signal_timestamp"]
+    canonical = frame.sort_values(order, ignore_index=True)
+    shuffled = frame.sample(frac=1, random_state=827)
+    expected = evaluator.evaluate(canonical)
+    monkeypatch.setattr(cross_section, "_PARALLEL_STATISTIC_CELLS", 0)
+    actual = evaluator.evaluate(shuffled)
+    pd.testing.assert_frame_equal(actual.per_bar_labels, canonical)
+    for field in ("ic_by_horizon", "quantile_stats", "cross_sections"):
+        pd.testing.assert_frame_equal(getattr(actual, field), getattr(expected, field))
+    actual.per_bar_labels.loc[0, "factor_value"] = -99.
+    assert not shuffled.factor_value.eq(-99.).any()
+    with pytest.raises(ContractValidationError, match="duplicate label keys"):
+        evaluator.evaluate(pd.concat([shuffled, shuffled.iloc[:1]], ignore_index=True))
+
+
+def test_parallel_time_series_horizons_keep_serial_results(monkeypatch):
+    from backtest_and_analysis.time_series import evaluator as module
+
+    frame = pd.concat([
+        labels([1, 8, 3, 3], [4, 2, 1, 7], instrument="A", horizon=2),
+        labels([3, 1, 2], [2, 0, 1], instrument="B", horizon=2),
+        labels([3, 3, 3, 0], [3, 2, 1, 4], instrument="A", horizon=4),
+    ], ignore_index=True)
+    frame.loc[len(frame) - 1, ["status", "exclusion_reason"]] = ["excluded", "missing_bar"]
+    frame = frame.sample(frac=1, random_state=827)
+    evaluator = TimeSeriesEvaluator(analysis_mode="time_series")
+    serial = evaluator.evaluate(frame)
+    monkeypatch.setattr(module, "_PARALLEL_LABEL_ROWS", 0)
+    parallel = evaluator.evaluate(frame)
+    for name in ("per_bar_labels", "ic_by_horizon", "quantile_stats"):
+        pd.testing.assert_frame_equal(getattr(parallel, name), getattr(serial, name))
+    assert parallel.exclusion_summary == serial.exclusion_summary
+    assert parallel.data_identity == serial.data_identity
+
+
+@pytest.mark.parametrize("evaluator_type, mode", [
+    (TimeSeriesEvaluator, "time_series"),
+    (BarCrossSectionalEvaluator, "cross_sectional"),
+])
+def test_independent_factors_join_on_label_columns_with_named_index(evaluator_type, mode):
+    frame = pd.concat([
+        labels([i + 1, 3 - i, 4 + i], [i, 2 + i, 4 - i], instrument=asset)
+        for i, asset in enumerate(("A", "B", "C"))
+    ], ignore_index=True)
+    factors = frame[["signal_timestamp", "instrument_id", "factor_value"]].rename(
+        columns={"signal_timestamp": "timestamp_utc"},
+    )
+    frame = frame.drop(columns="factor_value")
+    evaluator = evaluator_type(analysis_mode=mode)
+    expected = evaluator.evaluate(frame, factors)
+    actual = evaluator.evaluate(frame.set_index("signal_timestamp", drop=False), factors)
+    assert len(actual.per_bar_labels) == 9
+    for field in ("per_bar_labels", "ic_by_horizon", "quantile_stats", "cross_sections"):
+        pd.testing.assert_frame_equal(getattr(actual, field), getattr(expected, field))
+    assert actual.exclusion_summary == expected.exclusion_summary
+
+
+def test_interleaved_bar_horizons_preserve_canonical_labels_and_validate_keys():
+    frame = pd.concat([labels([1, 4, 2], horizon=h) for h in (1, 5, 15)], ignore_index=True)
+    interleaved = frame.sort_values(["signal_timestamp", "horizon_bars"], ignore_index=True)
+    interleaved.loc[2, ["status", "exclusion_reason"]] = ["excluded", "missing_bar"]
+    canonical = interleaved.sort_values(["horizon_bars", "signal_timestamp"], ignore_index=True)
+    expected = ts(canonical)
+    actual = ts(interleaved)
+    for field in ("per_bar_labels", "ic_by_horizon", "quantile_stats"):
+        pd.testing.assert_frame_equal(getattr(actual, field), getattr(expected, field))
+    assert actual.exclusion_summary == expected.exclusion_summary
+    duplicate = interleaved.copy()
+    duplicate.loc[3, "signal_timestamp"] = duplicate.loc[0, "signal_timestamp"]
+    with pytest.raises(ContractValidationError, match="duplicate label keys"):
+        ts(duplicate)
+    interleaved.loc[0, "exclusion_reason"] = "unknown"
+    with pytest.raises(ContractValidationError, match="status and exclusion_reason disagree"):
+        ts(interleaved)

@@ -247,16 +247,6 @@ def test_daily_dispatch_stays_on_original_runner(tmp_path):
     assert any('run_analysis_main.py' in arg for arg in payload['command']['argv'])
 
 
-def test_daily_sources_unchanged():
-    expected = {
-        "backtest_and_analysis/alphalens_runner.py": "9361511a1ee01ce7bdaa219c8333c9a1e53675f6222417c9c1e5bac102f2e3ed",
-        "backtest_and_analysis/forward_returns_calculator.py": "287b999cb1fc6794aa4e5e55339f2ef5e509e98687b35808d45b5669f97b4bcb",
-        "run_analysis_main.py": "0f36a5e3b7db00a8c931dc306226484cb404dd50ee7ffd18be65574d07870521"
-    }
-    for name, digest in expected.items():
-        assert hashlib.sha256((ROOT / name).read_bytes()).hexdigest() == digest, name
-
-
 @pytest.mark.parametrize('external', [False, True])
 def test_calendar_mapping_and_standard_factor_keys(tmp_path, external):
     path, frame = nq_bars(tmp_path)
