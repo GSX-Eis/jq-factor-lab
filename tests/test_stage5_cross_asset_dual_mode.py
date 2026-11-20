@@ -351,3 +351,55 @@ def test_mixed_asset_calendars_isolate_read_bounds(conn):
     assert item.market_bars.loc[item.market_bars.instrument_id.eq(stock_spec[1][0]), 'session_id'].min() == stock_spec[2]
     with pytest.raises(ContractValidationError, match='shared calendar'):
         item.get_session_daily_pricing()
+
+
+def test_factor_base_derived_signal_requires_complete_bar(conn, monkeypatch):
+    item = factor(conn, populate(conn, future=True, days=1))
+    values = item.get_bar_factor_frame()
+    signal_time = item.market_bars.timestamp_utc.iloc[10]
+    assert values.loc[values.timestamp_utc.eq(signal_time), 'factor_value'].notna().all()
+    # Keep the computed feature and mark its source Bar incomplete in the read snapshot.
+    item.market_bars['is_complete'] = item.market_bars.timestamp_utc.ne(signal_time)
+    monkeypatch.setattr(item, 'get_bar_factor_frame', lambda: values)
+
+    labels = item.evaluate_bar_factor().per_bar_labels
+    signal = labels.loc[labels.signal_timestamp.eq(signal_time)]
+    assert signal.exclusion_reason.tolist() == ['missing_bar', 'missing_bar']
+    assert signal.entry_timestamp.isna().all()
+    assert signal.factor_value.isna().all()
+
+
+def test_factor_base_export_preserves_signal_completeness_in_cli(conn, monkeypatch, tmp_path):
+    from utils.bars.source import BarSource
+
+    spec = populate(conn, future=True, days=1)
+    _, _, start, end = spec
+    item = factor(conn, spec)
+    signal_time = pd.Timestamp('2026-11-30T23:10Z')
+    next_signal = signal_time + pd.Timedelta(minutes=1)
+    original_read = BarSource.read
+
+    def read_with_incomplete_bar(reader, *args, **kwargs):
+        bars = original_read(reader, *args, **kwargs)
+        complete = bars.get('is_complete', True)
+        return bars.assign(is_complete=complete & bars.timestamp_utc.ne(signal_time))
+
+    monkeypatch.setattr(BarSource, 'read', read_with_incomplete_bar)
+    values = item.get_bar_factor_frame()
+    direct = item.evaluate_bar_factor().per_bar_labels
+    assert not item.market_bars.set_index('timestamp_utc').loc[signal_time, 'is_complete']
+    assert direct.loc[direct.signal_timestamp.eq(signal_time), 'entry_timestamp'].isna().all()
+
+    bars_path, factors_path = tmp_path / 'bars.csv', tmp_path / 'factors.csv'
+    item.market_bars.to_csv(bars_path, index=False)
+    values.to_csv(factors_path, index=False)
+    payload = run_cli(tmp_path, dict(bars_csv=str(bars_path), factors_csv=str(factors_path),
+        analysis_mode='time_series', calendar='NQ', start_date=start, end_date=end, horizons=[1, 5]))
+    replay = read_outputs(payload)[0]
+    replay_times = pd.to_datetime(replay.signal_timestamp, utc=True)
+    excluded = replay.loc[replay_times.eq(signal_time)]
+    assert excluded.horizon_bars.tolist() == [1, 5]
+    assert excluded.status.tolist() == ['excluded', 'excluded']
+    assert excluded.entry_timestamp.isna().all()
+    assert pd.isna(values.set_index('timestamp_utc').loc[signal_time, 'factor_value'])
+    assert replay.loc[replay_times.eq(next_signal), 'status'].tolist() == ['valid', 'valid']

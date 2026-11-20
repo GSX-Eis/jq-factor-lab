@@ -150,14 +150,20 @@ def _get_market_factor_values(self, force_recalculate: bool = False) -> pd.DataF
 
 
 def get_bar_factor_frame(self, force_recalculate: bool = False) -> pd.DataFrame:
-    """Return UTC (timestamp_utc, instrument_id, factor_value), retaining NaNs."""
+    """Return UTC factor keys with unavailable source-Bar values masked."""
+    from backtest_and_analysis.time_series.contracts import _mask_unavailable_factor_values
     from backtest_and_analysis.time_series.factor_bridge import bar_factor_frame
     if not self._frequency_route.bar_grid or self.output_frequency in ('daily', '1d'):
         raise ValueError('get_bar_factor_frame requires minute Bar output')
     values = bar_factor_frame(self._get_market_factor_values(force_recalculate))
-    return self.market_bar_grid[['timestamp_utc', 'instrument_id']].merge(
-        values, on=['timestamp_utc', 'instrument_id'], how='left', validate='one_to_one'
-    ).sort_values(['timestamp_utc', 'instrument_id']).reset_index(drop=True)
+    keys = ['timestamp_utc', 'instrument_id']
+    grid = self.market_bar_grid
+    columns = [*keys, 'is_complete'] if 'is_complete' in grid else keys
+    aligned = grid[columns].merge(values, on=keys, how='left', validate='one_to_one')
+    if 'is_complete' in aligned:
+        incomplete = ~aligned.pop('is_complete').eq(True).to_numpy(dtype=bool, na_value=False)
+        aligned['factor_value'] = _mask_unavailable_factor_values(aligned.factor_value, incomplete)
+    return aligned.sort_values(keys).reset_index(drop=True)
 
 
 def get_session_daily_pricing(self) -> pd.Series:
@@ -172,10 +178,13 @@ def get_session_daily_pricing(self) -> pd.Series:
 
 def evaluate_bar_factor(self, **evaluator_options):
     """Label and evaluate using the same read snapshot and explicit mode."""
+    from backtest_and_analysis.time_series.evaluator import evaluate_bars
     from backtest_and_analysis.time_series.labels import BarReturnLabeler
-    from backtest_and_analysis.time_series.evaluator import TimeSeriesEvaluator, BarCrossSectionalEvaluator
+
     factors = self.get_bar_factor_frame()
-    labels = BarReturnLabeler(self.market_calendars, view=self.session_view,
-                              **self.label_config).label(self.market_bars, factors)
-    evaluator = TimeSeriesEvaluator if self.analysis_mode == 'time_series' else BarCrossSectionalEvaluator
-    return evaluator(analysis_mode=self.analysis_mode, **evaluator_options).evaluate(labels, factors)
+    bars = self.market_bars.drop(columns='factor_value', errors='ignore').merge(
+        factors, on=['timestamp_utc', 'instrument_id'], how='left', validate='many_to_one',
+    )
+    bars.attrs = dict(self.market_bars.attrs)
+    labeler = BarReturnLabeler(self.market_calendars, view=self.session_view, **self.label_config)
+    return evaluate_bars(bars, labeler=labeler, analysis_mode=self.analysis_mode, **evaluator_options)

@@ -1,9 +1,9 @@
 """Single entry point for daily and Bar panel statistics."""
 
 from collections.abc import Hashable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import re
-from typing import Any, Literal
+from typing import Any, Literal, TypeVar
 
 import numpy as np
 import numpy.typing as npt
@@ -19,6 +19,23 @@ from .types import ReturnMode
 
 AnalysisMode = Literal["cross_sectional", "time_series"]
 Frequency = Literal["daily", "bar"]
+_Value = TypeVar("_Value")
+
+
+def _daily_horizon_steps(horizon: Hashable) -> Hashable:
+    if isinstance(horizon, str) and re.fullmatch(r"[0-9]+[dD]", horizon):
+        return int(horizon[:-1])
+    return horizon
+
+
+def _normalize_daily_horizons(values: Mapping[Hashable, _Value]) -> dict[int, _Value]:
+    by_step: dict[int, _Value] = {}
+    for horizon, value in values.items():
+        steps = _positive_int(_daily_horizon_steps(horizon), f"horizon {horizon!r}")
+        if steps in by_step:
+            raise ValueError(f"Duplicate daily horizon after normalization: {horizon!r} ({steps} steps)")
+        by_step[steps] = value
+    return by_step
 
 
 @dataclass(frozen=True)
@@ -62,7 +79,8 @@ class EvaluationEngine:
         """Evaluate one labeled panel on its original return scale.
 
         Pass the signal clock and scheduled exits for a split. Time-series
-        inference also needs entries and uses integer horizons in grid steps.
+        inference also needs entries. Daily time-series inputs accept labels
+        like "5D" or integer grid steps and return integer horizon keys.
         Forward mode-specific options to the S3 statistics layer, such as
         `hac_lag` or the bootstrap settings. Declare calibration_scenario
         only when it applies to the intervals being evaluated.
@@ -88,10 +106,7 @@ class EvaluationEngine:
             minimum_lag = _positive_int(statistics_options.pop("hac_lag", 0), "hac_lag", minimum=0)
             lags = {}
             for horizon in panel.returns:
-                steps = horizon
-                if self.frequency == "daily" and isinstance(horizon, str):
-                    if re.fullmatch(r"[0-9]+[dD]", horizon):
-                        steps = int(horizon[:-1])
+                steps = _daily_horizon_steps(horizon) if self.frequency == "daily" else horizon
                 if statistics_options.get("_legacy_ic_rounding") and not isinstance(steps, (int, np.integer)):
                     # Legacy daily dictionaries can include extra label keys and expose no HAC results.
                     lags[horizon] = minimum_lag
@@ -100,6 +115,16 @@ class EvaluationEngine:
                     lags[horizon] = max(minimum_lag, steps - 1)
             statistics_options.update(frequency=self.frequency, return_mode=return_mode, hac_lag=lags)
         else:
+            if self.frequency == "daily":
+                returns = _normalize_daily_horizons(panel.returns)
+                valid = _normalize_daily_horizons(panel.valid)
+                if valid.keys() != returns.keys():
+                    raise ValueError("Valid masks must contain the same horizons as the panel returns")
+                panel = replace(panel, returns=returns, valid=valid, _columns=pd.Index(["factor", *returns]))
+                if entry_timestamps is not None:
+                    entry_timestamps = _normalize_daily_horizons(entry_timestamps)
+                if exit_timestamps is not None:
+                    exit_timestamps = _normalize_daily_horizons(exit_timestamps)
             statistics_options.setdefault("block_length", max(panel.returns))
             statistics_options.setdefault("seed", 0)
             statistics_options.setdefault("n_boot", 999)

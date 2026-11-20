@@ -69,8 +69,44 @@
 - 分区数据：`parquet_data/factor_id=<factor_id>/frequency=<frequency>/year_month=<YYYY-MM>/part-*.parquet`（ZSTD 压缩，写入前按 `(factor_identity_hash, instrument_id, timestamp_utc)` 排序，默认 `row_group_size=65536`）。
 - 身份账本：`identities.jsonl`（只追加，对应 `factor_value_identities`）。
 - 批次账本：`batches.jsonl`（只追加，记录 `status='committed'` 批次及其分片清单与 Session 计数）。
-- 逻辑列（13 核心列 + 3 Hive 分区列）：
-  - `factor_id`（`VARCHAR NOT NULL`，非空单段安全路径标识）、`factor_identity_hash`（64 位小写 SHA256）、`frequency`（`Frequency.canonical`）、`session_view`（`ETH`/`RTH`）、`instrument_id`、`timestamp_utc`（UTC `TIMESTAMPTZ` Bar 开始时间）、`session_id`（`YYYY-MM-DD`，须与 `SessionCalendar.session_at` 一致）、`factor_value`（`DOUBLE`，允许 `NaN`，严格拒绝 `±inf`）、`source_build_id`（非空）、`calendar_hash`（64 位 SHA256）、`code_version`、`created_at`（UTC `TIMESTAMPTZ`）、`batch_id`；视图另含 `year_month`。
+- 逻辑列（13 个核心列）：
+  - `factor_id`（`VARCHAR NOT NULL`，非空单段安全路径标识）、`factor_identity_hash`（64 位小写 SHA256）、`frequency`（`Frequency.canonical`）、`session_view`（`ETH`/`RTH`）、`instrument_id`、`timestamp_utc`（UTC Bar 开始时间，SQL 类型为 `TIMESTAMP_NS`）、`session_id`（`YYYY-MM-DD`，须与 `SessionCalendar.session_at` 一致）、`factor_value`（`DOUBLE`，允许 `NaN`，严格拒绝 `±inf`）、`source_build_id`（非空）、`calendar_hash`（64 位 SHA256）、`code_version`、`created_at`（UTC 创建时间，SQL 类型为 `TIMESTAMP_NS`）、`batch_id`；视图另含 `year_month`。
+
+### DuckDB SQL 视图升级与时间比较
+
+`market_factor_values` 视图的 `timestamp_utc` 和 `created_at` 均以 `TIMESTAMP_NS` 表示 UTC 时间，空视图也使用这两个类型。DuckDB 1.5.3 的 `TIMESTAMPTZ` 只有微秒精度。`TIMESTAMP_NS` 本身没有时区字段，直接与 `TIMESTAMPTZ` 比较会受会话 `TimeZone` 影响。Python 的 `read_factor_values` 返回带 UTC 时区的 `datetime64[ns, UTC]`，闭区间上下界均按纳秒比较。
+
+升级已有持久视图时，先更新使用旧 `TIMESTAMPTZ` 谓词或连接条件的查询，再以可写连接刷新保存该视图的 DuckDB 文件。传入原因子库根目录和原视图名。刷新以 `CREATE OR REPLACE VIEW` 重新绑定当前已提交分片，可在刷新后使用 `DESCRIBE market_factor_values` 核对类型。Parquet 和账本可原样使用。后续有新批次时，再运行同一刷新调用即可让持久视图看到新增分片。
+
+```python
+import duckdb
+from utils.market_factor_store import MarketFactorValueStore
+
+store = MarketFactorValueStore("/path/to/factor-store")
+with duckdb.connect("/path/to/views.duckdb") as con:
+    store.create_view(con, view_name="market_factor_values")
+```
+
+SQL 的比较和连接可统一使用 UTC epoch 纳秒，适用于任意会话时区。
+
+```sql
+-- 带时区参数精确到微秒时，绑定含 UTC 偏移的值，例如 2026-01-04T20:30:00-05:00。
+SELECT * FROM market_factor_values
+WHERE epoch_ns(timestamp_utc) = epoch_ns(CAST(? AS TIMESTAMPTZ));
+
+-- 纳秒参数绑定整数 UTC epoch 纳秒，例如 1767576600000000001。
+SELECT * FROM market_factor_values
+WHERE epoch_ns(timestamp_utc) = CAST(? AS BIGINT);
+
+-- 行情表的 Bar 起点是 TIMESTAMPTZ，按同一品种和同一时间点连接。
+SELECT f.* FROM market_factor_values AS f
+JOIN market_bars AS b
+  ON f.instrument_id = b.instrument_id
+ AND f.frequency = b.frequency
+ AND epoch_ns(f.timestamp_utc) = epoch_ns(b.timestamp_utc);
+```
+
+闭区间可用 `BETWEEN` 比较同样归一后的两个上下界。固定的 UTC 纳秒时间也可直接使用同类型的字面量，例如 `TIMESTAMP_NS '2026-01-05 01:30:00.000000001'`。现有 Bar 列的微秒精度决定了可精确连接的时刻，整分钟 Bar 只命中整分钟因子键。
 
 ### 身份计算与冻结粒度约定
 
@@ -454,8 +490,12 @@ importer 扫描受影响 Session，build 扫描新构建 Session，audit 可扫�
 数据缺口不补行、不补价。只读登记的旧表为 `unscanned`，每张表仅记一次 info。
 每次 `BarSource.read` 覆盖质量标记范围时发一条合并的 `BarDataQualityWarning`
 并记录 warning 日志，列出频率、品种、缺失 Session、不完整桶数和示例日期。
-`BarAvailability(..., bucket_strategy=...)` 及标签器将 `is_complete=False` 当作
-`missing_bar`，含不完整的信号桶；没有完整性列的阶段 1–5 输入保持原行为。
+`BarAvailability(..., bucket_strategy=...)` 将 `is_complete=False` 当作 `missing_bar`。
+Bar 评估要求内嵌因子的当前信号桶完整，包括 FactorBase 从同批 Bar 计算的因子。
+连续合约的内嵌信号也读取输入快照的完整性，持有窗口仍检查具体合约行情。
+独立因子由调用方按实际发布时间对齐，可使用不完整的行情桶作为信号键。
+信号之后到退出为止的缺桶或不完整桶只影响所涉及的持有期标签。
+没有完整性列时沿用观测到的 Bar。
 所有命令仅获准在隔离的合成库中验证；生产库、旧原生价格表不在写入范围。
 
 ## 剔除原因与固定优先级
@@ -614,6 +654,11 @@ python3 -m tools.agent_harness.cli time-series-analysis --config work/minute-bar
 行情内提供 `factor_value` 即可；独立因子文件用 `factors_csv` 指定，按
 `(timestamp_utc, instrument_id)` 关联，也接受 `(timestamp, symbol)` 别名。
 同时提供独立因子文件时以该文件为准，缺因子不回填行情内的值。
+每个外部值须在其对应信号 Bar 的实际结束时刻已经可得。评估入口拒绝携带
+`signal_available_at[_utc]`、`available_at[_utc]`、`published_at[_utc]` 或
+`high_tf_bar_end` 的待对齐因子表。按品种将原始特征的 Bar 结束和发布时间提供给
+`backtest_and_analysis.evaluation.split.align_released_features`，以下游日历
+的实际信号 Bar 结束时间查询可用值，再按信号 Bar 开始时间和品种提交因子值。
 横截面将 `analysis_mode` 改为 `cross_sectional`，可配置 `min_cross_section_size`。
 多市场可用 `"calendar_by_instrument": {"NQZ26": "NQ", "000001": "XSHG"}`
 代替 `calendar`；每个标的必须有映射，共用声明的 `start_date/end_date` 覆盖。
@@ -714,7 +759,9 @@ Python 调用方也可通过传入预登记的 `trial_family` 启用 v2。
 每个频率和标的在训练期冻结分位边界、方向及可选标准化参数，训练和 OOS
 复用同一 `fit_identity`。样本外极端值进入端点桶，空桶保留编号。
 
-切分按日历上的实际信号可用时刻对齐。训练候选的计划退出晚于首个 OOS 应有信号的
+切分按日历上的实际信号可用时刻对齐。不完整的当前 Bar 上的内嵌因子以缺失值输出，
+并排除在训练拟合和截面分桶之外。当前可得的因子即使缺少某个未来持有期的收益，
+仍参与信号分桶和训练拟合。训练候选的计划退出晚于首个 OOS 应有信号的
 `signal_available_at` 时按持有期清除。退出恰好等于边界时保留。即便退出价缺失，
 跨界的计划退出仍计入清除数。各评估面板的训练与 OOS 段都须包含应有信号。
 时序区间使用持仓时间验证各非重叠相位，块重采样保留网格缺口并在每次复制中重排
@@ -938,7 +985,9 @@ warmup_sessions=0, warmup_bars=0, aggregation='mean')` 在桥接模块中也可�
 分钟 `get_factor_values()` 返回 UTC 宽表（索引名 `date` 保留旧缓存约定），
 `bar_factor_frame(wide)` 无损转成长表，NaN 不丢失。长表输出通过
 `validate_factor_frame`，重复键、非 UTC、无穷值报错。缺省输出覆盖整个网格，
-缺行情槽位因子固定为 NaN；标签候选仍仅为观测 Bar，符合既有标签器契约。
+缺行情槽位因子固定为 NaN。
+`get_bar_factor_frame()` 也将当前源 Bar 不完整的派生值置为 NaN，供 Python 和
+三列 CSV 回放共用。标签候选仍仅为观测 Bar。
 `evaluate_bar_factor` 从同一次读取快照生成因子、标签和评估；`label_config`
 直接传给标签器（`horizons, entry_offset_bars, boundary_policy`），视图来自
 `session_view`。若走 Harness CLI，写出 `market_bars` 和长表 CSV，使用既有

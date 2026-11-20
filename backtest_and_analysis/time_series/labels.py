@@ -11,9 +11,8 @@ import pandas as pd
 from backtest_and_analysis.evaluation.labels import ExecutionConvention
 
 from .contracts import (
-    ContractValidationError, LabelRecord, _numeric_column,
+    ContractValidationError, LabelRecord, _numeric_column, _validate_aligned_factor_frame,
     invalid_price_mask, primary_exclusion_reasons, validate_bar_frame,
-    validate_factor_frame,
 )
 from .csv_reader import _check_view
 from utils.time_axis import BarSchedule
@@ -108,7 +107,8 @@ class BarReturnLabeler:
         self.include_scheduled_exit = include_scheduled_exit
 
     def label(self, bars: pd.DataFrame, factors: pd.DataFrame | None = None, *,
-              signal_timestamps: Sequence | None = None) -> pd.DataFrame:
+              signal_timestamps: Sequence | None = None,
+              _incomplete_signals: pd.DatetimeIndex | None = None) -> pd.DataFrame:
         """Return all selected candidates, with one primary reason per exclusion.
 
         Factors join on (timestamp_utc, instrument_id); alternatively factor_value
@@ -122,7 +122,7 @@ class BarReturnLabeler:
             return self.continuous_source.label(frame, self, factors, signal_timestamps=signal_timestamps)
         factor_index = None
         if factors is not None:
-            factor_index = validate_factor_frame(factors).set_index(['timestamp_utc', 'instrument_id'])
+            factor_index = _validate_aligned_factor_frame(factors).set_index(['timestamp_utc', 'instrument_id'])
         elif 'factor_value' not in frame:
             raise ContractValidationError('Supply factors or a factor_value Bar column')
         elif np.isinf(_numeric_column(frame.factor_value)).any():
@@ -153,7 +153,8 @@ class BarReturnLabeler:
             if (instrument, frequency) not in coverage:
                 raise ContractValidationError(f'Missing raw coverage for {(instrument, frequency)}')
             tables.extend(self._label_group(group, factor_index, signals, calendar,
-                                            coverage[(instrument, frequency)], instrument, frequency))
+                                            coverage[(instrument, frequency)], instrument, frequency,
+                                            _incomplete_signals))
         scheduled = ('scheduled_exit_timestamp',) if self.include_scheduled_exit else ()
         columns = (*LABEL_COLUMNS, *scheduled)
         if not tables:
@@ -167,7 +168,8 @@ class BarReturnLabeler:
 
     def _label_group(self, group: pd.DataFrame, factors: pd.DataFrame | None,
                      signals: pd.DatetimeIndex | None, calendar: SessionCalendar,
-                     coverage_end: pd.Timestamp, instrument: str, frequency: str) -> list[pd.DataFrame]:
+                     coverage_end: pd.Timestamp, instrument: str, frequency: str,
+                     incomplete_signals: pd.DatetimeIndex | None) -> list[pd.DataFrame]:
         first, last = group.timestamp_utc.min(), group.timestamp_utc.max()
         calendar.session_at(first)
         calendar.session_at(last)
@@ -201,7 +203,13 @@ class BarReturnLabeler:
         observed = group.set_index('timestamp_utc').reindex(grid)
         missing = observed.instrument_id.isna().to_numpy()
         if 'is_complete' in observed:
-            missing |= ~observed.is_complete.fillna(False).to_numpy(dtype=bool)
+            missing |= ~observed.is_complete.eq(True).to_numpy(dtype=bool, na_value=False)
+        # An already aligned external signal does not need the current Bar prices.
+        incomplete_signal = False
+        if factors is None:
+            incomplete_signal = missing[positions]
+            if incomplete_signals is not None:
+                incomplete_signal |= signal_times.isin(incomplete_signals)
         invalid = invalid_price_mask(observed).to_numpy()
         entries = positions + self.entry_offset_bars
         tables = []
@@ -220,7 +228,7 @@ class BarReturnLabeler:
                 'insufficient_history': insufficient,
                 'session_boundary': boundary,
                 'missing_bar': ((_window_counts(missing, positions + 1, exits + 1) > 0)
-                                | missing[positions]),
+                                | incomplete_signal),
                 'invalid_price': _window_counts(invalid, entries, exits + 1) > 0,
             }))
             valid = reasons.isna().to_numpy()

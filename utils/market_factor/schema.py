@@ -41,6 +41,7 @@ TABLE_COLUMNS: tuple[str, ...] = (
 )
 
 VIEW_COLUMNS: tuple[str, ...] = TABLE_COLUMNS + ("year_month",)
+_EPOCH_NS_COLUMNS = {"timestamp_utc": "_timestamp_utc_ns", "created_at": "_created_at_ns"}
 LEAF_COLUMNS: tuple[str, ...] = tuple(
     col for col in TABLE_COLUMNS if col not in ("factor_id", "frequency")
 )

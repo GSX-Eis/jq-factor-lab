@@ -62,7 +62,9 @@ def evaluate_diagnostics(result: EvaluationResult, labeler: BarReturnLabeler, *,
             counts=dict(total_count=int(tally.total_count), valid_count=int(tally.valid_count),
                         excluded_count=int(tally.excluded_count), exclusion_counts=tally.exclusion_counts),
             ic=row['ic'], bootstrap={name: row['bootstrap'][name] for name in BOOTSTRAP_FIELDS},
-            **{key: row[key] for key in ('interval_usability', 'direction', 'return_distribution',
+            interval_usability={key: value for key, value in row['interval_usability'].items()
+                                if key != 'verified_horizon'},
+            **{key: row[key] for key in ('direction', 'return_distribution',
                                        'buckets', 'non_overlapping_ic')},
         ))
     return dict(schema='time_series_diagnostics.v1', return_unit='percent',

@@ -103,7 +103,7 @@ class MarketFactorValueStore:
         )
 
     def view_sql(self, view_name: str = "market_factor_values") -> str:
-        """Build CREATE OR REPLACE VIEW SQL bound strictly to committed shards."""
+        """Build a committed-shard view with UTC values in DuckDB TIMESTAMP_NS columns."""
         return reader.view_sql(self.parquet_root, self._committed_shards, view_name)
 
     def create_view(self, connection: duckdb.DuckDBPyConnection, view_name: str = "market_factor_values") -> None:
@@ -128,7 +128,7 @@ class MarketFactorValueStore:
         session_end: str | None = None,
         connection: duckdb.DuckDBPyConnection | None = None,
     ) -> pd.DataFrame:
-        """Read committed factor values via DuckDB read_parquet (lock-free)."""
+        """Read committed factor values with inclusive UTC nanosecond bounds (lock-free)."""
         plan = self.plan_read(
             factor_id=factor_id,
             factor_identity_hash=factor_identity_hash,

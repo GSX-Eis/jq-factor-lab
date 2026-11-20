@@ -74,6 +74,14 @@ def _parse_strict_utc_csv_column(series: Any, name: str) -> Any:
     return pd.to_datetime(text, format='ISO8601', utc=True).astype('datetime64[ns, UTC]')
 
 
+def _format_factor_timestamps(series: Any) -> Any:
+    microseconds = series.dt.strftime('%Y-%m-%dT%H:%M:%S.%f')
+    nanoseconds = series.dt.nanosecond
+    if nanoseconds.ne(0).any():
+        microseconds = microseconds + nanoseconds.astype(str).str.zfill(3)
+    return microseconds + 'Z'
+
+
 def _handle_factor_values_store(args: argparse.Namespace) -> HarnessResult:
     import datetime as dt
     import uuid
@@ -150,7 +158,7 @@ def _handle_factor_values_store(args: argparse.Namespace) -> HarnessResult:
                 identities_df = store.list_identities(factor_id=args.factor_id, frequency=args.frequency)
                 metrics['identity_count'] = int(len(identities_df))
                 identities_out = identities_df.copy()
-                identities_out['created_at'] = identities_out['created_at'].dt.strftime('%Y-%m-%dT%H:%M:%S.%fZ')
+                identities_out['created_at'] = _format_factor_timestamps(identities_out['created_at'])
                 metrics['identities'] = identities_out.to_dict('records')
             has_row_filters = any(
                 getattr(args, name) is not None
@@ -177,8 +185,8 @@ def _handle_factor_values_store(args: argparse.Namespace) -> HarnessResult:
                     metrics['scanned_shards'] = [str(p.relative_to(store.parquet_root)) for p in plan.shard_paths]
                 if args.limit and args.limit > 0:
                     preview = frame.head(args.limit).copy()
-                    preview['timestamp_utc'] = preview['timestamp_utc'].dt.strftime('%Y-%m-%dT%H:%M:%S.%fZ')
-                    preview['created_at'] = preview['created_at'].dt.strftime('%Y-%m-%dT%H:%M:%S.%fZ')
+                    preview['timestamp_utc'] = _format_factor_timestamps(preview['timestamp_utc'])
+                    preview['created_at'] = _format_factor_timestamps(preview['created_at'])
                     metrics['preview'] = preview.to_dict('records')
                 if args.out:
                     out_path = Path(args.out).expanduser().resolve()
@@ -187,8 +195,8 @@ def _handle_factor_values_store(args: argparse.Namespace) -> HarnessResult:
                         frame.to_parquet(out_path, index=False)
                     else:
                         export_df = frame.copy()
-                        export_df['timestamp_utc'] = export_df['timestamp_utc'].dt.strftime('%Y-%m-%dT%H:%M:%S.%fZ')
-                        export_df['created_at'] = export_df['created_at'].dt.strftime('%Y-%m-%dT%H:%M:%S.%fZ')
+                        export_df['timestamp_utc'] = _format_factor_timestamps(export_df['timestamp_utc'])
+                        export_df['created_at'] = _format_factor_timestamps(export_df['created_at'])
                         export_df.to_csv(out_path, index=False)
                     artifacts.append({'artifact_type': 'factor_values_export', 'path': str(out_path)})
             result = cli._success_result(

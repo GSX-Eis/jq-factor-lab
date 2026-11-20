@@ -1,6 +1,6 @@
 {
   "baseline_sha256": "42d2f3542e45acffef616254d290c0789df8687e2fa7feb9930ef0f7269ab52d",
-  "equivalent_sha256": "5ba9a17fec46240175434e73f78f0f9c6938938b6a1b375a087ae55ce7043d92",
+  "equivalent_sha256": "a38f6ed74c458ddd01ab8905c1dd030a6794b9ad6582403b09bc93c105eb2dfa",
   "dependencies": {
     "bar_source.py": "33199c50c8bc14fae45bef8fd489a58b6ba1b24aeffce4c28b025a692bf3e05d",
     "bar_catalog.py": "5d042a9a9890638777a9940d2b209539d94a1a9c7463f30eb75ceb32649e8b2c",
@@ -12,10 +12,9 @@
     "bars/catalog.py": "c1f3cd6638206a9cf0d0cc2618b699a847185a972e34c5fcc21e5d00f4b37e27",
     "bars/quality.py": "f4ae8c6c63dd3516d83a430f96cbfe0685427c42b304a538acad3ef9aae94a4e",
     "factor_core/__init__.py": "94ec5f1d33820bff319fcc58e49384372d16c1178a7e6937a9522928f58564d7",
-    "factor_core/bar_bridge.py": "25889b1f45a32c1321086d1a8d3ea3ff978d5358417dac2fef6739b2d6108b33",
-    "factor_core/cache.py": "e115521c50a1c75af8815c4825a91b99f36b312fc3099bec454007ae7f9841d3",
-    "factor_core/execution.py": "238f9b19fdb598bbb323e63ac8a62ffd580981049922c0641da883f6f25577ed",
+    "factor_core/bar_bridge.py": "631b1e4b2c6709e4188168000b4f0193b7b95b75fb6ca19cb5b2e31ef349f587",
+    "factor_core/cache.py": "0f069d66d92be60123213799479cde058fdb610e0b68e12ae0e404044844e5b9",
+    "factor_core/execution.py": "2ba3db52602fa30a2f7031ac0c694715b90d5bc4388a45b3b5973ad83322f6b4",
     "factor_core/legacy_storage.py": "aed500d0db4dfcc194dd55fb69f9f9e9c4933887e22b70f2b3e05f0c3d7a4b88"
-  },
-  "previous_public_sha256": "60db69913ee5aa3b936f0072ecd9ad25a8683d56bc1a4f56e2c200ddc0f0c992"
+  }
 }

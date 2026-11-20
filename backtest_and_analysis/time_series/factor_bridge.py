@@ -7,7 +7,9 @@ from collections.abc import Mapping
 import numpy as np
 import pandas as pd
 
-from .contracts import ContractValidationError, validate_bar_frame, validate_factor_frame
+from .contracts import (
+    ContractValidationError, _validate_aligned_factor_frame, validate_bar_frame, validate_factor_frame,
+)
 from utils.time_axis import BarSchedule
 
 
@@ -33,7 +35,7 @@ def bar_factor_frame(values: pd.DataFrame) -> pd.DataFrame:
         raise ContractValidationError('factor output must be a DataFrame')
     keys = ['timestamp_utc', 'instrument_id', 'factor_value']
     if set(keys).issubset(values.columns):
-        return validate_factor_frame(values[keys]).reset_index(drop=True)
+        return _validate_aligned_factor_frame(values).loc[:, keys].reset_index(drop=True)
     if not isinstance(values.index, pd.DatetimeIndex) or not values.columns.is_unique:
         raise ContractValidationError('wide factor output needs a UTC DatetimeIndex and unique instruments')
     long = values.rename_axis(index='timestamp_utc', columns='instrument_id').reset_index().melt(

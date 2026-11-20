@@ -26,8 +26,8 @@ from backtest_and_analysis.evaluation.split import SplitConfig
 
 from .contracts import (
     EXCLUSION_PRIORITY, ContractValidationError, DuplicateKeyError,
-    _duration, _frame_columns, _numeric_column, _text_column,
-    validate_bar_frame, validate_factor_frame,
+    _duration, _frame_columns, _mask_unavailable_factor_values, _numeric_column, _text_column,
+    _validate_aligned_factor_frame, validate_bar_frame,
 )
 from .evaluation_v2 import BarEvaluationV2, BarTrialFamily, evaluate_bar_splits
 from .labels import BarReturnLabeler, LABEL_COLUMNS
@@ -208,7 +208,7 @@ def _canonical_order(keys: tuple[np.ndarray, ...]) -> np.ndarray | None:
 
 
 def _attach_factor_values(labels: pd.DataFrame, factors: pd.DataFrame) -> pd.DataFrame:
-    values = validate_factor_frame(factors)[['timestamp_utc', 'instrument_id', 'factor_value']]
+    values = _validate_aligned_factor_frame(factors)[['timestamp_utc', 'instrument_id', 'factor_value']]
     return labels.reset_index(drop=True).drop(columns='factor_value', errors='ignore').merge(
         values.rename(columns={'timestamp_utc': 'signal_timestamp'}),
         on=['signal_timestamp', 'instrument_id'], how='left', validate='many_to_one')
@@ -629,6 +629,9 @@ def evaluate_bars(bars: pd.DataFrame, factors: pd.DataFrame | None = None,
     if factors is None:
         values = frame[['timestamp_utc', 'instrument_id', 'frequency', 'factor_value']].rename(
             columns={'timestamp_utc': 'signal_timestamp'})
+        if 'is_complete' in frame:
+            incomplete = ~frame.is_complete.eq(True).to_numpy(dtype=bool, na_value=False)
+            values['factor_value'] = _mask_unavailable_factor_values(values.factor_value, incomplete)
         labels = labels.merge(values, on=['signal_timestamp', 'instrument_id', 'frequency'],
                               how='left', validate='many_to_one')
     if family is not None:

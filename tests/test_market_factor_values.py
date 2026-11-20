@@ -952,6 +952,195 @@ def test_cli_end_to_end_write_read_verify(tmp_path: Path, capsys: pytest.Capture
     assert verify_out["metrics"]["uncommitted_shards"]
 
 
+def _restore_legacy_shards(store: MarketFactorValueStore) -> None:
+    """Keep the original tz-aware Parquet fields and historical ledger layout."""
+    records = [json.loads(line) for line in store.batches_path.read_text().splitlines()]
+    for record in records:
+        for shard in record["shards"]:
+            path = store.parquet_root / shard["part_path"]
+            with pq.ParquetFile(path) as file:
+                legacy = file.read(columns=list(LEAF_COLUMNS))
+            pq.write_table(legacy, path, compression="zstd")
+            shard.pop("has_epoch_ns", None)
+    store.batches_path.write_text("".join(json.dumps(record) + "\n" for record in records))
+
+
+def test_market_factor_minute_shard_nanosecond_bounds(tmp_path: Path) -> None:
+    df, identity, calendar = _make_sample_batch(
+        end_date="2026-01-05", instruments=("000001.XSHE",),
+    )
+    store = MarketFactorValueStore(tmp_path / "store")
+    minutes = df.iloc[:2].copy()
+    store.append_factor_values(minutes, identity_record=identity, calendar=calendar)
+    _restore_legacy_shards(store)
+    first, second = minutes["timestamp_utc"]
+    assert first == pd.Timestamp("2026-01-05T01:30:00Z")
+    assert second == pd.Timestamp("2026-01-05T01:35:00Z")
+    ns = pd.Timedelta(1, unit="ns")
+
+    for bounds, expected in [
+        ({"start_utc": (first + ns).isoformat()}, minutes.iloc[[1]]),
+        ({"end_utc": second - ns}, minutes.iloc[[0]]),
+        ({"start_utc": first, "end_utc": first}, minutes.iloc[[0]]),
+        ({"start_utc": first + ns, "end_utc": first + ns}, minutes.iloc[:0]),
+        ({"start_utc": "1600-01-01T00:00:00Z", "end_utc": "2400-01-01T00:00:00Z"}, minutes),
+        ({"start_utc": "2400-01-01T00:00:00Z"}, minutes.iloc[:0]),
+        ({"end_utc": "1600-01-01T00:00:00Z"}, minutes.iloc[:0]),
+    ]:
+        actual = store.read_factor_values(**bounds)
+        pd.testing.assert_frame_equal(actual, expected.reset_index(drop=True))
+
+
+def test_market_factor_distinct_nanosecond_keys_and_duplicates(tmp_path: Path) -> None:
+    df, identity, calendar = _make_sample_batch(
+        end_date="2026-01-05", instruments=("000001.XSHE",),
+    )
+    store = MarketFactorValueStore(tmp_path / "store")
+    first = df.iloc[[0]].copy()
+    minute = first["timestamp_utc"].iloc[0]
+    points = pd.concat([first, first], ignore_index=True)
+    points["timestamp_utc"] = minute + pd.to_timedelta([1, 2], unit="ns")
+    points["factor_value"] = [10.0, 20.0]
+    mixed = pd.concat([first, points], ignore_index=True)
+    receipt = store.append_factor_values(mixed.iloc[:2], identity_record=identity, calendar=calendar)
+    assert (receipt.inserted, receipt.skipped) == (2, 0)
+    _restore_legacy_shards(store)
+    receipt = store.append_factor_values(mixed.iloc[[2]], calendar=calendar)
+    assert (receipt.inserted, receipt.skipped) == (1, 0)
+    replay = store.append_factor_values(points.iloc[::-1], calendar=calendar)
+    assert (replay.inserted, replay.skipped) == (0, 2)
+    pd.testing.assert_frame_equal(store.read_factor_values(), mixed)
+    t1, t2 = points["timestamp_utc"]
+    with duckdb.connect() as con:
+        for start, end, expected in [
+            (t1, t2, points),
+            (t1, t1, points.iloc[[0]]),
+            (t2, t2, points.iloc[[1]]),
+            (t2, minute + pd.Timedelta(3, unit="ns"), points.iloc[[1]]),
+        ]:
+            actual = store.read_factor_values(start_utc=start, end_utc=end, connection=con)
+            pd.testing.assert_frame_equal(actual, expected.reset_index(drop=True))
+
+
+def test_market_factor_view_keeps_nanoseconds_and_empty_schema(tmp_path: Path) -> None:
+    df, identity, calendar = _make_sample_batch(
+        end_date="2026-01-05", instruments=("000001.XSHE",),
+    )
+    store = MarketFactorValueStore(tmp_path / "factor's store")
+    df = df.iloc[:2].copy()
+    df["timestamp_utc"] = df["timestamp_utc"].iloc[0] + pd.to_timedelta([1, 2], unit="ns")
+    df["factor_value"] = [10.0, 20.0]
+    query = """
+        SELECT epoch_ns(timestamp_utc), factor_value
+        FROM market_factor_values ORDER BY timestamp_utc
+    """
+    db_path = str(tmp_path / "views.duckdb")
+    with duckdb.connect(db_path) as con:
+        con.execute(store.view_sql())
+        empty_schema = con.execute("DESCRIBE market_factor_values").fetchall()
+        assert con.execute(query).fetchall() == []
+        store.append_factor_values(df.iloc[[0]], identity_record=identity, calendar=calendar)
+        _restore_legacy_shards(store)
+        store.append_factor_values(df.iloc[[1]], calendar=calendar)
+        store.create_view(con)
+        assert con.execute("DESCRIBE market_factor_values").fetchall() == empty_schema
+    with duckdb.connect(db_path, read_only=True) as con:
+        con.execute("SET TimeZone = 'America/New_York'")
+        assert con.execute(query).fetchall() == [
+            (ts.value, value) for ts, value in zip(df["timestamp_utc"], df["factor_value"])
+        ]
+        assert con.execute("""
+            SELECT factor_value FROM market_factor_values
+            WHERE timestamp_utc = TIMESTAMP_NS '2026-01-05 01:30:00.000000002'
+        """).fetchall() == [(20.0,)]
+
+
+def test_market_factor_nanosecond_view_migration_in_non_utc_session(tmp_path: Path) -> None:
+    df, identity, calendar = _make_sample_batch(
+        end_date="2026-01-05", instruments=("000001.XSHE",),
+    )
+    store = MarketFactorValueStore(tmp_path / "store")
+    df = df.iloc[:3].copy()
+    minute = df["timestamp_utc"].iloc[0]
+    df["timestamp_utc"] = minute + pd.to_timedelta([0, 1, 2], unit="ns")
+    df["factor_value"] = [5.0, 10.0, 20.0]
+    initial = store.append_factor_values(df.iloc[[0]], identity_record=identity, calendar=calendar)
+    _restore_legacy_shards(store)
+    shard_path = str(store.parquet_root / initial.shards_written[0]).replace("'", "''")
+    db_path = str(tmp_path / "views.duckdb")
+    zoned_time = "2026-01-04T20:30:00-05:00"
+    with duckdb.connect(db_path) as con:
+        con.execute(f"""
+            CREATE VIEW market_factor_values AS
+            SELECT timestamp_utc FROM read_parquet('{shard_path}')
+        """)
+        con.execute("""
+            CREATE TABLE market_bars (
+                instrument_id VARCHAR, frequency VARCHAR, timestamp_utc TIMESTAMPTZ
+            )
+        """)
+        con.execute("INSERT INTO market_bars VALUES (?, ?, CAST(? AS TIMESTAMPTZ))", [
+            df["instrument_id"].iloc[0], df["frequency"].iloc[0], zoned_time,
+        ])
+
+    store.append_factor_values(df.iloc[1:], calendar=calendar)
+    with duckdb.connect(db_path) as con:
+        con.execute("SET TimeZone = 'America/New_York'")
+        assert con.execute("""
+            SELECT count(*) FROM market_factor_values WHERE timestamp_utc = CAST(? AS TIMESTAMPTZ)
+        """, [zoned_time]).fetchone() == (1,)
+        store.create_view(con)
+
+    with duckdb.connect(db_path, read_only=True) as con:
+        con.execute("SET TimeZone = 'America/New_York'")
+        assert con.execute("""
+            SELECT count(*), min(factor_value) FROM market_factor_values
+            WHERE epoch_ns(timestamp_utc) = epoch_ns(CAST(? AS TIMESTAMPTZ))
+        """, [zoned_time]).fetchone() == (1, 5.0)
+        assert con.execute("""
+            SELECT count(*), min(f.factor_value) FROM market_factor_values AS f
+            JOIN market_bars AS b
+              ON f.instrument_id = b.instrument_id
+             AND f.frequency = b.frequency
+             AND epoch_ns(f.timestamp_utc) = epoch_ns(b.timestamp_utc)
+        """).fetchone() == (1, 5.0)
+        for offset, expected in [(0, (1, 5.0)), (1, (1, 10.0)), (2, (1, 20.0)), (3, (0, None))]:
+            assert con.execute("""
+                SELECT count(*), min(factor_value) FROM market_factor_values
+                WHERE epoch_ns(timestamp_utc) = CAST(? AS BIGINT)
+            """, [minute.value + offset]).fetchone() == expected
+
+
+def test_market_factor_cli_preserves_nanoseconds_in_preview_and_csv(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    df, identity, calendar = _make_sample_batch(
+        end_date="2026-01-05", instruments=("000001.XSHE",),
+    )
+    store = MarketFactorValueStore(tmp_path / "store")
+    df = df.iloc[:2].copy()
+    df["timestamp_utc"] = df["timestamp_utc"].iloc[0] + pd.to_timedelta([1, 2], unit="ns")
+    df["created_at"] += pd.Timedelta(3, unit="ns")
+    store.append_factor_values(df, identity_record=identity, calendar=calendar)
+    export_path = tmp_path / "factor_values.csv"
+
+    assert harness_main([
+        "read-factor-values", "--factor-values-store", str(store.root),
+        "--start-utc", df["timestamp_utc"].iloc[1].isoformat(),
+        "--limit", "2", "--out", str(export_path), "--output-root", str(tmp_path / "results"),
+    ]) == 0
+    metrics = json.loads(capsys.readouterr().out)["metrics"]
+    assert metrics["row_count"] == 1
+    csv = pd.read_csv(export_path, float_precision="round_trip")
+    assert len(csv) == 1
+    for actual in [metrics["preview"], csv.to_dict("records")]:
+        assert len(actual) == 1
+        expected = df.iloc[1]
+        assert pd.Timestamp(actual[0]["timestamp_utc"]) == expected["timestamp_utc"]
+        assert pd.Timestamp(actual[0]["created_at"]) == expected["created_at"]
+        assert actual[0]["factor_value"] == expected["factor_value"]
+
+
 def test_read_filters_empty_store_and_bad_factor_id_rejection(tmp_path: Path) -> None:
     empty_store = MarketFactorValueStore(tmp_path / "empty_store")
     empty_df = empty_store.read_factor_values(factor_id="nonexistent")

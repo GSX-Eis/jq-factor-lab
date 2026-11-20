@@ -173,9 +173,14 @@ class ContinuousBarSource(BarSource):
             raw = raw.assign(instrument_id=root)
             # The request bounds classify a hole after rolling as missing_bar, not a new contract.
             raw.attrs = dict(bars.attrs)
+            incomplete_signals = None
             if factors is None:
                 raw = raw.merge(group[['timestamp_utc', 'factor_value']], on='timestamp_utc', how='left')
                 raw.attrs = dict(bars.attrs)
+                if 'is_complete' in group:
+                    # Signal quality belongs to the continuous snapshot. Held Bar quality is raw.
+                    complete = group.is_complete.eq(True).to_numpy(dtype=bool, na_value=False)
+                    incomplete_signals = pd.DatetimeIndex(group.timestamp_utc[~complete])
             signals = pd.DatetimeIndex(group.timestamp_utc)
             if signal_timestamps is not None:
                 signals = signals.intersection(pd.DatetimeIndex(signal_timestamps))
@@ -186,6 +191,7 @@ class ContinuousBarSource(BarSource):
                 continuous_source=self, include_scheduled_exit=labeler.include_scheduled_exit)
             # Raw Bars deliberately drop the continuous marker to prevent recursive dispatch.
             raw = raw.drop(columns='contract_id', errors='ignore')
-            tables.append(concrete_labeler.label(raw, factors, signal_timestamps=signals))
+            tables.append(concrete_labeler.label(raw, factors, signal_timestamps=signals,
+                                                 _incomplete_signals=incomplete_signals))
         return pd.concat(tables, ignore_index=True).sort_values(
             ['instrument_id', 'frequency', 'signal_timestamp', 'horizon_bars']).reset_index(drop=True)

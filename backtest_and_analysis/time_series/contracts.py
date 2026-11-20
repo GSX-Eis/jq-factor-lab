@@ -134,6 +134,16 @@ def _numeric_column(series: pd.Series) -> np.ndarray:
     return series.to_numpy(dtype=float, na_value=np.nan)
 
 
+def _mask_unavailable_factor_values(values: pd.Series, unavailable: np.ndarray) -> pd.Series:
+    if not unavailable.any():
+        return values
+    # A float conversion could round valid integer ranks when adding a missing value.
+    if isinstance(values.dtype, np.dtype) and values.dtype.kind in 'iu':
+        masked = pd.arrays.IntegerArray(values.to_numpy(), unavailable)
+        return pd.Series(masked, index=values.index, name=values.name)
+    return values.mask(unavailable)
+
+
 def _frame_keys(frame: pd.DataFrame, key: tuple[str, ...]) -> pd.DataFrame:
     times = frame['timestamp_utc']
     if (not isinstance(times.dtype, pd.DatetimeTZDtype)
@@ -181,6 +191,22 @@ def validate_factor_frame(df: pd.DataFrame) -> pd.DataFrame:
     if np.isinf(_numeric_column(df['factor_value'])).any():
         raise ContractValidationError('factor_value must not be infinite (NaN is allowed)')
     return _frame_keys(df, FACTOR_KEY)
+
+
+def _validate_aligned_factor_frame(df: pd.DataFrame) -> pd.DataFrame:
+    """Require external values already aligned to the signal Bar clock."""
+    frame = validate_factor_frame(df)
+    release_columns = sorted({
+        'signal_available_at', 'signal_available_at_utc', 'available_at', 'available_at_utc',
+        'published_at', 'published_at_utc', 'high_tf_bar_end',
+    }.intersection(frame.columns))
+    if release_columns:
+        raise ContractValidationError(
+            f'External factor timing columns {release_columns} require prior alignment. '
+            'Use backtest_and_analysis.evaluation.split.align_released_features per instrument '
+            'at the actual signal Bar ends, then key the aligned values by signal Bar start.',
+        )
+    return frame
 
 
 class ExclusionReason(str, Enum):

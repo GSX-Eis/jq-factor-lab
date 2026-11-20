@@ -28,6 +28,7 @@ from .schema import (
     DEFAULT_ROW_GROUP_SIZE,
     LEAF_ARROW_SCHEMA,
     LEAF_COLUMNS,
+    _EPOCH_NS_COLUMNS,
     FactorValueConflictError,
     FactorWriteReceipt,
     canonical_float_bits,
@@ -239,6 +240,9 @@ def append_factor_values(
                 leaf_df["timestamp_utc"] = pd.to_datetime(leaf_df["timestamp_utc"], utc=True).dt.as_unit("ns")
                 leaf_df["created_at"] = pd.to_datetime(leaf_df["created_at"], utc=True).dt.as_unit("ns")
                 table = pa.Table.from_pandas(leaf_df, schema=LEAF_ARROW_SCHEMA, preserve_index=False)
+                # DuckDB 1.x reads UTC-adjusted Parquet timestamps at microsecond precision.
+                for name, epoch_col in _EPOCH_NS_COLUMNS.items():
+                    table = table.append_column(epoch_col, table[name].cast(pa.int64()))
                 pq.write_table(
                     table,
                     str(staged_file),
@@ -255,6 +259,7 @@ def append_factor_values(
                         "year_month": str(ym),
                         "part_path": rel_path,
                         "row_count": int(len(part_df)),
+                        "has_epoch_ns": True,
                         "sessions": sess_counts,
                         "min_timestamp_ns": int(part_ts_ns.min()),
                         "max_timestamp_ns": int(part_ts_ns.max()),

@@ -36,8 +36,6 @@ def _get_cache_key(
     stock_filter_cls: type,
     apply_pit_adjustment: Callable,
     raw_data: Optional[pd.DataFrame] = None,
-    *,
-    fallback_keys: Optional[list[str]] = None,
 ) -> Optional[str]:
     """Hash declared inputs; never infer configuration from runtime state."""
     import inspect
@@ -125,7 +123,6 @@ def _get_cache_key(
                             "value": value})
         parameters["stock_filters"] = filters
         sources = []
-        previous_public = None
         implementations = [cls for cls in type(self).__mro__ if cls is not object]
         implementations.append(apply_pit_adjustment)
         bar_grid = getattr(getattr(self, '_frequency_route', None), 'bar_grid', False)
@@ -143,33 +140,19 @@ def _get_cache_key(
                 legacy_digest = factor_base_digest(source_file)
                 sources.append(legacy_digest)
                 if legacy_digest != digest:
-                    if fallback_keys is not None:
-                        mapping_path = Path(__file__).parents[1] / "legacy_cache_identity.json"
-                        mapping = json.loads(mapping_path.read_text())
-                        if digest == mapping["equivalent_sha256"] and legacy_digest == mapping["baseline_sha256"]:
-                            previous_public = mapping.get("previous_public_sha256")
-                            facade_index = len(sources) - 1
                     continue  # The legacy mapping already tracks the extracted files.
             else:
                 sources.append(digest)
             if implementation is factor_base_cls:
                 # Bar and edited facades use source hashes outside the frozen mapping.
                 sources.extend(factor_core_source_hashes(path))
-        identity = {"schema": 3, "class": type(self).__qualname__,
-                    "source": sources, "parameters": parameters,
-                    "runtime": [pd.__version__, np.__version__],
-                    "inputs": declared, "source_revision": source_revision,
-                    "raw_data": frame_digest(raw_data)}
-
-        def render_key():
-            encoded = json.dumps(identity, sort_keys=True, allow_nan=False)
-            return "factor-v3-" + hashlib.sha256(encoded.encode()).hexdigest()
-
-        key = render_key()
-        if previous_public is not None:
-            sources[facade_index] = previous_public
-            fallback_keys.append(render_key())
-        return key
+        identity = json.dumps({"schema": 3, "class": type(self).__qualname__,
+                               "source": sources, "parameters": parameters,
+                               "runtime": [pd.__version__, np.__version__],
+                               "inputs": declared, "source_revision": source_revision,
+                               "raw_data": frame_digest(raw_data)},
+                              sort_keys=True, allow_nan=False)
+        return "factor-v3-" + hashlib.sha256(identity.encode()).hexdigest()
     except (TypeError, ValueError, OSError, pickle.PicklingError) as exc:
         self.logger.warning("Cache disabled: %s", exc)
         return None

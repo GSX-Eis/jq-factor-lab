@@ -3,13 +3,15 @@ from __future__ import annotations
 
 import datetime as dt
 import re
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
 from typing import Any
 
 import duckdb
 import numpy as np
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 from backtest_and_analysis.time_series.contracts import _utc
 from utils.time_axis import Frequency
@@ -23,6 +25,7 @@ from .schema import (
     VALID_VIEWS,
     VIEW_COLUMNS,
     FactorReadPlan,
+    _EPOCH_NS_COLUMNS,
     _require_nonempty_str,
     _validate_session_date_str,
     validate_factor_id,
@@ -80,9 +83,77 @@ def _committed_shards(load_committed_state: Callable[[], tuple[dict[str, dict[st
                     "part_path": str(shard["part_path"]),
                     "sessions": set(shard.get("sessions", {}).keys()),
                     "row_count": int(shard["row_count"]),
+                    "has_epoch_ns": shard.get("has_epoch_ns", False),
                 }
             )
     return items
+
+
+def _utc_bound_ns(bound: pd.Timestamp) -> int:
+    # Keep datetime bounds outside the storage range comparable to stored keys.
+    if bound < pd.Timestamp.min.tz_localize("UTC"):
+        return pd.Timestamp.min.value
+    if bound > pd.Timestamp.max.tz_localize("UTC"):
+        return pd.Timestamp.max.value
+    return bound.value
+
+
+def _quote_path(path: Path) -> str:
+    return "'" + str(path).replace("'", "''") + "'"
+
+
+def _legacy_timestamp_rows(path: Path) -> Iterator[str]:
+    """Extract only rows whose original Parquet timestamps require correction."""
+    sql_path = _quote_path(path)
+    start = 0
+    with pq.ParquetFile(path) as file:
+        for batch in file.iter_batches(columns=list(_EPOCH_NS_COLUMNS)):
+            timestamps, created = (
+                batch[name].cast(pa.timestamp("ns", tz="UTC")).cast(pa.int64()).to_numpy()
+                for name in _EPOCH_NS_COLUMNS
+            )
+            for i in np.flatnonzero((timestamps % 1000 != 0) | (created % 1000 != 0)):
+                yield f"({sql_path}, {start + i}, {timestamps[i]}, {created[i]})"
+            start += batch.num_rows
+
+
+def _scan_sql(parquet_root: Path, shards: Sequence[dict[str, Any]], paths_sql: str) -> str:
+    """Expose integer epoch columns uniformly across new and historical shards."""
+    legacy = [shard for shard in shards if not shard["has_epoch_ns"]]
+    has_epoch = len(legacy) < len(shards)
+    corrections = ", ".join(
+        row for shard in legacy for row in _legacy_timestamp_rows(parquet_root / shard["part_path"])
+    )
+    options = (
+        "hive_partitioning=true, "
+        "hive_types={'factor_id': 'VARCHAR', 'frequency': 'VARCHAR', 'year_month': 'VARCHAR'}"
+    )
+    if legacy and has_epoch:
+        options += ", union_by_name=true"
+    join = ""
+    if corrections:
+        options += ", file_row_number=true"
+        join = (
+            f" LEFT JOIN (VALUES {corrections}) AS exact(path, row_no, _timestamp_utc_ns, _created_at_ns)"
+            " ON raw.filename = exact.path AND raw.file_row_number = exact.row_no"
+        )
+
+    columns = [f"raw.{col}" for col in VIEW_COLUMNS if col not in _EPOCH_NS_COLUMNS]
+    for name, epoch_col in _EPOCH_NS_COLUMNS.items():
+        expr = f"raw.{epoch_col}" if has_epoch else f"epoch_ns(raw.{name})"
+        if legacy and has_epoch:
+            expr = f"coalesce({expr}, epoch_ns(raw.{name}))"
+        if corrections:
+            expr = f"coalesce(exact.{epoch_col}, {expr})"
+        columns.append(f"{expr} AS {epoch_col}")
+    return f"SELECT {', '.join(columns)} FROM read_parquet({paths_sql}, {options}) AS raw{join}"
+
+
+def _projection(columns: Sequence[str]) -> str:
+    return ", ".join(
+        f"make_timestamp_ns({_EPOCH_NS_COLUMNS[col]}) AS {col}" if col in _EPOCH_NS_COLUMNS else col
+        for col in columns
+    )
 
 
 def plan_read(
@@ -133,14 +204,12 @@ def plan_read(
 
     parsed_start: pd.Timestamp | None = None
     if start_utc is not None:
-        ts = pd.Timestamp(start_utc)
-        _utc(ts.to_pydatetime(), "start_utc")
-        parsed_start = ts
+        parsed_start = pd.Timestamp(start_utc)
+        _utc(parsed_start, "start_utc")
     parsed_end: pd.Timestamp | None = None
     if end_utc is not None:
-        ts = pd.Timestamp(end_utc)
-        _utc(ts.to_pydatetime(), "end_utc")
-        parsed_end = ts
+        parsed_end = pd.Timestamp(end_utc)
+        _utc(parsed_end, "end_utc")
     if parsed_start is not None and parsed_end is not None and parsed_start > parsed_end:
         raise ValueError("start_utc must not follow end_utc")
 
@@ -228,11 +297,11 @@ def plan_read(
             where_clauses.append(f"instrument_id IN ({placeholders})")
             params.extend(req_instruments)
     if parsed_start is not None:
-        where_clauses.append("timestamp_utc >= ?")
-        params.append(parsed_start.to_pydatetime())
+        where_clauses.append("_timestamp_utc_ns >= ?")
+        params.append(_utc_bound_ns(parsed_start))
     if parsed_end is not None:
-        where_clauses.append("timestamp_utc <= ?")
-        params.append(parsed_end.to_pydatetime())
+        where_clauses.append("_timestamp_utc_ns <= ?")
+        params.append(_utc_bound_ns(parsed_end))
     if session_start is not None:
         where_clauses.append("session_id >= ?")
         params.append(session_start)
@@ -240,12 +309,11 @@ def plan_read(
         where_clauses.append("session_id <= ?")
         params.append(session_end)
 
-    cols_sql = ", ".join(TABLE_COLUMNS)
     where_sql = f" WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+    scan = _scan_sql(parquet_root, selected, "?")
     sql = (
-        f"SELECT {cols_sql} FROM read_parquet(?, hive_partitioning=true, "
-        f"hive_types={{'factor_id': 'VARCHAR', 'frequency': 'VARCHAR', 'year_month': 'VARCHAR'}})"
-        f"{where_sql} ORDER BY factor_id, factor_identity_hash, instrument_id, timestamp_utc"
+        f"SELECT {_projection(TABLE_COLUMNS)} FROM ({scan})"
+        f"{where_sql} ORDER BY factor_id, factor_identity_hash, instrument_id, _timestamp_utc_ns"
     )
     return FactorReadPlan(
         resolved_factor_ids=final_fids,
@@ -266,7 +334,6 @@ def view_sql(
     if not re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]*", view_name):
         raise ValueError(f"Invalid SQL view name: {view_name!r}")
     shards = committed_shards()
-    cols_sql = ", ".join(VIEW_COLUMNS)
     if not shards:
         return (
             f'CREATE OR REPLACE VIEW "{view_name}" AS '
@@ -275,26 +342,20 @@ def view_sql(
             "CAST(NULL AS VARCHAR) AS frequency, "
             "CAST(NULL AS VARCHAR) AS session_view, "
             "CAST(NULL AS VARCHAR) AS instrument_id, "
-            "CAST(NULL AS TIMESTAMPTZ) AS timestamp_utc, "
+            "CAST(NULL AS TIMESTAMP_NS) AS timestamp_utc, "
             "CAST(NULL AS VARCHAR) AS session_id, "
             "CAST(NULL AS DOUBLE) AS factor_value, "
             "CAST(NULL AS VARCHAR) AS source_build_id, "
             "CAST(NULL AS VARCHAR) AS calendar_hash, "
             "CAST(NULL AS VARCHAR) AS code_version, "
-            "CAST(NULL AS TIMESTAMPTZ) AS created_at, "
+            "CAST(NULL AS TIMESTAMP_NS) AS created_at, "
             "CAST(NULL AS VARCHAR) AS batch_id, "
             "CAST(NULL AS VARCHAR) AS year_month "
             "WHERE 1 = 0"
         )
-    quoted_paths = ", ".join(
-        "'" + str(parquet_root / item["part_path"]).replace("'", "''") + "'"
-        for item in shards
-    )
-    return (
-        f'CREATE OR REPLACE VIEW "{view_name}" AS '
-        f"SELECT {cols_sql} FROM read_parquet([{quoted_paths}], hive_partitioning=true, "
-        "hive_types={'factor_id': 'VARCHAR', 'frequency': 'VARCHAR', 'year_month': 'VARCHAR'})"
-    )
+    paths_sql = ", ".join(_quote_path(parquet_root / item["part_path"]) for item in shards)
+    scan = _scan_sql(parquet_root, shards, f"[{paths_sql}]")
+    return f'CREATE OR REPLACE VIEW "{view_name}" AS SELECT {_projection(VIEW_COLUMNS)} FROM ({scan})'
 
 
 def create_view(

@@ -293,29 +293,38 @@ AR(1) 因子。自相关格的因子和收益为相互独立的 AR(1)，系数�
 
 在查看结果前，将参与同一次选择的全部 `(factor_id, horizon)` 传给
 `calibration.TrialLedger`。每个候选调用一次 `record(key, Trial(...))`，
-保留统计量、原始检验 p 值、有效样本数及可用的区间。区间缺失时可传
-`None`。无法生成原始 p 值的尝试也要登记，可用 `ledger.records` 取回。
-候选缺记录或缺原始 p 值时，`select_best` 会抛错。95% 区间本身不足以
-恢复原始 p 值。
+保留统计量、原始检验 p 值、观测数、区间以及 `evaluate_interval_usability()`
+返回的校准适用性。无原始 p 值或区间的尝试也要登记，可用 `ledger.records`
+取回。候选缺记录或缺原始 p 值时，账本暂停多重校正和择优
+（`select_best` 抛错，Bar 产物列出缺失候选）。Bootstrap 百分位区间本身
+不足以恢复原始 p 值。
 
-```python
-from backtest_and_analysis.evaluation.calibration import Trial, TrialLedger
+- `adjusted_p_value` 按完整登记族校正原始 p，仅供审计。
+- `inference_adjusted_p_value` 用于判定。区间可估、设计适用且校准通过的
+  候选使用其 p 值，族阈值也须在登记区间的标称错误率内。其余候选以 1
+  参加校正，保留完整分母，并返回空的推断 p 值。
+- `significant` 要求候选通过上述门禁，且推断校正 p 值不大于
+  登记阈值 `alpha`。`best` 是显著候选中原始 p 最小者，原始 p 并列按
+  登记顺序；无显著候选时为 null。
+- Bar 产物的 `selection_complete` 表示原始 p 已齐且完成校正。
+  `n_observations` 在时序中为有效配对数，在截面中为有效截面数。
+  `n_effective` 继续作为旧字段保留相同整数，`n_dependence_adjusted`
+  目前为 null（没有估计依赖调整后的样本量）。
+- 公开账本按候选键核对持有期。手工登记调用
+  `evaluate_interval_usability(..., horizon=h, cross_section_sizes=counts)`，
+  截面的 `counts` 为各槽实际有效配对数，必须符合 §6.1 登记的完整
+  32 资产设计。时序使用区间内的有效配对及重采样数。`verified_horizon`
+  只在提供并通过设计检查后生成，必须与候选键和登记场景的持有期一致。
+  设计信息缺失或不匹配的候选仍进入审计校正。调用方负责确认实际依赖与声明场景匹配。
 
-ledger = TrialLedger([("factor_a", 1), ("factor_a", 5), ("factor_b", 1)])
-ledger.record(("factor_a", 1), Trial(0.08, 0.04, 150))
-ledger.record(("factor_a", 5), Trial(0.18, 0.02, 99, (0.01, 0.35)))
-ledger.record(("factor_b", 1), Trial(0.10, 0.03, 150))
-selection = ledger.select_best(method="holm", alpha=0.05)
-```
-
-`selection` 返回尝试总数、全部试验行、所用校正方法和显著性水平，
-以及原始 p 值最小的候选键。原始 p 值并列时沿用登记顺序。
-示例中获选候选的 Holm 调整后 p 值为 0.06，未达 5% 显著性水平。
-独立的 `adjust_pvalues(p_values, method=...)` 按输入顺序返回调整后 p 值。
+`adjust_pvalues(p_values, method=...)` 按输入顺序返回调整后 p 值。
 Holm (`holm`) 在原始 p 值有效时控制族错误率（FWER），允许检验间
 任意依赖。Benjamini–Hochberg (`bh`) 控制错误发现率（FDR），要求检验
 独立或满足适用的正依赖条件。候选依赖结构未知时用 Holm。
-账本只核对登记清单，完整清单由发起选择的调用方提供。
+账本核对登记清单，完整清单由发起选择的调用方提供。
+
+可运行公开基准脚本
+[tools/benchmarks/trial_ledger_calibration.py](../tools/benchmarks/trial_ledger_calibration.py)复现独立合成压力实验。脚本输出各场景的覆盖率和多重检验结果。
 
 ## 7. 不可估计状态
 
@@ -648,6 +657,12 @@ daily = run.splits["full"].statistics
 
 `EngineResult.splits` 在全样本时包含 `full`，切分时包含 `train` 和 `oos`。
 每个切分带有统计结果、逐持有期有效掩码、清除计数、分位方案和拟合身份。
+日频时序可将 `DailyReturnLabels.returns` 的 `"1D"`、`"5D"` 等列直接并入
+因子面板。收益、有效掩码与成交时间映射都按正整数交易日步数匹配，接受整数与
+`D/d` 后缀的等价键。同一映射内的重复别名会报错。统计结果、掩码和清除计数
+统一输出整数键，日频截面沿用输入键。分割仍使用实际收盘可用时间，日频收益
+沿用收盘到收盘的小数口径。连续期货的开盘到收盘标签按 Bar 网格计算百分数收益，
+跨 session 时需显式提供连续合约源，并按信号所在的原合约取成交价格。
 [`QuantileScheme`](../backtest_and_analysis/evaluation/quantiles.py) 支持
 `per_cross_section` 和 `fitted_on_train`。
 `cross_sectional` 采用 `per_cross_section`，支持 `raw` 和

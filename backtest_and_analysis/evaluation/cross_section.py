@@ -118,6 +118,14 @@ def _divide(sums: npt.ArrayLike, counts: npt.NDArray[np.intp]) -> FloatArray:
     return np.divide(sums, counts, out=np.full(counts.shape, np.nan), where=counts > 0)
 
 
+def _directional_masks(
+    factor: npt.NDArray[np.integer | np.floating], direction: int,
+) -> tuple[npt.NDArray[np.bool_], npt.NDArray[np.bool_]]:
+    # Negating a signed integer's minimum value can overflow.
+    positive, negative = factor > 0, factor < 0
+    return (positive, negative) if direction == 1 else (negative, positive)
+
+
 def _directional_accuracy(
     hits: npt.ArrayLike, counts: npt.NDArray[np.intp], ups: npt.ArrayLike,
 ) -> DirectionalAccuracy:
@@ -246,7 +254,7 @@ def evaluate_cross_section(
         autocorrelation = np.full(len(factor), np.nan)
         turnover = np.full((len(factor), n_quantiles), np.nan)
     if not _bar_v1:
-        long, short = direction * factor > 0, direction * factor < 0
+        long, short = _directional_masks(factor, direction)
     horizons = {}
     for horizon, returns in panel.returns.items():
         valid = panel.valid[horizon] & eligible & np.isfinite(returns)

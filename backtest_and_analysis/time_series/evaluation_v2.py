@@ -17,7 +17,9 @@ from backtest_and_analysis.evaluation.kernels import CorrelationResult
 from backtest_and_analysis.evaluation.panel import EvaluationPanel
 from backtest_and_analysis.evaluation.split import SplitConfig
 from backtest_and_analysis.evaluation.time_series import summarize_time_series_horizon
-from backtest_and_analysis.evaluation.types import CrossSectionResult, TimeSeriesInstrument, TimeSeriesResult
+from backtest_and_analysis.evaluation.types import (
+    CalibrationEvidence, CrossSectionResult, IntervalUsability, TimeSeriesInstrument, TimeSeriesResult,
+)
 
 from .contracts import ContractValidationError, _numeric_column
 from .labels import BarReturnLabeler, _grid
@@ -112,19 +114,29 @@ class BarTrialFamily:
             selection = None if pending or missing else self._ledger.select_best(method=self.method, alpha=self.alpha)
             reasons = self._reasons.copy()
             window = self._window
-        adjusted = {row.key: row.adjusted_p_value for row in selection.trials} if selection else {}
+        adjusted = {row.key: row for row in selection.trials} if selection else {}
+        inference_adjusted = selection.inference_adjusted_p_values if selection else {}
+        candidates = []
+        for key in self.candidates:
+            trial, row = records.get(key), adjusted.get(key)
+            candidates.append(dict(
+                factor_id=key[0], horizon=key[1],
+                **(asdict(trial) if trial is not None else dict(
+                    statistic=None, p_value=None, n_effective=None, interval=None, interval_usability=None,
+                )),
+                n_observations=trial.n_observations if trial is not None else None,
+                n_dependence_adjusted=None,
+                reason=reasons.get(key, 'not_evaluated'),
+                adjusted_p_value=row.adjusted_p_value if row else None,
+                inference_adjusted_p_value=inference_adjusted.get(key),
+                significant=row.significant if row else False,
+            ))
         return dict(
             method=self.method, alpha=self.alpha, attempt_count=len(self.candidates),
             selection_complete=selection is not None, best=selection.best if selection else None,
             pending_candidates=pending, missing_p_value_candidates=missing,
             **({'split': window[0]} if window is not None else {}),
-            candidates=[
-                dict(factor_id=key[0], horizon=key[1],
-                     **(asdict(records[key]) if key in records else
-                        dict(statistic=None, p_value=None, n_effective=None, interval=None)),
-                     reason=reasons.get(key, 'not_evaluated'), adjusted_p_value=adjusted.get(key))
-                for key in self.candidates
-            ],
+            candidates=candidates,
         )
 
 
@@ -198,7 +210,7 @@ def _time_series_rows(stats: TimeSeriesResult, instrument: str, frequency: str) 
         row = horizon.instruments[instrument]
         ic = _ic(row.spearman_ic)
         usability = evaluate_interval_usability(
-            row.bootstrap, point_estimate=ic['spearman_ic'], point_reason=ic['reason'],
+            row.bootstrap, point_estimate=ic['spearman_ic'], point_reason=ic['reason'], horizon=h,
         )
         rows.append(dict(
             instrument_id=instrument, frequency=frequency, horizon_bars=h,
@@ -220,7 +232,9 @@ def _cross_section_rows(stats: CrossSectionResult, frequency: str) -> list[dict[
         summary, hac = horizon.ic_summary, horizon.hac
         interval = asdict(hac)
         interval['pair_counts'] = hac.pair_counts.tolist()
-        usability = evaluate_interval_usability(hac, point_estimate=summary.mean)
+        usability = evaluate_interval_usability(
+            hac, point_estimate=summary.mean, horizon=h, cross_section_sizes=horizon.ic.counts,
+        )
         # Use the HAC variance in the same two-sided normal test underlying the interval.
         p_value = erfc(abs(summary.mean) / sqrt(hac.variance) / sqrt(2)) if hac.reason is None else None
         rows.append(dict(
@@ -254,9 +268,14 @@ def _record_trials(family: BarTrialFamily, rows: list[dict[str, Any]], *,
         else:
             statistic, count, interval = ic['mean'], ic['n_valid'], row['hac']
         bounds = interval['lower'], interval['upper']
+        usability = row['interval_usability']
+        evidence = usability['calibration_evidence']
+        if evidence is not None:
+            evidence = CalibrationEvidence(**evidence)
         trials[key] = (Trial(
             statistic if np.isfinite(statistic) else None, row.get('p_value'), count,
             bounds if np.isfinite(bounds).all() else None,
+            IntervalUsability(**(usability | {'calibration_evidence': evidence})),
         ), interval['reason'] or ic['reason'])
     family._record_trials(trials, window=window)
 

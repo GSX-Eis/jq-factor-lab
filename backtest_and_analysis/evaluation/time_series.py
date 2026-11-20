@@ -8,7 +8,7 @@ import numpy.typing as npt
 
 from . import kernels
 from .calibration import resolve_interval_calibration
-from .cross_section import _directional_accuracy, _time_mean
+from .cross_section import _directional_accuracy, _directional_masks, _time_mean
 from .kernels import CorrelationResult, QuantileResult
 from .panel import EvaluationPanel
 from .quantiles import QuantileFit
@@ -85,10 +85,10 @@ def _distribution(returns: FloatArray, empty_reason: str, *, location_only: bool
 
 
 def _direction(factor: FloatArray, returns: FloatArray, direction: int) -> DirectionalAccuracy:
-    active = factor != 0
+    long, short = _directional_masks(factor, direction)
+    active = long | short
     up = returns > 0
-    signed = direction * factor
-    hits = ((signed > 0) & up) | ((signed < 0) & (returns < 0))
+    hits = (long & up) | (short & (returns < 0))
     return _directional_accuracy(hits.sum(keepdims=True), active.sum(keepdims=True),
                                  (active & up).sum(keepdims=True))
 

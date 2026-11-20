@@ -39,6 +39,7 @@ class IntervalUsability:
     calibration_evidence: CalibrationEvidence | None
     descriptive_stats_usable: bool
     significance_interpretation_usable: bool
+    verified_horizon: int | None = None
 
 
 @dataclass(frozen=True)

@@ -359,24 +359,6 @@ class FactorBase:
     def _get_cache_key(self, raw_data: Optional[pd.DataFrame] = None) -> Optional[str]:
         return _cache._get_cache_key(self, FactorBase, StockFilter, apply_pit_adjustment, raw_data)
 
-    def _read_daily_cache(self, raw_data: pd.DataFrame, force_recalculate: bool,
-                          _original_key=_get_cache_key) -> tuple[Optional[str], Optional[pd.DataFrame]]:
-        if not self.cache_dir:
-            return None, None
-        get_key = self._get_cache_key
-        fallback_keys: list[str] = []
-        if not force_recalculate and getattr(get_key, "__func__", None) is _original_key:
-            key = _cache._get_cache_key(self, FactorBase, StockFilter, apply_pit_adjustment,
-                                       raw_data, fallback_keys=fallback_keys)
-        else:
-            key = get_key(raw_data)
-        if not force_recalculate and key:
-            for candidate in (key, *fallback_keys):
-                cached = self._load_from_cache(candidate)
-                if cached is not None:
-                    return key, cached
-        return key, None
-
     def _save_to_cache(self, data: pd.DataFrame, cache_key: str) -> None:
         return _cache._save_to_cache(self, data, cache_key)
 

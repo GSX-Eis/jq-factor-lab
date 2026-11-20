@@ -9,12 +9,16 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from backtest_and_analysis.evaluation import EvaluationEngine
+from backtest_and_analysis.evaluation import EvaluationEngine, evaluate_interval_usability
 from backtest_and_analysis.evaluation.calibration import Trial, TrialLedger
-from backtest_and_analysis.evaluation.split import SplitConfig
+from backtest_and_analysis.evaluation.cross_section import bartlett_hac
+from backtest_and_analysis.evaluation.panel import EvaluationPanel
+from backtest_and_analysis.evaluation.split import SplitConfig, align_released_features
 from backtest_and_analysis.time_series import (
-    BarReturnLabeler, BarTrialFamily, ResultIdentity, evaluate_bars, write_evaluation_artifacts,
+    BarReturnLabeler, BarTrialFamily, ResultIdentity, TimeSeriesEvaluator,
+    evaluate_bars, write_evaluation_artifacts,
 )
+from backtest_and_analysis.time_series.evaluation_v2 import _cross_section_rows, _record_trials
 from test_time_series_cli_end_to_end import base_config, read_outputs, run_cli
 from utils.session_calendar import SessionCalendar
 
@@ -48,6 +52,67 @@ def _labeler():
 
 def _artifacts(payload):
     return {item['artifact_type']: Path(item['path']) for item in payload['artifacts']}
+
+
+@pytest.mark.parametrize('dtype', [np.int8, np.int16, np.int32, np.int64])
+@pytest.mark.parametrize('direction', [1, -1])
+@pytest.mark.parametrize('mode', ['time_series', 'cross_sectional'])
+@pytest.mark.parametrize('case', ['audit', 'mixed'])
+def test_bar_v2_signed_integer_direction_counts(dtype, direction, mode, case):
+    smallest, largest = np.iinfo(dtype).min, np.iinfo(dtype).max
+    first = [smallest, -1, 0, 1, 2 if case == 'audit' else largest, 3]
+    closes = [101] * 6 if case == 'audit' else [101, 101, 100, 101, 99, 101]
+    signals = [first]
+    if mode == 'cross_sectional':
+        signals += [first, first] if case == 'audit' else [
+            [-1, 0, -1, -1, smallest, -1],
+            [1, 1, 1, 0, 0, 0],
+        ]
+
+    assets = ('A', 'B', 'C')[:len(signals)]
+    bars = _bars(periods=6, assets=assets)
+    bars['open'], bars['high'], bars['low'] = 100, 101, 99
+    bars['close'] = np.tile(closes, len(assets))
+    bars['factor_value'] = np.asarray(signals, dtype=dtype).ravel()
+    labeler = BarReturnLabeler(
+        SessionCalendar('NQ', start_date='2026-12-01', end_date='2026-12-01'),
+        entry_offset_bars=1, horizons=(1,),
+    )
+
+    def directions(frame):
+        result = evaluate_bars(
+            frame, labeler=labeler, analysis_mode=mode, evaluation_v2=True,
+            n_quantiles=2, direction=direction,
+        )
+        row, = result.evaluation_v2.splits['full']['horizons']
+        buckets = ({q: bucket['direction'] for q, bucket in row['buckets'].items()}
+                   if mode == 'time_series' else row['direction_by_bucket'])
+        return row['direction'], buckets
+
+    overall, buckets = directions(bars)
+    float_overall, float_buckets = directions(bars.astype({'factor_value': 'float64'}))
+
+    def counts(stats):
+        return stats['hits'], stats['denominator'], stats['up_count']
+
+    if case == 'audit':
+        assert counts(overall) == (2 * len(assets), 4 * len(assets), 4 * len(assets))
+    else:
+        # Lag 1 gives the first five signals returns with signs +, 0, +, -, +.
+        # A zero signal abstains. A zero return is an active miss for either direction.
+        if mode == 'time_series':
+            expected = {1: (0, 2, 1), 2: (1, 2, 1)} if direction == 1 else {
+                1: (1, 2, 1), 2: (1, 2, 1),
+            }
+        else:
+            expected = {1: (1, 6, 4), 2: (3, 5, 3)} if direction == 1 else {
+                1: (4, 6, 4), 2: (1, 5, 3),
+            }
+        assert {q: counts(stats) for q, stats in buckets.items()} == expected
+        assert counts(overall) == tuple(map(sum, zip(*expected.values(), strict=True)))
+
+    assert overall == float_overall
+    assert buckets == float_buckets
 
 
 def test_preregister_split_family_and_use_expected_grid_and_scheduled_exits(monkeypatch):
@@ -164,7 +229,10 @@ def test_hac_family_reports_raw_and_adjusted_p_values(method):
     candidates = ledger['candidates']
     assert [row['p_value'] for row in candidates] == pytest.approx(raw)
     assert [candidates[i]['adjusted_p_value'] for i in order] == pytest.approx(expected)
-    assert ledger['best'] == ('factor_value', candidates[order[0]]['horizon'])
+    assert ledger['best'] is None
+    assert all(not row['significant'] for row in candidates)
+    assert [row['n_observations'] for row in candidates] == [row['ic']['n_valid'] for row in rows]
+    assert all(row['n_dependence_adjusted'] is None for row in candidates)
     assert all(not row['interval_usability']['significance_interpretation_usable'] for row in rows)
 
 
@@ -180,20 +248,26 @@ def test_cross_section_split_counts_scheduled_exits_and_cross_section_scheme():
     assert oos['split_purged_count'] == {1: 0, 3: 0}
 
 
-def test_shared_trial_family_keeps_every_factor_and_waits_for_raw_p_values():
+@pytest.mark.parametrize('method', ['holm', 'bh'])
+def test_shared_trial_family_keeps_every_factor_and_waits_for_raw_p_values(method):
     keys = [('alpha', 1), ('alpha', 3), ('beta', 1)]
-    family = BarTrialFamily(keys, method='bh')
+    family = BarTrialFamily(keys, method=method)
     family.record(keys[0], Trial(.2, .031, 40))
     assert family.report()['pending_candidates'] == keys[1:]
     assert not family.report()['selection_complete']
     family.record(keys[1], Trial(.1, None, 25, (-.1, .3)), reason='test_unavailable')
-    family.record(keys[2], Trial(.3, .014, 40))
+    hac = bartlett_hac(np.linspace(-1., 1., 512) + .3, lag=0, calibration_scenario='independent_null')
+    use = evaluate_interval_usability(hac, point_estimate=.3, horizon=1, cross_section_sizes=[32] * 512)
+    family.record(keys[2], Trial(.3, .014, 512, (hac.lower, hac.upper), use))
     report = family.report()
     assert report['attempt_count'] == 3 and report['missing_p_value_candidates'] == [keys[1]]
     assert report['best'] is None and not report['selection_complete']
     assert [row['p_value'] for row in report['candidates']] == [.031, None, .014]
     assert [row['adjusted_p_value'] for row in report['candidates']] == [None] * 3
+    assert [row['inference_adjusted_p_value'] for row in report['candidates']] == [None] * 3
+    assert not any(row['significant'] for row in report['candidates'])
     assert report['candidates'][1]['reason'] == 'test_unavailable'
+    assert report['candidates'][2]['interval_usability']['significance_interpretation_usable']
 
 
 def test_cli_split_diagnostics_and_duckdb_keep_v1_compatible(tmp_path):
@@ -312,7 +386,7 @@ def test_evaluate_bars_records_only_current_factor_in_preregistered_family(monke
     assert [second['candidates'][i]['adjusted_p_value'] for i in order] == pytest.approx(
         [min(1., 2 * low), min(1., max(2 * low, high))],
     )
-    assert second['best'] == keys[order[0]]
+    assert second['best'] is None
     assert first['pending_candidates'] == [keys[1]] and not first['selection_complete']
 
     def unexpected_evaluation(*args, **kwargs):
@@ -442,7 +516,7 @@ def test_shared_train_selection_is_invariant_to_oos_factor_values_and_timezone_s
     after_oos, after = evaluate_family(changed_bars)
     assert before_oos != pytest.approx(after_oos)
     assert before['split'] == 'train' and before['selection_complete']
-    assert before['best'] is not None
+    assert before['best'] is None
     assert [trial['n_effective'] for trial in before['candidates']] == [32, 32]
     assert after == before
 
@@ -466,3 +540,270 @@ def test_manual_trials_cannot_mix_with_evaluation_window_records():
     with pytest.raises(ValueError, match='selection window'):
         family.record(keys[1], manual)
     assert family.report() == before
+
+
+def test_incomplete_embedded_signal_cannot_change_training_fit_or_trials():
+    bars = _bars().drop(index=12).assign(is_complete=True)
+    bars.loc[5, ['is_complete', 'factor_value']] = [False, 0.]
+    options = dict(labeler=_labeler(), analysis_mode='time_series', split=SPLIT,
+                   bootstrap=BOOTSTRAP, n_quantiles=4, standardization='zscore')
+    baseline = evaluate_bars(bars, **options)
+    bars.loc[5, 'factor_value'] = 1e6
+    replay = evaluate_bars(bars, **options)
+
+    fit = baseline.evaluation_v2.splits['train']['fit_identity']
+    assert replay.evaluation_v2.splits['train']['fit_identity'] == fit
+    assert replay.evaluation_v2.splits['oos']['fit_identity'] == fit
+    assert replay.evaluation_v2.trial_ledger == baseline.evaluation_v2.trial_ledger
+    pd.testing.assert_frame_equal(replay.per_bar_labels, baseline.per_bar_labels)
+    observed = fit['1min']['NQZ26']['instruments'][0]
+    train_complete = (bars.timestamp_utc < TRAIN_END) & bars.is_complete
+    training = bars.loc[train_complete, 'factor_value']
+    assert observed['center'] == pytest.approx(training.mean())
+    assert observed['training_edges'] == pytest.approx(np.quantile(training, np.linspace(0, 1, 5)))
+
+    labels = replay.per_bar_labels.set_index(['signal_timestamp', 'horizon_bars'])
+    incomplete = START + pd.Timedelta(minutes=5)
+    assert labels.loc[incomplete, 'exclusion_reason'].tolist() == ['missing_bar', 'missing_bar']
+    assert labels.loc[incomplete, 'entry_timestamp'].isna().all()
+    before_gap = START + pd.Timedelta(minutes=10)
+    assert labels.loc[(before_gap, 1), 'entry_timestamp'] == before_gap + pd.Timedelta(minutes=1)
+    assert labels.loc[(before_gap, 3), 'exclusion_reason'] == 'missing_bar'
+
+
+def test_incomplete_embedded_signal_cannot_change_cross_section_buckets():
+    bars = _bars(assets=('A', 'B', 'C', 'D', 'E')).assign(is_complete=True)
+    target = START + pd.Timedelta(minutes=5)
+    section = bars.timestamp_utc.eq(target)
+    bars.loc[section, 'factor_value'] = [-100., 1., 2., 3., 4.]
+    incomplete = section & bars.instrument_id.eq('A')
+    bars.loc[incomplete, 'is_complete'] = False
+    options = dict(labeler=_labeler(), analysis_mode='cross_sectional', split=SPLIT, n_quantiles=2)
+    baseline = evaluate_bars(bars, **options)
+    bars.loc[incomplete, 'factor_value'] = 1e6
+    replay = evaluate_bars(bars, **options)
+
+    for before, after in zip(baseline.evaluation_v2.splits['train']['horizons'],
+                             replay.evaluation_v2.splits['train']['horizons'], strict=True):
+        assert after['buckets'] == before['buckets']
+        assert after['direction_by_bucket'] == before['direction_by_bucket']
+    assert replay.evaluation_v2.trial_ledger == baseline.evaluation_v2.trial_ledger
+
+
+def test_external_signal_on_incomplete_bar_keeps_independent_availability():
+    bars = _bars().assign(is_complete=True)
+    bars.loc[5, 'is_complete'] = False
+    factors = bars[['timestamp_utc', 'instrument_id', 'factor_value']]
+    result = evaluate_bars(bars.drop(columns='factor_value'), factors, _labeler(),
+                           analysis_mode='time_series', split=SPLIT, bootstrap=BOOTSTRAP)
+    signal = bars.loc[5, 'timestamp_utc']
+    labels = result.per_bar_labels.set_index(['signal_timestamp', 'horizon_bars'])
+    assert labels.loc[signal, 'status'].tolist() == ['valid', 'valid']
+    assert labels.loc[signal, 'entry_timestamp'].tolist() == [bars.loc[6, 'timestamp_utc']] * 2
+    assert labels.loc[(bars.loc[4, 'timestamp_utc'], 1), 'exclusion_reason'] == 'missing_bar'
+
+
+@pytest.mark.parametrize('column', ['signal_available_at', 'available_at_utc', 'published_at'])
+def test_external_release_time_is_rejected_before_bar_evaluation(column):
+    bars = _bars()
+    factors = bars[['timestamp_utc', 'instrument_id', 'factor_value']].iloc[[0]].copy()
+    factors[column] = START + pd.Timedelta(minutes=10)
+    options = dict(labeler=_labeler(), analysis_mode='time_series', evaluation_v2=True,
+                   bootstrap=BOOTSTRAP)
+    family = BarTrialFamily(('factor_value', h) for h in HORIZONS)
+    initial = family.report()
+    for value in [1., 1e6]:
+        factors['factor_value'] = value
+        with pytest.raises(ValueError, match=rf'{column}.*align_released_features'):
+            evaluate_bars(bars, factors, trial_family=family, **options)
+        assert family.report() == initial
+
+
+
+@pytest.mark.parametrize('mode', ['time_series', 'cross_sectional'])
+def test_aligned_external_release_cannot_change_earlier_evaluation(mode):
+    bars = _bars(assets=('A', 'B', 'C', 'D'))
+    external = bars[['timestamp_utc', 'instrument_id', 'factor_value']]
+    a = external[external.instrument_id.eq('A')]
+    bar_ends = pd.DatetimeIndex(a.timestamp_utc + pd.Timedelta(minutes=1))
+    # One observation is usable at the first close and its successor releases in OOS.
+    release = OOS_START + pd.Timedelta(minutes=2)
+    features = pd.DataFrame(dict(high_tf_bar_end=bar_ends[:2],
+                                 signal_available_at=[bar_ends[0], release],
+                                 factor_value=[1., 2.]))
+    options = dict(labeler=_labeler(), analysis_mode=mode, split=SPLIT, n_quantiles=2)
+    if mode == 'time_series':
+        options.update(standardization='zscore', bootstrap=BOOTSTRAP)
+
+    results = []
+    for value in (2., 1e6):
+        features.loc[1, 'factor_value'] = value
+        aligned = align_released_features(features, bar_ends)
+        a_factors = a.assign(factor_value=aligned.factor_value.to_numpy())
+        factors = pd.concat([a_factors, external[~external.instrument_id.eq('A')]])
+        results.append(evaluate_bars(bars.drop(columns='factor_value'), factors, **options))
+
+    baseline, replay = results
+    early = 'signal_available_at < @release'
+    pd.testing.assert_frame_equal(baseline.per_bar_labels.query(early), replay.per_bar_labels.query(early))
+    labels = replay.per_bar_labels.query("instrument_id == 'A' and horizon_bars == 1").set_index(
+        'signal_available_at'
+    )
+    assert labels.loc[bar_ends[0], 'entry_timestamp'] == bar_ends[0]
+    assert labels.loc[release, 'entry_timestamp'] == release
+    assert labels.loc[release - pd.Timedelta(minutes=1), 'factor_value'] == 1.
+    assert labels.loc[release, 'factor_value'] == 1e6
+    train = baseline.evaluation_v2.splits['train']
+    replay_train = replay.evaluation_v2.splits['train']
+    assert replay_train['fit_identity'] == train['fit_identity']
+    if mode == 'cross_sectional':
+        assert [row['buckets'] for row in replay_train['horizons']] == [row['buckets'] for row in train['horizons']]
+    else:
+        fit = train['fit_identity']['1min']['A']['instruments'][0]
+        assert fit['center'] == 1. and fit['training_edges'] == [1.]
+    assert replay.evaluation_v2.trial_ledger == baseline.evaluation_v2.trial_ledger
+
+
+def test_external_release_time_is_rejected_for_precomputed_labels_and_cli(tmp_path):
+    bars = _bars()
+    labeler = _labeler()
+    labels = labeler.label(bars)
+    factors = bars[['timestamp_utc', 'instrument_id', 'factor_value']].assign(
+        signal_available_at=START + pd.Timedelta(minutes=10),
+    )
+    with pytest.raises(ValueError, match='signal_available_at.*align_released_features'):
+        TimeSeriesEvaluator(analysis_mode='time_series').evaluate(labels, factors)
+
+    bars_path, factors_path = tmp_path / 'bars.csv', tmp_path / 'factors.csv'
+    bars.drop(columns='factor_value').to_csv(bars_path, index=False)
+    factors.to_csv(factors_path, index=False)
+    payload = run_cli(tmp_path, base_config(bars_path, factors_csv=str(factors_path)))
+    assert payload['exit_code'] == 2
+    assert 'align_released_features' in payload['error']['message']
+    assert all(item['artifact_type'] != 'per_bar_labels' for item in payload['artifacts'])
+
+
+@pytest.mark.parametrize(('method', 'audit', 'gated', 'claimed'), [
+    ('holm', [.005, .008, .012, .02, .009], [.03, .08], [True, False]),
+    ('bh', [.005, .005, .0075, .02, .005], [.03, .05], [True, True]),
+])
+def test_mixed_calibration_family_keeps_denominator_and_ignores_ineligible_evidence(method, audit, gated, claimed):
+    keys = [(name, 1) for name in ('unknown', 'failed', 'best', 'other', 'wrong_width')]
+    family = BarTrialFamily(keys, method=method)
+    setups = [(None, 32), ('ar1_null', 32), ('independent_null', 32),
+              ('independent_null', 32), ('independent_null', 31)]
+    p_values = [.001, .002, .006, .02, .003]
+    for key, (scenario, width), p in zip(keys, setups, p_values, strict=True):
+        hac = bartlett_hac(np.linspace(-1., 1., 512) + .1, lag=0, calibration_scenario=scenario)
+        use = evaluate_interval_usability(hac, point_estimate=.1, horizon=1, cross_section_sizes=[width] * 512)
+        family.record(key, Trial(.1, p, 512, (hac.lower, hac.upper), use))
+
+    report = family.report()
+    rows = report['candidates']
+    assert report['selection_complete'] and report['attempt_count'] == 5
+    assert report['best'] == keys[2]
+    assert [row['p_value'] for row in rows] == p_values
+    assert [row['adjusted_p_value'] for row in rows] == pytest.approx(audit)
+    assert [row['inference_adjusted_p_value'] for row in rows[2:4]] == pytest.approx(gated)
+    assert [rows[i]['inference_adjusted_p_value'] for i in (0, 1, 4)] == [None] * 3
+    assert [row['significant'] for row in rows] == [False, False, *claimed, False]
+    assert [row['interval_usability']['calibration_status'] for row in rows] == [
+        'uncalibrated', 'calibrated_fail', 'calibrated_pass', 'calibrated_pass', 'calibrated_pass',
+    ]
+
+
+@pytest.mark.parametrize(('width', 'horizon', 'missing', 'usable'), [
+    (32, 1, False, True),
+    (31, 1, False, False),
+    (32, 2, False, False),
+    (32, 1, True, False),
+])
+def test_dense_calibration_design_controls_candidate_selection(width, horizon, missing, usable):
+    rng = np.random.default_rng(917)
+    index = pd.MultiIndex.from_product([pd.date_range(START, periods=512, freq='min'), range(width)])
+    factor = rng.standard_normal(len(index))
+    returns = .3 * factor + rng.standard_normal(len(index))
+    if missing:
+        returns[:width] = np.nan
+    panel = EvaluationPanel.from_long(pd.DataFrame({'factor': factor, horizon: returns}, index=index))
+    scenario, lag = ('independent_null', 0) if horizon == 1 else ('overlap_null', 16)
+    stats = EvaluationEngine('cross_sectional').evaluate(
+        panel, calibration_scenario=scenario, hac_lag=lag,
+    ).splits['full'].statistics
+    rows = _cross_section_rows(stats, '1min')
+    key = ('signal', horizon)
+    family = BarTrialFamily([key])
+    _record_trials(family, rows, keys=(key,), mode='cross_sectional', window=('full', None))
+
+    report = family.report()
+    row, = report['candidates']
+    assert row['n_observations'] == row['n_effective'] == 512 - int(missing)
+    assert row['n_dependence_adjusted'] is None
+    assert row['statistic'] > 0.2 and row['adjusted_p_value'] == row['p_value'] < .05
+    assert row['interval_usability']['calibration_status'] == 'calibrated_pass'
+    assert row['interval_usability']['significance_interpretation_usable'] is usable
+    assert row['significant'] is usable
+    assert report['best'] == (key if usable else None)
+
+
+def test_evaluate_bars_selects_significant_candidate_in_dense_train_with_exit_buffer():
+    bars = _bars(525, assets=tuple(f'A{i:02}' for i in range(32)))
+    bars['timestamp_utc'] -= pd.Timedelta(hours=3)
+    start = bars.timestamp_utc.min()
+    prior_signal = bars.groupby('instrument_id').factor_value.shift().fillna(0)
+    bars['close'] += np.tanh(prior_signal)
+    split = SplitConfig(start + pd.Timedelta(minutes=512), start + pd.Timedelta(minutes=516))
+    labeler = BarReturnLabeler(_labeler().calendar, horizons=[1])
+
+    result = evaluate_bars(
+        bars, labeler=labeler, analysis_mode='cross_sectional', split=split,
+        calibration_scenario='independent_null',
+    ).evaluation_v2
+
+    report = result.trial_ledger
+    row, = report['candidates']
+    assert report['split'] == 'train' and report['best'] == ('factor_value', 1)
+    assert result.splits['train']['split_purged_count'] == {1: 0}
+    assert row['n_observations'] == 512
+    assert row['significant'] and row['interval_usability']['verified_horizon'] == 1
+    assert row['inference_adjusted_p_value'] == row['adjusted_p_value'] == row['p_value'] < .05
+
+
+@pytest.mark.parametrize('method,audit', [
+    ('holm', [.003, .024, .04]),
+    ('bh', [.003, .018, .04]),
+])
+@pytest.mark.parametrize('design', ['wrong_horizon', 'missing_width', 'missing_horizon'])
+def test_public_ledgers_gate_candidates_without_matching_calibration_design(method, audit, design):
+    keys = [('unsupported', 5 if design == 'wrong_horizon' else 1), ('one_step', 1), ('five_step', 5)]
+    values = np.linspace(-1., 1., 512) + .1
+    widths = [32] * 512
+    one_step = bartlett_hac(values, lag=0, calibration_scenario='independent_null')
+    five_step = bartlett_hac(values, lag=16, calibration_scenario='overlap_null')
+    specs = [
+        (one_step, .001, None if design == 'missing_horizon' else 1,
+         None if design == 'missing_width' else widths),
+        (one_step, .012, 1, widths),
+        (five_step, .04, 5, widths),
+    ]
+    ledger = TrialLedger(keys)
+    bar_family = BarTrialFamily(keys, method=method)
+    for key, (interval, raw, horizon, sizes) in zip(keys, specs, strict=True):
+        use = evaluate_interval_usability(interval, point_estimate=.1, horizon=horizon, cross_section_sizes=sizes)
+        trial = Trial(.1, raw, 512, (interval.lower, interval.upper), use)
+        ledger.record(key, trial)
+        bar_family.record(key, trial)
+
+    selection = ledger.select_best(method=method)
+    report = bar_family.report()
+    rows = report['candidates']
+    assert selection.attempt_count == report['attempt_count'] == 3
+    assert [row.trial.p_value for row in selection.trials] == [row['p_value'] for row in rows] == [.001, .012, .04]
+    assert [row.adjusted_p_value for row in selection.trials] == pytest.approx(audit)
+    assert [row['adjusted_p_value'] for row in rows] == pytest.approx(audit)
+    assert keys[0] not in selection.inference_adjusted_p_values
+    assert rows[0]['inference_adjusted_p_value'] is None
+    assert selection.inference_adjusted_p_values[keys[1]] == pytest.approx(.036)
+    assert keys[2] in selection.inference_adjusted_p_values
+    assert [row.significant for row in selection.trials] == [row['significant'] for row in rows] == [False, True, False]
+    assert selection.best == report['best'] == keys[1]

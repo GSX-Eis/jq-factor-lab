@@ -56,10 +56,12 @@ def get_factor_values(self, factor_base_cls: type, force_recalculate: bool = Fal
     # Read first: mutable files and borrowed connections have no immutable
     # version token. Cache calculations only after identifying actual inputs.
     raw_data = self._get_raw_data_for_factor()
-    cache_key, cached_result = factor_base_cls._read_daily_cache(self, raw_data, force_recalculate)
-    if cached_result is not None:
-        self.logger.info(f"从缓存加载因子 {self.factor_name}")
-        return cached_result
+    cache_key = self._get_cache_key(raw_data) if self.cache_dir else None
+    if not force_recalculate and cache_key:
+        cached_result = self._load_from_cache(cache_key)
+        if cached_result is not None:
+            self.logger.info(f"从缓存加载因子 {self.factor_name}")
+            return cached_result
 
     # Expose raw inputs to diagnostics while tolerating read-only overrides.
     try:

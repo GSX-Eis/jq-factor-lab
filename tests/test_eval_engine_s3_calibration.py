@@ -9,8 +9,19 @@ from backtest_and_analysis.evaluation.calibration import (
     adjust_pvalues,
     calibrate_coverage,
     coverage_passes,
+    evaluate_interval_usability,
     synthetic_sample,
 )
+from backtest_and_analysis.evaluation.cross_section import bartlett_hac
+
+
+def _eligible_trial(statistic, p_value, *, horizon=1):
+    scenario, lag = ("independent_null", 0) if horizon == 1 else ("overlap_null", 16)
+    interval = bartlett_hac(np.linspace(-1, 1, 512), lag=lag, calibration_scenario=scenario)
+    use = evaluate_interval_usability(
+        interval, point_estimate=statistic, horizon=horizon, cross_section_sizes=[32] * 512,
+    )
+    return Trial(statistic, p_value, 512, (interval.lower, interval.upper), use)
 
 
 def test_synthetic_overlap_shares_exactly_four_single_step_returns():
@@ -112,7 +123,7 @@ def test_ledger_selects_only_after_all_factors_and_horizons_are_recorded():
     family = [("first", 1), ("first", 5), ("second", 1)]
     first, winner, last = family
     ledger = TrialLedger(family)
-    winning_trial = Trial(0.18, 0.02, 99, (0.01, 0.35))
+    winning_trial = _eligible_trial(0.18, 0.02, horizon=winner[1])
     ledger.record(winner, winning_trial)
     with pytest.raises(ValueError, match="Missing trial records"):
         ledger.select_best(method="holm")
@@ -120,12 +131,12 @@ def test_ledger_selects_only_after_all_factors_and_horizons_are_recorded():
         ledger.record(("second", 5), winning_trial)
     with pytest.raises(ValueError, match="already recorded"):
         ledger.record(winner, winning_trial)
-    ledger.record(last, Trial(0.10, 0.03, 150))
-    ledger.record(first, Trial(0.08, 0.04, 150))
+    ledger.record(last, _eligible_trial(0.10, 0.03))
+    ledger.record(first, _eligible_trial(0.08, 0.04))
 
     holm = ledger.select_best(method="holm")
     bh = ledger.select_best(method="bh")
-    assert holm.best == bh.best == winner
+    assert holm.best is None and bh.best == winner
     assert holm.attempt_count == bh.attempt_count == 3
     assert [row.key for row in holm.trials] == family
     winner_row = holm.trials[1]
@@ -166,7 +177,7 @@ def test_ledger_bh_includes_ties_at_significance_boundary():
     keys = [("first", 1), ("first", 5), ("second", 1)]
     ledger = TrialLedger(keys)
     for key in keys:
-        ledger.record(key, Trial(0.18, 0.05, 99))
+        ledger.record(key, _eligible_trial(0.18, 0.05, horizon=key[1]))
     result = ledger.select_best(method="bh", alpha=0.05)
     assert [(row.adjusted_p_value, row.significant) for row in result.trials] == [(0.05, True)] * 3
 
@@ -180,9 +191,22 @@ def test_ledger_bh_significance_at_interior_rank(p_value, adjusted_p, significan
     keys = [(f"factor_{i}", 1) for i in range(100)]
     ledger = TrialLedger(keys)
     for key, raw_p in zip(keys, [p_value] * 83 + [1.0] * 17):
-        ledger.record(key, Trial(0.18, raw_p, 99))
+        ledger.record(key, _eligible_trial(0.18, raw_p))
 
     result = ledger.select_best(method="bh", alpha=0.05)
     assert [(row.adjusted_p_value, row.significant) for row in result.trials] == (
         [(adjusted_p, significant)] * 83 + [(1.0, False)] * 17
     )
+
+
+def test_selection_alpha_cannot_exceed_the_registered_error_rate():
+    key = ("factor", 1)
+    ledger = TrialLedger([key])
+    ledger.record(key, _eligible_trial(.2, .001))
+
+    assert ledger.select_best(method="holm", alpha=.05).best == key
+    report = ledger.select_best(method="holm", alpha=.1)
+    assert report.trials[0].adjusted_p_value == .001
+    assert not report.trials[0].significant
+    assert not report.inference_adjusted_p_values
+    assert report.best is None

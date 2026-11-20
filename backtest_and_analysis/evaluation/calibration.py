@@ -2,7 +2,7 @@
 
 from collections import Counter
 from collections.abc import Iterable
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from math import asin, isfinite, pi, sqrt
 from typing import Literal, NamedTuple
 
@@ -24,6 +24,7 @@ _ALPHA = 0.05
 _NOMINAL_COVERAGE = 1 - _ALPHA
 _TOLERANCE_MCSE = 3
 _REGISTERED_BOOTSTRAP_REPLICATES = 399
+_REGISTERED_CROSS_SECTION_ASSETS = 32
 
 
 @dataclass(frozen=True)
@@ -137,8 +138,13 @@ def resolve_interval_calibration(
 
 def evaluate_interval_usability(
     interval: HACInterval | BootstrapInterval, *, point_estimate: float, point_reason: str | None = None,
+    horizon: int | None = None, cross_section_sizes: npt.ArrayLike | None = None,
 ) -> IntervalUsability:
-    """Assess the point estimate and verify applicability of the frozen coverage evidence."""
+    """Assess usability and bind a horizon when the full registered design was checked."""
+    if horizon is not None:
+        horizon = _positive_int(horizon, "horizon")
+    design_supplied = horizon is not None
+    verified_horizon = None
     status: CalibrationStatus = "uncalibrated"
     evidence = None
     applicable = False
@@ -147,7 +153,15 @@ def evaluate_interval_usability(
         method: CalibrationMethod
         if isinstance(interval, HACInterval):
             method, window = "cross_section_hac", interval.lag
-            applicable = interval.n_valid == interval.grid_size
+            design_supplied = design_supplied and cross_section_sizes is not None
+            applicable = interval.n_valid == interval.grid_size and (
+                cross_section_sizes is None
+                or (
+                    np.shape(cross_section_sizes) == (interval.grid_size,)
+                    and not np.ma.is_masked(cross_section_sizes)
+                    and bool(np.all(np.asarray(cross_section_sizes) == _REGISTERED_CROSS_SECTION_ASSETS))
+                )
+            )
         else:
             method, window = "time_series_mbb", interval.block_length
             applicable = (
@@ -160,15 +174,20 @@ def evaluate_interval_usability(
         )
         if candidate == registered_evidence and interval.calibration_status == registered_status:
             status, evidence = registered_status, registered_evidence
+            applicable = applicable and (horizon is None or horizon == _SCENARIOS[candidate.scenario].horizon)
+            if applicable and design_supplied:
+                verified_horizon = horizon
 
+    point_usable = point_reason is None and isfinite(point_estimate)
     return IntervalUsability(
         reason=interval.reason,
         calibration_status=status,
         calibration_evidence=evidence,
-        descriptive_stats_usable=point_reason is None and isfinite(point_estimate),
+        descriptive_stats_usable=point_usable,
         significance_interpretation_usable=(
-            interval.reason is None and status == "calibrated_pass" and applicable
+            point_usable and interval.reason is None and status == "calibrated_pass" and applicable
         ),
+        verified_horizon=verified_horizon,
     )
 
 
@@ -188,7 +207,7 @@ class _CoverageCounts:
 
 def calibrate_coverage(
     *, seed: int = 791823, cross_section_repetitions: int = 2000,
-    time_series_repetitions: int = 500, n_times: int = 512, n_assets: int = 32,
+    time_series_repetitions: int = 500, n_times: int = 512, n_assets: int = _REGISTERED_CROSS_SECTION_ASSETS,
     n_boot: int = _REGISTERED_BOOTSTRAP_REPLICATES,
 ) -> dict:
     """Run the fixed synthetic scenarios through the S3-A and S3-B interval estimators."""
@@ -313,13 +332,36 @@ def adjust_pvalues(p_values: npt.ArrayLike, *, method: Correction) -> FloatArray
 
 @dataclass(frozen=True)
 class Trial:
+    """One attempt; the legacy n_effective field counts observed pairs or sections."""
+
     statistic: float | None
     p_value: float | None
     n_effective: int
     interval: tuple[float, float] | None = None
+    interval_usability: IntervalUsability | None = None
+
+    @property
+    def n_observations(self) -> int:
+        return self.n_effective
+
+    def inference_eligible(self, *, horizon: int, alpha: float) -> bool:
+        use = self.interval_usability
+        return (
+            self.p_value is not None and self.interval is not None
+            and use is not None and use.reason is None and use.descriptive_stats_usable
+            and use.significance_interpretation_usable and use.calibration_status == "calibrated_pass"
+            and use.calibration_evidence is not None
+            and use.calibration_evidence.passes
+            and use.calibration_evidence.sample_size == self.n_observations
+            and 1 - alpha >= use.calibration_evidence.nominal_coverage
+            and use.calibration_evidence in REGISTERED_CALIBRATIONS
+            and use.verified_horizon == horizon == _SCENARIOS[use.calibration_evidence.scenario].horizon
+        )
 
     def __post_init__(self) -> None:
         _positive_int(self.n_effective, "n_effective", minimum=0)
+        if self.interval_usability is not None and not isinstance(self.interval_usability, IntervalUsability):
+            raise TypeError("interval_usability must be an IntervalUsability")
         if self.statistic is not None and not np.isfinite(self.statistic):
             raise ValueError("statistic must be finite or None")
         if self.p_value is not None and not 0 <= self.p_value <= 1:
@@ -330,10 +372,12 @@ class Trial:
                 raise ValueError("interval must be a pair of ordered finite bounds")
         if self.p_value is not None or self.interval is not None:
             if self.statistic is None or not self.n_effective:
-                raise ValueError("inference requires a statistic and at least one effective sample")
+                raise ValueError("inference requires a statistic and at least one observation")
 
 
 class AdjustedTrial(NamedTuple):
+    """Audit adjustment and gated significance decision."""
+
     key: TrialKey
     trial: Trial
     adjusted_p_value: float
@@ -342,10 +386,11 @@ class AdjustedTrial(NamedTuple):
 
 @dataclass(frozen=True)
 class TrialSelection:
-    best: TrialKey
+    best: TrialKey | None
     method: Correction
     alpha: float
     trials: tuple[AdjustedTrial, ...]
+    inference_adjusted_p_values: dict[TrialKey, float] = field(default_factory=dict)
 
     @property
     def attempt_count(self) -> int:
@@ -384,7 +429,7 @@ class TrialLedger:
         return self._trials.copy()
 
     def select_best(self, *, method: Correction, alpha: float = 0.05) -> TrialSelection:
-        """Return the full adjusted family and the strongest candidate by p-value."""
+        """Return audit adjustments and select among eligible, significant candidates."""
         if not 0 < alpha < 1:
             raise ValueError("alpha must be in (0, 1)")
         missing = self._expected - self._trials.keys()
@@ -398,9 +443,20 @@ class TrialLedger:
                 raise ValueError(f"Missing raw p-value for {key!r}")
             p_values.append(p_value)
         adjusted = adjust_pvalues(p_values, method=method)
+        eligible = [
+            self._trials[key].inference_eligible(horizon=key[1], alpha=alpha) for key in self._candidates
+        ]
+        # Keep every registered hypothesis in the denominator, without borrowing evidence
+        # from the raw p-values of ineligible candidates.
+        inference = adjust_pvalues(np.where(eligible, p_values, 1.), method=method)
         trials = tuple(
-            AdjustedTrial(key, self._trials[key], float(p), bool(p <= alpha))
-            for key, p in zip(self._candidates, adjusted)
+            AdjustedTrial(key, self._trials[key], float(p), bool(usable and q <= alpha))
+            for key, p, q, usable in zip(self._candidates, adjusted, inference, eligible, strict=True)
         )
-        best = self._candidates[int(np.argmin(p_values))]
-        return TrialSelection(best, method, alpha, trials)
+        winners = [(p, index) for index, (p, row) in enumerate(zip(p_values, trials, strict=True))
+                   if row.significant]
+        winner = self._candidates[min(winners)[1]] if winners else None
+        inference_adjusted = {
+            key: float(q) for key, q, usable in zip(self._candidates, inference, eligible, strict=True) if usable
+        }
+        return TrialSelection(winner, method, alpha, trials, inference_adjusted)
