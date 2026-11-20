@@ -142,6 +142,12 @@ $$
 
 ### IC 均值的 HAC 置信区间
 
+统一入口默认使用 `cs_hac_adaptive_v1`。它在完整时间网格上做 AR(1) 预白化，
+以间隔幂处理跨缺口转移，依据加权创新选取 Bartlett 滞后。滞后下界为各持有期的
+`h - 1`。去均值后的二次型经矩修正，区间与双侧 p 值共用 Student t 分布和有效自由度。
+`HACInterval` 报告版本、实际滞后、预白化系数、有效自由度、临界值和缺口模式。
+显式整数窗口使用以下固定 Bartlett HAC。
+
 时间轴是预先冻结的应有信号网格（交易日或按日历定义的 Bar 槽位）。跨市场截面取预先绑定的各市场网格的并集。计划休市不占位，网格内无有效 IC 的槽位仍占位。设网格大小为 $N$，$m_t=\mathbf 1\{t\in V\}$，构造中心化得分
 
 $$
@@ -184,6 +190,12 @@ $$
 `fit_identity` 为 `None`。
 
 ### IC 的块 bootstrap 置信区间
+
+统一入口默认使用 `ts_boot_adaptive_v1`。它用标准化秩乘积的依赖结构选择块长，
+以当前持有期的 `h` 为下界。圆形块复制保留缺口并重新排名，Fisher-z 尺度的
+学生化枢轴经反演后给出 Spearman 区间。默认请求 999 次复制，至少 900 次有效。
+`BootstrapInterval` 报告版本、抽样与区间方法、实际块长、有效块数和复制计数。
+显式整数块长使用以下移动块百分位区间。
 
 在该品种当前切分的应有网格上做移动块 bootstrap。设网格有 $N$ 个槽位，原始 IC 可估计且 $h\le b<N$ 时，取长度 $b$ 的连续块。从 $N-b+1$ 个可用起点均匀有放回抽取 $\lceil N/b\rceil$ 个块，连接后截取前 $N$ 个槽位。因子、收益和有效掩码共同移动，缺失槽位占据原块位置，块不跨切分边界，也不循环拼接原序列首尾。
 
@@ -326,6 +338,42 @@ Holm (`holm`) 在原始 p 值有效时控制族错误率（FWER），允许检�
 可运行公开基准脚本
 [tools/benchmarks/trial_ledger_calibration.py](../tools/benchmarks/trial_ledger_calibration.py)复现独立合成压力实验。脚本输出各场景的覆盖率和多重检验结果。
 
+### 6.3 自适应适用域与独立校准
+
+自适应校准按方法版本和声明的依赖场景匹配登记域。核对项包括有效样本数、
+网格长度、缺失模式及比例、95% 标称覆盖率和持有期结构下界。截面还须核对
+Spearman IC 的有效槽宽与有效自由度。时序还须核对持仓区间、有效块数、
+申请复制数及有效复制数和比例。未获认证或超出适用域的观测保持 `uncalibrated`，
+在 `TrialLedger.select_best()` 中以 p=1 参与推断校正。
+
+`evaluation.v2` 保存 `interval_usability.adaptive_observation`。登记证据绑定版本、
+适用域 ID 和报告 SHA-256。截面候选的账本门控核对观测数、持有期、区间端点和
+重算的 Student t 双侧 p 值，包括 p 是否恰好等于 0.05。时序区间不提供原始 p 值。
+原 14 项固定窗口登记按 §6.1 解释。
+
+S4 用根种子 `93620261120` 对 160 个覆盖格和 4 个相关候选族执行历史联合门禁。
+该次验证有 19 个泛化覆盖格欠覆盖，`iid` 混合族 BH FWER 为 8.60%，当时两法均未登记。
+
+S5 用独立根种子 `93620261125` 对 88 个覆盖格和 4 个相关候选族每格重复 500 次，
+按方法独立判定。HAC 的 8 个核心格、54 个泛化格、2 个方向判据和 4 个相关族全部通过。
+混合族 BH 用 FDR 判定，FWER 随报告提供。`iid` 混合族的 BH FDR 为 3.22%，FWER 为 8.80%。
+Bootstrap 的 8 个核心格和 2 个方向判据通过，18 个泛化格中有 3 个覆盖 460/500，
+低于逐格下限 461/500。S5 整体判定为失败，HAC 依独立门禁获准登记。
+
+- `cs_hac_adaptive_v1` 登记 8 个核心域和 1 个泛化域。核心场景为 `iid`、`strong_ar`、
+  `overlap`、`gaps`、`heteroskedastic`、`combined`、`positive_effect` 和
+  `negative_effect`，使用固定 `T=512, N=32` 及对应持有期与精确缺口模式。
+  泛化场景 `generalized_ar_heteroskedastic` 要求 `256 ≤ T ≤ 1024`、有效槽的恒定
+  宽度 `32 ≤ N ≤ 64`、至少 180 个有效槽、缺失率至多 30% 和有效自由度至少 4。
+  支持 `h ∈ {1, 5, 20}`，缺口模式为 `none`、`periodic_17_3` 或 `periodic_17_5`。
+  匹配且估计有效时返回 `calibrated_pass`，账本用已绑定的双侧 p 值进行显著性判定。
+  `T=128`、`N=16` 或其他超域观测保持 `uncalibrated`。
+- `ts_boot_adaptive_v1` 登记 0 域，生产一律返回 `uncalibrated`。
+  `T=128` 和 `T=256` 同时低于 S5 泛化候选域的 `T=512` 下界。
+
+可运行公开基准脚本
+[tools/benchmarks/adaptive_inference_calibration.py](../tools/benchmarks/adaptive_inference_calibration.py)复现 S4 与 S5 的合成覆盖率和多重检验实验。
+
 ## 7. 不可估计状态
 
 不可估计的指标返回缺失值（表格 `NaN`，JSON `null`），并带有原因码及可用计数。计数为零是有效的计数结果。只让该指标缺失，它依赖的独立统计量仍可报告。
@@ -352,8 +400,6 @@ Holm (`holm`) 在原始 p 值有效时控制族错误率（FWER），允许检�
 | 仅一个有效 IC 时的日频 IR（有意差异） | `AlphalensRunner` 将唯一 IC 填入 IR | 统一结果的 ICIR 缺失，原因 `insufficient_valid_cross_sections`。旧格式适配器的兼容行为单独验证。 |
 | 日频 NumPy 无符号入场偏移（旧缺陷修复） | 旧版位移计算可使 `np.uint8(1)` 取负回绕为 255，使用错误的入场价或错误的有效信号键。 | 日频先验证偏移，再转为 Python 整数，使位移和成交端点使用同一个偏移。旧缓存键无法区分相同数值的偏移类型，新计算使用 `forward_returns.v4` 缓存键。 |
 | 截面分桶收益口径 | 旧日频主路径默认减当日截面均值，手工回退用原始均值 | 第 3 节明确两种口径，结果声明所用口径。 |
-| 时序分桶 | Bar v1 沿用全样本描述性分桶 | 统一引擎有训练/OOS 切分时使用训练冻结分位，见第 4 节。 |
-| 时序非重叠诊断 | Bar v1 在按时间排序的候选序列上保留第 0 相位 | 统一推断和时序诊断报告按应有网格检查全部 $h$ 个起始偏移与实际持仓区间，见第 4 节。 |
 
 ## 9. 夹具索引
 
@@ -544,10 +590,10 @@ result = evaluate_cross_section(
 也可选择 `"cross_section_excess"`。`low_quantile` 与
 `high_quantile` 默认为第 1 桶和请求的最高桶，可显式指定。
 `direction` 默认为 `+1`，也可取 `-1`，用于方向准确率。
-直接调用 `evaluate_cross_section` 时，`hac_lag` 接受一个非负整数或以面板持有期键
-索引的滞后映射。整数用于所有持有期，映射须为每个持有期提供滞后。接口按给定值计算，
-调用方须预先为每期满足 `h - 1` 的最低要求。各期共用 `alpha`，默认 0.05。
-[统一入口](#15-统一评测入口)接受一个整数，并自动为每期取 `max(hac_lag, h - 1)`。
+直接调用 `evaluate_cross_section` 时，`hac_lag` 默认为 `"auto"`，也接受非负整数
+或逐持有期窗口映射。自动滞后按当前持有期应用 `h - 1` 的下界。直接传入整数为
+最终固定窗口，调用方负责满足各期下界。各期共用 `alpha`，默认 0.05。
+[统一入口](#15-统一评测入口)收到整数时为每期取 `max(hac_lag, h - 1)`。
 
 | 结果字段 | 形状与含义 |
 | --- | --- |
@@ -592,8 +638,8 @@ result = evaluate_time_series(
 )
 ```
 
-`block_length`、`seed`、`n_boot` 和 `min_valid_replicates` 由调用方预先指定。
-同次调用的块长至少为最大的持有期。每个品种用记录的种子在自身网格上重采样。
+`block_length` 默认为 `"auto"`，按各持有期的 `h` 限制块长下界。显式整数块长
+必须满足所有持有期的下界。每个品种用记录的种子在自身网格上重采样。
 默认 `alpha=0.05`、`min_samples=3`、`ic_method="spearman"`、`direction=+1`。
 `ic_method="pearson"` 时，点估计和相位 IC 使用 Pearson，bootstrap 仍对应
 另行报告的 `spearman_ic`。
@@ -630,8 +676,8 @@ result = evaluate_time_series(
   Bar 的时间与覆盖边界按标签入口的会话网格及覆盖范围处理。
 - `mode="cross_section"` 使用 `per_cross_section`。`mode="time_series"`
   使用 `fitted_on_train`，还须传入同形、同持有期键的
-  `entry_timestamps`。时序持有期键用正整数，Bar 的 `return_pct` 先转成
-  小数收益。已有的统计参数沿用第 12、13 节的名称。
+  `entry_timestamps`。时序持有期键用正整数。统计沿用面板的收益单位，
+  已有参数沿用第 12、13 节的名称。
 - 输出以 `train` 和 `oos` 为键，各自提供 `statistics`、逐持有期对齐的
   `valid` 与 `split_purged_count`，以及 `quantile_scheme`、`fit_identity`。
   时序拟合身份支持字符串或整数品种标识。
@@ -642,7 +688,9 @@ result = evaluate_time_series(
 ## 15. 统一评测入口
 
 `EvaluationEngine` 接收已对齐、已标注的 `EvaluationPanel`。每个面板对应
-日频或一种 Bar 频率。统一接口按传入收益量纲计算，Bar 研究面板约定使用小数收益，持有期键用网格步数。
+日频或一种 Bar 频率。统一接口按传入收益量纲计算，持有期键用网格步数。
+直接构造跨频率研究面板时使用小数收益。`evaluate_bars()` 传入百分数收益，
+使主契约中的标准表、切分和诊断沿用同一单位。
 标签计算仍按第 1 节选择日频或 Bar 的执行约定。
 
 ```python
@@ -677,40 +725,58 @@ daily = run.splits["full"].statistics
 分布和已验证的非重叠诊断。省略两个持仓时间戳时，`intervals_verified` 为
 `False`，相位 IC 按网格位置抽取，bootstrap 区间的原因码为
 `holding_intervals_unavailable`。截面持有期使用整数网格步数，日频也支持
-`"5D"` 这类键。统一入口的 `hac_lag` 为非负整数，默认 0。每个持有期在
-每个切分上自动使用 `max(hac_lag, h - 1)`。需要直接指定逐期滞后时，使用
-[截面统计接口](#12-截面统计接口)。时序 bootstrap 默认块长为最长持有期，
-种子为 0，复制 999 次，最低有效次数为 900。统计配置可通过同名关键字覆盖。
+`"5D"` 这类键。统一入口的 `hac_lag` 默认 `"auto"`，逐持有期使用 `h - 1`
+结构下界。显式整数固定为 `max(hac_lag, h - 1)`。需要直接指定逐期滞后时，使用
+[截面统计接口](#12-截面统计接口)。时序 `block_length` 默认 `"auto"`，各持有期以
+`h` 为下界。种子为 0，复制 999 次，至少 900 次有效。
 
-三个旧入口保留原接口。日频字典沿用旧 Spearman 舍入和 pandas 样本标准差，
+日频 runner 字典沿用旧 Spearman 舍入和 pandas 样本标准差，
 并保留唯一 IC 作为 IR。分位主路径由引擎计算当日截面超额收益的逐桶均值和逐桶
 标准误，标准误为桶内样本标准差除以样本数的平方根，少于两条观测时为缺失。
-runner 的显式回退开关返回原始逐桶均值和旧版宽表。Bar v1 产物
-沿用百分数收益、按有效标签分桶和连续编号。时序 v1 显示各品种已有标签
-网格的第 0 相位，保留描述性分位标记。
+runner 的显式回退开关返回原始逐桶均值和旧版宽表。
 
 日频 runner 引擎路径在 `result["ic"].attrs["hac_inference"]` 按持有期输出
 HAC 校准与可用性元数据。旧 `newey_west_mean_test(values, max_lag)`
 二元组和由其生成的月度 `ic_t_stat`、`ic_p_value` 保留为未校准的描述性
 诊断量。可计算时可查阅这些数值，显著性解释不可用。
 
-Bar 的 `EvaluationResult.ic_inference` 按 `(frequency, horizon_bars, instrument_id)`
-提供 IC 推断元数据，截面键的 `instrument_id` 为 `None`。Bar v1 时序路径
-未验证持仓区间，因而 Bootstrap 区间不可用，IC 仍可作为描述性统计。
-四个标准 `bar_evaluation.v1` 产物和 DuckDB 入库沿用既有字段。
-后续 `evaluation.v2` 承载统一推断契约。
+### Bar 单趟评估和功能开关
+
+`evaluate_bars()` 先生成标签，再由统一引擎一次处理每个评估分组。
+轻量运行按频率和持有期处理观察样本，标准时序 IC 表取候选序列的第 0 相位。
+时序描述性分位按有效标签分桶，索引连续，收益以百分数发布。
+请求推断或诊断时，时序按频率和标的分组，截面按频率分组。每组调用一次
+`EvaluationEngine.evaluate()`，从同一 `EngineResult` 组装 `descriptive` 标准表及
+`splits` 网格统计。时序推断检查应有网格的所有相位及实际持仓区间。诊断渲染
+读取该结果中的推断统计。
+
+| `EvaluationEngine.evaluate()` 开关 | 作用 | Bar 用法 |
+| --- | --- | --- |
+| `all_non_overlapping_phases` | 时序默认检查全部 `h` 个相位，设为 `False` 时仅计算第 0 相位 | 标准时序表使用第 0 相位，网格推断使用全部相位 |
+| `signal_diagnostics` | 截面默认计算秩自相关和分桶换手，设为 `False` 时跳过 | Bar 截面关闭 |
+| `return_diagnostics` | 默认计算方向准确率及时序收益分布或截面分桶时间均值、价差等明细 | 轻量表关闭额外明细，网格推断开启 |
+
+Bar Python API 和 Harness 通过 `split`、`bootstrap`、`hac_lag`、
+`calibration_scenario`、`trial_selection` 等显式选项请求推断，详见
+[参数表](TIME_SERIES_CONTRACT.md#统一引擎参数)。
+`EvaluationResult.ic_inference` 按 `(frequency, horizon_bars, instrument_id)`
+提供标准表 IC 的可用性，截面键的 `instrument_id` 为 `None`。
+轻量时序缺少经验证的持仓区间，Bootstrap 区间不可用，IC 仍可作为描述性统计。
+`summary.json` 将标准表可用性、网格推断样本的区间及门控、候选账本一并发布为
+[`bar_evaluation.v2`](TIME_SERIES_CONTRACT.md#bar_evaluationv2-产物契约)。
 
 ## 16. S7 时序诊断与 NQ 1min 验收
 
-时序诊断夹具以仓库内已确认的输入行、Bar v1 输出字段和数学预期为依据。
+时序诊断夹具以仓库内已确认的输入行、标准 Bar 输出字段和数学预期为依据。
 `time-series-analysis --config <path> --diagnostics-report` 通过 Harness
 发布 `time_series_diagnostics.v1`、`diagnostics_report.csv` 和 `diagnostics_report.md`，
-同时保留四个 Bar v1 文件。测试核对文件哈希、退出时间、剔除守恒、
+同时发布四个标准 Bar 文件。切分报告使用 `time_series_diagnostics.v2`。
+诊断 JSON 内嵌评估 `summary.json`。测试核对文件哈希、退出时间、剔除守恒、
 同一时序组的条件收益、方向计数、全部网格相位和移动块重排名。
 报告字段与发布时序见 [时序研究契约](TIME_SERIES_CONTRACT.md#时序深度诊断报告)。
 诊断报告在每个持有期的 `interval_usability` 中附加校准状态、依据和两项可用性，
-并在 Markdown 区间表后逐品种和持有期展示判定。v1 CSV 列、原 `bootstrap`
-字段和 `summary.json` 顶层键沿用 S7 的冻结契约。
+并在 Markdown 区间表后逐品种和持有期展示判定。全样本诊断 CSV 列与
+`bootstrap` 字段沿用 S7 的诊断契约。
 
 NQ 1min 的 S7 结果来自固定种子的**合成工程验收**，报告标记
 `real_market_data_used=false`。训练为 2020–2025 年，OOS 为 2026 年。

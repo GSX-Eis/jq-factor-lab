@@ -18,8 +18,9 @@ def run_cli(tmp_path, config=None, *extra, command='time-series-analysis'):
     path = tmp_path / 'config.json'
     if config is not None:
         path.write_text(json.dumps(config), encoding='utf-8')
+    config_args = [] if command == 'read-bar-evaluations' else ['--config', str(path)]
     proc = subprocess.run([sys.executable, '-m', 'tools.agent_harness.cli', command,
-        '--config', str(path), '--output-root', str(tmp_path / 'harness'), *extra],
+        *config_args, '--output-root', str(tmp_path / 'harness'), *extra],
         cwd=ROOT, capture_output=True, text=True, timeout=45)
     payload = json.loads(proc.stdout)
     assert proc.returncode == payload['exit_code'], proc.stderr
@@ -53,8 +54,15 @@ def read_outputs(payload):
     assert items['evaluation_summary'].name == 'summary.json'
     assert items['summary'] != items['evaluation_summary']
     assert json.loads(items['summary'].read_text()) == payload
+    summary = json.loads(items['evaluation_summary'].read_text())
+    assert summary['result_schema_version'] == 'bar_evaluation.v2'
+    assert 'evaluation_v2' not in items
+    assert not items['evaluation_summary'].with_name('evaluation_v2.json').exists()
+    for key in ('result_schema_version', 'frequency', 'return_unit', 'splits',
+                'interval_usability', 'trial_ledger', 'ic_by_horizon', 'quantile_stats', 'result_identity'):
+        assert payload['metrics'][key] == summary[key]
     return (pd.read_csv(items['per_bar_labels']), pd.read_csv(items['ic_by_horizon']),
-            pd.read_csv(items['quantile_stats']), json.loads(items['evaluation_summary'].read_text()))
+            pd.read_csv(items['quantile_stats']), summary)
 
 
 def test_private_bar_results_db_config_still_uses_repo_root(
@@ -268,6 +276,67 @@ def test_single_factor_dispatch_and_overrides(tmp_path, nested):
     assert summary['analysis_mode'] == 'cross_sectional'
     assert summary['calendar_identity']['view'] == 'RTH'
     assert labels.entry_offset_bars.eq(2).all() and labels.horizon_bars.eq(1).all()
+
+
+@pytest.mark.parametrize('command', ['time-series-analysis', 'single-factor-analysis'])
+@pytest.mark.parametrize('nested', [False, True])
+def test_bar_cli_rejects_retired_inference_config(tmp_path, command, nested):
+    path, _ = nq_bars(tmp_path)
+    config = base_config(path, evaluation_v2=True)
+    if nested:
+        config = {'time_series_analysis': config}
+    destination = tmp_path / 'evaluation'
+    payload = run_cli(tmp_path, config, '--output-dir', str(destination), command=command)
+    assert payload['exit_code'] == 2
+    assert payload['error']['code'] == 'time_series_precondition_failed'
+    assert 'evaluation_v2' in payload['error']['message']
+    assert '"trial_selection": {"method": "holm"}' in payload['error']['message']
+    assert not (destination / 'summary.json').exists()
+
+
+def test_bar_cli_rejects_s1_output_directory_and_succeeds_in_fresh_directory(tmp_path):
+    path, _ = nq_bars(tmp_path)
+    legacy = tmp_path / 's1'
+    legacy.mkdir()
+    old_identity = {'result_schema_version': 'bar_evaluation.v1', 'identity_hash': 'a' * 64}
+    (legacy / 'summary.json').write_text(json.dumps(dict(
+        result_schema_version='bar_evaluation.v1', result_identity=old_identity,
+    )))
+    (legacy / 'evaluation_v2.json').write_text(json.dumps(dict(
+        schema_version='evaluation.v2', result_identity=old_identity, splits={'full': {}},
+    )))
+    (legacy / 'ic_by_horizon.csv').write_text('horizon_bars,spearman_ic\n1,1.0\n')
+    original = {artifact.name: artifact.read_bytes() for artifact in legacy.iterdir()}
+    config = base_config(path, trial_selection={'method': 'holm'})
+
+    rejected = run_cli(tmp_path, config, '--output-dir', str(legacy))
+    assert rejected['exit_code'] == 2
+    assert rejected['error']['code'] == 'time_series_precondition_failed'
+    assert 'evaluation_v2.json' in rejected['error']['message']
+    assert 'new output directory' in rejected['error']['message']
+    assert {artifact.name: artifact.read_bytes() for artifact in legacy.iterdir()} == original
+
+    results_db = tmp_path / 'full.duckdb'
+    fresh = run_cli(tmp_path, config, '--output-dir', str(tmp_path / 's2'), '--results-db', str(results_db))
+    _, _, _, summary = read_outputs(fresh)
+    assert set(summary['splits']) == {'full'}
+    assert summary['trial_ledger']['method'] == 'holm'
+    read = run_cli(tmp_path, None, '--results-db', str(results_db), '--split', 'full',
+                   '--has-trial-ledger', command='read-bar-evaluations')
+    assert read['ok'], read
+    assert read['metrics']['runs'][0]['trial_ledger_json'] == summary['trial_ledger']
+    assert read['metrics']['split_metrics'][0]['metrics_json'] == summary['splits']['full']['horizons'][0]
+
+
+@pytest.mark.parametrize('flag', ['--json-out', '--results-db'])
+def test_bar_cli_reserves_retired_sidecar_path(tmp_path, flag):
+    path, _ = nq_bars(tmp_path)
+    destination = tmp_path / 'evaluation'
+    sidecar = destination / 'evaluation_v2.json'
+    payload = run_cli(tmp_path, base_config(path), '--output-dir', str(destination), flag, str(sidecar))
+    assert payload['exit_code'] == 2
+    assert not sidecar.exists()
+    assert not (destination / 'summary.json').exists()
 
 
 def test_daily_dispatch_stays_on_original_runner(tmp_path):

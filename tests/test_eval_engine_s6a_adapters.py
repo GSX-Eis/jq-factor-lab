@@ -1,7 +1,7 @@
 """Exercise the unified facade and replay the legacy adapters on synthetic panels."""
 
 import json
-
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -9,6 +9,7 @@ import pytest
 
 from backtest_and_analysis.alphalens_runner import AlphalensRunner
 from backtest_and_analysis.evaluation import EvaluationEngine
+from backtest_and_analysis.evaluation.engine import DescriptiveSample
 from backtest_and_analysis.evaluation.panel import EvaluationPanel
 from backtest_and_analysis.evaluation.split import SplitConfig
 from backtest_and_analysis.time_series import BarCrossSectionalEvaluator, TimeSeriesEvaluator
@@ -16,6 +17,123 @@ from fixtures.eval_engine.baseline.regenerate import (
     BASELINE_DIR, MODES, _freeze_frame, run_snapshot, synthetic_inputs,
 )
 from test_time_series_evaluator import labels
+
+
+def test_evaluation_kernels_have_no_bar_v1_switch() -> None:
+    from backtest_and_analysis import evaluation
+
+    sources = Path(evaluation.__file__).parent.rglob("*.py")
+    assert not [source.name for source in sources if "_bar_v1" in source.read_text(encoding="utf-8")]
+
+
+def test_descriptive_time_series_ic_requires_the_same_pairs() -> None:
+    frame = pd.concat([
+        labels([1, 2, 3, 4, 5], [1, 2, 3, 5, 4]),
+        labels([1, 2, 3, 4, 5], instrument="B"),
+    ]).set_index(["signal_timestamp", "instrument_id"])
+    panel = EvaluationPanel.from_long(frame[["factor_value", "return_pct"]].set_axis(["factor", 1], axis=1))
+    grid = np.ones(panel.factor.shape, dtype=bool)
+    signal_valid = grid.copy()
+    signal_valid[-1, 0] = False
+    result = EvaluationEngine("time_series", "bar").evaluate(
+        panel, signal_valid=signal_valid, n_quantiles=2,
+        descriptive_samples={1: DescriptiveSample(panel, grid)},
+    )
+    inference, unaffected = result.splits["full"].statistics.horizons[1].instruments.values()
+    descriptive, reused = result.descriptive[1].horizons[1].instruments.values()
+    assert inference.ic.values[0] == pytest.approx(1.)
+    assert descriptive.ic.values[0] == pytest.approx(.9)
+    assert descriptive.ic.counts[0] == descriptive.non_overlapping_ic[0].counts[0] == 5
+    assert sum(bucket.n_samples for bucket in descriptive.returns_by_bucket.values()) == 5
+    assert reused.ic is unaffected.ic
+
+
+def test_descriptive_time_series_phase_zero_requires_the_same_grid_positions() -> None:
+    frame = labels(np.arange(7.), [1, 2, 5, 3, 4, 7, 6], horizon=2).set_index(
+        ["signal_timestamp", "instrument_id"],
+    )
+    frame.iloc[1, frame.columns.get_loc("return_pct")] = np.nan
+    panel = EvaluationPanel.from_long(frame[["factor_value", "return_pct"]].set_axis(["factor", 2], axis=1))
+    observed = np.ones(panel.factor.shape, dtype=bool)
+    expected = observed.copy()
+    expected[1] = False
+    result = EvaluationEngine("time_series", "bar").evaluate(
+        panel, expected_grid=expected, descriptive_samples={2: DescriptiveSample(panel, observed)},
+    )
+    inference, = result.splits["full"].statistics.horizons[2].instruments.values()
+    descriptive, = result.descriptive[2].horizons[2].instruments.values()
+    assert descriptive.ic is inference.ic
+    assert inference.non_overlapping_ic[0].values[0] == pytest.approx(1.)
+    assert descriptive.non_overlapping_ic[0].values[0] == pytest.approx(.8)
+
+
+def test_bar_time_series_phase_and_return_diagnostics_switches() -> None:
+    frame = labels(np.arange(12.), horizon=2).set_index(["signal_timestamp", "instrument_id"])
+    panel = EvaluationPanel.from_long(frame[["factor_value", "return_pct"]].set_axis(["factor", 2], axis=1))
+    engine = EvaluationEngine("time_series", "bar")
+
+    full = engine.evaluate(panel, n_quantiles=2).splits["full"].statistics
+    one_phase = engine.evaluate(panel, n_quantiles=2, all_non_overlapping_phases=False).splits["full"].statistics
+    location = engine.evaluate(panel, n_quantiles=2, return_diagnostics=False).splits["full"].statistics
+    deep, = full.horizons[2].instruments.values()
+    phase, = one_phase.horizons[2].instruments.values()
+    light, = location.horizons[2].instruments.values()
+
+    assert set(phase.non_overlapping_ic) == {0}
+    assert set(light.non_overlapping_ic) == set(deep.non_overlapping_ic) == {0, 1}
+    assert phase.direction == deep.direction
+    assert light.direction.reason == light.returns.reason == "not_requested"
+    assert light.returns_by_bucket[1].p50 == deep.returns_by_bucket[1].p50
+    assert np.isnan(light.returns_by_bucket[1].p95)
+    for option in ("return_diagnostics", "all_non_overlapping_phases"):
+        with pytest.raises(ValueError, match=option):
+            engine.evaluate(panel, **{option: 1})
+
+
+def test_cross_section_diagnostics_switches_keep_point_statistics() -> None:
+    panel = _daily_panel()
+    engine = EvaluationEngine("cross_sectional", "daily")
+    full = engine.evaluate(panel).splits["full"].statistics
+    returns_only = engine.evaluate(panel, signal_diagnostics=False).splits["full"].statistics
+    signals_only = engine.evaluate(panel, return_diagnostics=False).splits["full"].statistics
+    assert np.isnan(returns_only.rank_autocorrelation).all()
+    assert np.isnan(returns_only.turnover).all()
+    assert returns_only.horizons["1D"].direction == full.horizons["1D"].direction
+    np.testing.assert_array_equal(signals_only.rank_autocorrelation, full.rank_autocorrelation)
+    for horizon, reference in full.horizons.items():
+        point = signals_only.horizons[horizon]
+        assert point.direction.reason == point.spread_summary.reason == "not_requested"
+        assert not point.bucket_summary
+        np.testing.assert_array_equal(point.ic.values, reference.ic.values)
+        np.testing.assert_array_equal(point.bucket_returns, reference.bucket_returns)
+    with pytest.raises(ValueError, match="signal_diagnostics"):
+        engine.evaluate(panel, signal_diagnostics="false")
+    with pytest.raises(ValueError, match="all_non_overlapping_phases"):
+        engine.evaluate(panel, all_non_overlapping_phases=False)
+
+
+def test_large_single_horizon_bar_sections_parallelize_with_full_diagnostics(monkeypatch) -> None:
+    from backtest_and_analysis.evaluation import cross_section
+
+    frame = _daily_panel().to_long().loc[:, ["factor", "1D"]].rename(columns={"1D": 1})
+    panel = EvaluationPanel.from_long(frame)
+    engine = EvaluationEngine("cross_sectional", "bar")
+    serial = engine.evaluate(panel, n_quantiles=2).splits["full"].statistics
+    pool = cross_section.ThreadPoolExecutor
+    workers = []
+
+    def executor(*, max_workers):
+        workers.append(max_workers)
+        return pool(max_workers=max_workers)
+
+    monkeypatch.setattr(cross_section, "_PARALLEL_STATISTIC_CELLS", 0)
+    monkeypatch.setattr(cross_section, "ThreadPoolExecutor", executor)
+    parallel = engine.evaluate(panel, n_quantiles=2).splits["full"].statistics
+
+    assert workers == [2]
+    np.testing.assert_array_equal(parallel.horizons[1].ic.values, serial.horizons[1].ic.values)
+    np.testing.assert_array_equal(parallel.horizons[1].bucket_returns, serial.horizons[1].bucket_returns)
+    assert parallel.horizons[1].direction == serial.horizons[1].direction
 
 
 @pytest.mark.parametrize("mode", MODES)
@@ -47,6 +165,38 @@ def _daily_panel() -> EvaluationPanel:
         "1D": [.01, .03, .05, .07, .02, .01, .04, .03, .03, .02, .01, 0.],
         "5D": [.02, .03, .04, .05] + [np.nan] * 8,
     }, index=index))
+
+
+@pytest.mark.parametrize("change", ["pairs", "alpha"])
+def test_descriptive_hac_recomputes_on_the_same_grid_if_inputs_differ(monkeypatch, change) -> None:
+    from backtest_and_analysis.evaluation import cross_section
+
+    frame = _daily_panel().to_long().loc[:, ["factor", "1D"]].rename(columns={"1D": 1})
+    panel = EvaluationPanel.from_long(frame)
+    observed = np.ones(panel.factor.shape, dtype=bool)
+    signal_valid = observed.copy()
+    if change == "pairs":
+        signal_valid[0, 0] = False
+    calls = []
+    original = cross_section.bartlett_hac
+
+    def record(values, **options):
+        calls.append((values.copy(), options["alpha"]))
+        return original(values, **options)
+
+    monkeypatch.setattr(cross_section, "bartlett_hac", record)
+    result = EvaluationEngine("cross_sectional", "bar").evaluate(
+        panel, signal_valid=signal_valid, alpha=0.10 if change == "alpha" else 0.05,
+        descriptive_samples={1: DescriptiveSample(panel, observed, panel.datetimes)},
+    )
+    assert len(calls) == 2
+    inference = result.splits["full"].statistics.horizons[1]
+    descriptive = result.descriptive[1].horizons[1]
+    if change == "pairs":
+        assert inference.ic.counts[0] == 3
+        assert descriptive.ic.counts[0] == 4
+    else:
+        assert (inference.hac.alpha, descriptive.hac.alpha) == (0.10, 0.05)
 
 
 def test_engine_daily_full_sample_metrics_and_single_icir() -> None:
@@ -131,7 +281,7 @@ def test_bar_time_series_full_sample_and_legacy_phase_zero(multi_instrument: boo
     ).to_numpy()
     statistics = EvaluationEngine("time_series", "bar").evaluate(
         panel, entry_timestamps=endpoints["entry_timestamp"], exit_timestamps=endpoints["exit_timestamp"],
-        expected_grid=observed, n_quantiles=2, n_boot=20, min_valid_replicates=16,
+        expected_grid=observed, n_quantiles=2, block_length=2, n_boot=20, min_valid_replicates=16,
     ).splits["full"].statistics
     adapter = TimeSeriesEvaluator(analysis_mode="time_series", n_quantiles=2).evaluate(bars)
     assert statistics.intervals_verified
@@ -254,13 +404,19 @@ def test_engine_hac_respects_each_horizon_overlap_floor(
     panel = EvaluationPanel.from_long(pd.DataFrame({"factor": [1., 2., 3.] * 8,
                                                    short: outcome, long: outcome}, index=index))
     engine = EvaluationEngine("cross_sectional", frequency=frequency)
-    for options, short_lag, long_lag in (({}, 0, 4), ({"hac_lag": 1}, 1, 4), ({"hac_lag": 5}, 5, 5)):
-        stats = engine.evaluate(panel, **options).splits["full"].statistics
+    for requested_lag, short_lag, long_lag in ((0, 0, 4), (1, 1, 4), (5, 5, 5)):
+        stats = engine.evaluate(panel, hac_lag=requested_lag).splits["full"].statistics
         assert stats.horizons[short].hac.lag == short_lag
         assert stats.horizons[long].hac.lag == long_lag
-    horizons = engine.evaluate(panel).splits["full"].statistics.horizons
+    horizons = engine.evaluate(panel, hac_lag=0).splits["full"].statistics.horizons
     assert horizons[short].hac.variance == pytest.approx(.125)
     assert horizons[long].hac.variance == pytest.approx(.25)
+
+    automatic = engine.evaluate(panel).splits["full"].statistics.horizons
+    assert all(row.hac.bandwidth_method == "nw94_prewhitened" for row in automatic.values())
+    assert (automatic[short].hac.min_lag, automatic[long].hac.min_lag) == (0, 4)
+    assert 0 <= automatic[short].hac.lag <= 1
+    assert automatic[long].hac.reason == "insufficient_hac_grid"
 
     available = dates.tz_localize("UTC")
     exits = {
@@ -275,6 +431,12 @@ def test_engine_hac_respects_each_horizon_overlap_floor(
     ).splits
     assert all(part.statistics.horizons[long].hac.lag == 4 for part in splits.values())
     assert splits["oos"].statistics.horizons[long].hac.reason == "insufficient_hac_grid"
+    auto_splits = engine.evaluate(
+        panel, split=SplitConfig(available[3], available[4]), signal_available_at=available,
+        exit_timestamps=exits,
+    ).splits
+    assert set(auto_splits) == {"train", "oos"}
+    assert all(part.statistics.horizons[long].hac.min_lag == 4 for part in auto_splits.values())
 
 
 @pytest.mark.parametrize("single_precision", [("1D", "5D"), ("1D",)])

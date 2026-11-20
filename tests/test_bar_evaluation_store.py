@@ -150,6 +150,477 @@ def _republished_artifacts(payload: dict) -> list[dict]:
     ]
 
 
+def _make_legacy_schema(conn: duckdb.DuckDBPyConnection) -> str:
+    conn.execute("DROP TABLE bar_evaluation_split_metrics")
+    for col in ("has_split", "split_config_json", "trial_ledger_json", "calibration_summary_json"):
+        conn.execute(f"ALTER TABLE bar_evaluation_runs DROP COLUMN {col}")
+    current, config, inputs, calendar, version = conn.execute("""
+        SELECT identity_hash, config_hash, input_file_hashes, calendar_hash, code_version
+        FROM bar_evaluation_runs
+    """).fetchone()
+    previous = store.ResultIdentity(
+        config_hash=config, input_file_hashes=json.loads(inputs), calendar_hash=calendar,
+        code_version=version, result_schema_version="bar_evaluation.v1",
+    ).identity_hash()
+    for table in BAR_EVALUATION_TABLES:
+        if table != "bar_evaluation_split_metrics":
+            conn.execute(f"UPDATE {table} SET identity_hash=? WHERE identity_hash=?", [previous, current])
+    conn.execute("UPDATE bar_evaluation_runs SET result_schema_version='bar_evaluation.v1'")
+    return previous
+
+
+def test_train_oos_round_trip_and_inference_filters(tmp_path: Path) -> None:
+    config = tmp_path / "train_oos.json"
+    config.write_text(json.dumps({
+        "bars_csv": str(_make_ts_bars(tmp_path)), "analysis_mode": "time_series",
+        "calendar": "NQ", "start_date": "2026-12-01", "end_date": "2026-12-01",
+        "horizons": [1, 2], "n_quantiles": 3,
+        "split": {"train_end": "2026-12-01T21:02:00Z", "oos_start": "2026-12-01T21:03:00Z"},
+        "bootstrap": {"n_boot": 9, "min_valid_replicates": 2},
+    }), encoding="utf-8")
+    db, output = tmp_path / "split.duckdb", tmp_path / "split"
+    code, payload = _run_cli(tmp_path, "--config", str(config), "--results-db", str(db),
+                             "--output-dir", str(output))
+    assert code == 0, payload
+    identity = payload["metrics"]["results_db"]["identity_hash"]
+    before = db.read_bytes()
+    summary = json.loads((output / "summary.json").read_text(encoding="utf-8"))
+    detail = query_bar_evaluation_detail(db, identity)
+    run = detail["run"]
+    assert run["has_split"] is True
+    assert run["trial_ledger_json"] == summary["trial_ledger"]
+    assert run["calibration_summary_json"] == summary["interval_usability"]
+    assert run["trial_ledger_json"]["split"] == "train"
+    assert run["trial_ledger_json"]["selection_complete"] is False
+    assert len(detail["split_metrics"]) == 4
+    for split, report in summary["splits"].items():
+        assert run["split_config_json"][split] == {k: v for k, v in report.items() if k != "horizons"}
+        rows = [row for row in detail["split_metrics"] if row["split"] == split]
+        assert [r["metrics_json"] for r in rows] == report["horizons"]
+        for row in rows:
+            metrics = row["metrics_json"]
+            assert row["split_purged_count"] == metrics["split_purged_count"]
+            assert row["fit_identity_json"] == report["fit_identity"]["1min"]["000001"]
+            assert row["interval_lower"] == metrics["bootstrap"]["lower"]
+            assert row["n_observations"] == metrics["ic"]["sample_count"]
+            assert metrics["bootstrap"]["method_version"] == "ts_boot_adaptive_v1"
+            assert row["calibration_status"] == "uncalibrated"
+            assert row["significance_interpretation_usable"] is False
+            assert row["p_value"] is None
+            assert row["n_dependence_adjusted"] is None
+            assert row["p_value"] is None
+            assert row["significance_interpretation_usable"] is False
+    assert any(row["split_purged_count"] > 0 for row in detail["split_metrics"])
+    code, read = _run_cli(tmp_path, "--results-db", str(db), "--split", "oos",
+                          "--calibration-status", "uncalibrated", "--has-trial-ledger",
+                          "--no-significance-interpretation-usable", command="read-bar-evaluations")
+    assert code == 0 and {row["split"] for row in read["metrics"]["split_metrics"]} == {"oos"}
+    assert query_bar_evaluations(db, split="full")["runs"] == []
+    assert query_bar_evaluations(db, has_trial_ledger=False)["runs"] == []
+    code, monitor = _run_cli(tmp_path, "--database-path", str(db), command="monitor-refresh")
+    assert code == 0
+    assert monitor["metrics"]["bar_evaluation"]["tables"]["bar_evaluation_split_metrics"]["row_count"] == 4
+    assert db.read_bytes() == before
+
+    receipt = ingest_evaluation(db, output, artifacts=payload["artifacts"])
+    assert receipt.status == "noop" and receipt.split_rows == 4
+
+    # Stored JSON compares by structure, and new typed float fields normalize missing values.
+    with duckdb.connect(str(db)) as conn:
+        conn.execute("UPDATE bar_evaluation_runs SET trial_ledger_json=?", [json.dumps(run["trial_ledger_json"], indent=2)])
+        conn.execute("UPDATE bar_evaluation_split_metrics SET p_value = 'NaN'::DOUBLE")
+    assert ingest_evaluation(db, output, artifacts=payload["artifacts"]).status == "noop"
+
+    for mutation, conflict in (
+        ("UPDATE bar_evaluation_runs SET has_split = false", "has_split"),
+        ("UPDATE bar_evaluation_split_metrics SET split_purged_count = 42 WHERE row_index = 0", "split_purged_count"),
+    ):
+        with duckdb.connect(str(db)) as conn:
+            conn.execute(mutation)
+        changed = db.read_bytes()
+        failed_output = tmp_path / f"conflict-{conflict}"
+        code, result = _run_cli(tmp_path, "--config", str(config), "--results-db", str(db),
+                                "--output-dir", str(failed_output))
+        assert code == 4 and result["error"]["code"] == "bar_evaluation_store_conflict", result
+        assert conflict in result["error"]["message"]
+        assert not (failed_output / "summary.json").exists()
+        assert db.read_bytes() == changed
+        with duckdb.connect(str(db)) as conn:
+            conn.execute("UPDATE bar_evaluation_runs SET has_split = true")
+
+
+def test_legacy_read_only_and_explicit_migration_preserve_history(tmp_path: Path) -> None:
+    db = tmp_path / "legacy.duckdb"
+    bars, factors = _make_cs_bars_and_factors(tmp_path)
+    config = tmp_path / "cross.json"
+    options = {
+        "bars_csv": str(bars), "factors_csv": str(factors), "analysis_mode": "cross_sectional",
+        "calendar": "NQ", "start_date": "2026-12-01", "end_date": "2026-12-01",
+        "horizons": [1], "n_quantiles": 2,
+    }
+    config.write_text(json.dumps(options), encoding="utf-8")
+    code, old = _run_cli(tmp_path, "--config", str(config), "--results-db", str(db))
+    assert code == 0, old
+    with duckdb.connect(str(db)) as conn:
+        identity = _make_legacy_schema(conn)
+        conn.execute("CREATE TABLE unrelated (value INTEGER PRIMARY KEY)")
+        conn.execute("INSERT INTO unrelated VALUES (91)")
+        legacy_tables = tuple(row[0] for row in conn.execute("SHOW TABLES").fetchall())
+        historical = {table: conn.execute(f"SELECT * FROM {table} ORDER BY ALL").fetchall()
+                      for table in legacy_tables}
+    before = db.read_bytes()
+
+    code, read = _run_cli(tmp_path, "--results-db", str(db), command="read-bar-evaluations")
+    assert code == 0, read
+    assert read["metrics"]["split_metrics"] == []
+    assert read["metrics"]["cross_sections"]
+    run, = read["metrics"]["runs"]
+    assert run["result_schema_version"] == "bar_evaluation.v1"
+    new_columns = ("has_split", "split_config_json", "trial_ledger_json", "calibration_summary_json")
+    assert all(run[c] is None for c in new_columns)
+    assert query_bar_evaluation_detail(db, identity)["split_metrics"] == []
+    code, report = _run_cli(tmp_path, "--database-path", str(db), command="monitor-refresh")
+    assert code == 0, report
+    monitor = report["metrics"]["bar_evaluation"]
+    assert monitor["all_tables_exist"] is True
+    assert monitor["tables"]["bar_evaluation_split_metrics"] == {"exists": False, "row_count": None}
+
+    options["trial_selection"] = {"method": "bh"}
+    config.write_text(json.dumps(options), encoding="utf-8")
+    output = tmp_path / "evaluation"
+    args = ("--config", str(config), "--results-db", str(db), "--output-dir", str(output))
+    code, rejected = _run_cli(tmp_path, *args)
+    assert code == 2 and rejected["error"]["code"] == "bar_evaluation_store_precondition_failed", rejected
+    message = rejected["error"]["message"]
+    assert all(col in message for col in new_columns)
+    assert "bar_evaluation_split_metrics" in message and "migrate_bar_evaluation_db" in message
+    assert not (output / "summary.json").exists()
+    assert db.read_bytes() == before
+
+    store.migrate_bar_evaluation_db(db)
+    store.migrate_bar_evaluation_db(db)
+    with duckdb.connect(str(db), read_only=True) as conn:
+        for table, rows in historical.items():
+            migrated = conn.execute(f"SELECT * FROM {table} ORDER BY ALL").fetchall()
+            expected = [row + (None,) * len(new_columns) for row in rows] if table == "bar_evaluation_runs" else rows
+            assert migrated == expected
+        assert conn.execute("SELECT count(*) FROM bar_evaluation_split_metrics").fetchone() == (0,)
+        assert conn.execute("SELECT schema_name FROM duckdb_schemas() WHERE schema_name='meta'").fetchall() == []
+
+    code, fresh = _run_cli(tmp_path, *args)
+    assert code == 0, fresh
+    detail = query_bar_evaluation_detail(db, fresh["metrics"]["results_db"]["identity_hash"])
+    trial, = detail["run"]["trial_ledger_json"]["candidates"]
+    row, = detail["split_metrics"]
+    assert row["split"] == "full" and row["interval_method"] == "hac"
+    assert row["p_value"] == trial["p_value"] and row["p_value"] is not None
+    assert row["n_observations"] == trial["n_observations"]
+    assert row["n_dependence_adjusted"] is None
+    assert row["significant"] is False
+    assert query_bar_evaluation_detail(db, identity)["run"] == run
+
+
+def _make_calibrated_hac_config(tmp_path: Path) -> Path:
+    rng = np.random.default_rng(511)
+    start = pd.Timestamp("2026-12-01T11:31Z")
+    times = pd.date_range(start, periods=525, freq="1min")
+    frames = []
+    for i in range(32):
+        price = rng.uniform(99, 120, len(times))
+        noise = rng.uniform(-1, 1, len(times))
+        factor = rng.normal(size=len(times))
+        frames.append(pd.DataFrame(dict(
+            timestamp_utc=times, instrument_id=f"A{i:02}", frequency="1min", open=price,
+            high=price + 2, low=price - 2, close=price + noise + np.tanh(np.r_[0, factor[:-1]]),
+            volume=1.0, source="SYNTHETIC", data_version="NERE931", factor_value=factor,
+        )))
+    bars = tmp_path / "dense.csv"
+    pd.concat(frames).to_csv(bars, index=False)
+    config = tmp_path / "calibrated.json"
+    split = {
+        "train_end": (start + pd.Timedelta(minutes=512)).isoformat(),
+        "oos_start": (start + pd.Timedelta(minutes=516)).isoformat(),
+    }
+    config.write_text(json.dumps({
+        "bars_csv": str(bars), "analysis_mode": "cross_sectional",
+        "calendar": "NQ", "start_date": "2026-12-01", "end_date": "2026-12-01", "horizons": [1],
+        "split": split,
+        "calibration_scenario": "iid",
+    }), encoding="utf-8")
+    return config
+
+
+@pytest.mark.parametrize("hac_lag", [None, "auto", 0], ids=["default", "auto", "fixed"])
+def test_calibrated_hac_significance_round_trip(tmp_path: Path, hac_lag: str | int | None) -> None:
+    config = _make_calibrated_hac_config(tmp_path)
+    if hac_lag is not None:
+        settings = json.loads(config.read_text(encoding="utf-8"))
+        settings["hac_lag"] = hac_lag
+        if hac_lag == 0:
+            settings["calibration_scenario"] = "independent_null"
+        config.write_text(json.dumps(settings), encoding="utf-8")
+    db = tmp_path / "calibrated.duckdb"
+    code, payload = _run_cli(tmp_path, "--config", str(config), "--results-db", str(db))
+    assert code == 0, payload
+    data = query_bar_evaluations(db, calibration_status="calibrated_pass", significance_interpretation_usable=True)
+    row, = data["split_metrics"]
+    ledger = data["runs"][0]["trial_ledger_json"]
+    assert ledger["best"] == ["factor_value", 1]
+    assert row["split"] == "train" and row["significant"] is True
+    assert row["n_observations"] == 512 and row["n_dependence_adjusted"] is None
+    method = "two_sided_normal_hac" if hac_lag == 0 else "two_sided_student_t_hac"
+    assert row["p_value_method"] == ledger["candidates"][0]["p_value_method"] == method
+    assert row["p_value"] == row["adjusted_p_value"] == row["inference_adjusted_p_value"] < 0.05
+    assert row["metrics_json"]["interval_usability"]["calibration_evidence"]["passes"] is True
+    assert row["interval_lower"] == row["metrics_json"]["hac"]["lower"]
+    assert query_bar_evaluations(db, split="oos")["split_metrics"][0]["significant"] is None
+
+    summary_path = Path(data["runs"][0]["summary_path"])
+    original = summary_path.read_text(encoding="utf-8")
+    cases = [("variance", "HAC bounds"), ("lower", "HAC bounds"), ("p_value", "HAC p value")]
+    if hac_lag != 0:
+        cases.extend([("pattern", "HAC bandwidth and missing pattern"),
+                      ("evidence", "interval usability matching")])
+    for changed, diagnostic in cases:
+        summary = json.loads(original)
+        train = summary["splits"]["train"]["horizons"][0]
+        oos = summary["splits"]["oos"]["horizons"][0]
+        candidate, = summary["trial_ledger"]["candidates"]
+        # Keep the trained ledger intact while testing forged adaptive evidence on OOS.
+        row_under_test = train if hac_lag == 0 else oos
+        if changed == "variance":
+            row_under_test["hac"]["variance"] = 1
+        elif changed == "lower":
+            row_under_test["hac"]["lower"] -= 0.001
+            if hac_lag == 0:
+                candidate["interval"][0] = train["hac"]["lower"]
+        elif changed == "p_value":
+            row_under_test["p_value"] = 1e-15
+            if hac_lag == 0:
+                for field in ("p_value", "adjusted_p_value", "inference_adjusted_p_value"):
+                    candidate[field] = train["p_value"]
+        elif changed == "pattern":
+            oos["hac"]["missing_pattern"] = "periodic_17_3"
+        else:
+            assert oos["interval_usability"]["calibration_status"] == "uncalibrated"
+            oos["interval_usability"] = train["interval_usability"]
+        summary_path.write_text(json.dumps(summary), encoding="utf-8")
+        rejected = tmp_path / f"inconsistent_hac_{changed}.duckdb"
+        duckdb.connect(str(rejected)).close()
+        with pytest.raises(BarEvaluationIntegrityError, match=diagnostic):
+            ingest_evaluation(rejected, artifacts=_republished_artifacts(payload))
+        with duckdb.connect(str(rejected), read_only=True) as conn:
+            assert conn.execute("SHOW TABLES").fetchall() == []
+
+
+@pytest.mark.parametrize("per_instrument", [False, True], ids=["single_calendar", "per_instrument"])
+def test_python_export_ingests_adaptive_hac_with_periodic_gaps(tmp_path: Path, per_instrument: bool) -> None:
+    from backtest_and_analysis.time_series import (
+        RESULT_SCHEMA_VERSION, BarReturnLabeler, evaluate_bars, read_bar_csv, write_evaluation_artifacts,
+    )
+    from utils.session_calendar import SessionCalendar
+
+    config = json.loads(_make_calibrated_hac_config(tmp_path).read_text(encoding="utf-8"))
+    bars = read_bar_csv(config["bars_csv"])
+    minute = (bars["timestamp_utc"] - bars["timestamp_utc"].min()) // pd.Timedelta(minutes=1)
+    calendar = SessionCalendar("NQ", config["start_date"], config["end_date"])
+    calendars = dict.fromkeys(bars["instrument_id"].unique(), calendar) if per_instrument else calendar
+    result = evaluate_bars(
+        bars.loc[minute % 17 < 15], labeler=BarReturnLabeler(calendars, horizons=[1]),
+        analysis_mode="cross_sectional", split=config["split"], calibration_scenario="gaps",
+    )
+    train, = result.splits["train"]["horizons"]
+    assert train["hac"]["grid_size"] == 512 and train["hac"]["n_valid"] == 422
+    assert train["hac"]["missing_pattern"] == "periodic_17_3"
+    assert train["interval_usability"]["calibration_status"] == "calibrated_pass"
+
+    identity = store.ResultIdentity("a" * 64, {"bars": "b" * 64}, calendar.calendar_hash,
+                                    "test-build", RESULT_SCHEMA_VERSION)
+    output = tmp_path / "python_export"
+    paths = write_evaluation_artifacts(result, output, result_identity=identity)
+    db = tmp_path / "python_export.duckdb"
+    receipt = ingest_evaluation(db, output, expected_hashes={k: store.sha256_file(v) for k, v in paths.items()})
+    assert receipt.status == "inserted"
+    row, = query_bar_evaluations(db, split="train")["split_metrics"]
+    assert row["calibration_status"] == "calibrated_pass"
+    assert row["significance_interpretation_usable"] is True
+
+    original = paths["summary"].read_text(encoding="utf-8")
+    if per_instrument:
+        for instrument in ("A00", "A31"):
+            for field, value in (("end_date", "2026-12-02"), ("rth_reference_calendar", "CME Globex Equity")):
+                summary = json.loads(original)
+                summary["calendar_identity"]["calendars"][instrument]["schedule"][field] = value
+                paths["summary"].write_text(json.dumps(summary), encoding="utf-8")
+                with pytest.raises(BarEvaluationIntegrityError, match="interval usability matching"):
+                    ingest_evaluation(tmp_path / f"forged_{instrument}_{field}.duckdb", output,
+                                      expected_hashes={k: store.sha256_file(v) for k, v in paths.items()})
+        return
+
+    for change, error in (("pattern", "HAC bandwidth and missing pattern"),
+                          ("coverage", "interval usability matching")):
+        summary = json.loads(original)
+        assert summary["config"] == {}
+        if change == "pattern":
+            summary["splits"]["train"]["horizons"][0]["hac"]["missing_pattern"] = "periodic_17_5"
+        else:
+            summary["calendar_identity"]["schedule"]["end_date"] = "2026-12-02"
+        paths["summary"].write_text(json.dumps(summary), encoding="utf-8")
+        with pytest.raises(BarEvaluationIntegrityError, match=error):
+            ingest_evaluation(tmp_path / f"forged_{change}.duckdb", output,
+                              expected_hashes={k: store.sha256_file(v) for k, v in paths.items()})
+
+
+@pytest.mark.parametrize("config_source", [
+    "calendar", "matching", "legacy", "legacy_continuous", "conflict",
+    "default_match", "default_match_descriptive", "default_conflict", "default_unconfigured",
+])
+def test_store_uses_verified_bucket_strategy(tmp_path: Path, config_source: str) -> None:
+    from backtest_and_analysis.time_series import (
+        RESULT_SCHEMA_VERSION, BarReturnLabeler, evaluate_bars, read_bar_csv, write_evaluation_artifacts,
+    )
+    from utils.session_calendar import SessionCalendar
+
+    calendar = SessionCalendar("NQ", "2026-12-01", "2026-12-01")
+    published_strategy = None if config_source.startswith("default_") else "session_clock"
+    options = {} if config_source == "default_match_descriptive" else {
+        "bootstrap": {"n_boot": 9, "min_valid_replicates": 2},
+    }
+    result = evaluate_bars(
+        read_bar_csv(_make_ts_bars(tmp_path)),
+        labeler=BarReturnLabeler(calendar, horizons=[1], bucket_strategy=published_strategy),
+        analysis_mode="time_series", **options,
+    )
+    identity = store.ResultIdentity("a" * 64, {"bars": "b" * 64}, calendar.calendar_hash,
+                                    "test-build", RESULT_SCHEMA_VERSION)
+    config = None if config_source in ("calendar", "default_unconfigured") else {
+        "bucket_strategy": ("segment_anchored"
+                            if config_source == "conflict" or config_source.startswith("default_match")
+                            else "session_clock"),
+    }
+    if config_source in ("legacy", "legacy_continuous"):
+        del result.calendar_identity["bucket_strategy"]
+        del result.calendar_identity["schedule"]
+        config = ({"continuous_futures": config} if config_source == "legacy_continuous"
+                  else config | {"start_date": "2026-12-01", "end_date": "2026-12-01"})
+    output = tmp_path / "bucket_export"
+    paths = write_evaluation_artifacts(result, output, result_identity=identity, config=config)
+    hashes = {key: store.sha256_file(path) for key, path in paths.items()}
+    db = tmp_path / "bucket.duckdb"
+    if config_source in ("conflict", "default_conflict"):
+        with pytest.raises(BarEvaluationIntegrityError, match="bucket_strategy.*disagree"):
+            ingest_evaluation(db, output, expected_hashes=hashes)
+    else:
+        assert ingest_evaluation(db, output, expected_hashes=hashes).status == "inserted"
+        row, = query_bar_evaluation_runs(db)
+        expected = config["bucket_strategy"] if config_source.startswith("default_match") else published_strategy
+        assert row["bucket_strategy"] == expected
+
+
+@pytest.mark.parametrize("strategy", ["segment_anchored", "session_clock", None])
+def test_default_bucket_strategy_with_empty_rth_labels(tmp_path: Path, strategy: str | None) -> None:
+    from backtest_and_analysis.time_series import (
+        RESULT_SCHEMA_VERSION, BarReturnLabeler, evaluate_bars, read_bar_csv, write_evaluation_artifacts,
+    )
+    from utils.session_calendar import SessionCalendar
+
+    bars = read_bar_csv(_make_ts_bars(tmp_path)).assign(
+        instrument_id="NQ", timestamp_utc=pd.date_range("2026-12-01T10:00Z", periods=12, freq="min"),
+    )
+    bars.attrs.clear()
+    calendar = SessionCalendar("NQ", "2026-12-01", "2026-12-01")
+    result = evaluate_bars(bars, labeler=BarReturnLabeler(calendar, horizons=[1], view="RTH"),
+                           analysis_mode="time_series")
+    assert result.per_bar_labels.empty
+    assert result.data_identity["instruments"] == ["NQ"] and result.data_identity["frequencies"] == ["1min"]
+    assert result.calendar_identity["bucket_strategy"] is None
+
+    identity = store.ResultIdentity("a" * 64, {"bars": "b" * 64}, calendar.calendar_hash,
+                                    "test-build", RESULT_SCHEMA_VERSION)
+    output = tmp_path / "rth_export"
+    config = {"bucket_strategy": strategy} if strategy is not None else {}
+    paths = write_evaluation_artifacts(result, output, result_identity=identity, config=config)
+    hashes = {key: store.sha256_file(path) for key, path in paths.items()}
+    db = tmp_path / "rth.duckdb"
+    if strategy == "session_clock":
+        with pytest.raises(BarEvaluationIntegrityError, match="bucket_strategy.*disagree"):
+            ingest_evaluation(db, output, expected_hashes=hashes)
+    else:
+        assert ingest_evaluation(db, output, expected_hashes=hashes).status == "inserted"
+        row, = query_bar_evaluation_runs(db)
+        assert row["bucket_strategy"] == strategy
+
+    if strategy == "segment_anchored":
+        summary = json.loads(paths["summary"].read_text())
+        summary["data_identity"]["frequencies"] = []
+        paths["summary"].write_text(json.dumps(summary))
+        hashes["summary"] = store.sha256_file(paths["summary"])
+        with pytest.raises(BarEvaluationIntegrityError, match=r"data_identity\.frequencies"):
+            ingest_evaluation(tmp_path / "missing_frequency.duckdb", output, expected_hashes=hashes)
+
+
+def test_adaptive_bootstrap_observation_round_trips_without_calibration(tmp_path: Path) -> None:
+    config = _make_calibrated_hac_config(tmp_path)
+    settings = json.loads(config.read_text(encoding="utf-8"))
+    bars = pd.read_csv(settings["bars_csv"])
+    bars[bars["instrument_id"] == "A00"].to_csv(settings["bars_csv"], index=False)
+    settings.update(
+        analysis_mode="time_series",
+        bootstrap={"block_length": "auto", "n_boot": 9, "min_valid_replicates": 2},
+    )
+    config.write_text(json.dumps(settings), encoding="utf-8")
+
+    db = tmp_path / "adaptive_bootstrap.duckdb"
+    code, payload = _run_cli(tmp_path, "--config", str(config), "--results-db", str(db))
+    assert code == 0, payload
+    train, = query_bar_evaluations(db, split="train")["split_metrics"]
+    use = train["metrics_json"]["interval_usability"]
+    assert train["interval_lower"] is not None
+    assert train["p_value"] is None and train["calibration_status"] == "uncalibrated"
+    assert train["significance_interpretation_usable"] is False
+    assert use["adaptive_observation"]["method_version"] == "ts_boot_adaptive_v1"
+    assert use["adaptive_observation"]["n_valid"] == 512
+    assert use["calibration_evidence"] is None
+
+
+def test_split_grid_keeps_missing_slots_and_truncated_bars_across_closure(tmp_path: Path) -> None:
+    from utils.session_calendar import SessionCalendar
+    from utils.time_axis import BarSchedule
+
+    calendar = SessionCalendar("NQ", start_date="2026-12-04", end_date="2026-12-07")
+    schedule = BarSchedule(calendar, "60min", view="RTH")
+    friday = schedule.for_session("2026-12-04")
+    monday = schedule.for_session("2026-12-07")
+    assert friday.iloc[-1].is_partial and monday.iloc[-1].is_partial
+    slots = pd.concat([friday, monday.drop(index=1)], ignore_index=True)
+    assert len(slots) == len(friday) + len(monday) - 1
+    bars_path = tmp_path / "sparse_bars.csv"
+    price = 100.0 + np.arange(len(slots))
+    pd.DataFrame(dict(
+        timestamp_utc=slots.start_utc, instrument_id="NQ", frequency="60min", open=price,
+        high=price + 2, low=price - 2, close=price + 1, factor_value=np.arange(len(price)),
+        volume=1, source="SYNTHETIC", data_version="NERE931",
+    )).to_csv(bars_path, index=False)
+    config = tmp_path / "sparse.json"
+    config.write_text(json.dumps({
+        "bars_csv": str(bars_path), "analysis_mode": "time_series", "calendar": "NQ", "view": "RTH",
+        "start_date": "2026-12-04", "end_date": "2026-12-07", "horizons": [1],
+        "split": {"train_end": monday.iloc[1].end_utc.isoformat(), "oos_start": monday.iloc[2].end_utc.isoformat()},
+        "bootstrap": {"n_boot": 9, "min_valid_replicates": 2},
+    }), encoding="utf-8")
+    db = tmp_path / "sparse.duckdb"
+    code, payload = _run_cli(tmp_path, "--config", str(config), "--results-db", str(db))
+    assert code == 0, payload
+    rows = query_bar_evaluations(db)["split_metrics"]
+    train, oos = rows
+    assert train["split"] == "train"
+    train_metrics = train["metrics_json"]
+    assert pd.Timestamp(train_metrics["grid_end_utc"]) == monday.iloc[1].start_utc
+    assert train_metrics["bootstrap"]["grid_size"] == len(friday) + 2
+    assert oos["split"] == "oos"
+    assert oos["metrics_json"]["bootstrap"]["grid_size"] == len(monday) - 2
+
+
 def test_end_to_end_both_modes_and_csv_parity(tmp_path: Path) -> None:
     results_db = tmp_path / "results" / "bar_eval.duckdb"
 
@@ -306,19 +777,12 @@ def test_idempotency_and_conflict_rejection(tmp_path: Path) -> None:
             for t in BAR_EVALUATION_TABLES
         }
 
-    # Tamper one metric inside ic_by_horizon.csv AND summary.json keeping the same identity_hash
-    ic_path = eval_dir / "ic_by_horizon.csv"
-    ic_df = pd.read_csv(ic_path, dtype=store._CSV_STRING_DTYPES)
-    ic_df.loc[0, "spearman_ic"] = 0.999123456
-    ic_df.to_csv(ic_path, index=False)
-
-    summary_path = eval_dir / "summary.json"
-    summary = json.loads(summary_path.read_text(encoding="utf-8"))
-    summary["ic_by_horizon"][0]["spearman_ic"] = 0.999123456
-    summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    # Keep the published artifacts consistent while changing the stored value.
+    with duckdb.connect(str(results_db)) as conn:
+        conn.execute("UPDATE bar_evaluation_ic SET spearman_ic = 0.999123456 WHERE row_index = 0")
 
     with pytest.raises(BarEvaluationConflictError, match="Conflict") as exc_info:
-        ingest_evaluation(results_db, eval_dir, artifacts=_republished_artifacts(p1))
+        ingest_evaluation(results_db, eval_dir, artifacts=p1["artifacts"])
     assert isinstance(exc_info.value, ValueError)
 
     with duckdb.connect(str(results_db), read_only=True) as conn:
@@ -346,6 +810,7 @@ def test_transaction_atomicity_rollback_on_mid_write_failure(
                 "end_date": "2026-12-01",
                 "horizons": [1, 2, 5],
                 "n_quantiles": 3,
+                "trial_selection": {"method": "holm"},
             }
         ),
         encoding="utf-8",
@@ -353,17 +818,19 @@ def test_transaction_atomicity_rollback_on_mid_write_failure(
     rc, payload = _run_cli(tmp_path, "--config", str(cfg_path), "--output-dir", str(eval_dir))
     assert rc == 0
 
-    def boom_before_second_table(conn, rows):
-        raise RuntimeError("injected failure before bar_evaluation_ic insert")
+    insert_splits = store._insert_split_rows
 
-    monkeypatch.setattr(store, "_insert_ic_rows", boom_before_second_table)
+    def boom_after_split_insert(conn, rows):
+        assert rows
+        insert_splits(conn, rows)
+        raise RuntimeError("injected failure after split insert")
+
+    monkeypatch.setattr(store, "_insert_split_rows", boom_after_split_insert)
     with pytest.raises(RuntimeError, match="injected failure"):
         ingest_evaluation(results_db, eval_dir, artifacts=payload["artifacts"])
 
     with duckdb.connect(str(results_db), read_only=True) as conn:
-        tables = {row[0] for row in conn.execute("SHOW TABLES").fetchall()}
-        for t in tables:
-            assert conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0] == 0
+        assert conn.execute("SHOW TABLES").fetchall() == []
 
 
 def test_rejects_tampered_sha256_and_missing_summary(
@@ -729,7 +1196,7 @@ def test_monitor_refresh_three_database_states(tmp_path: Path) -> None:
 
     rc3, m3 = _run_cli(tmp_path, "--database-path", str(legacy_db), command="monitor-refresh")
     assert rc3 == 0 and m3["ok"] is True
-    assert m3["metrics"]["table_count"] == 5
+    assert m3["metrics"]["table_count"] == 1 + len(BAR_EVALUATION_TABLES)
     assert m3["metrics"]["factor_count"] == 2
     bar_eval = m3["metrics"]["bar_evaluation"]
     assert bar_eval["all_tables_exist"] is True
@@ -738,10 +1205,55 @@ def test_monitor_refresh_three_database_states(tmp_path: Path) -> None:
     assert bar_eval["tables"]["bar_evaluation_runs"] == {"exists": True, "row_count": 1}
     assert bar_eval["tables"]["bar_evaluation_ic"]["exists"] is True
     assert bar_eval["tables"]["bar_evaluation_ic"]["row_count"] == 2
+    assert bar_eval["tables"]["bar_evaluation_split_metrics"] == {"exists": True, "row_count": 0}
     assert isinstance(bar_eval["latest_ingested_at_utc"], str)
     assert bar_eval["latest_ingested_at_utc"].endswith("Z")
 
 
+
+
+@pytest.fixture
+def dashboard_capture() -> tuple[SimpleNamespace, list[tuple[str | None, pd.DataFrame]], list[dict]]:
+    recorded_frames: list[tuple[str | None, pd.DataFrame]] = []
+    recorded_json: list[dict] = []
+    pending_caption: str | None = None
+
+    def record_caption(caption: str | None) -> None:
+        nonlocal pending_caption
+        pending_caption = caption
+
+    def record_frame(frame: pd.DataFrame, **kwargs: object) -> None:
+        recorded_frames.append((pending_caption, frame))
+        record_caption(None)
+
+    class FakeSidebar:
+        def header(self, *args, **kwargs):
+            pass
+
+        def selectbox(self, label, options, **kwargs):
+            return options[0]
+
+    class FakeColumn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+    fake_st = SimpleNamespace(
+        set_page_config=lambda **kwargs: None,
+        title=lambda *args, **kwargs: None,
+        caption=record_caption,
+        subheader=lambda *args, **kwargs: record_caption(None),
+        info=lambda *args, **kwargs: None,
+        error=lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError(f"Unexpected st.error: {args}")),
+        json=lambda data: recorded_json.append(data),
+        dataframe=record_frame,
+        columns=lambda n: [FakeColumn() for _ in range(n)],
+        selectbox=lambda label, options, **kwargs: options[0],
+        sidebar=FakeSidebar(),
+    )
+    return fake_st, recorded_frames, recorded_json
 
 
 def test_single_factor_daily_rejects_results_db_and_sqlite_rejected(tmp_path: Path) -> None:
@@ -817,17 +1329,11 @@ def test_nan_null_normalization_and_empty_quantiles(tmp_path: Path) -> None:
     receipt = ingest_evaluation(results_db, eval_dir, artifacts=p1["artifacts"])
     assert receipt.status == "noop"
 
-    # Changing NaN/NULL to finite 0.0 triggers conflict
-    ic_path = eval_dir / "ic_by_horizon.csv"
-    ic_df = pd.read_csv(ic_path, dtype=store._CSV_STRING_DTYPES)
-    ic_df.loc[0, "spearman_ic"] = 0.0
-    ic_df.to_csv(ic_path, index=False)
-    summary_path = eval_dir / "summary.json"
-    summary = json.loads(summary_path.read_text(encoding="utf-8"))
-    summary["ic_by_horizon"][0]["spearman_ic"] = 0.0
-    summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    # Changing the stored NaN/NULL to finite 0.0 triggers a conflict on replay.
+    with duckdb.connect(str(results_db)) as conn:
+        conn.execute("UPDATE bar_evaluation_ic SET spearman_ic = 0.0 WHERE row_index = 0")
     with pytest.raises(BarEvaluationConflictError, match="spearman_ic"):
-        ingest_evaluation(results_db, eval_dir, artifacts=_republished_artifacts(p1))
+        ingest_evaluation(results_db, eval_dir, artifacts=p1["artifacts"])
 
 
 def test_precondition_errors_and_dry_run_flags(tmp_path: Path) -> None:

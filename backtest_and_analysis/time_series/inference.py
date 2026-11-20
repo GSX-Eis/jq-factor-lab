@@ -1,31 +1,32 @@
-"""Calendar-grid inputs and the evaluation.v2 Bar result contract."""
+"""Calendar-grid inputs, inference reports and trial families for Bar evaluation."""
 from __future__ import annotations
 
 from collections.abc import Hashable, Iterable, Mapping
-from dataclasses import asdict, dataclass
-from math import erfc, sqrt
-from numbers import Real
+from dataclasses import asdict
+from numbers import Integral, Real
 from threading import Lock
 from typing import Any, Literal
 
 import numpy as np
 import pandas as pd
 
-from backtest_and_analysis.evaluation import EvaluationEngine, evaluate_interval_usability
-from backtest_and_analysis.evaluation.calibration import Correction, Trial, TrialKey, TrialLedger
+from backtest_and_analysis.evaluation import evaluate_interval_usability
+from backtest_and_analysis.evaluation.calibration import (
+    REGISTERED_CALIBRATIONS, Correction, Trial, TrialKey, TrialLedger, _registered_adaptive_evidence,
+)
+from backtest_and_analysis.evaluation.cross_section import hac_p_value
 from backtest_and_analysis.evaluation.kernels import CorrelationResult
 from backtest_and_analysis.evaluation.panel import EvaluationPanel
-from backtest_and_analysis.evaluation.split import SplitConfig
+from backtest_and_analysis.evaluation.split import SplitConfig, SplitEvaluation
 from backtest_and_analysis.evaluation.time_series import summarize_time_series_horizon
 from backtest_and_analysis.evaluation.types import (
-    CalibrationEvidence, CrossSectionResult, IntervalUsability, TimeSeriesInstrument, TimeSeriesResult,
+    AdaptiveCalibrationObservation, CalibrationEvidence, CrossSectionResult, IntervalUsability,
+    TimeSeriesInstrument, TimeSeriesResult,
 )
 
 from .contracts import ContractValidationError, _numeric_column
 from .labels import BarReturnLabeler, _grid
 
-EVALUATION_V2_SCHEMA_VERSION = 'evaluation.v2'
-EVALUATION_V2_FILENAME = 'evaluation_v2.json'
 _SelectionWindow = tuple[Literal['full', 'train'], SplitConfig | None]
 
 
@@ -36,17 +37,6 @@ def _selection_window(split: SplitConfig | None) -> _SelectionWindow:
     if train_end.tzinfo is None or oos_start.tzinfo is None:
         raise ContractValidationError('Use timezone-aware split bounds for Bar evaluation')
     return 'train', SplitConfig(train_end.tz_convert('UTC'), oos_start.tz_convert('UTC'))
-
-
-@dataclass(frozen=True)
-class BarEvaluationV2:
-    """Inference and candidate evidence carried alongside the frozen Bar tables."""
-
-    splits: dict[str, dict[str, Any]]
-    trial_ledger: dict[str, Any]
-    schema_version: str = EVALUATION_V2_SCHEMA_VERSION
-    frequency: str = 'bar'
-    return_unit: str = 'percent'
 
 
 class BarTrialFamily:
@@ -123,6 +113,7 @@ class BarTrialFamily:
                 factor_id=key[0], horizon=key[1],
                 **(asdict(trial) if trial is not None else dict(
                     statistic=None, p_value=None, n_effective=None, interval=None, interval_usability=None,
+                    p_value_method=None,
                 )),
                 n_observations=trial.n_observations if trial is not None else None,
                 n_dependence_adjusted=None,
@@ -211,6 +202,7 @@ def _time_series_rows(stats: TimeSeriesResult, instrument: str, frequency: str) 
         ic = _ic(row.spearman_ic)
         usability = evaluate_interval_usability(
             row.bootstrap, point_estimate=ic['spearman_ic'], point_reason=ic['reason'], horizon=h,
+            ic_method='spearman', intervals_verified=stats.intervals_verified,
         )
         rows.append(dict(
             instrument_id=instrument, frequency=frequency, horizon_bars=h,
@@ -232,21 +224,117 @@ def _cross_section_rows(stats: CrossSectionResult, frequency: str) -> list[dict[
         summary, hac = horizon.ic_summary, horizon.hac
         interval = asdict(hac)
         interval['pair_counts'] = hac.pair_counts.tolist()
+        sizes = horizon.ic.counts
+        if hac.bandwidth_method != 'fixed':
+            sizes = np.where(np.isfinite(horizon.ic.values), sizes, 0)
         usability = evaluate_interval_usability(
-            hac, point_estimate=summary.mean, horizon=h, cross_section_sizes=horizon.ic.counts,
+            hac, point_estimate=summary.mean, horizon=h,
+            cross_section_sizes=sizes, ic_method=stats.ic_method,
         )
-        # Use the HAC variance in the same two-sided normal test underlying the interval.
-        p_value = erfc(abs(summary.mean) / sqrt(hac.variance) / sqrt(2)) if hac.reason is None else None
+        p_value, p_value_method = hac_p_value(hac, summary.mean)
         rows.append(dict(
             frequency=frequency, horizon_bars=h, grid_start_utc=stats.datetimes[0],
             grid_end_utc=stats.datetimes[-1], ic=asdict(summary), hac=interval,
             interval_usability=asdict(usability), p_value=p_value,
-            p_value_method='two_sided_normal_hac' if p_value is not None else None,
+            p_value_method=p_value_method,
             buckets={q: asdict(value) for q, value in horizon.bucket_summary.items()},
             spread=asdict(horizon.spread_summary), direction=asdict(horizon.direction),
             direction_by_bucket={q: asdict(value) for q, value in horizon.direction_by_bucket.items()},
         ))
     return rows
+
+
+def _hac_observation_matches(interval: Mapping[str, Any], observation: AdaptiveCalibrationObservation,
+                             *, horizon: int, count: int) -> bool:
+    expected = {
+        'method_version': observation.method_version,
+        'calibration_scenario': observation.scenario,
+        'grid_size': observation.grid_size,
+        'n_valid': observation.n_valid,
+        'lag': observation.window,
+        'min_lag': observation.structural_minimum,
+        'variance': observation.hac_variance,
+        'effective_df': observation.effective_df,
+        'alpha': observation.alpha,
+        'missing_pattern': observation.missing_pattern,
+        'bandwidth_method': 'nw94_prewhitened',
+    }
+    required = (*expected.values(), observation.cross_section_width_min, observation.cross_section_width_max)
+    return (
+        None not in required and 'reason' in interval and interval['reason'] is None
+        and observation.horizon == horizon and observation.n_valid == count
+        and all(
+            field in interval and not isinstance(interval[field], (bool, np.bool_)) and interval[field] == value
+            for field, value in expected.items()
+        )
+    )
+
+
+def _read_trial_usability(row: Mapping[str, Any], interval: Mapping[str, Any], usability: Mapping[str, Any], *,
+                          mode: str, count: int, has_bounds: bool, point_usable: bool) -> IntervalUsability:
+    status = usability.get('calibration_status')
+    reason = usability.get('reason')
+    descriptive = usability.get('descriptive_stats_usable')
+    significant = usability.get('significance_interpretation_usable')
+    verified_horizon = usability.get('verified_horizon')
+    horizon = row['horizon_bars']
+    horizon_matches = (
+        all(isinstance(value, Integral) and not isinstance(value, (bool, np.bool_))
+            for value in (horizon, verified_horizon))
+        and horizon > 0 and verified_horizon == horizon
+    )
+    declaration_valid = (
+        'reason' in usability and (reason is None or isinstance(reason, str))
+        and status in ('uncalibrated', 'calibrated_pass', 'calibrated_fail')
+        and isinstance(descriptive, bool) and isinstance(significant, bool)
+        and (verified_horizon is None or horizon_matches)
+        and (not significant or (status == 'calibrated_pass' and reason is None and descriptive and horizon_matches))
+    )
+    payload = usability.get('adaptive_observation')
+    observation = None
+    if payload is not None:
+        try:
+            observation = AdaptiveCalibrationObservation(**payload)
+        except TypeError:
+            pass
+    adaptive = (
+        payload is not None or interval.get('method_version') is not None
+        or interval.get('bandwidth_method', 'fixed') != 'fixed'
+        or row.get('p_value_method') == 'two_sided_student_t_hac'
+    )
+    invalid_observation = adaptive and (observation is None or (
+        mode != 'time_series' and not _hac_observation_matches(
+            interval, observation, horizon=horizon, count=count,
+        )
+    ))
+    evidence_payload = usability.get('calibration_evidence')
+    evidence = None
+    if isinstance(evidence_payload, Mapping):
+        try:
+            evidence = CalibrationEvidence(**evidence_payload)
+        except TypeError:
+            pass
+    claims_calibration = evidence_payload is not None or status != 'uncalibrated'
+    if not declaration_valid or invalid_observation or (claims_calibration and (
+        evidence is None or status == 'uncalibrated' or evidence.passes is not (status == 'calibrated_pass')
+        or not {'lower', 'upper', 'reason'} <= interval.keys() or (significant and not has_bounds)
+        or (
+            (not horizon_matches or evidence != _registered_adaptive_evidence(observation)) if adaptive
+            else evidence not in REGISTERED_CALIBRATIONS
+        )
+    )):
+        return IntervalUsability(
+            reason=interval.get('reason') or (reason if isinstance(reason, str) else None),
+            calibration_status='uncalibrated',
+            calibration_evidence=None,
+            descriptive_stats_usable=descriptive if isinstance(descriptive, bool) else point_usable,
+            significance_interpretation_usable=False,
+        )
+    return IntervalUsability(
+        reason=reason, calibration_status=status, calibration_evidence=evidence,
+        descriptive_stats_usable=descriptive, significance_interpretation_usable=significant,
+        verified_horizon=verified_horizon, adaptive_observation=observation,
+    )
 
 
 def _record_trials(family: BarTrialFamily, rows: list[dict[str, Any]], *,
@@ -267,30 +355,45 @@ def _record_trials(family: BarTrialFamily, rows: list[dict[str, Any]], *,
             statistic, count, interval = ic['spearman_ic'], ic['sample_count'], row['bootstrap']
         else:
             statistic, count, interval = ic['mean'], ic['n_valid'], row['hac']
-        bounds = interval['lower'], interval['upper']
-        usability = row['interval_usability']
-        evidence = usability['calibration_evidence']
-        if evidence is not None:
-            evidence = CalibrationEvidence(**evidence)
+        lower, upper = interval.get('lower'), interval.get('upper')
+        bounds = (lower, upper) if all(
+            isinstance(bound, Real) and not isinstance(bound, bool) and np.isfinite(bound)
+            for bound in (lower, upper)
+        ) and lower <= upper else None
+        statistic = statistic if statistic is not None and np.isfinite(statistic) else None
+        declared = row.get('interval_usability')
+        declared = declared if isinstance(declared, Mapping) else {}
+        # A cross-sectional summary reason can explain missing ICIR while the mean is defined.
+        point_usable = statistic is not None and (mode != 'time_series' or ic['reason'] is None)
+        usability = _read_trial_usability(
+            row, interval, declared, mode=mode, count=count, has_bounds=bounds is not None,
+            point_usable=point_usable,
+        )
+        if mode == 'cross_sectional' and count == 0:
+            # Corroborate the count for the ledger only after checking the conflict.
+            payload = declared.get('adaptive_observation')
+            observed_count = payload.get('n_valid') if isinstance(payload, Mapping) else None
+            hac_count = interval.get('n_valid')
+            if hac_count == observed_count and all(
+                isinstance(n, Integral) and not isinstance(n, bool) and n > 0
+                for n in (hac_count, observed_count)
+            ):
+                count = int(hac_count)
         trials[key] = (Trial(
-            statistic if np.isfinite(statistic) else None, row.get('p_value'), count,
-            bounds if np.isfinite(bounds).all() else None,
-            IntervalUsability(**(usability | {'calibration_evidence': evidence})),
-        ), interval['reason'] or ic['reason'])
+            statistic, row.get('p_value'), count,
+            bounds,
+            usability,
+            p_value_method=row.get('p_value_method'),
+        ), interval.get('reason') or ic['reason'])
     family._record_trials(trials, window=window)
 
 
-def evaluate_bar_splits(labels: pd.DataFrame, labeler: BarReturnLabeler, *,
-                        engine: EvaluationEngine, split: SplitConfig | None,
-                        family: BarTrialFamily, factor_id: str,
-                        options: dict[str, Any]) -> BarEvaluationV2:
-    """Adapt Bar labels to the unified engine and retain split-level evidence."""
-    window = _selection_window(split)
-    family._validate_evaluation_window(window)
-    selection_split, split = window
-    if split is not None and labels.empty:
-        raise ContractValidationError('Both train and oos require at least one scheduled signal')
-    time_series = engine.analysis_mode == 'time_series'
+def build_bar_splits(
+    groups: Iterable[tuple[str, str | None, dict[str, SplitEvaluation]]],
+    *, horizons: tuple[int, ...], mode: str, split: SplitConfig | None,
+) -> dict[str, dict[str, Any]]:
+    """Assemble split reports from existing engine statistics."""
+    time_series = mode == 'time_series'
     scheme = 'per_cross_section'
     if time_series:
         scheme = 'fitted_on_train' if split else 'full_sample_descriptive_only'
@@ -298,23 +401,14 @@ def evaluate_bar_splits(labels: pd.DataFrame, labeler: BarReturnLabeler, *,
         name: dict(train_end=pd.Timestamp(split.train_end) if split else None,
                    oos_start=pd.Timestamp(split.oos_start) if split else None, quantile_scheme=scheme,
                    fit_identity={} if time_series and split else None,
-                   split_purged_count=dict.fromkeys(labeler.horizons, 0), horizons=[])
+                   split_purged_count=dict.fromkeys(horizons, 0), horizons=[])
         for name in (('train', 'oos') if split else ('full',))
     }
     instrument_stats: dict[str, dict[tuple[str, int], dict[Hashable, TimeSeriesInstrument]]] = {
         name: {} for name in splits
     }
-    keys = ['frequency', 'instrument_id'] if time_series else 'frequency'
-    for key, group in labels.groupby(keys):
-        frequency, instrument = key if time_series else (key, None)
-        panel, expected, signal_valid, clock, entries, exits = _bar_panel(
-            group, labeler, frequency, scheduled_exits=split is not None, by_availability=not time_series,
-        )
-        results = engine.evaluate(
-            panel, split=split, expected_grid=expected, signal_valid=signal_valid,
-            signal_available_at=clock, entry_timestamps=entries, exit_timestamps=exits, **options,
-        )
-        for name, evaluation in results.splits.items():
+    for frequency, instrument, evaluations in groups:
+        for name, evaluation in evaluations.items():
             report = splits[name]
             if evaluation.fit_identity is not None:
                 report['fit_identity'].setdefault(frequency, {})[instrument] = evaluation.fit_identity
@@ -343,6 +437,4 @@ def evaluate_bar_splits(labels: pd.DataFrame, labeler: BarReturnLabeler, *,
                 ))
             report['instrument_ic_summaries'] = summaries
 
-    _record_trials(family, splits[selection_split]['horizons'],
-                   keys=tuple((factor_id, h) for h in labeler.horizons), mode=engine.analysis_mode, window=window)
-    return BarEvaluationV2(splits, family.report())
+    return splits

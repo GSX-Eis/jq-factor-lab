@@ -14,24 +14,21 @@ from tools.agent_harness._cli_compat import _cli_bindings
 from tools.agent_harness.runner import HarnessResult
 
 
-def _bar_artifact_paths(evaluation_dir: Path, diagnostics_report: bool, *,
-                        evaluation_v2: bool = False) -> set[Path]:
-    names = ("summary.json", "per_bar_labels.csv", "ic_by_horizon.csv", "quantile_stats.csv")
+def _bar_artifact_paths(evaluation_dir: Path, diagnostics_report: bool) -> set[Path]:
+    from backtest_and_analysis.time_series.artifacts import (
+        DIAGNOSTICS_CSV, DIAGNOSTICS_MARKDOWN, LEGACY_EVALUATION_SIDECAR,
+    )
+
+    # Reserve the retired name so auxiliary outputs cannot recreate a sidecar.
+    names = ("summary.json", "per_bar_labels.csv", "ic_by_horizon.csv", "quantile_stats.csv",
+             LEGACY_EVALUATION_SIDECAR)
     if diagnostics_report:
-        from backtest_and_analysis.time_series.artifacts import (
-            DIAGNOSTICS_CSV,
-            DIAGNOSTICS_MARKDOWN,
-        )
         names += (DIAGNOSTICS_CSV, DIAGNOSTICS_MARKDOWN)
-    if evaluation_v2:
-        from backtest_and_analysis.time_series.evaluation_v2 import EVALUATION_V2_FILENAME
-        names += (EVALUATION_V2_FILENAME,)
     return {evaluation_dir / name for name in names}
 
 
 def _validate_bar_output_paths(db_path: Path, output_dir: Path, json_out: str,
-                               evaluation_dir: Path | None = None, *, diagnostics_report: bool = False,
-                               evaluation_v2: bool = False) -> None:
+                               evaluation_dir: Path | None = None, *, diagnostics_report: bool = False) -> None:
     from utils.bar_evaluation_store import BarEvaluationPreconditionError
 
     cli = _cli_bindings(__name__)
@@ -42,7 +39,7 @@ def _validate_bar_output_paths(db_path: Path, output_dir: Path, json_out: str,
     if json_out:
         targets.append(Path(json_out).expanduser())
     if evaluation_dir is not None:
-        targets.extend(cli._bar_artifact_paths(evaluation_dir, diagnostics_report, evaluation_v2=evaluation_v2))
+        targets.extend(cli._bar_artifact_paths(evaluation_dir, diagnostics_report))
     db_path = db_path.resolve()
     for target in targets:
         target = target.resolve()
@@ -55,7 +52,8 @@ def _validate_bar_output_paths(db_path: Path, output_dir: Path, json_out: str,
 def _handle_time_series_analysis(
     args: argparse.Namespace, *, public_output: ExitStack | None = None,
 ) -> HarnessResult:
-    from tools.agent_harness.time_series_analysis import evaluation_v2_requested, load_config
+    from backtest_and_analysis.time_series.artifacts import validate_evaluation_output_dir
+    from tools.agent_harness.time_series_analysis import load_config
     from utils.bar_evaluation_store import (
         BarEvaluationConflictError,
         BarEvaluationIntegrityError,
@@ -92,7 +90,6 @@ def _handle_time_series_analysis(
         except (OSError, ValueError, TypeError):
             pass
     diagnostics_requested = bool(getattr(args, 'diagnostics_report', False) or guard_config.get('diagnostics_report') is True)
-    v2_requested = bool(getattr(args, 'evaluation_v2', False) or evaluation_v2_requested(guard_config))
     guard_reason = "time_series_precondition_failed"
     try:
         requested_destination = None
@@ -113,14 +110,15 @@ def _handle_time_series_analysis(
         guarded_destination = requested_destination or destination
         if guarded_destination in harness_summary_dirs:
             guarded_destination = destination
+        validate_evaluation_output_dir(guarded_destination)
 
         # A retry can target an artifact published by an earlier attempt.
-        if args.json_out and Path(args.json_out).expanduser().resolve() in {
-            path.resolve() for path in cli._bar_artifact_paths(
-                guarded_destination, diagnostics_report=True, evaluation_v2=True
-            )
-        }:
-            raise ValueError("--json-out must differ from evaluation artifact paths")
+        if args.json_out:
+            json_out = Path(args.json_out).expanduser().resolve()
+            protected = (path.resolve() for path in cli._bar_artifact_paths(
+                guarded_destination, diagnostics_report=True))
+            if any(path == json_out or path in json_out.parents for path in protected):
+                raise ValueError("--json-out must differ from evaluation artifact paths")
 
         guard_reason = "bar_evaluation_store_precondition_failed"
         cli_results_db = getattr(args, "results_db", None)
@@ -132,7 +130,7 @@ def _handle_time_series_analysis(
                           else cli._resolve_repo_relative_path(raw_db))
         if guarded_db is not None:
             cli._validate_bar_output_paths(guarded_db, output_dir, args.json_out, guarded_destination,
-                                       diagnostics_report=diagnostics_requested, evaluation_v2=v2_requested)
+                                       diagnostics_report=diagnostics_requested)
         if (public_output is not None and requested_destination is not None and config_error is None
                 and not (args.fake_result or args.dry_run)):
             from utils.local_outputs import reserve_output_directory
@@ -191,8 +189,6 @@ def _handle_time_series_analysis(
             config.pop("calendar_by_instrument", None)
         if getattr(args, 'diagnostics_report', False):
             config['diagnostics_report'] = True
-        if getattr(args, 'evaluation_v2', False):
-            config['evaluation_v2'] = True
         output_dir.mkdir(parents=True, exist_ok=True)
         resolved_config = output_dir / "config" / "resolved.json"
         cli._write_json(resolved_config, config)
@@ -331,6 +327,11 @@ def _handle_read_bar_evaluations(args: argparse.Namespace) -> HarnessResult:
             calendar_id=args.calendar_id,
             start_utc=args.start_utc,
             end_utc=args.end_utc,
+            split=args.split,
+            calibration_status=args.calibration_status,
+            descriptive_stats_usable=args.descriptive_stats_usable,
+            significance_interpretation_usable=args.significance_interpretation_usable,
+            has_trial_ledger=args.has_trial_ledger,
         )
         return cli._complete_result(
             cli._success_result(

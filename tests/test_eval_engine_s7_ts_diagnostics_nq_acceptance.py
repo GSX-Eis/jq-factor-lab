@@ -45,13 +45,14 @@ def test_diagnostics_harness_json_and_csv_contract(tmp_path):
 
     summary_path = Path(artifacts['evaluation_summary']['path'])
     summary = json.loads(summary_path.read_text(encoding='utf-8'))
-    assert set(summary) == set(expected['summary_fields'])
-    assert payload['metrics'] == {key: summary[key] for key in expected['metric_fields']}
     assert summary['result_schema_version'] == expected['evaluation_schema']
+    assert set(summary) == set(expected['summary_fields'])
+    assert payload['metrics'] == {key: value for key, value in summary.items() if key != 'config'}
     assert summary['analysis_mode'] == 'time_series' and summary['cross_sections'] == []
     assert summary['config'] == config
     assert set(summary['result_identity']) == set(expected['identity_fields'])
     identity = summary['result_identity']
+    assert identity['result_schema_version'] == expected['evaluation_schema']
     assert identity['input_file_hashes'] == {str(path.resolve()): sha256(path.read_bytes()).hexdigest()}
     assert identity['calendar_hash'] == summary['calendar_identity']['calendar_hash']
     assert summary['calendar_identity']['calendar_id'] == 'CME Globex Equity'
@@ -163,7 +164,7 @@ def test_diagnostics_opt_in_cli_publishes_frozen_json_csv_and_markdown(tmp_path)
     assert len(offset_one) == 3
     assert offset_one.factor_value.corr(offset_one.return_pct, method='spearman') == 1
     summary = json.loads(paths['evaluation_summary'].read_text(encoding='utf-8'))
-    assert summary['result_schema_version'] == FROZEN['harness']['evaluation_schema']
+    assert summary['result_schema_version'] == 'bar_evaluation.v2'
     report = summary['diagnostics_report']
     assert report == payload['metrics']['diagnostics_report']
     assert report['schema'] == expected['schema']
@@ -180,10 +181,17 @@ def test_diagnostics_opt_in_cli_publishes_frozen_json_csv_and_markdown(tmp_path)
         assert (row['grid_start_utc'], row['grid_end_utc']) == ('2026-12-01T14:30:00Z', '2026-12-01T14:38:00Z')
         oracle = expected['horizons'][h]
         ci, counts = row['bootstrap'], row['counts']
-        assert [ci[k] for k in ('grid_size', 'block_length', 'seed', 'n_boot', 'min_valid_replicates', 'alpha')] == [
-            9, 5, 0, 999, 900, 0.05,
+        assert [ci[k] for k in ('grid_size', 'seed', 'n_boot', 'min_valid_replicates', 'alpha')] == [
+            9, 0, 999, 900, 0.05,
         ]
-        _check_values([ci[k] for k in ('valid_replicates', 'lower', 'upper', 'reason')], oracle['bootstrap'])
+        assert ci['lower'] is None and ci['upper'] is None
+        if h == '1':
+            assert ci['block_length'] == 1
+            assert ci['reason'] == 'insufficient_bootstrap_replicates'
+            assert 0 < ci['valid_replicates'] < ci['min_valid_replicates']
+        else:
+            assert ci['block_length'] == ci['valid_replicates'] == 0
+            assert ci['reason'] == 'insufficient_bootstrap_grid'
         assert counts['total_count'] == counts['valid_count'] + sum(counts['exclusion_counts'].values()) == 9
         assert counts['excluded_count'] == sum(counts['exclusion_counts'].values())
         assert counts['valid_count'] == row['ic']['sample_count'] == oracle['overall']['samples']
@@ -220,7 +228,10 @@ def test_diagnostics_opt_in_cli_publishes_frozen_json_csv_and_markdown(tmp_path)
     assert not csv_rows
     markdown = paths['diagnostics_report_markdown'].read_text(encoding='utf-8').splitlines()
     assert [line for line in markdown if line.startswith('#')] == expected['markdown_headings']
-    assert all(row in markdown for row in expected['markdown_rows'])
+    *descriptive_rows, _fixed_bootstrap_row = expected['markdown_rows']
+    assert all(row in markdown for row in descriptive_rows)
+    assert ('| NQZ26 | 1min | 2 | 9 | 0 | 0 | 999 | 0 | 900 | 0.05 | — | — '
+            '| insufficient_bootstrap_grid |') in markdown
 
 
 def test_diagnostics_cli_keeps_missing_minutes_in_the_phase_grid(tmp_path):

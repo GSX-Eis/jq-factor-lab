@@ -16,7 +16,6 @@ import numpy as np
 import pandas as pd
 
 from .contracts import ContractValidationError, ResultIdentity
-from .evaluation_v2 import EVALUATION_V2_FILENAME
 from .evaluator import EvaluationResult, RESULT_SCHEMA_VERSION, _mode, _prepare
 
 
@@ -53,24 +52,39 @@ def _csv_table(frame: pd.DataFrame) -> pd.DataFrame:
 
 DIAGNOSTICS_CSV = 'diagnostics_report.csv'
 DIAGNOSTICS_MARKDOWN = 'diagnostics_report.md'
+LEGACY_EVALUATION_SIDECAR = 'evaluation_v2.json'
+
+
+class LegacyEvaluationOutputError(ContractValidationError):
+    """The output directory still holds a legacy Bar sidecar."""
+
+
+def validate_evaluation_output_dir(destination: Path) -> None:
+    sidecar = destination / LEGACY_EVALUATION_SIDECAR
+    try:
+        sidecar.lstat()
+    except (FileNotFoundError, NotADirectoryError):
+        return
+    raise LegacyEvaluationOutputError(
+        f'Legacy Bar evaluation sidecar exists at {sidecar}. Choose a new output directory.')
 
 
 def write_evaluation_artifacts(evaluation_result: EvaluationResult, output_dir: str | Path, *,
                                result_identity: ResultIdentity,
                                config: Mapping[str, Any] | None = None,
                                code_version_source: str | None = None,
-                               diagnostics_report: Mapping[str, Any] | None = None,
-                               split_diagnostics_report: Mapping[str, Any] | None = None) -> dict[str, Path]:
+                               diagnostics_report: Mapping[str, Any] | None = None) -> dict[str, Path]:
     """Stage the evaluation files on the destination filesystem, publish summary last.
 
     Each rename is atomic. Readers must require summary.json; a failed retry
     removes that completion marker even if older CSV files remain for diagnosis.
     Label-only evaluation cannot reconstruct source/calendar provenance: supply
     metadata on the result, or use evaluate_bars to retain it automatically.
-    IC inference metadata is available on the result; v1 persists it only
-    through the opt-in diagnostics report when supplied.
+    Standard-table interval usability and any calendar-grid inference are
+    published together in the completion marker.
     """
     destination = Path(output_dir)
+    validate_evaluation_output_dir(destination)
     destination.mkdir(parents=True, exist_ok=True)
     summary_path = destination / 'summary.json'
     summary_path.unlink(missing_ok=True)
@@ -92,6 +106,7 @@ def write_evaluation_artifacts(evaluation_result: EvaluationResult, output_dir: 
         raise ContractValidationError('Invalid code_version_source')
     payload = dict(
         result_schema_version=RESULT_SCHEMA_VERSION, analysis_mode=result.analysis_mode,
+        frequency='bar', return_unit='percent',
         config=dict(config) if config is not None else {}, data_identity=result.data_identity,
         calendar_identity=dict(calendar_id=None, calendar_hash=result_identity.calendar_hash,
                                view=None, boundary_policy=None) | result.calendar_identity,
@@ -101,22 +116,17 @@ def write_evaluation_artifacts(evaluation_result: EvaluationResult, output_dir: 
         ic_by_horizon=result.ic_by_horizon.to_dict('records'),
         quantile_stats=result.quantile_stats.to_dict('records'),
         exclusion_summary=result.exclusion_summary,
-        cross_sections=result.cross_sections.to_dict('records'))
+        cross_sections=result.cross_sections.to_dict('records'),
+        interval_usability=[
+            dict(frequency=frequency, horizon_bars=horizon, instrument_id=instrument, **asdict(usability))
+            for (frequency, horizon, instrument), usability in result.ic_inference.items()
+        ],
+        splits=result.splits, trial_ledger=result.trial_ledger)
     if code_version_source is not None:
         payload['result_identity']['code_version_source'] = code_version_source
     if diagnostics_report is not None:
         payload['diagnostics_report'] = diagnostics_report
-    if split_diagnostics_report is not None and result.evaluation_v2 is None:
-        raise ContractValidationError('split_diagnostics_report requires evaluation.v2')
-    v2_json = None
     try:
-        if result.evaluation_v2 is not None:
-            v2 = dict(**asdict(result.evaluation_v2), analysis_mode=result.analysis_mode,
-                      data_identity=payload['data_identity'], calendar_identity=payload['calendar_identity'],
-                      result_identity=payload['result_identity'])
-            if split_diagnostics_report is not None:
-                v2['diagnostics_report'] = split_diagnostics_report
-            v2_json = json.dumps(_json_value(v2), ensure_ascii=False, indent=2, allow_nan=False) + '\n'
         payload = _json_value(payload)
         summary = json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False) + '\n'
     except (ValueError, TypeError) as exc:
@@ -124,9 +134,7 @@ def write_evaluation_artifacts(evaluation_result: EvaluationResult, output_dir: 
     tables = {'per_bar_labels': result.per_bar_labels, 'ic_by_horizon': result.ic_by_horizon,
               'quantile_stats': result.quantile_stats}
     paths = {name: destination / f'{name}.csv' for name in tables}
-    if v2_json is not None:
-        paths['evaluation_v2'] = destination / EVALUATION_V2_FILENAME
-    if diagnostics_report is not None or split_diagnostics_report is not None:
+    if diagnostics_report is not None:
         paths.update(diagnostics_report_csv=destination / DIAGNOSTICS_CSV,
                      diagnostics_report_markdown=destination / DIAGNOSTICS_MARKDOWN)
     paths['summary'] = summary_path
@@ -135,14 +143,11 @@ def write_evaluation_artifacts(evaluation_result: EvaluationResult, output_dir: 
         staged = Path(staging)
         for name, table in tables.items():
             _csv_table(table).to_csv(staged / paths[name].name, index=False)
-        if v2_json is not None:
-            (staged / EVALUATION_V2_FILENAME).write_text(v2_json, encoding='utf-8')
         if 'diagnostics_report_csv' in paths:
             from .diagnostics_report import DIAGNOSTICS_CSV_COLUMNS, diagnostics_rows, render_diagnostics_markdown
-            report = (_json_value(split_diagnostics_report) if split_diagnostics_report is not None
-                      else payload['diagnostics_report'])
+            report = payload['diagnostics_report']
             columns = DIAGNOSTICS_CSV_COLUMNS
-            if split_diagnostics_report is not None:
+            if report['schema'] == 'time_series_diagnostics.v2':
                 columns = ('split', *columns, 'split_purged_count')
             rows = diagnostics_rows(report)
             with (staged / DIAGNOSTICS_CSV).open('w', encoding='utf-8', newline='') as stream:

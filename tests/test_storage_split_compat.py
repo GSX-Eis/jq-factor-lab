@@ -42,7 +42,7 @@ LEGACY_EXPORTS = {
         acquire_exclusive_write_conn Frequency BAR_EVALUATION_TABLES
         SUPPORTED_RESULT_SCHEMA_VERSIONS VALID_ANALYSIS_MODES BarEvaluationPreconditionError
         BarEvaluationIntegrityError BarEvaluationConflictError BarEvaluationIngestReceipt
-        ingest_evaluation query_bar_evaluation_runs query_bar_evaluation_detail
+        ingest_evaluation migrate_bar_evaluation_db query_bar_evaluation_runs query_bar_evaluation_detail
         query_bar_evaluations get_bar_evaluation_filter_options summarize_bar_evaluation_connection
         summarize_bar_evaluation_db
     """,

@@ -17,8 +17,10 @@ from .contracts import (
 )
 from .csv_reader import BarAvailability, filter_bars_by_view, read_bar_csv, read_factor_csv
 from .labels import BarReturnLabeler
-from .evaluation_v2 import BarEvaluationV2, BarTrialFamily, EVALUATION_V2_SCHEMA_VERSION
-from .evaluator import BarCrossSectionalEvaluator, EvaluationResult, TimeSeriesEvaluator, evaluate_bars
+from .inference import BarTrialFamily
+from .evaluator import (
+    RESULT_SCHEMA_VERSION, BarCrossSectionalEvaluator, EvaluationResult, TimeSeriesEvaluator, evaluate_bars,
+)
 from .artifacts import write_evaluation_artifacts
 
 __all__ = [
@@ -29,6 +31,6 @@ __all__ = [
     'BarAvailability', 'filter_bars_by_view', 'read_bar_csv', 'read_factor_csv',
     'BarReturnLabeler',
     'BarCrossSectionalEvaluator', 'EvaluationResult', 'TimeSeriesEvaluator', 'evaluate_bars',
-    'BarEvaluationV2', 'BarTrialFamily', 'EVALUATION_V2_SCHEMA_VERSION',
+    'BarTrialFamily', 'RESULT_SCHEMA_VERSION',
     'write_evaluation_artifacts',
 ]

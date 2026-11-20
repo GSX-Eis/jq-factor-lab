@@ -2,8 +2,9 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 import duckdb
 
@@ -28,13 +29,25 @@ from .schema import (
     _QUANTILE_TABLE_COLUMNS,
     _RUN_ALL_COLUMNS,
     _RUN_ARTIFACT_HASH_COLUMNS,
+    _RUN_BOOL_COLUMNS,
+    _RUN_JSON_COLUMNS,
     _RUN_SEMANTIC_COLUMNS,
+    _RUN_V2_COLUMN_TYPES,
+    _SPLIT_BOOL_COLUMNS,
+    _SPLIT_FLOAT_COLUMNS,
+    _SPLIT_INT_COLUMNS,
+    _SPLIT_JSON_COLUMNS,
+    _SPLIT_TABLE,
+    _SPLIT_TABLE_COLUMNS,
     BarEvaluationConflictError,
     BarEvaluationIngestReceipt,
     BarEvaluationIntegrityError,
     BarEvaluationPreconditionError,
+    _catalog_columns,
     _column_kind,
+    _create_split_table,
     _create_tables,
+    _require_write_schema,
 )
 from .validation import (
     _published_artifact_sha256,
@@ -82,6 +95,7 @@ def _verify_existing_run_matches(
     ic_tuples: list[tuple[Any, ...]],
     q_tuples: list[tuple[Any, ...]],
     cs_tuples: list[tuple[Any, ...]],
+    split_tuples: list[tuple[Any, ...]],
 ) -> None:
     identity_hash = run_record["identity_hash"]
     run_cols_sql = ", ".join(_RUN_SEMANTIC_COLUMNS)
@@ -91,9 +105,8 @@ def _verify_existing_run_matches(
     ).fetchone()
     assert existing_run is not None
 
-    json_run_cols = {"input_file_hashes", "data_identity", "exclusion_summary"}
     for idx, col in enumerate(_RUN_SEMANTIC_COLUMNS):
-        kind = "json" if col in json_run_cols else "str"
+        kind = _column_kind(col, frozenset(), frozenset(), _RUN_BOOL_COLUMNS, _RUN_JSON_COLUMNS)
         if _canonical_compare_token(existing_run[idx], kind=kind) != _canonical_compare_token(run_record[col], kind=kind):
             raise BarEvaluationConflictError(
                 identity_hash,
@@ -151,6 +164,16 @@ def _verify_existing_run_matches(
         bool_cols=_CS_BOOL_COLUMNS,
         json_cols=_CS_JSON_COLUMNS,
     )
+    existing_splits = conn.execute(
+        f"SELECT {', '.join(_SPLIT_TABLE_COLUMNS)} FROM {_SPLIT_TABLE} "
+        "WHERE identity_hash=? ORDER BY row_index",
+        [identity_hash],
+    ).fetchall()
+    _compare_table_rows(
+        identity_hash, _SPLIT_TABLE, _SPLIT_TABLE_COLUMNS, existing_splits, split_tuples,
+        int_cols=_SPLIT_INT_COLUMNS, float_cols=_SPLIT_FLOAT_COLUMNS,
+        bool_cols=_SPLIT_BOOL_COLUMNS, json_cols=_SPLIT_JSON_COLUMNS,
+    )
 
     hash_cols_sql = ", ".join(_RUN_ARTIFACT_HASH_COLUMNS)
     existing_hashes = conn.execute(
@@ -205,6 +228,53 @@ def _insert_cross_section_rows(conn: duckdb.DuckDBPyConnection, rows: list[tuple
     )
 
 
+def _insert_split_rows(conn: duckdb.DuckDBPyConnection, rows: list[tuple[Any, ...]]) -> None:
+    if rows:
+        placeholders = ", ".join("?" for _ in _SPLIT_TABLE_COLUMNS)
+        conn.executemany(
+            f"INSERT INTO {_SPLIT_TABLE} ({', '.join(_SPLIT_TABLE_COLUMNS)}) VALUES ({placeholders})",
+            rows,
+        )
+
+
+@contextmanager
+def _write_transaction(
+    db_path: Path, retry_interval_sec: float = 0.2,
+) -> Iterator[duckdb.DuckDBPyConnection]:
+    acquire = _legacy_binding(_LEGACY_MODULE, "acquire_exclusive_write_conn", acquire_exclusive_write_conn)
+    with acquire(db_path, retry_interval_sec=retry_interval_sec) as session:
+        conn = session.conn
+        active = conn.execute("SELECT current_database()").fetchone()[0]
+        if not any(name == active and filename and Path(filename).resolve() == db_path
+                   for _, name, filename in conn.execute("PRAGMA database_list").fetchall()):
+            raise BarEvaluationPreconditionError(
+                f"results_db connection must use the requested persistent DuckDB file: {db_path}")
+        _legacy_binding(_LEGACY_MODULE, "_validate_db_target_path", _validate_db_target_path)(db_path)
+        conn.execute("BEGIN TRANSACTION")
+        try:
+            yield conn
+            conn.execute("COMMIT")
+        except BaseException:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
+
+
+def migrate_bar_evaluation_db(db_path: str | Path) -> None:
+    """Explicitly upgrade an existing v1 store while preserving its historical rows."""
+    resolved_db = _validate_db_target_path(db_path)
+    if not resolved_db.is_file():
+        raise BarEvaluationPreconditionError(f"results_db does not exist: {resolved_db}")
+    with _write_transaction(resolved_db) as conn:
+        _require_write_schema(conn, _catalog_columns(conn), legacy_only=True)
+        for column, kind in _RUN_V2_COLUMN_TYPES.items():
+            conn.execute(f"ALTER TABLE bar_evaluation_runs ADD COLUMN IF NOT EXISTS {column} {kind}")
+        _create_split_table(conn)
+        _require_write_schema(conn, _catalog_columns(conn))
+
+
 def ingest_evaluation(
     db_path: str | Path,
     evaluation_dir: str | Path | None = None,
@@ -224,67 +294,42 @@ def ingest_evaluation(
     resolved_db = _legacy_binding(_LEGACY_MODULE, "_validate_db_target_path", _validate_db_target_path)(db_path)
     paths, hashes = _resolve_artifact_paths(evaluation_dir, artifacts, expected_hashes)
     prepare_payload = _legacy_binding(_LEGACY_MODULE, "_validate_and_prepare_payload", _validate_and_prepare_payload)
-    run_record, ic_tuples, q_tuples, cs_tuples = prepare_payload(paths, hashes, run_id)
+    run_record, ic_tuples, q_tuples, cs_tuples, split_tuples = prepare_payload(paths, hashes, run_id)
 
     identity_hash = run_record["identity_hash"]
-    acquire_write_conn = _legacy_binding(_LEGACY_MODULE, "acquire_exclusive_write_conn", acquire_exclusive_write_conn)
-    with acquire_write_conn(resolved_db, retry_interval_sec=retry_interval_sec) as session:
-        conn = session.conn
-        active = conn.execute("SELECT current_database()").fetchone()[0]
-        databases = conn.execute("PRAGMA database_list").fetchall()
-        if not any(name == active and filename and Path(filename).resolve() == resolved_db
-                   for _, name, filename in databases):
-            raise BarEvaluationPreconditionError(
-                f"results_db connection must use the requested persistent DuckDB file: {resolved_db}")
-        _legacy_binding(_LEGACY_MODULE, "_validate_db_target_path", _validate_db_target_path)(resolved_db)
+    with _write_transaction(resolved_db, retry_interval_sec) as conn:
         # Reject a concurrent retry replacing files while we parsed them or waited for the lock.
         for key, path in paths.items():
             if not path.is_file() or _published_artifact_sha256(path) != hashes[key]:
                 raise BarEvaluationIntegrityError(f"Published artifact changed during ingestion: {path}")
-        conn.execute("BEGIN TRANSACTION")
-        try:
+        catalog = _catalog_columns(conn)
+        if not catalog:
             _create_tables(conn)
-            exists = conn.execute(
-                "SELECT 1 FROM bar_evaluation_runs WHERE identity_hash=?",
-                [identity_hash],
-            ).fetchone()
-            if exists is not None:
-                _verify_existing_run_matches(conn, run_record, ic_tuples, q_tuples, cs_tuples)
-                ingested_at = conn.execute(
-                    "SELECT ingested_at_utc FROM bar_evaluation_runs WHERE identity_hash=?",
-                    [identity_hash],
-                ).fetchone()[0]
-                conn.execute("COMMIT")
-                return BarEvaluationIngestReceipt(
-                    db_path=resolved_db,
-                    identity_hash=identity_hash,
-                    status="noop",
-                    analysis_mode=run_record["analysis_mode"],
-                    ic_rows=len(ic_tuples),
-                    quantile_rows=len(q_tuples),
-                    cross_section_rows=len(cs_tuples),
-                    ingested_at_utc=_format_utc_iso(ingested_at) or "",
-                )
-
+            catalog = _catalog_columns(conn)
+        _require_write_schema(conn, catalog)
+        existing = conn.execute(
+            "SELECT ingested_at_utc FROM bar_evaluation_runs WHERE identity_hash=?",
+            [identity_hash],
+        ).fetchone()
+        if existing is not None:
+            _verify_existing_run_matches(conn, run_record, ic_tuples, q_tuples, cs_tuples, split_tuples)
+            status, ingested_at = "noop", existing[0]
+        else:
             _legacy_binding(_LEGACY_MODULE, "_insert_run_row", _insert_run_row)(conn, run_record)
             _legacy_binding(_LEGACY_MODULE, "_insert_ic_rows", _insert_ic_rows)(conn, ic_tuples)
             _legacy_binding(_LEGACY_MODULE, "_insert_quantile_rows", _insert_quantile_rows)(conn, q_tuples)
             _legacy_binding(_LEGACY_MODULE, "_insert_cross_section_rows", _insert_cross_section_rows)(conn, cs_tuples)
-            conn.execute("COMMIT")
-        except BaseException:
-            try:
-                conn.execute("ROLLBACK")
-            except Exception:
-                pass
-            raise
+            _legacy_binding(_LEGACY_MODULE, "_insert_split_rows", _insert_split_rows)(conn, split_tuples)
+            status, ingested_at = "inserted", run_record["ingested_at_utc"]
 
     return BarEvaluationIngestReceipt(
         db_path=resolved_db,
         identity_hash=identity_hash,
-        status="inserted",
+        status=status,
         analysis_mode=run_record["analysis_mode"],
         ic_rows=len(ic_tuples),
         quantile_rows=len(q_tuples),
         cross_section_rows=len(cs_tuples),
-        ingested_at_utc=_format_utc_iso(run_record["ingested_at_utc"]) or "",
+        ingested_at_utc=_format_utc_iso(ingested_at) or "",
+        split_rows=len(split_tuples),
     )

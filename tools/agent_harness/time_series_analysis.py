@@ -8,12 +8,8 @@ from pathlib import Path
 from typing import Any
 
 
-_ADVANCED_OPTIONS = ('split', 'bootstrap', 'hac_lag', 'direction', 'standardization',
-                     'calibration_scenario', 'trial_selection')
-
-
-def evaluation_v2_requested(config: dict[str, Any]) -> bool:
-    return config.get('evaluation_v2') is True or any(config.get(key) is not None for key in _ADVANCED_OPTIONS)
+_INFERENCE_OPTIONS = ('split', 'bootstrap', 'hac_lag', 'direction', 'standardization',
+                      'calibration_scenario', 'trial_selection')
 
 
 class AnalysisPreconditionError(ValueError):
@@ -39,12 +35,16 @@ def load_config(path: Path) -> dict[str, Any]:
 
 def evaluate(config: dict[str, Any], destination: Path) -> dict[str, Any]:
     from backtest_and_analysis.time_series import (
-        BarReturnLabeler, ResultIdentity, evaluate_bars, read_bar_csv, read_factor_csv,
+        RESULT_SCHEMA_VERSION, BarReturnLabeler, ResultIdentity, evaluate_bars, read_bar_csv, read_factor_csv,
         sha256_file, write_evaluation_artifacts,
     )
-    from backtest_and_analysis.time_series.evaluator import RESULT_SCHEMA_VERSION
     from utils.session_calendar import SessionCalendar
 
+    if 'evaluation_v2' in config:
+        raise ValueError(
+            'The Bar config key "evaluation_v2" has been removed. Remove it and set '
+            '"trial_selection": {"method": "holm"} to request inference and the trial ledger.'
+        )
     mode = config.get('analysis_mode')
     if mode is None:
         raise AnalysisPreconditionError('missing_analysis_mode', 'Explicit analysis_mode is required')
@@ -118,16 +118,12 @@ def evaluate(config: dict[str, Any], destination: Path) -> dict[str, Any]:
         result = evaluate_bars(bars, factors, labeler, analysis_mode=mode,
             n_quantiles=config.get('n_quantiles', 5), min_ic_samples=config.get('min_ic_samples', 3),
             min_cross_section_size=config.get('min_cross_section_size', 3),
-            factor_id=config.get('factor_id', 'factor_value'), evaluation_v2=config.get('evaluation_v2', False),
-            **{key: config[key] for key in _ADVANCED_OPTIONS if key in config})
-    diagnostics_report = split_diagnostics_report = None
+            factor_id=config.get('factor_id', 'factor_value'), diagnostics=diagnostics_requested,
+            **{key: config[key] for key in _INFERENCE_OPTIONS if key in config})
+    diagnostics_report = None
     if diagnostics_requested:
         from backtest_and_analysis.time_series.diagnostics_report import evaluate_diagnostics
-        options = dict(n_quantiles=config.get('n_quantiles', 5), min_samples=config.get('min_ic_samples', 3))
-        diagnostics_report = evaluate_diagnostics(result, labeler, **options)
-        if diagnostics_report['schema'] == 'time_series_diagnostics.v2':
-            split_diagnostics_report = diagnostics_report
-            diagnostics_report = evaluate_diagnostics(result, labeler, legacy_full=True, **options)
+        diagnostics_report = evaluate_diagnostics(result)
     # A changing source must not be bound to the digest from before it was read.
     if hashes != {str(path): sha256_file(path) for path in paths.values()}:
         raise ValueError('Input CSV changed during evaluation')
@@ -139,27 +135,27 @@ def evaluate(config: dict[str, Any], destination: Path) -> dict[str, Any]:
         input_file_hashes=hashes, calendar_hash=result.calendar_identity['calendar_hash'],
         code_version=code_version, result_schema_version=RESULT_SCHEMA_VERSION)
     outputs = write_evaluation_artifacts(result, destination, result_identity=identity, config=config,
-                                         code_version_source=code_version_source, diagnostics_report=diagnostics_report,
-                                         split_diagnostics_report=split_diagnostics_report)
-    summary = json.loads(outputs['summary'].read_text(encoding='utf-8'))
-    metrics = {key: summary[key] for key in ('analysis_mode', 'exclusion_summary', 'ic_by_horizon',
-                                            'quantile_stats', 'cross_sections', 'result_identity')}
-    if diagnostics_requested:
-        diagnostics_source = (json.loads(outputs['evaluation_v2'].read_text(encoding='utf-8'))
-                              if split_diagnostics_report is not None else summary)
-        metrics['diagnostics_report'] = diagnostics_source['diagnostics_report']
+                                         code_version_source=code_version_source, diagnostics_report=diagnostics_report)
+    metrics = json.loads(outputs['summary'].read_text(encoding='utf-8'))
+    metrics.pop('config')
     return dict(ok=True, exit_code=0, metrics=metrics,
         artifacts=[dict(artifact_type='evaluation_summary' if name == 'summary' else name,
                         path=str(path), sha256=sha256_file(path)) for name, path in outputs.items()])
 
 
 def main() -> int:
+    from backtest_and_analysis.time_series.artifacts import (
+        LegacyEvaluationOutputError, validate_evaluation_output_dir,
+    )
+
     destination = Path(sys.argv[2])
     try:
+        validate_evaluation_output_dir(destination)
         config = json.loads(Path(sys.argv[1]).read_text(encoding='utf-8'))
         payload = evaluate(config, destination)
     except Exception as exc:
-        destination.joinpath('summary.json').unlink(missing_ok=True)
+        if not isinstance(exc, LegacyEvaluationOutputError):
+            destination.joinpath('summary.json').unlink(missing_ok=True)
         precondition = isinstance(exc, (ValueError, TypeError, KeyError, FileNotFoundError))
         payload = dict(ok=False, exit_code=2 if precondition else 3,
             error=dict(code=getattr(exc, 'code', 'time_series_precondition_failed' if precondition

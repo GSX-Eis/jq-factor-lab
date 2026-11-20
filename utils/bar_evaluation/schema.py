@@ -7,16 +7,18 @@ from pathlib import Path
 
 import duckdb
 
-from backtest_and_analysis.time_series.evaluator import (
-    RESULT_SCHEMA_VERSION,
-)
+from backtest_and_analysis.time_series import RESULT_SCHEMA_VERSION
 
-BAR_EVALUATION_TABLES: tuple[str, ...] = (
+_BASE_TABLES: tuple[str, ...] = (
     "bar_evaluation_runs",
     "bar_evaluation_ic",
     "bar_evaluation_quantiles",
     "bar_evaluation_cross_sections",
 )
+_SPLIT_TABLE = "bar_evaluation_split_metrics"
+BAR_EVALUATION_TABLES = (*_BASE_TABLES, _SPLIT_TABLE)
+_SPLIT_NAMES = ("full", "train", "oos")
+_CALIBRATION_STATUSES = ("uncalibrated", "calibrated_pass", "calibrated_fail")
 SUPPORTED_RESULT_SCHEMA_VERSIONS: tuple[str, ...] = (RESULT_SCHEMA_VERSION,)
 VALID_ANALYSIS_MODES: tuple[str, ...] = ("time_series", "cross_sectional")
 
@@ -124,6 +126,49 @@ _CROSS_SECTION_TABLE_COLUMNS: tuple[str, ...] = (
     "descriptive_only",
 )
 
+_RUN_V2_COLUMN_TYPES = {
+    "has_split": "BOOLEAN",
+    "split_config_json": "VARCHAR",
+    "trial_ledger_json": "VARCHAR",
+    "calibration_summary_json": "VARCHAR",
+}
+_RUN_BOOL_COLUMNS = frozenset({"has_split"})
+_RUN_JSON_COLUMNS = frozenset({
+    "input_file_hashes", "data_identity", "exclusion_summary",
+    "split_config_json", "trial_ledger_json", "calibration_summary_json",
+})
+_SPLIT_COLUMN_TYPES = {
+    "identity_hash": "VARCHAR NOT NULL",
+    "row_index": "BIGINT NOT NULL",
+    "split": "VARCHAR NOT NULL",
+    "frequency": "VARCHAR NOT NULL",
+    "instrument_id": "VARCHAR",
+    "horizon_bars": "BIGINT NOT NULL",
+    "split_purged_count": "BIGINT NOT NULL",
+    "ic": "DOUBLE",
+    "ic_reason": "VARCHAR",
+    "n_observations": "BIGINT NOT NULL",
+    "n_dependence_adjusted": "DOUBLE",
+    "interval_method": "VARCHAR NOT NULL",
+    "interval_lower": "DOUBLE",
+    "interval_upper": "DOUBLE",
+    "calibration_status": "VARCHAR NOT NULL",
+    "descriptive_stats_usable": "BOOLEAN NOT NULL",
+    "significance_interpretation_usable": "BOOLEAN NOT NULL",
+    "p_value": "DOUBLE",
+    "p_value_method": "VARCHAR",
+    "adjusted_p_value": "DOUBLE",
+    "inference_adjusted_p_value": "DOUBLE",
+    "significant": "BOOLEAN",
+    "fit_identity_json": "VARCHAR",
+    "metrics_json": "VARCHAR NOT NULL",
+}
+_SPLIT_TABLE_COLUMNS = tuple(_SPLIT_COLUMN_TYPES)
+_SPLIT_INT_COLUMNS = frozenset(k for k, t in _SPLIT_COLUMN_TYPES.items() if t.startswith("BIGINT"))
+_SPLIT_FLOAT_COLUMNS = frozenset(k for k, t in _SPLIT_COLUMN_TYPES.items() if t == "DOUBLE")
+_SPLIT_BOOL_COLUMNS = frozenset(k for k, t in _SPLIT_COLUMN_TYPES.items() if t.startswith("BOOLEAN"))
+_SPLIT_JSON_COLUMNS = frozenset({"fit_identity_json", "metrics_json"})
+
 _RUN_SEMANTIC_COLUMNS: tuple[str, ...] = (
     "identity_hash",
     "analysis_mode",
@@ -140,6 +185,7 @@ _RUN_SEMANTIC_COLUMNS: tuple[str, ...] = (
     "code_version_source",
     "result_schema_version",
     "exclusion_summary",
+    *_RUN_V2_COLUMN_TYPES,
 )
 
 _RUN_ARTIFACT_HASH_COLUMNS: tuple[str, ...] = (
@@ -175,6 +221,7 @@ _RUN_ALL_COLUMNS: tuple[str, ...] = (
     "quantile_stats_sha256",
     "run_id",
     "ingested_at_utc",
+    *_RUN_V2_COLUMN_TYPES,
 )
 
 _IC_INT_COLUMNS = frozenset({
@@ -236,11 +283,13 @@ class BarEvaluationIngestReceipt:
     quantile_rows: int
     cross_section_rows: int
     ingested_at_utc: str
+    split_rows: int = 0
 
 
 def _create_tables(conn: duckdb.DuckDBPyConnection) -> None:
+    v2_columns = ", ".join(f"{name} {kind}" for name, kind in _RUN_V2_COLUMN_TYPES.items())
     conn.execute(
-        """CREATE TABLE IF NOT EXISTS bar_evaluation_runs (
+        f"""CREATE TABLE IF NOT EXISTS bar_evaluation_runs (
             identity_hash VARCHAR PRIMARY KEY,
             analysis_mode VARCHAR NOT NULL,
             frequency VARCHAR NOT NULL,
@@ -265,7 +314,8 @@ def _create_tables(conn: duckdb.DuckDBPyConnection) -> None:
             quantile_stats_path VARCHAR NOT NULL,
             quantile_stats_sha256 VARCHAR NOT NULL,
             run_id VARCHAR,
-            ingested_at_utc TIMESTAMPTZ NOT NULL
+            ingested_at_utc TIMESTAMPTZ NOT NULL,
+            {v2_columns}
         )"""
     )
     conn.execute(
@@ -363,6 +413,74 @@ def _create_tables(conn: duckdb.DuckDBPyConnection) -> None:
             PRIMARY KEY (identity_hash, row_index)
         )"""
     )
+
+    _create_split_table(conn)
+
+
+def _create_split_table(conn: duckdb.DuckDBPyConnection) -> None:
+    columns = ", ".join(f"{name} {kind}" for name, kind in _SPLIT_COLUMN_TYPES.items())
+    conn.execute(f"""CREATE TABLE IF NOT EXISTS {_SPLIT_TABLE} (
+        {columns}, PRIMARY KEY (identity_hash, row_index)
+    )""")
+
+
+def _catalog_columns(conn: duckdb.DuckDBPyConnection) -> dict[str, dict[str, str]]:
+    rows = conn.execute("""
+        SELECT t.table_name, c.column_name, c.data_type
+        FROM duckdb_tables() AS t JOIN duckdb_columns() AS c USING (database_name, schema_name, table_name)
+        WHERE t.database_name = current_database() AND t.schema_name = 'main'
+          AND NOT t.temporary AND t.table_name IN (SELECT unnest(?))
+    """, [list(BAR_EVALUATION_TABLES)]).fetchall()
+    result: dict[str, dict[str, str]] = {}
+    for table, column, data_type in rows:
+        result.setdefault(table, {})[column] = data_type
+    return result
+
+
+def _require_write_schema(
+    conn: duckdb.DuckDBPyConnection, catalog: dict[str, dict[str, str]], *, legacy_only: bool = False,
+) -> None:
+    types = {
+        "str": "VARCHAR", "int": "BIGINT", "float": "DOUBLE", "bool": "BOOLEAN",
+        "timestamp": "TIMESTAMP WITH TIME ZONE",
+    }
+    runs = {col: "VARCHAR" for col in _RUN_ALL_COLUMNS if col not in _RUN_V2_COLUMN_TYPES}
+    runs["ingested_at_utc"] = types["timestamp"]
+    required = {"bar_evaluation_runs": runs}
+    for table, columns, ints, floats, bools in (
+        ("bar_evaluation_ic", _IC_TABLE_COLUMNS, _IC_INT_COLUMNS, _IC_FLOAT_COLUMNS, _IC_BOOL_COLUMNS),
+        ("bar_evaluation_quantiles", _QUANTILE_TABLE_COLUMNS, _QUANTILE_INT_COLUMNS,
+         _QUANTILE_FLOAT_COLUMNS, _QUANTILE_BOOL_COLUMNS),
+        ("bar_evaluation_cross_sections", _CROSS_SECTION_TABLE_COLUMNS, _CS_INT_COLUMNS,
+         _CS_FLOAT_COLUMNS, _CS_BOOL_COLUMNS),
+    ):
+        required[table] = {col: types[_column_kind(col, ints, floats, bools, frozenset())] for col in columns}
+    if not legacy_only:
+        runs.update(_RUN_V2_COLUMN_TYPES)
+        required[_SPLIT_TABLE] = {col: kind.removesuffix(" NOT NULL") for col, kind in _SPLIT_COLUMN_TYPES.items()}
+    primary_keys = dict(conn.execute("""
+        SELECT table_name, constraint_column_names FROM duckdb_constraints()
+        WHERE database_name = current_database() AND schema_name = 'main' AND constraint_type = 'PRIMARY KEY'
+    """).fetchall())
+    missing = []
+    for table, columns in required.items():
+        if table not in catalog:
+            missing.append(table)
+            continue
+        expected_key = ["identity_hash"] if table == "bar_evaluation_runs" else ["identity_hash", "row_index"]
+        if primary_keys.get(table) != expected_key:
+            missing.append(f"{table} PRIMARY KEY ({', '.join(expected_key)})")
+        for column, expected in columns.items():
+            actual = catalog[table].get(column)
+            if actual is None:
+                missing.append(f"{table}.{column}")
+            elif actual != expected:
+                missing.append(f"{table}.{column} (expected {expected}, found {actual})")
+    if missing:
+        hint = "" if legacy_only else "; upgrade a v1 database explicitly with migrate_bar_evaluation_db(db_path)"
+        raise BarEvaluationPreconditionError(
+            f"Bar evaluation schema missing required tables/columns or has incompatible types: {', '.join(missing)}{hint}"
+        )
 
 
 def _column_kind(col: str, int_cols: frozenset[str], float_cols: frozenset[str],

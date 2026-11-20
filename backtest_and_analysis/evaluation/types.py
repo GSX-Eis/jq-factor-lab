@@ -14,8 +14,35 @@ FloatArray = npt.NDArray[np.float64]
 ReturnMode = Literal["raw", "cross_section_excess"]
 ICMethod = Literal["spearman", "pearson"]
 
+DEFAULT_BOOTSTRAP_REPLICATES = 999
+DEFAULT_MIN_VALID_REPLICATES = 900
+
 CalibrationStatus = Literal["uncalibrated", "calibrated_pass", "calibrated_fail"]
-CalibrationMethod = Literal["cross_section_hac", "time_series_mbb"]
+CalibrationMethod = Literal[
+    "cross_section_hac", "time_series_mbb", "cross_section_hac_adaptive", "time_series_bootstrap_adaptive",
+]
+
+
+@dataclass(frozen=True)
+class AdaptiveCalibrationObservation:
+    method_version: str
+    scenario: str
+    grid_size: int
+    n_valid: int
+    horizon: int
+    window: int
+    structural_minimum: int
+    missing_pattern: str
+    alpha: float
+    cross_section_width_min: int | None
+    cross_section_width_max: int | None
+    effective_df: float | None
+    hac_variance: float | None
+    effective_blocks: float | None
+    n_boot: int | None
+    min_valid_replicates: int | None
+    valid_replicates: int | None
+    min_pairs_per_replicate: int | None
 
 
 @dataclass(frozen=True)
@@ -30,6 +57,9 @@ class CalibrationEvidence:
     passes: bool
     report_ref: str
     bootstrap_replicates: int | None = None
+    method_version: str | None = None
+    domain_id: str | None = None
+    report_sha256: str | None = None
 
 
 @dataclass(frozen=True)
@@ -40,6 +70,7 @@ class IntervalUsability:
     descriptive_stats_usable: bool
     significance_interpretation_usable: bool
     verified_horizon: int | None = None
+    adaptive_observation: AdaptiveCalibrationObservation | None = None
 
 
 @dataclass(frozen=True)
@@ -66,6 +97,14 @@ class HACInterval:
     reason: str | None
     calibration_status: CalibrationStatus = "uncalibrated"
     calibration_evidence: CalibrationEvidence | None = None
+    method_version: str | None = None
+    missing_pattern: str | None = None
+    calibration_scenario: str | None = None
+    bandwidth_method: Literal["fixed", "nw94_prewhitened"] = "fixed"
+    min_lag: int | None = None
+    prewhitening_ar1: float | None = None
+    effective_df: float | None = None
+    critical_value: float | None = None
 
 
 @dataclass(frozen=True)
@@ -135,6 +174,16 @@ class BootstrapInterval:
     calibration_status: CalibrationStatus = "uncalibrated"
     calibration_evidence: CalibrationEvidence | None = None
     n_valid_pairs: int | None = None
+    method_version: str | None = None
+    missing_pattern: str | None = None
+    calibration_scenario: str | None = None
+    block_length_method: Literal["fixed", "ppw2009"] = "fixed"
+    resample_method: Literal["moving_block", "circular_block"] = "moving_block"
+    interval_method: Literal["percentile", "fisher_z_bootstrap_t"] = "percentile"
+    min_block_length: int | None = None
+    min_pairs_per_replicate: int | None = None
+    effective_blocks: float | None = None
+    fisher_z_standard_error: float | None = None
 
     @property
     def confidence_level(self) -> float:

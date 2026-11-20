@@ -1,11 +1,12 @@
 """DuckDB persistence and read-only query store for Bar evaluation results (Stage 6.6).
 
 Stores published `time-series-analysis` evaluation artifacts in an explicitly
-specified DuckDB database across four tables:
+specified DuckDB database:
   - bar_evaluation_runs
   - bar_evaluation_ic
   - bar_evaluation_quantiles
   - bar_evaluation_cross_sections
+  - bar_evaluation_split_metrics
 
 `per_bar_labels.csv` is NOT stored in DuckDB; only its path and SHA256 digest
 are recorded in `bar_evaluation_runs`.
@@ -45,6 +46,7 @@ from utils.time_axis import Frequency
 
 from .ingest import (
     ingest_evaluation,
+    migrate_bar_evaluation_db,
 )
 from .query import (
     get_bar_evaluation_filter_options,
@@ -95,6 +97,7 @@ __all__ = [
     "ingest_evaluation",
     "json",
     "math",
+    "migrate_bar_evaluation_db",
     "np",
     "pd",
     "query_bar_evaluation_detail",

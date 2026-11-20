@@ -148,7 +148,10 @@ def test_daily_closes_to_engine_result(prices_and_scores, mode):
             if time_series:
                 for col, asset in enumerate(ASSETS):
                     row = stats.instruments[asset]
-                    assert row.bootstrap.block_length == 2
+                    assert row.bootstrap.block_length_method == "ppw2009"
+                    assert row.bootstrap.min_block_length == h
+                    if h == 2:
+                        assert row.bootstrap.block_length == 0
                     assert row.ic.counts[0] == row.returns.n_samples == len(pairs)
                     assert row.ic.values[0] == pytest.approx(spearmanr(signals[:, col], returns[:, col]).statistic)
                     assert row.returns.mean == pytest.approx(returns[:, col].mean(), abs=1e-12)
@@ -219,12 +222,8 @@ def test_minute_csv_to_published_evaluation(tmp_path, prices_and_scores, mode):
         config.update(bootstrap=BOOTSTRAP, standardization="zscore")
     payload = run_cli(tmp_path, config)
     labels, _, _, summary = read_outputs(payload)
-    published = next(item for item in payload["artifacts"] if item["artifact_type"] == "evaluation_v2")
-    contents = Path(published["path"]).read_bytes()
-    assert sha256(contents).hexdigest() == published["sha256"]
-    report = json.loads(contents)
+    report = summary
     assert (report["analysis_mode"], report["frequency"], report["return_unit"]) == (mode, "bar", "percent")
-    assert report["result_identity"] == summary["result_identity"]
     assert report["result_identity"]["input_file_hashes"] == {str(path): input_hash}
     assert report["calendar_identity"]["calendar_hash"] == calendar.calendar_hash
     assert report["calendar_identity"]["view"] == "RTH"
@@ -276,7 +275,9 @@ def test_minute_csv_to_published_evaluation(tmp_path, prices_and_scores, mode):
                 assert {row["instrument_id"] for row in stats} == set(ASSETS)
                 for row in stats:
                     col = ASSETS.index(row["instrument_id"])
-                    assert row["intervals_verified"] and row["bootstrap"]["block_length"] == 2
+                    assert row["intervals_verified"]
+                    assert row["bootstrap"]["block_length_method"] == "ppw2009"
+                    assert row["bootstrap"]["min_block_length"] == h
                     assert row["ic"]["sample_count"] == row["return_distribution"]["n_samples"] == len(pairs)
                     assert row["ic"]["spearman_ic"] == pytest.approx(spearmanr(signals[:, col], returns[:, col]).statistic)
                     assert row["return_distribution"]["mean"] == pytest.approx(returns[:, col].mean(), abs=1e-12)
@@ -295,7 +296,11 @@ def test_minute_csv_to_published_evaluation(tmp_path, prices_and_scores, mode):
                 assert row["ic"]["mean"] == pytest.approx(np.mean([
                     spearmanr(x, y).statistic for x, y in zip(signals, returns, strict=True)
                 ]))
-                assert row["hac"]["lag"] == h - 1
+                hac = row["hac"]
+                assert hac["bandwidth_method"] == "nw94_prewhitened"
+                assert hac["min_lag"] == h - 1
+                if hac["reason"] is None:
+                    assert h - 1 <= hac["lag"] <= (hac["grid_size"] - 1) // 4
                 _assert_direction(row["direction"], _direction(signals.ravel(), returns.ravel()))
                 for bucket, cols in ((1, slice(0, 2)), (2, slice(2, 4))):
                     data = row["buckets"][str(bucket)]
@@ -324,7 +329,8 @@ def test_daily_time_series_full_sample_aligns_horizon_aliases(prices_and_scores,
     np.testing.assert_array_equal(full.valid[2], panel.valid[columns[1]])
     for h, count in ((1, 11), (2, 11)):
         row = full.statistics.horizons[h].instruments[ASSETS[0]]
-        assert row.bootstrap.block_length == 2
+        assert row.bootstrap.min_block_length == h
+        assert h <= row.bootstrap.block_length <= count // 4
         assert row.ic.counts[0] == count
     assert panel.to_long().columns.tolist() == ["factor", *columns]
 
@@ -363,7 +369,7 @@ def test_daily_time_series_rejects_mismatched_endpoint_horizons(prices_and_score
         EvaluationEngine("time_series").evaluate(replace(panel, valid={"1D": panel.valid["1D"]}))
 
 
-def test_daily_time_series_uses_longest_native_horizon_for_default_block(prices_and_scores):
+def test_daily_time_series_uses_each_native_horizon_for_adaptive_block(prices_and_scores):
     _, prices, scores = prices_and_scores
     panel, _, entries, exits = _daily_inputs(prices, scores, horizons=(1, 5))
     full = EvaluationEngine("time_series").evaluate(
@@ -372,7 +378,12 @@ def test_daily_time_series_uses_longest_native_horizon_for_default_block(prices_
     assert full.statistics.horizons.keys() == {1, 5}
     for h, pair_count in ((1, 12), (5, 8)):
         row = full.statistics.horizons[h].instruments[ASSETS[0]]
-        assert row.bootstrap.block_length == 5
+        assert row.bootstrap.min_block_length == h
+        if h == 1:
+            assert h <= row.bootstrap.block_length <= pair_count // 4
+        else:
+            assert row.bootstrap.block_length == 0
+            assert row.bootstrap.reason == "insufficient_bootstrap_grid"
         assert row.ic.counts[0] == pair_count
         assert [x.counts[0] for x in row.non_overlapping_ic.values()] == [
             len(range(offset, pair_count, h)) for offset in range(h)
@@ -406,7 +417,7 @@ def test_synthetic_nq_csv_distinguishes_closed_session_and_missing_minute(tmp_pa
     payload = run_cli(tmp_path, dict(
         bars_csv=str(path), analysis_mode="time_series", calendar="NQ", view="ETH",
         start_date="2024-03-08", end_date="2024-03-11", horizons=[1, 2], n_quantiles=2,
-        evaluation_v2=True, bootstrap=BOOTSTRAP,
+        bootstrap=BOOTSTRAP,
     ))
     labels, _, _, summary = read_outputs(payload)
     assert summary["calendar_identity"]["calendar_hash"] == calendar.calendar_hash

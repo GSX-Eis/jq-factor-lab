@@ -1,8 +1,11 @@
 {
   "harness": {
-    "evaluation_schema": "bar_evaluation.v1",
-    "metric_fields": ["analysis_mode", "exclusion_summary", "ic_by_horizon", "quantile_stats", "cross_sections", "result_identity"],
-    "summary_fields": ["result_schema_version", "analysis_mode", "config", "data_identity", "calendar_identity", "result_identity", "ic_by_horizon", "quantile_stats", "exclusion_summary", "cross_sections"],
+    "evaluation_schema": "bar_evaluation.v2",
+    "summary_fields": [
+      "result_schema_version", "analysis_mode", "frequency", "return_unit", "config",
+      "data_identity", "calendar_identity", "result_identity", "ic_by_horizon", "quantile_stats",
+      "exclusion_summary", "cross_sections", "interval_usability", "splits", "trial_ledger"
+    ],
     "identity_fields": ["config_hash", "input_file_hashes", "calendar_hash", "code_version", "result_schema_version", "identity_hash", "code_version_source"],
     "artifacts": {
       "evaluation_summary": "summary.json",

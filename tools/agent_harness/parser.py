@@ -168,8 +168,6 @@ def build_parser(*, public_bar_cli: bool = False) -> argparse.ArgumentParser:
     bar_analysis.add_argument("--config", default="", help="Bar analysis JSON config")
     bar_analysis.add_argument("--diagnostics-report", action="store_true",
                               help="Publish time-series diagnostics in JSON, CSV and Markdown")
-    bar_analysis.add_argument("--evaluation-v2", action="store_true",
-                              help="Publish evaluation.v2 alongside the Bar v1 artifacts")
     for subparser in (bar_analysis, analyze):
         subparser.add_argument("--bars-csv")
         subparser.add_argument("--factors-csv")
@@ -194,6 +192,11 @@ def build_parser(*, public_bar_cli: bool = False) -> argparse.ArgumentParser:
     read_bar_eval.add_argument("--calendar-id", default=None)
     read_bar_eval.add_argument("--start-utc", default=None, help="Inclusive UTC start timestamp or YYYY-MM-DD")
     read_bar_eval.add_argument("--end-utc", default=None, help="Inclusive UTC end timestamp or YYYY-MM-DD")
+    read_bar_eval.add_argument("--split", choices=("full", "train", "oos"), help="Filter split metrics and matching runs")
+    read_bar_eval.add_argument("--calibration-status", choices=("uncalibrated", "calibrated_pass", "calibrated_fail"))
+    read_bar_eval.add_argument("--descriptive-stats-usable", action=argparse.BooleanOptionalAction)
+    read_bar_eval.add_argument("--significance-interpretation-usable", action=argparse.BooleanOptionalAction)
+    read_bar_eval.add_argument("--has-trial-ledger", action=argparse.BooleanOptionalAction)
     if public_bar_cli:
         output_root = str(Path("outputs/agent_harness").resolve())
         for command in (bar_analysis, read_bar_eval):

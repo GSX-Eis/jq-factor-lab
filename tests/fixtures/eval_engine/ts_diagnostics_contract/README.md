@@ -1,9 +1,11 @@
 # 时序诊断验收夹具
 
 本夹具依据仓库中已确认的 `docs/TIME_SERIES_CONTRACT.md`、`tests/fixtures/time_series/`
-和 `docs/EVALUATION_ENGINE.md`。Bar v1 的 CLI 契约包括摘要 JSON 和三张 CSV。
-启用 `time-series-analysis --diagnostics-report` 后，同一次执行发布增强 JSON、CSV 与 Markdown。
-`expected.json` 的 `diagnostics_cli` 固定该发布契约。训练/OOS 专项报告由本目录的合成验收脚本生成。
+和 `docs/EVALUATION_ENGINE.md`。`expected.json` 的 `harness` 固定 `bar_evaluation.v2`
+主契约，包括摘要 JSON 和三张 CSV。
+启用 `time-series-analysis --diagnostics-report` 后，同次执行在摘要中嵌入
+`time_series_diagnostics.v1` 全样本诊断，并发布诊断 CSV 和 Markdown。
+`diagnostics_cli` 固定该子报告契约。训练/OOS 专项报告由本目录的合成验收脚本生成。
 
 ## 手算样例
 

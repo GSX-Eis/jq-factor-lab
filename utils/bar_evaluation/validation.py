@@ -21,6 +21,8 @@ from backtest_and_analysis.time_series.evaluator import (
 from utils._storage_compat import _legacy_binding
 from utils.data_store import _reject_sqlite_file
 
+from .inference_validation import prepare_inference
+from .labels_validation import check_labels
 from .normalization import (
     _canonical_json,
     _coerce_optional_bool,
@@ -163,6 +165,8 @@ def _cross_check_csv_against_summary(
         if not isinstance(json_row, Mapping):
             raise BarEvaluationIntegrityError(f"summary.json {table_label}[{idx}] must be an object")
         for col in expected_columns:
+            if col not in json_row:
+                raise BarEvaluationIntegrityError(f"summary.json {table_label}[{idx}] missing {col}")
             c_val = csv_row.get(col)
             j_val = json_row.get(col)
             if _is_missing(c_val) and _is_missing(j_val):
@@ -235,14 +239,31 @@ def _resolve_frequency_field(data_identity: Mapping[str, Any], ic_rows: list[dic
     return _canonical_json(clean)
 
 
+def _summary_object(items: list[tuple[str, Any]]) -> dict[str, Any]:
+    result = dict(items)
+    if len(result) != len(items):
+        raise ValueError("duplicate object key")
+    return result
+
+
+def _summary_float(value: str) -> float:
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError(f"non-finite JSON number {value}")
+    return number
+
+
 def _validate_and_prepare_payload(
     paths: dict[str, Path],
     hashes: dict[str, str],
     run_id: str | None,
-) -> tuple[dict[str, Any], list[tuple[Any, ...]], list[tuple[Any, ...]], list[tuple[Any, ...]]]:
+) -> tuple[dict[str, Any], list[tuple[Any, ...]], list[tuple[Any, ...]], list[tuple[Any, ...]], list[tuple[Any, ...]]]:
     try:
-        summary = json.loads(paths["summary"].read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        summary = json.loads(
+            paths["summary"].read_text(encoding="utf-8"),
+            object_pairs_hook=_summary_object, parse_float=_summary_float, parse_constant=_summary_float,
+        )
+    except (OSError, ValueError) as exc:
         raise BarEvaluationIntegrityError(f"Failed to parse summary.json ({paths['summary']}): {exc}") from exc
     if not isinstance(summary, dict):
         raise BarEvaluationIntegrityError("summary.json must contain a JSON object")
@@ -301,13 +322,13 @@ def _validate_and_prepare_payload(
 
     data_identity_payload = _extract_data_identity_payload(summary)
 
-    # Read and validate CSV tables.
     expected_ic_cols = TS_IC_COLUMNS if analysis_mode == "time_series" else CS_IC_COLUMNS
     expected_q_cols = TS_QUANTILE_COLUMNS if analysis_mode == "time_series" else CS_QUANTILE_COLUMNS
 
     try:
-        ic_df = pd.read_csv(paths["ic_by_horizon"], dtype=_CSV_STRING_DTYPES)
-        q_df = pd.read_csv(paths["quantile_stats"], dtype=_CSV_STRING_DTYPES)
+        csv_options = dict(dtype=_CSV_STRING_DTYPES, keep_default_na=False, na_values=[""])
+        ic_df = pd.read_csv(paths["ic_by_horizon"], **csv_options)
+        q_df = pd.read_csv(paths["quantile_stats"], **csv_options)
     except Exception as exc:
         raise BarEvaluationIntegrityError(f"Failed to read evaluation CSV artifacts: {exc}") from exc
 
@@ -345,14 +366,16 @@ def _validate_and_prepare_payload(
         bool_cols=_QUANTILE_BOOL_COLUMNS,
         json_cols=frozenset(),
     )
-
     cross_sections_raw = summary.get("cross_sections")
     if not isinstance(cross_sections_raw, list):
         raise BarEvaluationIntegrityError("summary.json cross_sections must be a list")
     if analysis_mode == "time_series" and cross_sections_raw:
         raise BarEvaluationIntegrityError("time_series evaluation must not contain cross_sections rows")
+    label_streams, minimum, instruments, frequencies = check_labels(paths["per_bar_labels"], summary)
+    inference, split_tuples = prepare_inference(
+        summary, identity_hash, label_streams, minimum, instruments=instruments, frequencies=frequencies,
+    )
 
-    # Normalize child table rows.
     ic_tuples: list[tuple[Any, ...]] = []
     for row_index, rec in enumerate(ic_records):
         row_map: dict[str, Any] = {
@@ -421,9 +444,6 @@ def _validate_and_prepare_payload(
                 row_map[col] = _coerce_optional_str(rec.get(col))
         cs_tuples.append(tuple(row_map[col] for col in _CROSS_SECTION_TABLE_COLUMNS))
 
-    bucket_strategy = config.get("bucket_strategy")
-    if bucket_strategy is None and isinstance(config.get("continuous_futures"), Mapping):
-        bucket_strategy = config["continuous_futures"].get("bucket_strategy")
     frequency_str = _resolve_frequency_field(data_identity_payload, ic_records)
     ingested_at = dt.datetime.now(dt.timezone.utc)
 
@@ -433,7 +453,6 @@ def _validate_and_prepare_payload(
         "frequency": frequency_str,
         "view": _coerce_optional_str(cal_identity.get("view")),
         "boundary_policy": _coerce_optional_str(cal_identity.get("boundary_policy")),
-        "bucket_strategy": _coerce_optional_str(bucket_strategy),
         "calendar_id": _coerce_optional_str(cal_identity.get("calendar_id")),
         "calendar_hash": reconstructed.calendar_hash,
         "config_hash": reconstructed.config_hash,
@@ -453,8 +472,9 @@ def _validate_and_prepare_payload(
         "quantile_stats_sha256": hashes["quantile_stats"],
         "run_id": _coerce_optional_str(run_id),
         "ingested_at_utc": ingested_at,
+        **inference,
     }
-    return run_record, ic_tuples, q_tuples, cs_tuples
+    return run_record, ic_tuples, q_tuples, cs_tuples, split_tuples
 
 
 def _validate_db_target_path(db_path: str | Path) -> Path:

@@ -174,13 +174,15 @@ def test_engine_hac_uses_effective_lag_and_spearman_method() -> None:
     panel = _panel(32)
     engine = EvaluationEngine("cross_sectional")
     options = {"calibration_scenario": "overlap_null"}
-    failed = engine.evaluate(panel, **options).splits["full"].statistics.horizons[5]
+    adaptive = engine.evaluate(panel, **options).splits["full"].statistics.horizons[5]
+    failed = engine.evaluate(panel, hac_lag=0, **options).splits["full"].statistics.horizons[5]
     passed = engine.evaluate(panel, hac_lag=16, **options).splits["full"].statistics.horizons[5]
     pearson = engine.evaluate(
         panel, hac_lag=16, ic_method="pearson", **options,
     ).splits["full"].statistics.horizons[5]
     undeclared = engine.evaluate(panel, hac_lag=16).splits["full"].statistics.horizons[5]
     assert (failed.hac.lag, failed.hac.calibration_status, failed.hac.reason) == (4, "calibrated_fail", None)
+    assert adaptive.hac.calibration_status == "uncalibrated" and adaptive.hac.calibration_evidence is None
     assert (passed.hac.lag, passed.hac.calibration_status, passed.hac.reason) == (16, "calibrated_pass", None)
     assert evaluate_interval_usability(passed.hac, point_estimate=passed.ic_summary.mean).significance_interpretation_usable
     assert pearson.hac.calibration_status == undeclared.hac.calibration_status == "uncalibrated"
@@ -242,22 +244,23 @@ def test_engine_mbb_requires_replicates_and_complete_pairs_from_registered_desig
     assert usability.significance_interpretation_usable is significance_usable
 
 
-def test_bar_inference_and_published_diagnostics_preserve_v1_rows() -> None:
+def test_bar_inference_and_published_diagnostics_report_usability() -> None:
     day = "2026-12-01"
     calendar = SessionCalendar("CME Globex Equity", day, day, rth_reference_calendar="NYSE")
     labeler = BarReturnLabeler(calendar, view="RTH", horizons=[1])
     bars = read_bar_csv(Path(__file__).parent / "fixtures/eval_engine/ts_diagnostics_contract/bars.csv")
-    result = evaluate_bars(bars, labeler=labeler, analysis_mode="time_series", n_quantiles=2)
+    result = evaluate_bars(bars, labeler=labeler, analysis_mode="time_series", n_quantiles=2, diagnostics=True)
     inference = result.ic_inference["1min", 1, "NQZ26"]
     assert inference.calibration_status == "uncalibrated"
     assert inference.reason == "holding_intervals_unavailable"
     assert inference.descriptive_stats_usable and not inference.significance_interpretation_usable
 
-    report = evaluate_diagnostics(result, labeler, n_quantiles=2, min_samples=3)
+    report = evaluate_diagnostics(result)
     horizon, = report["horizons"]
-    assert horizon["bootstrap"]["reason"] is None
+    assert horizon["bootstrap"]["reason"] == "insufficient_bootstrap_replicates"
     assert horizon["interval_usability"] == {
-        "reason": None, "calibration_status": "uncalibrated", "calibration_evidence": None,
+        "reason": "insufficient_bootstrap_replicates",
+        "calibration_status": "uncalibrated", "calibration_evidence": None,
         "descriptive_stats_usable": True, "significance_interpretation_usable": False,
     }
     rows = diagnostics_rows(report)
@@ -266,6 +269,51 @@ def test_bar_inference_and_published_diagnostics_preserve_v1_rows() -> None:
     assert "Calibration **uncalibrated**" in markdown
     assert "Descriptive statistics usable **yes**" in markdown
     assert "Significance interpretation usable **no**" in markdown
+
+
+def test_reversed_full_diagnostics_use_one_bootstrap_and_requested_direction(monkeypatch) -> None:
+    from backtest_and_analysis.evaluation import time_series
+
+    day = "2026-12-01"
+    calendar = SessionCalendar("CME Globex Equity", day, day, rth_reference_calendar="NYSE")
+    labeler = BarReturnLabeler(calendar, view="RTH", horizons=[1])
+    bars = read_bar_csv(Path(__file__).parent / "fixtures/eval_engine/ts_diagnostics_contract/bars.csv")
+    calls = []
+    original = time_series._bootstrap_spearman
+
+    def record(*args, **kwargs):
+        interval = original(*args, **kwargs)
+        calls.append(interval)
+        return interval
+
+    monkeypatch.setattr(time_series, "_bootstrap_spearman", record)
+    result = evaluate_bars(
+        bars, labeler=labeler, analysis_mode="time_series", n_quantiles=2, direction=-1, diagnostics=True,
+        bootstrap={"block_length": 1},
+    )
+    inference, = evaluate_diagnostics(result)["horizons"]
+    assert (inference["direction"]["hits"], inference["direction"]["denominator"]) == (1, 6)
+    assert len(calls) == 1
+    assert (calls[0].lower, calls[0].upper) == pytest.approx((.18786728732554484, 1.0))
+
+
+def test_full_diagnostics_reuse_configured_bootstrap_without_split(monkeypatch) -> None:
+    day = "2026-12-01"
+    calendar = SessionCalendar("CME Globex Equity", day, day, rth_reference_calendar="NYSE")
+    labeler = BarReturnLabeler(calendar, view="RTH", horizons=[1])
+    bars = read_bar_csv(Path(__file__).parent / "fixtures/eval_engine/ts_diagnostics_contract/bars.csv")
+    options = dict(labeler=labeler, analysis_mode="time_series", n_quantiles=2, diagnostics=True)
+    result = evaluate_bars(
+        bars, bootstrap=dict(block_length=1, seed=73, n_boot=21, min_valid_replicates=15), **options,
+    )
+
+    def unexpected_evaluation(*args, **kwargs):
+        pytest.fail("Rendering diagnostics must reuse statistics")
+
+    monkeypatch.setattr(EvaluationEngine, "evaluate", unexpected_evaluation)
+    inference, = evaluate_diagnostics(result)["horizons"]
+    assert (inference["bootstrap"]["seed"], inference["bootstrap"]["n_boot"]) == (73, 21)
+    assert inference["bootstrap"]["lower"] == pytest.approx(.322322, abs=1e-6)
 
 
 def test_cross_section_bar_reports_a_point_even_with_degenerate_hac() -> None:

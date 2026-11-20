@@ -1,5 +1,6 @@
 """Synthetic, hand-computed Bar evaluations and publication boundaries."""
 import json
+from dataclasses import replace
 
 import numpy as np
 import pandas as pd
@@ -7,7 +8,7 @@ import pytest
 
 from backtest_and_analysis.time_series import (
     BarCrossSectionalEvaluator, BarReturnLabeler, ContractValidationError,
-    EXCLUSION_PRIORITY, ResultIdentity, TimeSeriesEvaluator, evaluate_bars,
+    EXCLUSION_PRIORITY, RESULT_SCHEMA_VERSION, ResultIdentity, TimeSeriesEvaluator, evaluate_bars,
     read_bar_csv, read_factor_csv, write_evaluation_artifacts,
 )
 from backtest_and_analysis.time_series.labels import LABEL_COLUMNS
@@ -207,7 +208,7 @@ def evaluated():
         source='SYNTHETIC', data_version='v1', factor_value=np.arange(10.)))
     calendar = SessionCalendar('NQ', '2026-12-01', '2026-12-01')
     result = evaluate_bars(bars, labeler=BarReturnLabeler(calendar, horizons=[1, 5]), analysis_mode='time_series')
-    identity = ResultIdentity('a'*64, {'bars.csv': 'b'*64}, calendar.calendar_hash, 'test', 'bar_evaluation.v1')
+    identity = ResultIdentity('a'*64, {'bars.csv': 'b'*64}, calendar.calendar_hash, 'test', RESULT_SCHEMA_VERSION)
     return bars, result, identity
 
 
@@ -240,10 +241,28 @@ def test_artifacts_roundtrip_and_identity(tmp_path, evaluated):
     assert summary['data_identity']['raw_coverage_end_utc'] == bars.timestamp_utc.max().isoformat().replace('+00:00', 'Z')
     assert summary['calendar_identity']['calendar_hash'] == identity.calendar_hash
     assert summary['result_identity']['identity_hash'] == identity.identity_hash()
+    assert summary['splits'] == {} and summary['trial_ledger'] is None
+    assert {row['horizon_bars'] for row in summary['interval_usability']} == {1, 5}
     assert summary['ic_by_horizon'] and summary['quantile_stats']
     assert not any(name in summary_text for name in ['p_value', 't_stat', 'is_significant', 'NaN', 'Infinity'])
     assert len(pd.read_csv(paths['ic_by_horizon'])) == len(result.ic_by_horizon)
     assert len(pd.read_csv(paths['quantile_stats'])) == len(result.quantile_stats)
+
+
+def test_result_identity_binds_main_schema_and_rejects_v1_publication(tmp_path, evaluated):
+    _, result, identity = evaluated
+    paths = write_evaluation_artifacts(result, tmp_path, result_identity=identity)
+    summary = json.loads(paths['summary'].read_text())
+    payload = summary['result_identity']
+    assert payload['result_schema_version'] == summary['result_schema_version'] == 'bar_evaluation.v2'
+    expected_hash = payload.pop('identity_hash')
+    assert ResultIdentity(**payload).identity_hash() == expected_hash
+
+    old_identity = replace(identity, result_schema_version='bar_evaluation.v1')
+    assert old_identity.identity_hash() != expected_hash
+    with pytest.raises(ContractValidationError, match=r'result_schema_version must be bar_evaluation\.v2'):
+        write_evaluation_artifacts(result, tmp_path, result_identity=old_identity)
+    assert not paths['summary'].exists()
 
 
 def test_empty_quantile_artifact_and_json_null(tmp_path, evaluated):
@@ -268,6 +287,18 @@ def test_failed_write_invalidates_stale_summary(tmp_path, evaluated, monkeypatch
     with pytest.raises(OSError, match='disk failure'):
         write_evaluation_artifacts(result, tmp_path, result_identity=identity)
     assert not (tmp_path / 'summary.json').exists()
+
+
+def test_publisher_refuses_legacy_sidecar_before_replacing_summary(tmp_path, evaluated):
+    _, result, identity = evaluated
+    summary = tmp_path / 'summary.json'
+    summary.write_text('{"result_schema_version": "bar_evaluation.v1"}')
+    sidecar = tmp_path / 'evaluation_v2.json'
+    sidecar.symlink_to(tmp_path / 'missing-sidecar.json')
+    with pytest.raises(ContractValidationError, match=r'evaluation_v2\.json.*new output directory'):
+        write_evaluation_artifacts(result, tmp_path, result_identity=identity)
+    assert json.loads(summary.read_text()) == {'result_schema_version': 'bar_evaluation.v1'}
+    assert sidecar.is_symlink()
 
 
 def test_empty_results_have_readable_artifacts(tmp_path, evaluated):
@@ -358,7 +389,7 @@ def test_cross_sectional_artifacts_and_per_bar_text(tmp_path, evaluated):
 def test_identity_mismatch_invalidates_previous_publication(tmp_path, evaluated):
     _, result, identity = evaluated
     write_evaluation_artifacts(result, tmp_path, result_identity=identity)
-    mismatch = ResultIdentity('a'*64, {}, 'c'*64, 'test', 'bar_evaluation.v1')
+    mismatch = replace(identity, calendar_hash='c'*64)
     with pytest.raises(ContractValidationError, match='calendar_hash'):
         write_evaluation_artifacts(result, tmp_path, result_identity=mismatch)
     assert not (tmp_path / 'summary.json').exists()

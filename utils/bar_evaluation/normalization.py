@@ -6,6 +6,7 @@ import json
 import math
 import struct
 from collections.abc import Mapping
+from sys import float_info
 from typing import Any
 
 import numpy as np
@@ -16,6 +17,42 @@ from .schema import (
     BarEvaluationIntegrityError,
     BarEvaluationPreconditionError,
 )
+
+
+def _require(condition: bool, field: str, expected: str) -> None:
+    if not condition:
+        raise BarEvaluationIntegrityError(f"summary.json {field}: expected {expected}")
+
+
+def _object(value: Any, field: str, *required: str) -> dict[str, Any]:
+    _require(isinstance(value, dict), field, "an object")
+    missing = set(required) - value.keys()
+    _require(not missing, field, f"required fields {sorted(missing)}")
+    return value
+
+
+def _array(value: Any, field: str) -> list[Any]:
+    _require(isinstance(value, list), field, "an array")
+    return value
+
+
+def _count(value: Any, field: str, *, minimum: int = 0) -> int:
+    _require(type(value) is int and minimum <= value < 2**63, field, f"an integer >= {minimum}")
+    return value
+
+
+def _metric(value: Any, field: str, *, probability: bool = False) -> float | None:
+    if value is None:
+        return None
+    _require(type(value) in (float, int) and abs(value) <= float_info.max,
+             field, "a finite number or null")
+    if probability:
+        _require(0 <= value <= 1, field, "a probability in [0, 1]")
+    return 0.0 if value == 0 else float(value)
+
+
+def _nullable_text(value: Any, field: str) -> None:
+    _require(value is None or isinstance(value, str), field, "a string or null")
 
 
 def _is_missing(value: Any) -> bool:
@@ -154,7 +191,7 @@ def _coerce_optional_str(value: Any) -> str | None:
 def _coerce_optional_json_str(value: Any, field: str) -> str | None:
     if _is_missing(value):
         return None
-    if isinstance(value, Mapping):
+    if isinstance(value, (Mapping, list)):
         return _canonical_json(_json_safe(value))
     if isinstance(value, str):
         text = value.strip()
@@ -165,7 +202,7 @@ def _coerce_optional_json_str(value: Any, field: str) -> str | None:
         except json.JSONDecodeError as exc:
             raise BarEvaluationIntegrityError(f"{field} contains invalid JSON: {exc}") from exc
         return _canonical_json(_json_safe(parsed))
-    raise BarEvaluationIntegrityError(f"{field} must be JSON text or mapping")
+    raise BarEvaluationIntegrityError(f"{field} must be JSON text, an object, or an array")
 
 
 def _canonical_compare_token(value: Any, *, kind: str) -> Any:

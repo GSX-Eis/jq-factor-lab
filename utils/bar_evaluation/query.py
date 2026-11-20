@@ -17,15 +17,24 @@ from .normalization import (
     _parse_filter_timestamp,
 )
 from .schema import (
+    _BASE_TABLES,
+    _CALIBRATION_STATUSES,
     _CROSS_SECTION_TABLE_COLUMNS,
     _CS_JSON_COLUMNS,
     _IC_JSON_COLUMNS,
     _IC_TABLE_COLUMNS,
     _QUANTILE_TABLE_COLUMNS,
     _RUN_ALL_COLUMNS,
+    _RUN_JSON_COLUMNS,
+    _RUN_V2_COLUMN_TYPES,
+    _SPLIT_JSON_COLUMNS,
+    _SPLIT_NAMES,
+    _SPLIT_TABLE,
+    _SPLIT_TABLE_COLUMNS,
     BAR_EVALUATION_TABLES,
     VALID_ANALYSIS_MODES,
     BarEvaluationPreconditionError,
+    _catalog_columns,
 )
 from .validation import (
     _validate_db_target_path,
@@ -51,7 +60,7 @@ def _open_read_only(db_path: str | Path) -> Iterator[duckdb.DuckDBPyConnection]:
 
 def _require_bar_evaluation_tables(conn: duckdb.DuckDBPyConnection) -> None:
     existing = {row[0] for row in conn.execute("SHOW TABLES").fetchall()}
-    missing = [name for name in BAR_EVALUATION_TABLES if name not in existing]
+    missing = [name for name in _BASE_TABLES if name not in existing]
     if missing:
         raise BarEvaluationPreconditionError(
             f"Missing bar evaluation table(s): {missing}; run time-series-analysis --results-db first"
@@ -60,7 +69,7 @@ def _require_bar_evaluation_tables(conn: duckdb.DuckDBPyConnection) -> None:
 
 def _decode_run_row(columns: Sequence[str], row: tuple[Any, ...]) -> dict[str, Any]:
     record = dict(zip(columns, row))
-    for json_col in ("input_file_hashes", "data_identity", "exclusion_summary"):
+    for json_col in _RUN_JSON_COLUMNS:
         raw = record.get(json_col)
         if isinstance(raw, str):
             record[json_col] = json.loads(raw)
@@ -72,7 +81,9 @@ def _decode_run_row(columns: Sequence[str], row: tuple[Any, ...]) -> dict[str, A
     else:
         record["frequencies"] = []
     record["ingested_at_utc"] = _format_utc_iso(record.get("ingested_at_utc"))
-    return _json_safe(record)
+    safe = _json_safe(record)
+    safe["split_config_json"] = record.get("split_config_json")
+    return safe
 
 
 def _decode_table_rows(
@@ -91,7 +102,10 @@ def _decode_table_rows(
                 item[col] = json.loads(raw)
         for col in ts_cols:
             item[col] = _format_utc_iso(item.get(col))
-        result.append(_json_safe(item))
+        safe = _json_safe(item)
+        if "fit_identity_json" in item:
+            safe["fit_identity_json"] = item["fit_identity_json"]
+        result.append(safe)
     return result
 
 
@@ -146,8 +160,13 @@ def _query_runs_on_conn(
         params.append(end_ts.to_pydatetime())
 
     where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    run_columns = _catalog_columns(conn).get("bar_evaluation_runs", {})
+    projections = [
+        col if col not in _RUN_V2_COLUMN_TYPES or col in run_columns else f"NULL AS {col}"
+        for col in _RUN_ALL_COLUMNS
+    ]
     sql = (
-        f"SELECT {', '.join(_RUN_ALL_COLUMNS)} FROM bar_evaluation_runs "
+        f"SELECT {', '.join(projections)} FROM bar_evaluation_runs "
         f"{where_sql} ORDER BY ingested_at_utc DESC, identity_hash ASC"
     )
     rows = conn.execute(sql, params).fetchall()
@@ -184,41 +203,15 @@ def query_bar_evaluation_detail(
     db_path: str | Path,
     identity_hash: str,
 ) -> dict[str, Any]:
-    """Read-only fetch of one evaluation run and its IC/quantile/cross-section tables."""
+    """Read-only fetch of one evaluation run and its child tables."""
     if not isinstance(identity_hash, str) or not identity_hash.strip():
         raise BarEvaluationPreconditionError("identity_hash must be a nonempty string")
-    with _open_read_only(db_path) as conn:
-        runs = _query_runs_on_conn(conn, identity_hash=identity_hash)
-        if not runs:
-            raise LookupError(f"No bar evaluation found for identity_hash={identity_hash!r}")
-        run = runs[0]
-        ic_rows = conn.execute(
-            f"SELECT {', '.join(_IC_TABLE_COLUMNS)} FROM bar_evaluation_ic "
-            "WHERE identity_hash=? ORDER BY row_index",
-            [identity_hash],
-        ).fetchall()
-        q_rows = conn.execute(
-            f"SELECT {', '.join(_QUANTILE_TABLE_COLUMNS)} FROM bar_evaluation_quantiles "
-            "WHERE identity_hash=? ORDER BY row_index",
-            [identity_hash],
-        ).fetchall()
-        cs_rows = conn.execute(
-            f"SELECT {', '.join(_CROSS_SECTION_TABLE_COLUMNS)} FROM bar_evaluation_cross_sections "
-            "WHERE identity_hash=? ORDER BY row_index",
-            [identity_hash],
-        ).fetchall()
-
-    return {
-        "run": run,
-        "ic_by_horizon": _decode_table_rows(_IC_TABLE_COLUMNS, ic_rows, json_cols=_IC_JSON_COLUMNS),
-        "quantile_stats": _decode_table_rows(_QUANTILE_TABLE_COLUMNS, q_rows),
-        "cross_sections": _decode_table_rows(
-            _CROSS_SECTION_TABLE_COLUMNS,
-            cs_rows,
-            json_cols=_CS_JSON_COLUMNS,
-            ts_cols=frozenset({"signal_timestamp"}),
-        ),
-    }
+    detail = query_bar_evaluations(db_path, identity_hash=identity_hash)
+    runs = detail.pop("runs")
+    if not runs:
+        raise LookupError(f"No bar evaluation found for identity_hash={identity_hash!r}")
+    detail.pop("run_count")
+    return {"run": runs[0], **detail}
 
 
 def query_bar_evaluations(
@@ -231,8 +224,30 @@ def query_bar_evaluations(
     start_utc: str | None = None,
     end_utc: str | None = None,
     include_cross_sections: bool = True,
+    split: str | None = None,
+    calibration_status: str | None = None,
+    descriptive_stats_usable: bool | None = None,
+    significance_interpretation_usable: bool | None = None,
+    has_trial_ledger: bool | None = None,
 ) -> dict[str, Any]:
-    """Read-only query returning matching runs and associated child records."""
+    """Filter runs and split rows by their inference fields. Legacy tables remain run-scoped."""
+    if split is not None and split not in _SPLIT_NAMES:
+        raise BarEvaluationPreconditionError(f"split must be one of {_SPLIT_NAMES}, got {split!r}")
+    if calibration_status is not None and calibration_status not in _CALIBRATION_STATUSES:
+        raise BarEvaluationPreconditionError(f"calibration_status must be one of {_CALIBRATION_STATUSES}")
+    filters = {
+        "split": split,
+        "calibration_status": calibration_status,
+        "descriptive_stats_usable": descriptive_stats_usable,
+        "significance_interpretation_usable": significance_interpretation_usable,
+    }
+    filters = {key: value for key, value in filters.items() if value is not None}
+
+    def matches(row: dict[str, Any]) -> bool:
+        return all(row.get(key) == value for key, value in filters.items()) and (
+            frequency is None or _frequency_matches([row["frequency"]], frequency)
+        )
+
     with _open_read_only(db_path) as conn:
         runs = _query_runs_on_conn(
             conn,
@@ -243,7 +258,29 @@ def query_bar_evaluations(
             start_utc=start_utc,
             end_utc=end_utc,
         )
+        if has_trial_ledger is not None:
+            runs = [run for run in runs if (run["trial_ledger_json"] is not None) == has_trial_ledger]
         hashes = [run["identity_hash"] for run in runs]
+        split_rows: list[dict[str, Any]] = []
+        if hashes and _SPLIT_TABLE in _catalog_columns(conn):
+            rows = conn.execute(
+                f"SELECT {', '.join(_SPLIT_TABLE_COLUMNS)} FROM {_SPLIT_TABLE} "
+                "WHERE identity_hash IN (SELECT unnest(?)) ORDER BY identity_hash, row_index",
+                [hashes],
+            ).fetchall()
+            split_rows = _decode_table_rows(_SPLIT_TABLE_COLUMNS, rows, json_cols=_SPLIT_JSON_COLUMNS)
+        if filters:
+            with_splits = {row["identity_hash"] for row in split_rows}
+            split_rows = [row for row in split_rows if matches(row)]
+            matching = {row["identity_hash"] for row in split_rows}
+            runs = [
+                run for run in runs if run["identity_hash"] in matching
+                or (
+                    run["identity_hash"] not in with_splits and split is None
+                    and any(matches(row) for row in run["calibration_summary_json"] or [])
+                )
+            ]
+            hashes = [run["identity_hash"] for run in runs]
         if not hashes:
             return {
                 "run_count": 0,
@@ -251,6 +288,7 @@ def query_bar_evaluations(
                 "ic_by_horizon": [],
                 "quantile_stats": [],
                 "cross_sections": [],
+                "split_metrics": [],
             }
         placeholders = ", ".join("?" for _ in hashes)
         ic_rows = conn.execute(
@@ -275,6 +313,7 @@ def query_bar_evaluations(
     return {
         "run_count": len(runs),
         "runs": runs,
+        "split_metrics": split_rows,
         "ic_by_horizon": _decode_table_rows(_IC_TABLE_COLUMNS, ic_rows, json_cols=_IC_JSON_COLUMNS),
         "quantile_stats": _decode_table_rows(_QUANTILE_TABLE_COLUMNS, q_rows),
         "cross_sections": _decode_table_rows(
@@ -323,7 +362,7 @@ def summarize_bar_evaluation_connection(
             latest_ingested_at_utc = _format_utc_iso(row[0])
 
     return {
-        "all_tables_exist": all(tables_info[name]["exists"] for name in BAR_EVALUATION_TABLES),
+        "all_tables_exist": all(tables_info[name]["exists"] for name in _BASE_TABLES),
         "any_table_exists": any(tables_info[name]["exists"] for name in BAR_EVALUATION_TABLES),
         "tables": tables_info,
         "run_count": int(tables_info["bar_evaluation_runs"]["row_count"] or 0),

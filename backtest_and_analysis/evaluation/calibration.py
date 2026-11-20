@@ -2,21 +2,28 @@
 
 from collections import Counter
 from collections.abc import Iterable
-from dataclasses import asdict, dataclass, field
-from math import asin, isfinite, pi, sqrt
+from dataclasses import asdict, dataclass, field, replace
+from fractions import Fraction
+from math import asin, ceil, isclose, isfinite, pi, sqrt
+from numbers import Real
 from typing import Literal, NamedTuple
 
 import numpy as np
 import numpy.typing as npt
+from scipy.stats import t as student_t
 
 from .kernels import _positive_int, spearman
 from .types import (
+    AdaptiveCalibrationObservation,
     BootstrapInterval,
     CalibrationEvidence,
     CalibrationMethod,
     CalibrationStatus,
+    DEFAULT_BOOTSTRAP_REPLICATES,
+    DEFAULT_MIN_VALID_REPLICATES,
     FloatArray,
     HACInterval,
+    ICMethod,
     IntervalUsability,
 )
 
@@ -136,13 +143,264 @@ def resolve_interval_calibration(
     return ("calibrated_pass" if evidence.passes else "calibrated_fail"), evidence
 
 
+@dataclass(frozen=True)
+class AdaptiveCalibrationDomain:
+    domain_id: str
+    method_version: str
+    scenario: str
+    grid_size_min: int
+    grid_size_max: int
+    min_n_valid: int
+    max_missing_fraction: float
+    missing_patterns: tuple[str, ...]
+    horizons: tuple[int, ...]
+    cross_section_width_min: int | None
+    cross_section_width_max: int | None
+    min_effective_df: float | None
+    min_effective_blocks: float | None
+    min_n_boot: int | None
+    min_valid_replicates: int | None
+    min_valid_fraction: float | None
+    min_pairs_per_replicate: int | None
+    nominal_coverage: float
+    report_ref: str
+    report_sha256: str
+    coverage_cell_ids: tuple[str, ...]
+    covered: int
+    repetitions: int
+
+
+_PATTERN_GAPS = {"none": 0, "periodic_17_3": 3, "periodic_17_5": 5}
+
+
+def _expected_mask(size: int, pattern: str) -> npt.NDArray[np.bool_]:
+    return np.arange(size) % 17 < 17 - _PATTERN_GAPS[pattern]
+
+
+def _adaptive_calibration_observation(
+    interval: HACInterval | BootstrapInterval, *, point_estimate: float, horizon: int,
+    ic_method: ICMethod | None, point_reason: str | None = None,
+    cross_section_sizes: npt.ArrayLike | None = None, intervals_verified: bool = False,
+) -> AdaptiveCalibrationObservation | None:
+    if (
+        ic_method != "spearman" or not isinstance(interval.calibration_scenario, str)
+        or not interval.calibration_scenario or not isinstance(interval.missing_pattern, str)
+        or interval.missing_pattern not in _PATTERN_GAPS or point_reason is not None
+        or interval.reason is not None or not isfinite(point_estimate)
+        or not isfinite(interval.lower) or not isfinite(interval.upper) or interval.lower > interval.upper
+        or isinstance(interval.grid_size, (bool, np.bool_))
+        or not isinstance(interval.grid_size, (int, np.integer)) or interval.grid_size <= 0
+    ):
+        return None
+    common = dict(
+        scenario=interval.calibration_scenario, grid_size=int(interval.grid_size),
+        horizon=horizon, missing_pattern=interval.missing_pattern, alpha=interval.alpha,
+    )
+    if isinstance(interval, HACInterval):
+        if (
+            interval.method_version != "cs_hac_adaptive_v1" or interval.bandwidth_method != "nw94_prewhitened"
+            or interval.min_lag is None or interval.effective_df is None
+            or cross_section_sizes is None or np.ma.is_masked(cross_section_sizes)
+        ):
+            return None
+        sizes = np.asarray(cross_section_sizes)
+        if sizes.shape != (interval.grid_size,) or sizes.dtype.kind not in "iu" or np.any(sizes < 0):
+            return None
+        valid = sizes > 0
+        if not valid.any() or not np.array_equal(valid, _expected_mask(interval.grid_size, interval.missing_pattern)):
+            return None
+        return AdaptiveCalibrationObservation(
+            method_version=interval.method_version, n_valid=interval.n_valid, window=interval.lag,
+            structural_minimum=interval.min_lag,
+            cross_section_width_min=int(sizes[valid].min()), cross_section_width_max=int(sizes[valid].max()),
+            effective_df=interval.effective_df, hac_variance=interval.variance, effective_blocks=None,
+            n_boot=None, min_valid_replicates=None, valid_replicates=None, min_pairs_per_replicate=None,
+            **common,
+        )
+    if (
+        not intervals_verified or interval.method_version != "ts_boot_adaptive_v1"
+        or interval.block_length_method != "ppw2009" or interval.resample_method != "circular_block"
+        or interval.interval_method != "fisher_z_bootstrap_t" or interval.n_valid_pairs is None
+        or interval.min_block_length is None or interval.min_pairs_per_replicate is None
+        or interval.effective_blocks is None or interval.fisher_z_standard_error is None
+        or not isfinite(interval.fisher_z_standard_error) or interval.fisher_z_standard_error <= 0
+    ):
+        return None
+    return AdaptiveCalibrationObservation(
+        method_version=interval.method_version, n_valid=interval.n_valid_pairs, window=interval.block_length,
+        structural_minimum=interval.min_block_length, cross_section_width_min=None, cross_section_width_max=None,
+        effective_df=None, hac_variance=None, effective_blocks=interval.effective_blocks,
+        n_boot=interval.n_boot, min_valid_replicates=interval.min_valid_replicates,
+        valid_replicates=interval.valid_replicates, min_pairs_per_replicate=interval.min_pairs_per_replicate,
+        **common,
+    )
+
+
+def _adaptive_domain_mismatches(
+    domain: AdaptiveCalibrationDomain, observation: AdaptiveCalibrationObservation,
+) -> tuple[str, ...]:
+    o = observation
+    integers = (o.grid_size, o.n_valid, o.horizon, o.window, o.structural_minimum)
+    if any(isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, np.integer)) for value in integers):
+        return ("invalid_observation_counts",)
+    size, n = int(o.grid_size), int(o.n_valid)
+    if not 0 < n <= size:
+        return ("invalid_observation_counts",)
+    if not isinstance(o.missing_pattern, str):
+        return ("missing_pattern",)
+    gaps = _PATTERN_GAPS.get(o.missing_pattern)
+    periods, remainder = divmod(size, 17)
+    expected_n = None if gaps is None else periods * (17 - gaps) + min(remainder, 17 - gaps)
+    checks = {
+        "method_version": o.method_version == domain.method_version,
+        "scenario": o.scenario == domain.scenario,
+        "grid_size": domain.grid_size_min <= size <= domain.grid_size_max,
+        "n_valid": n == expected_n and n >= domain.min_n_valid,
+        "missing_fraction": 1 - n / size <= domain.max_missing_fraction,
+        "missing_pattern": o.missing_pattern in domain.missing_patterns,
+        "horizon": o.horizon in domain.horizons,
+        "nominal_coverage": o.alpha == _ALPHA and 1 - o.alpha == domain.nominal_coverage,
+    }
+    if domain.min_effective_df is not None:
+        checks.update(
+            structural_minimum=o.structural_minimum == o.horizon - 1,
+            window=o.horizon - 1 <= o.window <= (size - 1) // 4,
+            cross_section_width=(
+                isinstance(o.cross_section_width_min, (int, np.integer))
+                and isinstance(o.cross_section_width_max, (int, np.integer))
+                and domain.cross_section_width_min
+                <= o.cross_section_width_min == o.cross_section_width_max <= domain.cross_section_width_max
+            ),
+            effective_df=isinstance(o.effective_df, Real) and domain.min_effective_df <= o.effective_df <= n - 1,
+            hac_variance=isinstance(o.hac_variance, Real) and isfinite(o.hac_variance) and o.hac_variance > 0,
+        )
+    else:
+        boot_counts = (o.n_boot, o.min_valid_replicates, o.valid_replicates, o.min_pairs_per_replicate)
+        if any(isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, np.integer)) for value in boot_counts):
+            return ("invalid_bootstrap_counts",)
+        requested, minimum, valid, pairs = map(int, boot_counts)
+        fraction = Fraction(str(domain.min_valid_fraction))
+        checks.update(
+            structural_minimum=o.structural_minimum == o.horizon,
+            window=o.horizon <= o.window <= min(n // 4, ceil(min(3 * sqrt(size), size / 3))),
+            effective_blocks=(
+                o.window > 0 and isinstance(o.effective_blocks, Real)
+                and o.effective_blocks >= domain.min_effective_blocks
+                and isclose(o.effective_blocks, n / o.window, rel_tol=1e-12, abs_tol=0)
+            ),
+            n_boot=requested >= domain.min_n_boot,
+            min_valid_replicates=minimum >= domain.min_valid_replicates,
+            valid_replicates=minimum <= valid <= requested,
+            valid_fraction=requested > 0 and valid * fraction.denominator >= requested * fraction.numerator,
+            min_pairs_per_replicate=pairs == domain.min_pairs_per_replicate,
+        )
+    return tuple(key for key, passed in checks.items() if not passed)
+
+
+def _candidate_adaptive_domain(
+    *, cross_section: bool, scenario: str, horizon: int, gap: int, s5: bool = False,
+) -> AdaptiveCalibrationDomain:
+    generalized = scenario == "generalized_ar_heteroskedastic"
+    mode = "none" if gap == 0 else f"periodic_17_{gap}"
+    core_valid = int(_expected_mask(512, mode).sum())
+    version = "cs_hac_adaptive_v1" if cross_section else "ts_boot_adaptive_v1"
+    grid_min, valid_min, width_min = (128, 90, 16)
+    if s5:
+        grid_min, valid_min, width_min = (256, 180, 32) if cross_section else (512, 360, 32)
+    return AdaptiveCalibrationDomain(
+        domain_id=f"{version}:{scenario}", method_version=version, scenario=scenario,
+        grid_size_min=grid_min if generalized else 512, grid_size_max=1024 if generalized else 512,
+        min_n_valid=valid_min if generalized else core_valid,
+        max_missing_fraction=.30 if generalized else 1 - core_valid / 512,
+        missing_patterns=tuple(_PATTERN_GAPS) if generalized else (mode,),
+        horizons=(1, 5, 20) if generalized else (horizon,),
+        cross_section_width_min=(width_min if generalized else 32) if cross_section else None,
+        cross_section_width_max=(64 if generalized else 32) if cross_section else None,
+        min_effective_df=4 if cross_section else None, min_effective_blocks=None if cross_section else 4,
+        min_n_boot=None if cross_section else DEFAULT_BOOTSTRAP_REPLICATES,
+        min_valid_replicates=None if cross_section else DEFAULT_MIN_VALID_REPLICATES,
+        min_valid_fraction=None if cross_section else .9,
+        min_pairs_per_replicate=None if cross_section else 4,
+        nominal_coverage=_NOMINAL_COVERAGE, report_ref="", report_sha256="",
+        coverage_cell_ids=(), covered=0, repetitions=0,
+    )
+
+
+# S5 released HAC. Bootstrap missed the coverage gate in three generalization cells.
+REGISTERED_ADAPTIVE_CALIBRATIONS: tuple[AdaptiveCalibrationDomain, ...] = tuple(
+    replace(
+        _candidate_adaptive_domain(cross_section=True, scenario=scenario, horizon=horizon, gap=gap, s5=True),
+        report_ref="reports/NERE-936/adaptive-calibration-s5.json",
+        report_sha256="b56486d13112787bff507143f56bbc82413112d05bc73dac4c79889321242d62",
+        coverage_cell_ids=cell_ids,
+        covered=covered,
+        repetitions=500,
+    )
+    for scenario, horizon, gap, cell_ids, covered in (
+        ("iid", 1, 0, ("0:000",), 465),
+        ("strong_ar", 1, 0, ("0:001",), 479),
+        ("overlap", 5, 0, ("0:002",), 478),
+        ("gaps", 1, 3, ("0:003",), 472),
+        ("heteroskedastic", 1, 0, ("0:004",), 470),
+        ("combined", 5, 3, ("0:005",), 478),
+        ("positive_effect", 1, 0, ("0:006",), 468),
+        ("negative_effect", 1, 0, ("0:007",), 480),
+        ("generalized_ar_heteroskedastic", 1, 0, tuple(f"2:{index:03d}" for index in range(54)), 461),
+    )
+)
+
+
+def _registered_adaptive_evidence(
+    observation: AdaptiveCalibrationObservation | None,
+) -> CalibrationEvidence | None:
+    if observation is None:
+        return None
+    for domain in REGISTERED_ADAPTIVE_CALIBRATIONS:
+        if _adaptive_domain_mismatches(domain, observation):
+            continue
+        cross_section = domain.method_version == "cs_hac_adaptive_v1"
+        method: CalibrationMethod = "cross_section_hac_adaptive" if cross_section else "time_series_bootstrap_adaptive"
+        return CalibrationEvidence(
+            scenario=observation.scenario, method=method, window=observation.window,
+            sample_size=observation.grid_size, bootstrap_replicates=observation.n_boot,
+            nominal_coverage=domain.nominal_coverage, observed_coverage=domain.covered / domain.repetitions,
+            tolerance=_TOLERANCE_MCSE * _coverage_mcse(domain.repetitions),
+            passes=True, report_ref=domain.report_ref, method_version=domain.method_version,
+            domain_id=domain.domain_id, report_sha256=domain.report_sha256,
+        )
+    return None
+
+
 def evaluate_interval_usability(
     interval: HACInterval | BootstrapInterval, *, point_estimate: float, point_reason: str | None = None,
     horizon: int | None = None, cross_section_sizes: npt.ArrayLike | None = None,
+    ic_method: ICMethod | None = None, intervals_verified: bool = False,
 ) -> IntervalUsability:
     """Assess usability and bind a horizon when the full registered design was checked."""
     if horizon is not None:
         horizon = _positive_int(horizon, "horizon")
+    point_usable = point_reason is None and isfinite(point_estimate)
+    adaptive = interval.method_version is not None or (
+        interval.bandwidth_method != "fixed" if isinstance(interval, HACInterval) else (
+            interval.block_length_method != "fixed" or interval.resample_method != "moving_block"
+            or interval.interval_method != "percentile"
+        )
+    )
+    if adaptive:
+        observation = None if horizon is None else _adaptive_calibration_observation(
+            interval, point_estimate=point_estimate, point_reason=point_reason, horizon=horizon,
+            ic_method=ic_method, cross_section_sizes=cross_section_sizes, intervals_verified=intervals_verified,
+        )
+        evidence = _registered_adaptive_evidence(observation)
+        return IntervalUsability(
+            reason=interval.reason,
+            calibration_status="uncalibrated" if evidence is None else "calibrated_pass",
+            calibration_evidence=evidence,
+            descriptive_stats_usable=point_usable,
+            significance_interpretation_usable=evidence is not None,
+            verified_horizon=horizon if evidence is not None else None,
+            adaptive_observation=observation,
+        )
     design_supplied = horizon is not None
     verified_horizon = None
     status: CalibrationStatus = "uncalibrated"
@@ -178,7 +436,6 @@ def evaluate_interval_usability(
             if applicable and design_supplied:
                 verified_horizon = horizon
 
-    point_usable = point_reason is None and isfinite(point_estimate)
     return IntervalUsability(
         reason=interval.reason,
         calibration_status=status,
@@ -339,6 +596,7 @@ class Trial:
     n_effective: int
     interval: tuple[float, float] | None = None
     interval_usability: IntervalUsability | None = None
+    p_value_method: str | None = None
 
     @property
     def n_observations(self) -> int:
@@ -346,16 +604,43 @@ class Trial:
 
     def inference_eligible(self, *, horizon: int, alpha: float) -> bool:
         use = self.interval_usability
+        if (
+            self.p_value is None or self.interval is None or use is None or use.reason is not None
+            or not use.descriptive_stats_usable or not use.significance_interpretation_usable
+            or use.calibration_status != "calibrated_pass" or use.verified_horizon != horizon
+            or not isinstance(use.calibration_evidence, CalibrationEvidence) or not use.calibration_evidence.passes
+        ):
+            return False
+        evidence = use.calibration_evidence
+        observation = use.adaptive_observation
+        if observation is not None or self.p_value_method == "two_sided_student_t_hac":
+            if (
+                not isinstance(observation, AdaptiveCalibrationObservation)
+                or observation.horizon != horizon or observation.n_valid != self.n_observations
+                or alpha != _ALPHA or self.p_value_method != "two_sided_student_t_hac"
+                or evidence.method != "cross_section_hac_adaptive"
+                or evidence != _registered_adaptive_evidence(observation)
+                or self.statistic is None
+            ):
+                return False
+            from .cross_section import student_t_hac_p_value
+
+            half_width = float(student_t.isf(alpha / 2, observation.effective_df)) * sqrt(observation.hac_variance)
+            lower, upper = self.statistic - half_width, self.statistic + half_width
+            expected = student_t_hac_p_value(
+                self.statistic, observation.hac_variance, observation.effective_df, alpha, lower, upper,
+            )
+            actual = self.p_value
+            return (
+                isclose(actual, expected, rel_tol=1e-12, abs_tol=0.0)
+                and (actual < alpha) == (expected < alpha) and (actual > alpha) == (expected > alpha)
+                and isclose(self.interval[0], lower, rel_tol=1e-12, abs_tol=0.0)
+                and isclose(self.interval[1], upper, rel_tol=1e-12, abs_tol=0.0)
+            )
         return (
-            self.p_value is not None and self.interval is not None
-            and use is not None and use.reason is None and use.descriptive_stats_usable
-            and use.significance_interpretation_usable and use.calibration_status == "calibrated_pass"
-            and use.calibration_evidence is not None
-            and use.calibration_evidence.passes
-            and use.calibration_evidence.sample_size == self.n_observations
-            and 1 - alpha >= use.calibration_evidence.nominal_coverage
-            and use.calibration_evidence in REGISTERED_CALIBRATIONS
-            and use.verified_horizon == horizon == _SCENARIOS[use.calibration_evidence.scenario].horizon
+            evidence.sample_size == self.n_observations
+            and 1 - alpha >= evidence.nominal_coverage and evidence in REGISTERED_CALIBRATIONS
+            and horizon == _SCENARIOS[evidence.scenario].horizon
         )
 
     def __post_init__(self) -> None:

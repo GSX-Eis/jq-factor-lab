@@ -9,6 +9,7 @@ from .bar_evaluation.ingest import (
     _insert_ic_rows as _insert_ic_rows,
     _insert_quantile_rows as _insert_quantile_rows,
     _insert_run_row as _insert_run_row,
+    _insert_split_rows as _insert_split_rows,
     _verify_existing_run_matches as _verify_existing_run_matches,
 )
 from .bar_evaluation.normalization import (

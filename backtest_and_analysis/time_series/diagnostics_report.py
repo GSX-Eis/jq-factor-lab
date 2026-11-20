@@ -8,24 +8,17 @@ from typing import Any
 
 import pandas as pd
 
-from backtest_and_analysis.evaluation import EvaluationEngine
 from backtest_and_analysis.evaluation.types import DirectionalAccuracy, ReturnDistribution
 
-from .evaluation_v2 import _bar_panel, _time_series_rows
 from .evaluator import EXCLUSION_COLUMNS, EvaluationResult, _counts
-from .labels import BarReturnLabeler
 
 
-def evaluate_diagnostics(result: EvaluationResult, labeler: BarReturnLabeler, *,
-                         n_quantiles: int, min_samples: int,
-                         calibration_scenario: str | None = None,
-                         legacy_full: bool = False) -> dict[str, Any]:
-    """Reuse split diagnostics when present, and preserve the full v1 report contract."""
-    advanced = result.evaluation_v2
-    if advanced is not None and 'train' in advanced.splits and not legacy_full:
+def evaluate_diagnostics(result: EvaluationResult) -> dict[str, Any]:
+    """Render diagnostics retained by the Bar evaluation."""
+    if 'train' in result.splits:
         horizons = []
         groups = result.per_bar_labels.groupby(list(KEY_COLUMNS), sort=False)
-        for split, evaluation in advanced.splits.items():
+        for split, evaluation in result.splits.items():
             for row in evaluation['horizons']:
                 labels = groups.get_group(tuple(row[name] for name in KEY_COLUMNS))
                 clock = labels.signal_available_at
@@ -42,28 +35,26 @@ def evaluate_diagnostics(result: EvaluationResult, labeler: BarReturnLabeler, *,
 
     counts = {(row.instrument_id, row.frequency, row.horizon_bars): row
               for row in result.ic_by_horizon.itertuples(index=False) if row.scope == 'per_instrument'}
-    rows = []
-    if advanced is not None and 'full' in advanced.splits and not legacy_full:
-        rows = advanced.splits['full']['horizons']
-    else:
-        for (instrument, frequency), labels in result.per_bar_labels.groupby(['instrument_id', 'frequency']):
-            panel, expected, signal_valid, _, entries, exits = _bar_panel(labels, labeler, frequency)
-            stats = EvaluationEngine('time_series', 'bar').evaluate(
-                panel, n_quantiles=n_quantiles, min_samples=min_samples,
-                expected_grid=expected, signal_valid=signal_valid, entry_timestamps=entries, exit_timestamps=exits,
-                calibration_scenario=calibration_scenario,
-            ).splits['full'].statistics
-            rows.extend(_time_series_rows(stats, instrument, frequency))
+    if 'full' not in result.splits:
+        raise ValueError('Full diagnostics require evaluate_bars(..., diagnostics=True)')
+    rows = result.splits['full']['horizons']
     horizons = []
     for row in sorted(rows, key=lambda row: tuple(row[name] for name in KEY_COLUMNS)):
         tally = counts[tuple(row[name] for name in KEY_COLUMNS)]
+        usability = {key: value for key, value in row['interval_usability'].items()
+                     if key not in ('verified_horizon', 'adaptive_observation')}
+        evidence = usability['calibration_evidence']
+        if evidence is not None:
+            usability['calibration_evidence'] = {
+                key: value for key, value in evidence.items()
+                if key not in ('method_version', 'domain_id', 'report_sha256')
+            }
         horizons.append(dict(
             **{key: row[key] for key in (*KEY_COLUMNS, 'grid_start_utc', 'grid_end_utc')},
             counts=dict(total_count=int(tally.total_count), valid_count=int(tally.valid_count),
                         excluded_count=int(tally.excluded_count), exclusion_counts=tally.exclusion_counts),
             ic=row['ic'], bootstrap={name: row['bootstrap'][name] for name in BOOTSTRAP_FIELDS},
-            interval_usability={key: value for key, value in row['interval_usability'].items()
-                                if key != 'verified_horizon'},
+            interval_usability=usability,
             **{key: row[key] for key in ('direction', 'return_distribution',
                                        'buckets', 'non_overlapping_ic')},
         ))

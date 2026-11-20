@@ -6,12 +6,16 @@
 
 ### 表结构与双模式兼容性
 
-结果写入显式指定的 DuckDB（无默认共享路径），仅通过 `CREATE TABLE IF NOT EXISTS` 创建以下四张表，不触碰同库其他任何表（也不创建 `meta.*` 目录表）：
+结果写入显式指定的 DuckDB。首次写入时创建以下五张 Bar 表，其他表保留原样。
 
 1. **`bar_evaluation_runs`**（每次评估一行，主键 `identity_hash VARCHAR PRIMARY KEY`，即 `result_identity.identity_hash`）：
    - 模式与网格：`analysis_mode`、`frequency`（单频率存单值字符串如 `'1min'`；多频率存规范 JSON 数组）、`view`、`boundary_policy`、`bucket_strategy`、`calendar_id`、`calendar_hash`；
    - 身份与版本：`config_hash`、`input_file_hashes`（JSON）、`data_identity`（JSON，如实记录来源、`data_versions` 及已存在的 `build_id`/`build_ids`/`roll_build_ids`/`continuous_futures`，不编造缺失字段）、`code_version`、`code_version_source`、`result_schema_version`；
    - 统计与产物存证：`exclusion_summary`（JSON）、`summary_path`、`summary_sha256`、`per_bar_labels_path`、`per_bar_labels_sha256`、`ic_by_horizon_path`、`ic_by_horizon_sha256`、`quantile_stats_path`、`quantile_stats_sha256`、`run_id`、`ingested_at_utc`（`TIMESTAMPTZ`）。
+   - v2 新增可空列 `has_split BOOLEAN` 表示是否使用 train/OOS，
+     `split_config_json VARCHAR` 保存各段除 `horizons` 外的元数据，
+     `trial_ledger_json VARCHAR` 保存候选账本，
+     `calibration_summary_json VARCHAR` 保存标准表的 `interval_usability`。只读查询将 JSON 文本解码。
    - `per_bar_labels.csv` **不入库**，仅在 `bar_evaluation_runs` 记录路径与 SHA256。
 2. **`bar_evaluation_ic`**（主键 `(identity_hash, row_index)`）：
    - 采用**列取并集 + 可空 + `analysis_mode` 列**结构，同时容纳 `time_series`（`TS_IC_COLUMNS`）与 `cross_sectional`（`CS_IC_COLUMNS`）两种模式；非当前模式的专属列存为 `NULL`。
@@ -20,41 +24,78 @@
 4. **`bar_evaluation_cross_sections`**（主键 `(identity_hash, row_index)`）：
    - 对应 `CS_COLUMNS`，仅 `cross_sectional` 模式有行（`signal_timestamp TIMESTAMPTZ NOT NULL`），`time_series` 模式写入 0 行。
 
-**`result_schema_version` 演进约定**：
-- 入库仅消费四份全样本 `bar_evaluation.v1` 文件及其哈希。`evaluation_v2.json`
-  和独立诊断文件通过 Harness 产物登记交付，无需新增表或列。
-- 未支持的 `result_schema_version` 一律拒绝写入，本阶段不自动迁移已有表。未来版本须单独评审迁移方案，保留历史版本的列、类型与行；新增列应可空，历史行保留 `NULL`。若库中已有表缺少当前必需列，事务失败并回滚，不修改该表结构。
+5. **`bar_evaluation_split_metrics`**（主键由 `identity_hash VARCHAR` 和 `row_index BIGINT` 组成）
+   - 每行对应 `summary.json` 中一个 split 的一条 horizon 统计。`split`、`frequency`、
+     `interval_method`、`calibration_status` 为非空 `VARCHAR`，`instrument_id VARCHAR`
+     在截面行为空。`horizon_bars`、`split_purged_count`、`n_observations` 为非空 `BIGINT`。
+   - `ic`、`n_dependence_adjusted`、`interval_lower`、`interval_upper` 为可空 `DOUBLE`。
+     `ic_reason`、`p_value_method` 为可空 `VARCHAR`。`descriptive_stats_usable` 和
+     `significance_interpretation_usable` 为非空 `BOOLEAN`。`p_value`、`adjusted_p_value`、
+     `inference_adjusted_p_value` 为可空 `DOUBLE`，`significant` 为可空 `BOOLEAN`。
+   - `fit_identity_json VARCHAR` 保存可用的训练拟合身份，`metrics_json VARCHAR NOT NULL`
+     保存该行完整统计和校准证据。两列以 JSON 文本存储。候选能唯一对应评估流时，
+     在候选选择段保存其校正 p 值和显著性判定。轻量评估在此表写入 0 行。
+
+### 旧 v1 DuckDB 的显式迁移
+
+写入仅接受已发布的 `bar_evaluation.v2` 产物。写入前核对 DuckDB 主 schema 的必需表、
+列类型和主键。v1 库缺少 v2 列或表时，写入事务回滚，Harness 返回退出码 `2`
+并提示迁移。包含原四张表的 v1 库仍可只读查询，新增运行列以 `null` 返回，推断行为空。
+
+1. 暂停结果库写入，关闭连接，并保留已关闭的旧库快照。
+2. 在显式指定的现有库或其工作副本上执行迁移。
+
+   ```bash
+   python -c 'import sys; from utils.bar_evaluation_store import migrate_bar_evaluation_db; migrate_bar_evaluation_db(sys.argv[1])' work/bar-evaluation/results.duckdb
+   ```
+
+3. 用 `read-bar-evaluations` 复核历史 identity 和行，用 `monitor-refresh` 检查
+   `bar_evaluation_split_metrics` 已存在，并核对旧运行新增的列为 `null`。验收后恢复 v2 写入。
+
+迁移在同一库的独占写锁下验证原四表及主键，单事务添加可空列和 split 表，且可重复执行。
+旧记录的版本与产物散列保持原值，历史行不会回填推断。校验或 DDL 失败时事务回滚。
+迁移已提交后如需回到旧库，关闭连接后从迁移前快照恢复。先保留已迁移库以保存任何
+后续 v2 写入，避免恢复旧快照时丢失该批证据。
 
 ### 写入规则、锁选择与幂等/冲突语义
 
-- **写锁选择理由**：写入串行锁沿用 `utils.duckdb_results_writer.acquire_exclusive_write_conn`（基于 `<db>.write.lock` 的 `fcntl.flock` + DuckDB 文件锁重试 + `_reject_sqlite_file`），而不使用 `utils.data_store.write_store`，因为 `write_store` 会创建并更新 `meta.*` 编目与缓存版本表，违背阶段 6.6“只建四张 `bar_evaluation_*` 表、不碰库内其他任何表”的隔离边界。库被其他进程占用时沿用该重试/等待机制，不静默跳过。
-- **发布校验**：入库前只读取已发布产物（`summary.json` 及三个 CSV 均须存在）。调用方必须通过 `artifacts` 或 `expected_hashes` 提供 Harness 发布的全部四份 SHA256，缺失或格式非法立即拒绝；重新计算四文件 `sha256_file` 并与其核对一致，校验 `ResultIdentity.identity_hash()` 复算一致，并核对 CSV 与 `summary.json` 逐行内容一致。取得写锁后再次核验四文件未在解析或等待期间改变；任一核对失败立即拒绝。
+- **写锁选择理由**：写入串行锁沿用 `utils.duckdb_results_writer.acquire_exclusive_write_conn`（基于 `<db>.write.lock` 的 `fcntl.flock` + DuckDB 文件锁重试 + `_reject_sqlite_file`），而不使用 `utils.data_store.write_store`，因为 `write_store` 会创建并更新 `meta.*` 编目与缓存版本表，违背阶段 6.6“只管理 `bar_evaluation_*` 表、不碰库内其他任何表”的隔离边界。库被其他进程占用时沿用该重试/等待机制，不静默跳过。
+- **发布校验**：入库前只读取已发布产物（`summary.json` 及三个 CSV 均须存在）。调用方必须通过 `artifacts` 或 `expected_hashes` 提供 Harness 发布的全部四份 SHA256，缺失或格式非法立即拒绝；重新计算四文件 `sha256_file` 并与其核对一致，校验 `ResultIdentity.identity_hash()` 复算一致，并核对 CSV 与 `summary.json` 的统计、计数和身份一致，同时校验切分网格、区间和候选账本。取得写锁后再次核验四文件未在解析或等待期间改变；任一核对失败立即拒绝。
 - **持久化目标校验**：已有目标必须是带原生 DuckDB 文件头（偏移 8 的 `DUCK` 标识）的普通文件；CSV、JSON、空文件及其他非原生格式在开库前以退出码 `2` 拒绝，原文件不变。扩展名不作为判断依据。取得写连接后，必须由 `current_database()` 与 `PRAGMA database_list` 确认当前活动库对应显式指定的持久化文件，拒绝内存库或其他库的连接，再开始写入事务。普通目标前置条件失败仍撤销评估完成标记。
-- **单事务原子性**：建表、幂等/冲突检查与四张表的 `INSERT` 在同一个 DuckDB `BEGIN TRANSACTION ... COMMIT` 事务内完成；任一步异常立即 `ROLLBACK`，不留任何残留行。不提供任何 `UPDATE`/`DELETE` 接口。
-- **幂等与冲突检测**：比较时对 `DOUBLE` 的 `NaN`/`NULL` 统一归一（`-0.0` 归为 `+0.0`，按 IEEE-754 位模式比对），JSON 字段按解析后的结构比对。同一 `identity_hash` 下语义字段（含 4 份 SHA256 与配置/数据/日历身份）及 `bar_evaluation_ic` / `_quantiles` / `_cross_sections` 全部行完全一致时为纯 no-op（`status='noop'`，各表行数不变，`ingested_at_utc` 与 `run_id` 保留首次记录）；任一字段或指标存在差异即抛出 `BarEvaluationConflictError(ValueError)` 并回滚。
+- **单事务原子性**：建表、幂等/冲突检查与五张表的 `INSERT` 在同一个 DuckDB `BEGIN TRANSACTION ... COMMIT` 事务内完成；任一步异常立即 `ROLLBACK`，不留任何残留行。不提供任何 `UPDATE`/`DELETE` 接口。
+- **幂等与冲突检测**：比较时对 `DOUBLE` 的 `NaN`/`NULL` 统一归一（`-0.0` 归为 `+0.0`，按 IEEE-754 位模式比对），JSON 字段按解析后的结构比对。同一 `identity_hash` 下语义字段（含 4 份 SHA256 与配置/数据/日历身份）及 `bar_evaluation_ic`、`bar_evaluation_quantiles`、`bar_evaluation_cross_sections` 和 `bar_evaluation_split_metrics` 全部行完全一致时为纯 no-op（`status='noop'`，各表行数不变，`ingested_at_utc` 与 `run_id` 保留首次记录）；任一字段或指标存在差异即抛出 `BarEvaluationConflictError(ValueError)` 并回滚。
 
 ### CLI 参数优先级、退出码与页面启动
 
 - **`--results-db` 参数与优先级**：
   - `time-series-analysis` 与分流至 Bar 路径的 `single-factor-analysis` 均支持可选 `--results-db <path>`，也可在配置 JSON（顶层或 `time_series_analysis` 块）中写 `results_db`。
-  - 两者同时存在时，**命令行 `--results-db` 优先**（按调用方工作目录解析），配置 `results_db` 按仓库根目录解析。`results_db` 在传给子进程 `tools/agent_harness/time_series_analysis.py` 前从 `resolved.json` 剥离，不进入 `config_hash` 计算；未传 `--results-db` 且配置未声明 `results_db` 时，产物、行为和退出码与阶段 6.5b 完全一致，不创建任何 DuckDB 文件。
+  - 两者同时存在时，**命令行 `--results-db` 优先**（按调用方工作目录解析），配置 `results_db` 按仓库根目录解析。`results_db` 在传给子进程 `tools/agent_harness/time_series_analysis.py` 前从 `resolved.json` 剥离，不进入 `config_hash` 计算；未传 `--results-db` 且配置未声明 `results_db` 时，照常发布 `bar_evaluation.v2` 产物，不创建 DuckDB 文件。
   - 若 `single-factor-analysis` 未分流到 Bar 路径（即保留日频 `run_analysis_main.py`）却显式传入 `--results-db`，直接以退出码 `2` 拒绝。
   - 子进程评估成功后由父进程入库：成功时 Harness `metrics["results_db"]` 记录 `path`、`identity_hash` 与 `status`（`inserted` 或 `noop`）。
   - **输出路径隔离**：在任何完成标记清理、子进程发布、Harness/JSON 镜像写入之前，拒绝结果库与四份评估产物、Harness attempt/run summary、`config/resolved.json`、`output_bindings.json`、`--json-out` 重合（包括符号链接、硬链接和文件/目录祖先冲突）。命令行及配置指定的库均受保护；dry-run、fake-result、只读查询以及日频拒绝路径也不能通过镜像覆盖库。路径冲突返回退出码 `2`，仅向 stdout 返回失败 JSON，**不写错误镜像、Harness 文件，也不删除完成标记**。
   - 写库失败时按现有规则撤销 `evaluation/summary.json`，并按 `EVAL_POLICY.md` 返回区分写库原因的失败结果：
-    - 退出码 `2`（`bar_evaluation_store_precondition_failed`）：路径非法/为目录/SQLite 文件、或发布产物/SHA256 校验失败；
+    - 退出码 `2`（`bar_evaluation_store_precondition_failed`）：路径非法、旧库 schema、非 DuckDB 文件或发布产物/SHA256 校验失败；
     - 退出码 `4`（`bar_evaluation_store_conflict`）：同 `identity_hash` 内容冲突（`BarEvaluationConflictError`）；
     - 退出码 `3`（`bar_evaluation_store_write_failed`）：其他 DuckDB 写入执行异常。
 - **只读查询与监控**：
-  - `read-bar-evaluations --results-db <path>` 支持 `--identity-hash`、`--analysis-mode`、`--frequency`、`--calendar-id`、`--start-utc`、`--end-utc`（按 `ingested_at_utc` 闭区间过滤，接受 `YYYY-MM-DD` 或带时区 UTC 时间）与 `--json-out`。以 DuckDB `read_only=True` 打开；库不存在、为 SQLite 文件或缺少 `bar_evaluation_*` 表时返回退出码 `2`。
-  - `monitor-refresh` 在原有 `metrics` 中仅追加 `bar_evaluation` 段（汇报 4 张表是否存在、各自 `row_count`、`run_count` 与 `latest_ingested_at_utc`），原有键值完全不变；不含 `bar_evaluation_*` 表的旧库或空库照常退出码 `0` 并标明 `exists: false`。
+  - `read-bar-evaluations --results-db <path>` 支持 `--identity-hash`、`--analysis-mode`、`--frequency`、`--calendar-id`、`--start-utc`、`--end-utc`（按 `ingested_at_utc` 闭区间过滤，接受 `YYYY-MM-DD` 或带时区 UTC 时间）与 `--json-out`。以 DuckDB `read_only=True` 打开。库不存在、为非 DuckDB 文件或缺少原四张必需表时返回退出码 `2`。
+  - 推断筛选支持 `--split {full,train,oos}`、`--calibration-status {uncalibrated,calibrated_pass,calibrated_fail}`，
+    以及 `--descriptive-stats-usable`、`--significance-interpretation-usable`、`--has-trial-ledger`
+    和对应的 `--no-...` 形式。匹配的运行返回标准表和筛选后的 split 行。
+    没有推断行的轻量运行可按标准表的校准可用性匹配，指定 split 时只匹配推断行。
+  - `monitor-refresh --database-path <path>` 在 `metrics.bar_evaluation` 报告五张表各自的
+    `exists` 和 `row_count`，以及 `run_count`、`latest_ingested_at_utc`。
+    `all_tables_exist` 检查原四表，因此兼容旧库。空库或没有 Bar 表的库仍可返回
+    退出码 `0`，此时 `any_table_exists=false`。
 - **只读 Streamlit 页面启动方式**：
   ```bash
   streamlit run utils/bar_evaluation_app.py -- --results-db work/NERE-749/results.duckdb
   # 或通过环境变量（命令行 --results-db 优先于环境变量）：
   QUANT_BAR_RESULTS_DB=work/NERE-749/results.duckdb streamlit run utils/bar_evaluation_app.py
   ```
-  页面与纯查询函数全程仅以 `read_only=True` 连接读取，不做任何写入；导入模块不触发数据库连接。
+  页面按评估模式、频率、日历和运行筛选，展示原始统计、身份、候选账本和按 split
+  分组的 IC、区间、校准与显著性门控。页面及查询以 `read_only=True` 打开库，
+  导入模块不触发数据库连接。
 
 ## 阶段 6.5b：分钟因子值入库（`market_factor_values`，方案 B）
 
@@ -610,7 +651,7 @@ records = labeler.label_records(bars, factors, signal_timestamps=['2026-12-01T14
 
 `TimeSeriesEvaluator(analysis_mode='time_series')` 按标的、频率、持有长度独立计算
 Spearman IC（平均秩处理同值），再汇总各资产 IC 的均值和中位数。
-Bar v1 的 `non_overlapping_ic` 先按候选信号时间排序、每隔 h 根取样，再筛选有效记录；
+标准 IC 表的 `non_overlapping_ic` 先按候选信号时间排序、每隔 h 根取样，再筛选有效记录；
 不能先删除剔除行再取步长。默认 `min_ic_samples=3`，常数因子、常数收益及样本不足
 分别报告 `constant_factor`、`constant_return`、`insufficient_samples`，IC 为空。
 全样本 `qcut(..., duplicates='drop')` 不打散同值，报告实际组数，分组固定标为
@@ -625,7 +666,7 @@ Bar v1 的 `non_overlapping_ic` 先按候选信号时间排序、每隔 h 根取
 分位组按截面先计算、再等权汇总，范围为 `cross_sectional_time_aggregated`。
 重复值导致某些截面组数减少时，高分位组只汇总实际存在该组的截面；消费时同时检查
 `cross_section_count`、`min_actual_quantiles`、`max_actual_quantiles`，不能假设各组覆盖相同。
-四份 Bar v1 文件继续使用上述全样本统计。区间与候选选择证据由 v2 提供。
+轻量与推断运行的标准表均报告上述全样本描述性统计。启用推断后，同次摘要也报告应有网格上的统计与候选证据。
 
 ```bash
 python3 -m tools.agent_harness.cli time-series-analysis --config work/minute-bars/nq.json
@@ -685,7 +726,8 @@ Bar 模式始终必须显式指定；缺失/非法分别返回 `missing_analysis
 （退出码 2），不删除用户文件或递归删除目录；清理异常记录在 `error.details` 中。
 预演、模拟及实际执行均在写摘要前校验 `--json-out`。指向评估产物时返回退出码 2，
 保留已有产物与完成标记。`diagnostics_report.csv`、`diagnostics_report.md` 和
-`evaluation_v2.json` 作为保留路径，在未请求这些额外产物时也参与校验。
+已退役的旁路文件名均作为保留路径参与碰撞校验。若输出目录含旧旁路文件，选用新目录
+重跑，以保留原有历史证据。
 默认 Harness 摘要和运行级导航遵循 `docs/PUBLIC_SCOPE.md 的 Harness 输出布局`。
 
 | 标准文件 | 内容 / Harness artifact_type |
@@ -693,7 +735,7 @@ Bar 模式始终必须显式指定；缺失/非法分别返回 `missing_analysis
 | `per_bar_labels.csv` | 全部候选 LabelRecord 字段和因子值 / `per_bar_labels` |
 | `ic_by_horizon.csv` | 时序逐资产及汇总 IC，或沿时间汇总的截面 IC / `ic_by_horizon` |
 | `quantile_stats.csv` | 分位组样本数、平均/中位收益、正收益比例及实际组数 / `quantile_stats` |
-| `summary.json` | 配置、数据/日历/代码身份、统计和截面明细 / `evaluation_summary` |
+| `summary.json` | 配置、身份、标准统计、切分推断、门控与候选账本 / `evaluation_summary` |
 
 CSV 时间为 ISO8601 UTC `Z`，JSON 不可算数值为 null。四文件各自登记绝对路径与
 SHA256，核心摘要复制到 Harness `metrics`。评估 `summary.json` 最后原子发布，作为唯一
@@ -704,10 +746,10 @@ SHA256，核心摘要复制到 Harness `metrics`。评估 `summary.json` 最后�
 ### 时序深度诊断报告
 
 使用 `time-series-analysis --config <path> --diagnostics-report`，或设置 JSON 布尔字段
-`"diagnostics_report": true`。该选项适用于 `time_series`。默认仍发布四个 Bar v1 产物。
-全样本报告采用 `time_series_diagnostics.v1`。评估 `summary.json` 保留该全样本
-`diagnostics_report` 对象。配置训练/OOS 切分后，`evaluation_v2.json` 和 Harness
-`metrics.diagnostics_report` 使用 `time_series_diagnostics.v2`，诊断 CSV 增加
+`"diagnostics_report": true`。该选项适用于 `time_series`，诊断直接复用当次评估的应有网格统计。
+全样本报告采用 `time_series_diagnostics.v1`。配置训练/OOS 切分后采用
+`time_series_diagnostics.v2`。评估 `summary.json` 和 Harness
+`metrics.diagnostics_report` 携带同一报告，切分诊断 CSV 增加
 `split`、`split_purged_count` 两列，Markdown 分别展示训练和 OOS。
 候选和剔除计数基于清除前的标签，清除数单列报告。`diagnostics_report.csv`
 和 `diagnostics_report.md` 分别以 `diagnostics_report_csv` 和
@@ -715,12 +757,12 @@ SHA256，核心摘要复制到 Harness `metrics`。评估 `summary.json` 最后�
 CSV 的 `scope` 为 `overall`、`bucket` 或 `offset`，
 `index` 依次为空、从 1 开始的桶号或从 0 开始的网格偏移。
 JSON 用 null、CSV 用空字段、Markdown 用破折号表示不可计算的数值。
-显式 `--results-db` 持久化 Bar v1 的字段，时序诊断明细保存在报告产物中。
+显式 `--results-db` 持久化主契约标准统计及推断字段，诊断报告作为发布产物保留。
 
 对每组标的和频率，所选视图的应有网格从首个到末个候选信号，包含中间缺 Bar 的槽位。
 各持有期在该网格上报告全部 `0..h-1` 个偏移的有效样本数、Spearman IC 与状态，
-并核对实际持仓区间在各偏移内互不重叠。候选及剔除计数沿用 Bar v1 的标签分类。
-块 bootstrap 在网格上重采样，按有效配对重新排名。块长缺省为最长持有期。
+并核对实际持仓区间在各偏移内互不重叠。候选及剔除计数沿用标准 LabelRecord 分类。
+块 bootstrap 在网格上重采样，按有效配对重新排名。缺省自动选块，各持有期以自身的 `h` 为下界。
 可通过 `bootstrap.block_length` 显式配置，解释区间时以报告逐持有期记录的
 `bootstrap.block_length` 实际值为准。未配置切分时，即使指定了块长，全样本
 诊断仍采用 `time_series_diagnostics.v1`。其他默认值为种子 0、999 次抽样、
@@ -736,23 +778,25 @@ S7 的 NQ 1min 报告标记 `real_market_data_used=false`。真实 NQ 1min 在�
 可选因子长表、`BarReturnLabeler` 和显式 `analysis_mode`。通过标签器和交易日历构造
 应有网格、信号可用时刻，以及逐持有期的 `entry_timestamps` 和 `exit_timestamps`，
 再交给 [`EvaluationEngine.evaluate()`](../backtest_and_analysis/evaluation/engine.py)。
-这些时间数组由 Bar 适配器生成。预计算标签可直接交给对应模式的 v1 评估器。
+推断按时序的 `(frequency, instrument_id)` 或截面的 `frequency` 分组，
+每组只调用一次引擎，标准表与切分统计由该次返回值组装。轻量运行可直接基于观察样本
+出表；预计算标签可交给对应模式的描述性评估器。
 
 | 参数 | Python API 与 JSON 配置语义 |
 | --- | --- |
-| `evaluation_v2` | 布尔开关，默认 `false`。设置为 `true` 或传入 `--evaluation-v2` 即显式启用。 |
 | `split` | `train_end` 与 `oos_start` 两个带时区的边界。Python API 也接受 `SplitConfig`。 |
-| `bootstrap` | 仅时序。支持 `block_length`、`n_boot`、`seed`、`min_valid_replicates` 和区间 `alpha`。 |
-| `hac_lag` | 仅截面。请求的最小 Bartlett HAC 滞后阶数，缺省 0，由引擎保证各持有期至少为 `h - 1`。 |
+| `bootstrap` | 仅时序。支持 `block_length`（缺省 `"auto"`，可指定正整数）、`n_boot`（默认 999）、`seed`、`min_valid_replicates`（默认 900）和区间 `alpha`。 |
+| `hac_lag` | 仅截面。缺省 `"auto"`，可指定非负整数以固定 Bartlett HAC 窗口。可估区间的各期滞后至少为 `h - 1`。 |
 | `direction`、`standardization` | 方向缺省为 1。可选标准化仅用于时序训练/OOS 切分。 |
-| `calibration_scenario` | 显式声明依赖场景，供区间匹配已登记的校准依据。 |
+| `calibration_scenario` | 显式声明依赖场景，供区间按方法匹配已登记的校准依据。自适应 HAC 的独立场景名为 `iid`，固定 HAC 使用 `independent_null`。 |
 | `trial_selection` | 配置候选族的 `method` 和 `alpha`，默认 `holm`、0.05。 |
-| `factor_id` | 账本中的候选因子标识，默认为 `factor_value`。单独设置此字段不会开启 v2。 |
+| `factor_id` | 账本中的候选因子标识，默认为 `factor_value`。单独设置此字段只指定候选标识。 |
 
 配置中的 `split`、`bootstrap`、`hac_lag`、`direction`、`standardization`、
-`calibration_scenario`、`trial_selection` 中任一项为非 null 即自动启用 v2。
-有效的空对象（如 `"trial_selection": {}`）也会启用 v2，并采用该项的默认设置。
-Python 调用方也可通过传入预登记的 `trial_family` 启用 v2。
+`calibration_scenario`、`trial_selection` 中任一项为非 null 即请求应有网格推断和账本。
+有效的空对象（如 `"trial_selection": {}`）采用该项默认设置。Python 调用方也可传入
+预登记的 `trial_family`。仅请求诊断（Python `diagnostics=True` 或 Harness
+`diagnostics_report`）时有 `full` 推断统计，`trial_ledger` 为 `null`。
 
 截面按频率和信号实际可用时刻对齐，于每个截面使用 `per_cross_section` 分桶。
 时序全样本使用 `full_sample_descriptive_only`。时序切分采用 `fitted_on_train`，
@@ -765,22 +809,31 @@ Python 调用方也可通过传入预登记的 `trial_family` 启用 v2。
 `signal_available_at` 时按持有期清除。退出恰好等于边界时保留。即便退出价缺失，
 跨界的计划退出仍计入清除数。各评估面板的训练与 OOS 段都须包含应有信号。
 时序区间使用持仓时间验证各非重叠相位，块重采样保留网格缺口并在每次复制中重排
-有效配对。块长至少覆盖评估的最长持有期。切分与推断细节见
+有效配对。自动块长须覆盖当前持有期的 `h`。显式整数块长须满足所有持有期下界。切分与推断细节见
 [统一评测引擎](EVALUATION_ENGINE.md#14-训练与样本外评测接口)。
 
-### evaluation.v2 产物契约
+### bar_evaluation.v2 产物契约
 
-[`evaluation_v2.py`](../backtest_and_analysis/time_series/evaluation_v2.py) 定义内存契约，
-由 [`artifacts.py`](../backtest_and_analysis/time_series/artifacts.py) 发布
-`evaluation_v2.json`。文件以 `evaluation_v2` 类型登记路径和 SHA256，与同次
-`bar_evaluation.v1` 复用 `data_identity`、`calendar_identity` 和
-`result_identity`。以评估 `summary.json` 为发布完成标记，消费时检查当前产物登记。
-可选报告独立携带 `schema_version="evaluation.v2"`，既有 ResultIdentity 仍使用
-`result_schema_version="bar_evaluation.v1"`。
+[`inference.py`](../backtest_and_analysis/time_series/inference.py) 组装推断统计和候选族。
+[`artifacts.py`](../backtest_and_analysis/time_series/artifacts.py) 始终将
+`result_schema_version="bar_evaluation.v2"` 写入评估 `summary.json` 和 `result_identity`。
+Harness 复制摘要字段至 `metrics`（配置见冻结的 `config/resolved.json`）。
 
-- 顶层包含 `analysis_mode`、`frequency="bar"`、`return_unit="percent"`、
-  上述身份、`splits` 和 `trial_ledger`，并可包含切分后的 `diagnostics_report`。
-- `splits` 为 `full` 或 `train` 与 `oos`。每段提供 `train_end`、
+- 顶层含 `analysis_mode`、`frequency="bar"`、`return_unit="percent"`、
+  `config`、`data_identity`、`calendar_identity`、`result_identity`、
+  `ic_by_horizon`、`quantile_stats`、`cross_sections`、`exclusion_summary`。
+  `interval_usability` 是按频率、持有期和标的标注的标准 IC 表可用性。请求诊断时
+  摘要还包含 `diagnostics_report`。
+- `evaluate_bars()` 在 `calendar_identity` 中记录分桶策略，以及单个或逐标的日历的
+  覆盖日期和 RTH 参考日历。即使 Python 发布时省略 `config`，入库仍可在日历哈希
+  匹配后从标签重建应有网格，复算与缺口有关的 HAC 统计和校准观测。
+  入库校验和运行表共用同一个分桶策略。旧产物未记录策略时按发布配置回退，
+  与产物或其他配置项冲突的显式策略会导致拒收。
+  产物记录 `null` 而发布配置显式指定策略时，入库按已核验日历和标签的实际频率
+  确认 `BarSchedule` 的默认策略，并仅在配置与默认值一致时记录该值。
+  标签为空时，使用摘要 `data_identity` 中通过产物哈希校验的原始输入标的与频率。
+- 轻量评估的 `splits={}`、`trial_ledger=null`。推断的 `splits` 为 `full`
+  或 `train` 与 `oos`。每段提供 `train_end`、
   `oos_start`、`quantile_scheme`、`fit_identity`、逐持有期 `split_purged_count`
   和 `horizons` 统计行。每行记录实际 Bar 频率、持有期和 UTC 网格边界，以及
   对应的 IC、分桶、方向和区间。时序行还含 `intervals_verified` 和各非重叠相位，
@@ -797,17 +850,21 @@ Python 调用方也可通过传入预登记的 `trial_family` 启用 v2。
 
 ### TrialLedger 候选登记与校正
 
-启用 v2 即在评估前登记配置中的全部 `(factor_id, horizon)` 候选，切分时使用
+请求带账本的推断时，在评估前登记配置中的全部 `(factor_id, horizon)` 候选，切分时使用
 训练期统计，全样本运行则使用 `full`。Python 调用方可在查看结果前创建包含
 全部因子与持有期的 `BarTrialFamily`，再将同一实例作为 `trial_family` 随每个
 因子的 `factor_id` 传入。每次只记录该因子本次已登记的持有期。共享族首次成功
 记录时绑定全样本或训练窗口。复用时训练边界须按 UTC 一致。手工记录应使用独立候选族。
 
 `trial_ledger` 提供 `method`、`alpha`、`split`、`attempt_count`、
-`selection_complete` 和 `best`。逐候选记录统计量、`n_effective`、区间、
-原始 `p_value`、`adjusted_p_value` 和 `reason`。单流截面候选的原始 p 值
-是依据均值和 HAC 方差计算的双侧正态检验值，显著性解释仍受校准门控。时序移动块
-百分位区间本身不提供原始 p 值，同一候选涉及多个评估流时也不自动合并原始 p 值。
+`selection_complete` 和 `best`。逐候选记录统计量、观测数 `n_observations`
+（`n_effective` 为同值旧字段）、区间、原始 `p_value`、审计校正
+`adjusted_p_value`、推断校正 `inference_adjusted_p_value`、`significant` 和
+`reason`。单流截面候选的原始 p 值由 HAC 区间的分布计算。`p_value_method` 记录
+`two_sided_student_t_hac`（自动窗口，有效自由度）或 `two_sided_normal_hac`（固定窗口）。
+显著性解释仍受校准门控。自适应 HAC 依据方法版本和可核验的网格、缺失模式、截面宽度等观测匹配
+已登记适用域。自适应 Bootstrap 当前没有已登记适用域，保持 `uncalibrated`。
+时序区间不提供原始 p 值，同一候选涉及多个评估流时也不自动合并原始 p 值。
 未评测和缺原始 p 值的候选分别列入 `pending_candidates` 和
 `missing_p_value_candidates`。整族均有原始 p 值时才执行 Holm 或 BH 校正并报告
 最优候选。详见[尝试账本与多重检验](EVALUATION_ENGINE.md#62-择优的尝试账本与多重检验)。
@@ -837,13 +894,12 @@ CLI 的 `config_hash` 绑定合并命令行覆盖后的配置，递归排序、�
 
 ## 验证
 
-`python3 -m pytest tests/test_time_series_contracts.py -q` 验证合法/非法输入、
-排序无损、重复键诊断、全部 32 种剔除原因组合、标签时间及百分比单位、身份稳定性。
-`python3 -m pytest tests/test_time_series_csv_reader.py tests/test_session_calendar.py -q`
-验证 CSV 输入、覆盖元数据、视图筛选、休市与缺 Bar/尾部不足及日历边界。
-`python3 -m pytest tests/test_bar_return_labeler.py -q` 验证偏移与多持有长度、
-面板六类状态隔离、跨市场午休/收盘对齐、频率独立覆盖、输入校验与日历先导入。
-CLI 双模式合成演示与失败重试见 `tests/test_time_series_cli_end_to_end.py`。
+`tests/test_time_series_contracts.py` 验证输入、排序、重复键诊断、
+全部 32 种剔除原因组合、标签时间、百分比单位及身份稳定性。
+CSV 和标签分别由 `tests/test_time_series_csv_reader.py` 与
+`tests/test_bar_return_labeler.py` 覆盖。
+CLI 双模式合成演示和失败重试见 `tests/test_time_series_cli_end_to_end.py`。
+入库、旧库迁移和校准门控的往返见 `tests/test_bar_evaluation_store.py`。
 冻结合成数据集见 `tests/fixtures/time_series/README.md`。
 
 ## 验收测试清单

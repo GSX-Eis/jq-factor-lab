@@ -61,6 +61,14 @@ def test_cli_subcommand_inventory() -> None:
     ]
 
 
+@pytest.mark.parametrize("command", ["time-series-analysis", "single-factor-analysis"])
+def test_cli_rejects_retired_bar_sidecar_flag(command, capsys) -> None:
+    with pytest.raises(SystemExit) as exit_info:
+        cli.build_parser().parse_args([command, "--evaluation-v2"])
+    assert exit_info.value.code == 2
+    assert "unrecognized arguments: --evaluation-v2" in capsys.readouterr().err
+
+
 def test_cli_monitor_defaults_and_result_hooks(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
     db = tmp_path / "monitor.duckdb"
     db.touch()

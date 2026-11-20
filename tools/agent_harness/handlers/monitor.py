@@ -38,6 +38,7 @@ def _duckdb_count_tables(db_path: Path, *, bindings=None) -> Dict[str, Any]:
             "available": True,
             "table_count": len(tables),
             "factor_count": factor_count,
+            # Includes optional split metrics even when a legacy Bar schema is still present.
             "bar_evaluation": summarize_bar_evaluation_connection(conn, table_names=table_names),
         }
     finally:
