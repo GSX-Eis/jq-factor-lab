@@ -8,19 +8,19 @@
 
 ```bash
 # 日线、5 分钟行情：输入根目录下分别使用 daily/ 和 5m/
-python -m data_pipeline.loaders.price_data_to_duckdb --data-dir ./data/import/price_data --db-path ./data/market.duckdb
+python3 -m data_pipeline.loaders.price_data_to_duckdb --data-dir ./data/import/price_data --db-path ./data/market.duckdb
 
 # 已有因子 CSV：每个证券一个文件
-python -m data_pipeline.loaders.factor_data_to_duckdb --csv-dir ./data/import/factors --db-path ./data/market.duckdb
+python3 -m data_pipeline.loaders.factor_data_to_duckdb --csv-dir ./data/import/factors --db-path ./data/market.duckdb
 
 # 辅助数据：示例为证券基本信息；--help 列出其他数据集
-python -m data_pipeline.loaders.portfolio_data_to_duckdb --dataset security_master --source ./data/import/security_master --db ./data/market.duckdb
+python3 -m data_pipeline.loaders.portfolio_data_to_duckdb --dataset security_master --source ./data/import/security_master --db ./data/market.duckdb
 
 # 指数成分
-python -m data_pipeline.loaders.import_index_constituents_duckdb --csv ./data/import/index_constituents.csv --db ./data/market.duckdb
+python3 -m data_pipeline.loaders.import_index_constituents_duckdb --csv ./data/import/index_constituents.csv --db ./data/market.duckdb
 
 # 财务报表：调用方提供字段契约
-python -m data_pipeline.loaders.import_raw_financial_statements_duckdb --statement income --source ./data/import/financials --schema-contract ./data/import/financial_schema.json --db ./data/market.duckdb
+python3 -m data_pipeline.loaders.import_raw_financial_statements_duckdb --statement income --source ./data/import/financials --schema-contract ./data/import/financial_schema.json --db ./data/market.duckdb
 ```
 
 ## 输入约定

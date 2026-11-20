@@ -64,11 +64,12 @@ def test_alphalens_reference_matches_installed_package() -> None:
     )
 
 
+@pytest.mark.slow
 def test_production_does_not_import_alphalens_reference() -> None:
     root = Path(__file__).resolve().parents[1]
     source_dirs = (
         "backtest_and_analysis", "config", "data_pipeline", "examples", "factor_mining",
-        "factor_synthesis", "factors", "jq_strategies", "scripts", "tools", "utils",
+        "factor_synthesis", "factors", "scripts", "tools", "utils",
     )
     paths = list(root.glob("*.py"))
     for directory in source_dirs:

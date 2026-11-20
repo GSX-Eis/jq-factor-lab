@@ -231,7 +231,7 @@ $$
 
 ### 6.1 一次性合成校准
 
-运行 `python -m tools.benchmarks.eval_engine_coverage_calibration`。
+运行 `python3 -m tools.benchmarks.eval_engine_coverage_calibration`。
 完整结果写入 `reports/NERE-791/coverage_calibration_20261118.json`。
 主种子为 791823。每组使用 512 个无缺失的应有时点，截面有 32 个独立
 资产且每配置模拟 2,000 次，单品种时序每配置模拟 500 次且每次区间用
@@ -260,6 +260,34 @@ AR(1) 因子。自相关格的因子和收益为相互独立的 AR(1)，系数�
 建议采用 $L=\max(h-1,16)$、$b=\max(h,17)$。相同窗口在 AR(1) 场景
 仍覆盖不足。AR(1) 两个建议窗口均未达标。用于推断前，按实际样本长度、依赖和缺失机制
 重新登记配置并在独立合成随机流校准。
+
+校准登记由 §6.1 的 14 个唯一配置组成，可通过
+[REGISTERED_CALIBRATIONS](../backtest_and_analysis/evaluation/calibration.py) 审计。
+每条冻结的 `CalibrationEvidence` 记录场景、方法、窗口、应有时点数、标称与观测
+覆盖率、容差、是否达标及报告引用。`HACInterval` 和 `BootstrapInterval`
+通过 `calibration_status` 和 `calibration_evidence` 表示登记结果。
+两字段默认是 `uncalibrated` 和 `None`。`reason` 独立记录当前区间能否估计。
+
+调用方须按实际依赖显式声明 `calibration_scenario`。登记场景包括
+`independent_null`、`ar1_null`、`overlap_null`、`positive_effect` 和
+`negative_effect`。`resolve_interval_calibration()` 按场景、实际区间方法
+（截面 Spearman IC 均值的 Bartlett HAC 或时序 Spearman 的移动块重排名）、
+实际滞后或块长、应有网格长度及标称覆盖率精确匹配。截面用 `grid_size`，
+时序用各品种的应有网格长度。切分后逐段匹配，网格内缺失槽位仍计入长度。
+匹配时按登记记录返回 `calibrated_pass` 或 `calibrated_fail`。场景未声明、
+参数未匹配或没有登记依据时返回 `uncalibrated`。状态描述已登记的合成配置。
+
+`evaluate_interval_usability()` 用区间的实际方法、窗口、应有网格长度和标称覆盖率
+重新核对依据。缺失、与登记内容不符或与登记状态矛盾的依据按 `uncalibrated` 报告。
+匹配的登记状态仍保留，当前样本是否符合冻结覆盖设计在显著性判定时检查。
+
+- `descriptive_stats_usable` 在点估计有限且无点估计失败原因时为 `True`。
+  例如只有一个有效截面时仍可描述 IC 均值，即使 ICIR 和 HAC 区间不可估计。
+- `significance_interpretation_usable` 要求区间可估计、登记状态为
+  `calibrated_pass` 且覆盖依据适用。§6.1 的 HAC 要求每个应有槽位都有有效 IC。
+  移动块 Bootstrap 要求所有应有槽位都有有效因子收益对，且请求次数与有效复制次数
+  均等于登记的 399 次。未满足适用条件时仍可报告可计算的 IC 与区间。
+  调用方还须核对场景及其余估计设置的适用性。择优须满足第 6.2 节的多重检验要求。
 
 ### 6.2 择优的尝试账本与多重检验
 
@@ -353,7 +381,7 @@ NERE-803 在 S1-B 验收版本上测量旧评测入口。三组输入均使用�
 下面是 S1-C 在 S1-B 验收版本上生成旧入口基线时使用的命令。
 
 ```sh
-python -m tools.benchmarks.eval_engine_baseline
+python3 -m tools.benchmarks.eval_engine_baseline
 ```
 
 在当前版本运行这条命令会调用当前适配器。所得耗时仅代表当前版本，历史门禁仍需使用
@@ -380,14 +408,14 @@ S1-C 冻结产物。
 对照，无需冻结基线，并跳过全尺寸性能门槛。
 
 ```sh
-python -m tools.benchmarks.eval_engine_kernels --smoke
+python3 -m tools.benchmarks.eval_engine_kernels --smoke
 ```
 
 历史 S2-B 全尺寸验收命令如下。运行前须将 NERE-803 附件中 S1-C 冻结的 JSON
 放到 `--baseline` 指定的位置。
 
 ```sh
-python -m tools.benchmarks.eval_engine_kernels --baseline reports/NERE-791/perf_baseline_20261118.json
+python3 -m tools.benchmarks.eval_engine_kernels --baseline reports/NERE-791/perf_baseline_20261118.json
 ```
 
 正式运行使用同一批合成输入生成器，逐场景核对规模、标签元数据和预计算配对数。
@@ -426,7 +454,7 @@ RSS 取三次最大值，分位分配采用单独的内存采样。
 放到 `--baseline` 指定的位置。公开检出可运行第 10.1 节的合成内核冒烟。
 
 ```sh
-python -m tools.benchmarks.eval_engine_e2e --baseline reports/NERE-791/perf_baseline_20261118.json
+python3 -m tools.benchmarks.eval_engine_e2e --baseline reports/NERE-791/perf_baseline_20261118.json
 ```
 
 从 S1-C 的预计算标签开始计时，运行切换后的日频、Bar 截面与 Bar 时序三个适配器。
@@ -646,6 +674,17 @@ runner 的显式回退开关返回原始逐桶均值和旧版宽表。Bar v1 产
 沿用百分数收益、按有效标签分桶和连续编号。时序 v1 显示各品种已有标签
 网格的第 0 相位，保留描述性分位标记。
 
+日频 runner 引擎路径在 `result["ic"].attrs["hac_inference"]` 按持有期输出
+HAC 校准与可用性元数据。旧 `newey_west_mean_test(values, max_lag)`
+二元组和由其生成的月度 `ic_t_stat`、`ic_p_value` 保留为未校准的描述性
+诊断量。可计算时可查阅这些数值，显著性解释不可用。
+
+Bar 的 `EvaluationResult.ic_inference` 按 `(frequency, horizon_bars, instrument_id)`
+提供 IC 推断元数据，截面键的 `instrument_id` 为 `None`。Bar v1 时序路径
+未验证持仓区间，因而 Bootstrap 区间不可用，IC 仍可作为描述性统计。
+四个标准 `bar_evaluation.v1` 产物和 DuckDB 入库沿用既有字段。
+后续 `evaluation.v2` 承载统一推断契约。
+
 ## 16. S7 时序诊断与 NQ 1min 验收
 
 时序诊断夹具以仓库内已确认的输入行、Bar v1 输出字段和数学预期为依据。
@@ -654,6 +693,9 @@ runner 的显式回退开关返回原始逐桶均值和旧版宽表。Bar v1 产
 同时保留四个 Bar v1 文件。测试核对文件哈希、退出时间、剔除守恒、
 同一时序组的条件收益、方向计数、全部网格相位和移动块重排名。
 报告字段与发布时序见 [时序研究契约](TIME_SERIES_CONTRACT.md#时序深度诊断报告)。
+诊断报告在每个持有期的 `interval_usability` 中附加校准状态、依据和两项可用性，
+并在 Markdown 区间表后逐品种和持有期展示判定。v1 CSV 列、原 `bootstrap`
+字段和 `summary.json` 顶层键沿用 S7 的冻结契约。
 
 NQ 1min 的 S7 结果来自固定种子的**合成工程验收**，报告标记
 `real_market_data_used=false`。训练为 2020–2025 年，OOS 为 2026 年。

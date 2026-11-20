@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from backtest_and_analysis.alphalens_runner import AlphalensRunner
+from backtest_and_analysis.alphalens_runner import AlphalensRunner, InsufficientCrossSectionAssets
 
 
 def panel():
@@ -28,6 +28,14 @@ def test_constant_factor_has_no_valid_ic_or_quantile_returns():
     result = AlphalensRunner(periods=(1,)).run(prices * 0 + 1, pricing, max_loss=1.)
     assert result['ic'].dropna(how='all').empty
     assert result['quantile_returns'].empty
+
+
+def test_daily_runner_rejects_single_asset_before_quantiling() -> None:
+    _, signal, pricing = panel()
+    one_asset = pricing.loc[['S00']]
+    one_asset.attrs['trading_calendar'] = pricing.attrs['trading_calendar']
+    with pytest.raises(InsufficientCrossSectionAssets, match='at least 2 assets.*time-series-analysis'):
+        AlphalensRunner(periods=(1,)).run(signal[['S00']], one_asset)
 
 
 def test_tied_values_retain_raw_spearman_ic():

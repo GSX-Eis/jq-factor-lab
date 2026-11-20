@@ -7,11 +7,11 @@
 ## 可运行示例
 
 ```bash
-python -m pip install -e '.[dev,synthesis]'
-python -m tools.demo_cli factor-synthesis-demo --method weighted_sum --output-dir outputs/synthesis-weighted
+python3 -m pip install '.[synthesis]'
+jq-factor-lab factor-synthesis-demo --method weighted_sum
 ```
 
-`weighted_sum` 是默认方法；省略 `--method` 也能运行。本随机特征示例只运行 `weighted_sum`。它构造12个虚构标的、100个工作日、4列随机特征；固定权重方法不训练，保留一期信号延迟，写出 scores.csv、summary.json 和本次权重描述。必须使用新的输出目录。
+`weighted_sum` 是默认方法；省略 `--method` 也能运行。本随机特征示例只运行 `weighted_sum`。它构造12个虚构标的、100个工作日、4列随机特征；固定权重方法不训练，保留一期信号延迟，写出 scores.csv、summary.json 和本次权重描述。默认每次使用独立目录。显式指定已有目录时，可传入 `--overwrite` 更新演示文件。
 
 `synthetic_panel` 的人工响应是同一行特征公式，不能声明为下一交易日收益，也没有经核验的退出日。`pca`、`lasso`、`ridge`、`elasticnet`、`quantile_elasticnet`、`lightgbm` 参数仍可解析；此示例不含这些方法的无效调参选项。在进入 pipeline 和创建输出目录之前明确抛出 `LabelIsolationError`，整次命令非成功退出。PCA 虽不拟合响应，其 pipeline 同样要求严格窗口的退出上下文；本例不绕过该检查。
 
@@ -39,11 +39,11 @@ Qlib 转换保留原始股票键映射，模型输出恢复调用方的代码和
 
 ## 依赖与验证边界
 
-基础算法依赖 scikit-learn、dcor、NumPy、Pandas、SciPy。`synthesis` 可选依赖安装 LightGBM；`qlib` 可选依赖安装原生 Qlib。普通线性模型及原生 LightGBM 回退路径无需 Qlib。MPS 求解器另需支持 MPS 的 PyTorch，未纳入本次验证。
+`synthesis` 可选依赖提供 scikit-learn、dcor、LightGBM 和可视化工具。核心依赖提供 NumPy、Pandas 和 SciPy。`qlib` 可选依赖安装原生 Qlib。普通线性模型及原生 LightGBM 回退路径无需 Qlib。MPS 求解器另需支持 MPS 的 PyTorch，未纳入本次验证。
 
 当前同步保留原算法的行为与参数。不同实现的训练/验证划分和时间间隔口径并不完全相同：例如 PCA pipeline 使用日历天扣减 target_period，线性 pipeline 使用交易日期边界；FactorComposer 现在按完整交易日历调度，并按标签实际可观测时间筛选训练与验证样本；其他模型分支须分别检查。使用真实未来收益标签前，应按具体接口检查标签退出日、训练截止日和预处理拟合范围。公开示例只证明接口可运行，不构成所有算法无前视偏差或可直接实盘的证明。
 
-运行 `python -m pytest -q` 会覆盖公开 tests/ 及各合成模块保留的测试。全套验证需安装 dev,synthesis；没有 LightGBM 时该方法的端到端测试跳过。原生 Qlib、GPU/MPS、真实行情、完整交易回测、部署和 Windows 未验证。
+运行 `python3 -m pytest -q` 会覆盖公开 tests/ 及各合成模块保留的测试。全套验证需安装 dev,synthesis；没有 LightGBM 时该方法的端到端测试跳过。原生 Qlib、GPU/MPS、真实行情、完整交易回测、部署和 Windows 未验证。
 
 本次 macOS 验证中，12 项 BLAS 线程限制测试因底层运行库不暴露可控制线程池而跳过；1 项真实数据库测试按原声明跳过。其余测试使用合成输入，未连接私人数据库。
 

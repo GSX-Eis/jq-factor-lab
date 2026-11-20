@@ -7,7 +7,7 @@ import pytest
 from backtest_and_analysis.forward_returns_calculator import ForwardReturnsCalculator
 from backtest_and_analysis.time_series.labels import BarReturnLabeler
 from calendar_test_support import synthetic_calendar
-from futures_roll_samples import futures_sample
+from futures_roll_samples import futures_sample, warm_market_calendars  # noqa: F401
 from utils.continuous_bars import ContinuousBarSource
 from utils.futures_roll import build_roll_schedule
 from utils.session_calendar import SessionCalendar
@@ -137,6 +137,8 @@ def test_dst_switch_moves_utc_endpoints_without_changing_bar_count() -> None:
         assert label.return_pct == pytest.approx(5.0)
 
 
+@pytest.mark.slow
+@pytest.mark.usefixtures('warm_market_calendars')
 def test_futures_roll_uses_raw_prices_from_the_signal_contract() -> None:
     with duckdb.connect(':memory:') as conn:
         futures_sample(conn, end='2026-01-09', oi=[

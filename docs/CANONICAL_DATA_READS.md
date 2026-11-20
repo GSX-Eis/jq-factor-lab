@@ -23,7 +23,7 @@
 ```
 
 ```bash
-python -m examples.canonical_data_reads --config config.json --receipt receipt.json
+python3 -m examples.canonical_data_reads --config config.json --receipt receipt.json
 ```
 
 选一个短日期区间、少量股票和已有因子。`current` 是显式选择的版本标签，运行时不会自动追踪最新版本。两个行情版本由独立连接读取，避免同名表的版本互相覆盖。所有连接只读，忽略环境中的 `QUANT_DATA_BINDINGS`；此入口拒绝 `sources` 和外部 `data_bindings` 配置。

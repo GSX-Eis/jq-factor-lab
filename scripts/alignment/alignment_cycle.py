@@ -581,6 +581,8 @@ def run_cycle(
     result_file: Path | None = None,
     work_log: Path | None = None,
 ) -> dict[str, Any]:
+    if real_cloud:
+        raise ValueError("Real-cloud factor alignment requires the private cloud workflow")
     output_dir.mkdir(parents=True, exist_ok=True)
     factor_path = Path(factor)
     if not factor_path.is_absolute():
@@ -734,7 +736,7 @@ def run_cycle(
         elif failed:
             next_action = "repair_source_then_rerun_cycle"
         else:
-            next_action = "complete" if real_cloud else "real_cloud_alignment"
+            next_action = "complete"
         result = {
             "schema_version": 2,
             "fingerprint": fingerprint,
@@ -808,6 +810,7 @@ def run_cycle(
         _emit("cycle_finished", **result)
         return result
 
+    requirements = REPO_ROOT / "config/factor_requirements.json"
     preflight = (
         (
             "static_review",
@@ -824,26 +827,15 @@ def run_cycle(
             lambda stage: _classify_static_review(stage, static_json),
         ),
         (
-            "prepare_dumper",
-            [
-                sys.executable,
-                str(SCRIPT_DIR / "prepare_cloud_dumper.py"),
-                "--factor",
-                factor_class,
-                "--output",
-                str(prepared_dumper),
-                "--fingerprint",
-                fingerprint,
-            ],
-            (prepared_dumper,),
-            None,
-        ),
-        (
             "build_strategy",
             [
                 sys.executable,
                 "scripts/build_jq_strategy.py",
                 "--single-file",
+                "--requirements",
+                str(requirements),
+                "--cloud-api-mapping",
+                str(REPO_ROOT / "config/cloud_api_mapping.json"),
                 "--factor-files",
                 str(factor_path),
                 "--factors",
@@ -866,7 +858,7 @@ def run_cycle(
                 "--bundle",
                 str(bundle),
                 "--requirements",
-                str(prepared_dumper),
+                str(requirements),
                 "--output",
                 str(compat_json),
             ],

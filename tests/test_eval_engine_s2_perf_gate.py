@@ -10,6 +10,7 @@ import pytest
 from tools.benchmarks import eval_engine_kernels as benchmark
 
 
+@pytest.mark.perf_gate
 def test_eval_engine_kernels_perf_smoke(tmp_path: Path) -> None:
     output = tmp_path / "kernels.json"
     subprocess.run(

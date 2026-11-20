@@ -60,7 +60,6 @@ def input_manifest(repo: Path, factor: Path, factor_class: str, extra_paths=()) 
         "utils",
         "scripts/build",
         "scripts/alignment",
-        "jq_strategies",
         "factor_synthesis/core",
         "backtest_and_analysis",
         "factor_synthesis/vectorbt_adapter",

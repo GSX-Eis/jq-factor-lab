@@ -14,6 +14,32 @@ FloatArray = npt.NDArray[np.float64]
 ReturnMode = Literal["raw", "cross_section_excess"]
 ICMethod = Literal["spearman", "pearson"]
 
+CalibrationStatus = Literal["uncalibrated", "calibrated_pass", "calibrated_fail"]
+CalibrationMethod = Literal["cross_section_hac", "time_series_mbb"]
+
+
+@dataclass(frozen=True)
+class CalibrationEvidence:
+    scenario: str
+    method: CalibrationMethod
+    window: int
+    sample_size: int
+    nominal_coverage: float
+    observed_coverage: float
+    tolerance: float
+    passes: bool
+    report_ref: str
+    bootstrap_replicates: int | None = None
+
+
+@dataclass(frozen=True)
+class IntervalUsability:
+    reason: str | None
+    calibration_status: CalibrationStatus
+    calibration_evidence: CalibrationEvidence | None
+    descriptive_stats_usable: bool
+    significance_interpretation_usable: bool
+
 
 @dataclass(frozen=True)
 class ICSummary:
@@ -37,6 +63,8 @@ class HACInterval:
     lower: float
     upper: float
     reason: str | None
+    calibration_status: CalibrationStatus = "uncalibrated"
+    calibration_evidence: CalibrationEvidence | None = None
 
 
 @dataclass(frozen=True)
@@ -103,6 +131,9 @@ class BootstrapInterval:
     lower: float
     upper: float
     reason: str | None
+    calibration_status: CalibrationStatus = "uncalibrated"
+    calibration_evidence: CalibrationEvidence | None = None
+    n_valid_pairs: int | None = None
 
     @property
     def confidence_level(self) -> float:

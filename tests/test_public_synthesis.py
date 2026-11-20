@@ -77,3 +77,16 @@ def test_public_synthesis_cli_defaults_to_runnable_method(tmp_path):
     target = tmp_path / "default"
     assert main(["factor-synthesis-demo", "--output-dir", str(target)]) == 0
     assert json.loads((target / "summary.json").read_text())["method"] == "weighted_sum"
+
+
+def test_public_synthesis_cli_explains_missing_optional_dependency(tmp_path, monkeypatch, capsys):
+    from examples import synthesis_demo
+
+    def missing(*args, **kwargs):
+        raise ModuleNotFoundError("scikit-learn is absent", name="sklearn")
+
+    monkeypatch.setattr(synthesis_demo, "run_demo", missing)
+    with pytest.raises(SystemExit) as error:
+        main(["factor-synthesis-demo", "--output-dir", str(tmp_path / "out")])
+    assert error.value.code == 1
+    assert "jq-factor-lab[synthesis]" in capsys.readouterr().err

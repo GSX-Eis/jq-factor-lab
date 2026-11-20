@@ -9,6 +9,7 @@ import hashlib
 import json
 from collections.abc import Iterator, Mapping
 from concurrent.futures import ThreadPoolExecutor
+from copy import copy
 from dataclasses import dataclass, field
 from numbers import Integral
 from typing import Any
@@ -16,14 +17,19 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from backtest_and_analysis.evaluation import EvaluationEngine
+from backtest_and_analysis.evaluation import (
+    EvaluationEngine, IntervalUsability, evaluate_interval_usability,
+)
 from backtest_and_analysis.evaluation.panel import EvaluationPanel
+from backtest_and_analysis.evaluation.quantiles import Standardization
+from backtest_and_analysis.evaluation.split import SplitConfig
 
 from .contracts import (
     EXCLUSION_PRIORITY, ContractValidationError, DuplicateKeyError,
     _duration, _frame_columns, _numeric_column, _text_column,
     validate_bar_frame, validate_factor_frame,
 )
+from .evaluation_v2 import BarEvaluationV2, BarTrialFamily, evaluate_bar_splits
 from .labels import BarReturnLabeler, LABEL_COLUMNS
 
 
@@ -57,8 +63,12 @@ CS_COLUMNS = ['frequency', 'horizon_bars', 'signal_timestamp', *COUNT_COLUMNS,
               'valid_instruments', 'spearman_ic', 'cs_status', *QUANTILE_META]
 
 
+ICInferenceKey = tuple[str, int, str | None]
+
+
 @dataclass
 class EvaluationResult:
+    """Bar v1 tables with in-memory IC inference metadata keyed by frequency, horizon and instrument."""
     analysis_mode: str
     per_bar_labels: pd.DataFrame
     ic_by_horizon: pd.DataFrame
@@ -67,6 +77,8 @@ class EvaluationResult:
     cross_sections: pd.DataFrame = field(default_factory=lambda: pd.DataFrame(columns=CS_COLUMNS))
     data_identity: dict[str, Any] = field(default_factory=dict)
     calendar_identity: dict[str, Any] = field(default_factory=dict)
+    ic_inference: dict[ICInferenceKey, IntervalUsability] = field(default_factory=dict)
+    evaluation_v2: BarEvaluationV2 | None = None
 
 
 def _mode(value: str | None, expected: str | None = None) -> str:
@@ -195,6 +207,13 @@ def _canonical_order(keys: tuple[np.ndarray, ...]) -> np.ndarray | None:
     return order
 
 
+def _attach_factor_values(labels: pd.DataFrame, factors: pd.DataFrame) -> pd.DataFrame:
+    values = validate_factor_frame(factors)[['timestamp_utc', 'instrument_id', 'factor_value']]
+    return labels.reset_index(drop=True).drop(columns='factor_value', errors='ignore').merge(
+        values.rename(columns={'timestamp_utc': 'signal_timestamp'}),
+        on=['signal_timestamp', 'instrument_id'], how='left', validate='many_to_one')
+
+
 def _prepare(labels: pd.DataFrame, factors: pd.DataFrame | None) -> _PreparedLabels:
     _frame_columns(labels, LABEL_COLUMNS)
     frame = labels
@@ -216,10 +235,7 @@ def _prepare(labels: pd.DataFrame, factors: pd.DataFrame | None) -> _PreparedLab
             codes = np.broadcast_to(np.int8(0), codes.shape)
         text_keys.append((codes, pd.Index(values, name=name)))
     if factors is not None:
-        values = validate_factor_frame(factors)[['timestamp_utc', 'instrument_id', 'factor_value']]
-        frame = frame.reset_index(drop=True).drop(columns='factor_value', errors='ignore').merge(
-            values.rename(columns={'timestamp_utc': 'signal_timestamp'}),
-            on=['signal_timestamp', 'instrument_id'], how='left', validate='many_to_one')
+        frame = _attach_factor_values(frame, factors)
     _frame_columns(frame, ('factor_value',))
     # The labeler's empty contract table has object value columns; normalize only empties.
     if frame.empty:
@@ -367,6 +383,7 @@ class TimeSeriesEvaluator:
                  factors: pd.DataFrame | None = None) -> EvaluationResult:
         prepared = _prepare(per_bar_labels, factors)
         rows, quantiles, counts_by_horizon = [], [], {}
+        ic_inference = {}
         groups = list(prepared.groups())
         if len(groups) > 1 and len(prepared.frame) >= _PARALLEL_LABEL_ROWS:
             with ThreadPoolExecutor(max_workers=min(4, len(groups))) as executor:
@@ -377,10 +394,11 @@ class TimeSeriesEvaluator:
         else:
             evaluated = [self._evaluate_group(group) for group in groups]
             canonical_frame = prepared.canonical_frame()
-        for group, (group_rows, group_quantiles, counts) in zip(groups, evaluated, strict=True):
+        for group, (group_rows, group_quantiles, counts, inference) in zip(groups, evaluated, strict=True):
             counts_by_horizon[group.frequency, group.horizon] = counts
             rows.extend(group_rows)
             quantiles.extend(group_quantiles)
+            ic_inference.update(inference)
         rows.sort(key=lambda row: (row['instrument_id'], row['frequency'], row['horizon_bars']))
         quantiles.sort(key=lambda row: (row['instrument_id'], row['frequency'], row['horizon_bars']))
         details = pd.DataFrame(rows, columns=TS_IC_COLUMNS)
@@ -398,10 +416,13 @@ class TimeSeriesEvaluator:
         return EvaluationResult(self.analysis_mode, canonical_frame, pd.DataFrame(rows, columns=TS_IC_COLUMNS),
                                 pd.DataFrame(quantiles, columns=TS_QUANTILE_COLUMNS), _counts(prepared.reasons),
                                 data_identity=prepared.identity(),
-                                calendar_identity=dict(per_bar_labels.attrs.get('calendar_identity', {})))
+                                calendar_identity=dict(per_bar_labels.attrs.get('calendar_identity', {})),
+                                ic_inference=ic_inference)
 
-    def _evaluate_group(self, group: _LabelGroup) -> tuple[list[dict], list[dict], dict[str, Any]]:
-        rows, quantiles = [], []
+    def _evaluate_group(self, group: _LabelGroup) -> tuple[
+        list[dict], list[dict], dict[str, Any], dict[ICInferenceKey, IntervalUsability],
+    ]:
+        rows, quantiles, ic_inference = [], [], {}
         horizon = group.horizon
         panel, observed, _, asset_codes = _legacy_panel(group)
         statistics = EvaluationEngine('time_series', frequency='bar').evaluate(
@@ -414,6 +435,9 @@ class TimeSeriesEvaluator:
             identity = dict(instrument_id=instrument, frequency=group.frequency, horizon_bars=horizon)
             instrument_stats = statistics.horizons[horizon].instruments[instrument]
             ic = instrument_stats.ic
+            ic_inference[group.frequency, horizon, instrument] = evaluate_interval_usability(
+                instrument_stats.bootstrap, point_estimate=ic.values[0], point_reason=ic.reasons[0],
+            )
             phase = instrument_stats.non_overlapping_ic[0]
             buckets = [(bucket, stats) for bucket, stats in instrument_stats.returns_by_bucket.items()
                        if stats.n_samples]
@@ -440,7 +464,7 @@ class TimeSeriesEvaluator:
                     quantiles.append(dict(**identity, **meta, quantile=number, sample_count=stats.n_samples,
                                           mean_return_pct=stats.mean, median_return_pct=stats.p50,
                                           positive_ratio=float((returns > 0).mean())))
-        return rows, quantiles, counts
+        return rows, quantiles, counts, ic_inference
 
 
 class BarCrossSectionalEvaluator:
@@ -456,6 +480,7 @@ class BarCrossSectionalEvaluator:
                  factors: pd.DataFrame | None = None) -> EvaluationResult:
         prepared = _prepare(per_bar_labels, factors)
         sections, rows, aggregates = [], [], []
+        ic_inference = {}
         engine = EvaluationEngine('cross_sectional', frequency='bar')
         for group in prepared.groups():
             frequency, horizon = group.frequency, group.horizon
@@ -514,6 +539,9 @@ class BarCrossSectionalEvaluator:
                     quantile_status='ok' if np.all(quantile_counts == self.n_quantiles) else 'reduced_quantiles',
                 ))
             summary = result.ic_summary
+            ic_inference[frequency, horizon, None] = evaluate_interval_usability(
+                result.hac, point_estimate=summary.mean,
+            )
             status = ('ok' if summary.n_valid else
                       statuses.index[0] if len(statuses) == 1 else 'no_valid_cross_sections')
             rows.append(dict(frequency=frequency, horizon_bars=horizon, **_counts(group.reasons),
@@ -530,17 +558,31 @@ class BarCrossSectionalEvaluator:
         return EvaluationResult(self.analysis_mode, prepared.canonical_frame(), pd.DataFrame(rows, columns=CS_IC_COLUMNS),
                                 pd.DataFrame(aggregates, columns=CS_QUANTILE_COLUMNS), _counts(prepared.reasons),
                                 cross_sections=section_frame, data_identity=prepared.identity(),
-                                calendar_identity=dict(per_bar_labels.attrs.get('calendar_identity', {})))
+                                calendar_identity=dict(per_bar_labels.attrs.get('calendar_identity', {})),
+                                ic_inference=ic_inference)
 
 
 def evaluate_bars(bars: pd.DataFrame, factors: pd.DataFrame | None = None,
                   labeler: BarReturnLabeler | None = None, *, analysis_mode: str | None = None,
                   n_quantiles: int = 5, min_ic_samples: int = 3,
-                  min_cross_section_size: int = 3) -> EvaluationResult:
+                  min_cross_section_size: int = 3,
+                  split: SplitConfig | Mapping[str, str | pd.Timestamp] | None = None,
+                  bootstrap: Mapping[str, Any] | None = None,
+                  hac_lag: int | None = None, direction: int | None = None,
+                  standardization: Standardization | None = None,
+                  calibration_scenario: str | None = None,
+                  trial_selection: Mapping[str, Any] | None = None,
+                  factor_id: str = 'factor_value', evaluation_v2: bool = False,
+                  trial_family: BarTrialFamily | None = None) -> EvaluationResult:
     """Label and evaluate raw Bars; preserve raw coverage and calendar provenance.
 
     For precomputed labels use the matching evaluator's ``evaluate`` method.
-    ``analysis_mode`` is mandatory even for a one-instrument input.
+    ``analysis_mode`` is mandatory even for a one-instrument input. Advanced
+    settings opt into evaluation.v2 while the complete full-sample v1 tables
+    remain available for existing readers. Split selection uses training evidence.
+    Pass a preregistered trial_family to record this factor's configured horizons
+    in a shared selection. The first successful evaluation binds the family's
+    selection window. Each result carries a snapshot of family progress.
     """
     mode = _mode(analysis_mode)
     evaluator = (TimeSeriesEvaluator(analysis_mode=mode, n_quantiles=n_quantiles,
@@ -549,14 +591,62 @@ def evaluate_bars(bars: pd.DataFrame, factors: pd.DataFrame | None = None,
                                              min_cross_section_size=min_cross_section_size))
     if not isinstance(labeler, BarReturnLabeler):
         raise ContractValidationError('labeler must be a BarReturnLabeler')
+    if not isinstance(evaluation_v2, bool):
+        raise ContractValidationError('evaluation_v2 must be a boolean')
+    for name, value, supported in (
+        ('bootstrap', bootstrap, {'block_length', 'n_boot', 'seed', 'min_valid_replicates', 'alpha'}),
+        ('trial_selection', trial_selection, {'method', 'alpha'}),
+    ):
+        if value is not None and (not isinstance(value, Mapping) or value.keys() - supported):
+            raise ContractValidationError(f'{name} must be a mapping with keys from {sorted(supported)}')
+    if bootstrap is not None and mode != 'time_series':
+        raise ContractValidationError('bootstrap requires time_series analysis')
+    if hac_lag is not None and mode != 'cross_sectional':
+        raise ContractValidationError('hac_lag requires cross_sectional analysis')
+    if standardization is not None and (mode != 'time_series' or split is None):
+        raise ContractValidationError('standardization requires a time_series train/oos split')
+    if isinstance(split, Mapping):
+        split = SplitConfig(**split)
+    if split is not None and not isinstance(split, SplitConfig):
+        raise ContractValidationError('split must specify train_end and oos_start')
+    if trial_family is not None:
+        if not isinstance(trial_family, BarTrialFamily):
+            raise ContractValidationError('trial_family must be a BarTrialFamily')
+        if trial_selection is not None:
+            raise ContractValidationError('Configure method and alpha on trial_family for a shared selection')
+        trial_family._validate_registration((factor_id, h) for h in labeler.horizons)
+    family = trial_family
+    if family is None and (evaluation_v2 or any(value is not None for value in (
+        split, bootstrap, hac_lag, direction, standardization, calibration_scenario, trial_selection,
+    ))):
+        family = BarTrialFamily(((factor_id, h) for h in labeler.horizons), **(trial_selection or {}))
     frame = validate_bar_frame(bars)
-    labels = labeler.label(frame, factors)
+    labeling = labeler
+    if split is not None and not labeler.include_scheduled_exit:
+        labeling = copy(labeler)
+        labeling.include_scheduled_exit = True
+    labels = labeling.label(frame, factors)
     if factors is None:
         values = frame[['timestamp_utc', 'instrument_id', 'frequency', 'factor_value']].rename(
             columns={'timestamp_utc': 'signal_timestamp'})
         labels = labels.merge(values, on=['signal_timestamp', 'instrument_id', 'frequency'],
                               how='left', validate='many_to_one')
-    result = evaluator.evaluate(labels, factors)
+    if family is not None:
+        if factors is not None:
+            labels = _attach_factor_values(labels, factors)
+        options = dict(n_quantiles=n_quantiles, direction=1 if direction is None else direction,
+                       standardization=standardization, calibration_scenario=calibration_scenario)
+        if mode == 'time_series':
+            options.update(min_samples=min_ic_samples, **(bootstrap or {}))
+        else:
+            options.update(min_samples=min_cross_section_size, hac_lag=0 if hac_lag is None else hac_lag)
+        result = evaluator.evaluate(labels)
+        result.evaluation_v2 = evaluate_bar_splits(
+            labels, labeler, engine=EvaluationEngine(mode, 'bar'),
+            split=split, family=family, factor_id=factor_id, options=options,
+        )
+    else:
+        result = evaluator.evaluate(labels, factors)
     result.data_identity = _data_identity(frame, labels)
     if isinstance(labeler.calendar, Mapping):
         calendars = {key: dict(calendar_id=cal.calendar_id, calendar_hash=cal.calendar_hash)

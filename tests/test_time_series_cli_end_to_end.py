@@ -57,6 +57,35 @@ def read_outputs(payload):
             pd.read_csv(items['quantile_stats']), json.loads(items['evaluation_summary'].read_text()))
 
 
+def test_private_bar_results_db_config_still_uses_repo_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tools.agent_harness import cli
+
+    repo = tmp_path / 'repo'
+    caller = tmp_path / 'caller'
+    repo.mkdir()
+    caller.mkdir()
+    monkeypatch.setattr(cli, 'REPO_ROOT', repo)
+    monkeypatch.chdir(caller)
+    config_path = repo / 'bar.json'
+    config_path.write_text(json.dumps({
+        'output_dir': 'evaluation',
+        'results_db': 'evaluation/summary.json',
+    }))
+    args = cli.build_parser().parse_args([
+        'time-series-analysis', '--config', config_path.name,
+        '--output-root', str(tmp_path / 'harness'),
+    ])
+
+    result = cli._handle_time_series_analysis(args)
+    assert result.exit_code == 2
+    assert result.error['code'] == 'bar_evaluation_store_precondition_failed'
+    assert str(repo / 'evaluation/summary.json') in result.error['message']
+    assert not (repo / 'evaluation').exists()
+    assert not (caller / 'evaluation').exists()
+
+
 @pytest.mark.parametrize('view', ['ETH', 'RTH'])
 def test_nq_eth_rth_hand_computed_rows(tmp_path, view):
     path, bars = nq_bars(tmp_path)

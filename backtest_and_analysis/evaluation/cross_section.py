@@ -11,6 +11,7 @@ import numpy as np
 import numpy.typing as npt
 
 from . import kernels
+from .calibration import resolve_interval_calibration
 from .panel import EvaluationPanel
 from .types import (
     CrossSectionHorizon,
@@ -44,7 +45,9 @@ def _ic_summary(values: FloatArray) -> ICSummary:
     return ICSummary(n, mean, median, positive, std, mean / std, None)
 
 
-def bartlett_hac(ic: npt.ArrayLike, *, lag: int, alpha: float = 0.05) -> HACInterval:
+def bartlett_hac(
+    ic: npt.ArrayLike, *, lag: int, alpha: float = 0.05, calibration_scenario: str | None = None,
+) -> HACInterval:
     """Estimate the IC mean interval, with nonfinite ICs occupying their grid slots."""
     lag = kernels._positive_int(lag, "lag", minimum=0)
     if not 0 < alpha / 2 < 0.5:
@@ -89,7 +92,14 @@ def bartlett_hac(ic: npt.ArrayLike, *, lag: int, alpha: float = 0.05) -> HACInte
         else:
             variance = np.nan
 
-    return HACInterval(n, grid_size, lag, alpha, pair_counts, variance, lower, upper, reason)
+    status, evidence = resolve_interval_calibration(
+        scenario=calibration_scenario, method="cross_section_hac", window=lag,
+        sample_size=grid_size, nominal_coverage=1 - alpha,
+    )
+    return HACInterval(
+        n, grid_size, lag, alpha, pair_counts, variance, lower, upper, reason,
+        calibration_status=status, calibration_evidence=evidence,
+    )
 
 
 def _time_mean(values: FloatArray, empty_reason: str) -> TimeMean:
@@ -159,6 +169,7 @@ def evaluate_cross_section(
     signal_valid: npt.NDArray[np.bool_] | None = None,
     bucket_labels: npt.ArrayLike | None = None,
     bucket_standard_errors: bool = False,
+    calibration_scenario: str | None = None,
     _legacy_ic_rounding: bool = False,
     _bar_v1: bool = False,
 ) -> CrossSectionResult:
@@ -242,7 +253,10 @@ def evaluate_cross_section(
         ic = bar_ic if bar_ic is not None else correlate(factor, returns, valid=valid, min_samples=min_samples)
         ic_summary = _ic_summary(ic.values[np.isfinite(ic.values)])
         lag = hac_lag[horizon] if isinstance(hac_lag, Mapping) else hac_lag
-        hac = bartlett_hac(ic.values, lag=lag, alpha=alpha)
+        hac = bartlett_hac(
+            ic.values, lag=lag, alpha=alpha,
+            calibration_scenario=calibration_scenario if ic_method == "spearman" and not _legacy_ic_rounding else None,
+        )
 
         buckets = kernels.bucket_sums(returns, labels, n_quantiles, valid=valid)
         bucket_returns = _divide(buckets.sums, buckets.counts)

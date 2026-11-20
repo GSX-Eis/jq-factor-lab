@@ -16,7 +16,7 @@
 
 - `tools/agent_harness/cli.py`：结构化 JSON 包装，覆盖 `single-factor-analysis`、`time-series-analysis`、`factor-synthesis`、`symbolic-factor-mining`、`quanta-alpha-realize`、`parent-factor-screen`、`alignment-run`、`monitor-refresh` 和 `outputs-gc`。教学 CLI 位于 `tools/demo_cli.py`。
 - `run_analysis_main.py`、`run_factor_synthesis.py`、`run_symbolic_factor_mining.py` 及其依赖的 `backtest_and_analysis`、`factor_synthesis`（含 VectorBT 适配）、`factor_mining/symbolic`。
-- `scripts/alignment/` 的本地对齐与证据校验工具，以及其余审阅过的 `data_pipeline/loaders`。云端因子生产脚本不随公开版提供；使用准备脚本时需通过 `--source` 指定调用者自备的生产脚本。
+- `scripts/alignment/` 的本地对齐与证据校验工具，以及其余审阅过的 `data_pipeline/loaders`。`alignment-run --factor` 使用 `scripts.build_jq_strategy` 打包，并以 `config/factor_requirements.json` 执行本地兼容性预检。独立的 `prepare_cloud_dumper` 工具需要通过 `--source` 传入自备的云端因子生产脚本。 源文件须在模块顶层或 `main()` 函数体中直接用字符串字面量各赋值一次 `start_date` 和 `end_date`。指定 `--target-date` 时，生成文件的两个日期均设为该日。
 - 后端的默认门槛和参数按源码原样公开。
 
 后端需要调用者自备 DuckDB 数据库、因子文件和运行配置；数据库默认路径为 `./data/duckdb/`。VectorBT 回测与 DSO 符号挖掘分别需要可选依赖 `backtest` 与 `mining`。对齐流程的浏览器上传、下载辅助脚本不在本仓库中。Regime 研究命令不公开。
@@ -28,6 +28,8 @@
 `time-series-analysis` 默认在 `outputs/agent_harness/time-series-analysis/<run-id>/attempts/<execution-id>/` 保存每次调用。`--output-root` 改变根目录，重复 run-id 仍生成独立 attempt。attempt 的 `summary.json` 是包装器摘要，run 目录的同名文件是最近一次调用的导航。
 
 Bar 评估默认写入 attempt 下的 `evaluation/`：`per_bar_labels.csv`、`ic_by_horizon.csv`、`quantile_stats.csv` 与 `summary.json`。评估的 `summary.json` 最后原子写入，作为四文件完整发布的完成标记；失败时旧 CSV 不能单独作为成功证据。`--output-dir` 或配置中的 `output_dir` 可指定评估目录，但不能覆盖包装器摘要。具体路径规则、哈希和失败契约见 [分钟研究契约](TIME_SERIES_CONTRACT.md)。教学 CLI 的独立布局见 [配置参考](CONFIG.md)。
+
+公开控制台 `jq-factor-lab time-series-analysis` 和 `jq-factor-lab read-bar-evaluations` 以进程的当前工作目录解析相对路径，包括配置文件及其中的 Bar 输入、输出目录和 `results_db`。写库后可用相同的相对路径回查。使用 `--output-root` 指定 Harness 输出、临时文件和缓存的根目录，默认使用当前工作目录下的 `outputs/agent_harness`。显式评估目录已存在时需要 `--overwrite`。
 
 分钟评估从代码根目录自己的 Git 元数据读取版本。无 Git 元数据时，依次使用 `QUANTATION_CODE_VERSION`、已安装的 `jq-factor-lab` 分发包版本或 `unknown`。通过 `result_identity.code_version_source` 核对所用来源。
 

@@ -13,7 +13,9 @@ from fixtures.eval_engine.baseline.regenerate import (
 )
 
 
-@pytest.fixture(scope="module", params=["synthetic"])
+@pytest.fixture(scope="module", params=[
+    "synthetic",
+])
 def baseline(request: pytest.FixtureRequest) -> tuple:
     sample = request.param
     expected = json.loads((BASELINE_DIR / f"{sample}.json").read_text(encoding="utf-8"))
@@ -22,6 +24,7 @@ def baseline(request: pytest.FixtureRequest) -> tuple:
     return inputs, expected["paths"]
 
 
+@pytest.mark.golden
 @pytest.mark.parametrize("mode", MODES)
 def test_eval_engine_s1_runner_golden(baseline: tuple, mode: str) -> None:
     inputs, paths = baseline

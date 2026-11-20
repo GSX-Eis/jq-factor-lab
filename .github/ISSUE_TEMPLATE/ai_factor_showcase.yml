@@ -1,0 +1,29 @@
+name: AI Factor Research Showcase
+description: Share a factor research workflow you ran with a coding agent.
+body:
+  - type: input
+    id: agent
+    attributes:
+      label: Coding agent
+      description: For example, Claude Code, Codex, or Cursor.
+    validations:
+      required: true
+  - type: textarea
+    id: factor
+    attributes:
+      label: Factor idea and evaluation horizon
+      description: Outline the factor idea, data frequency, and forecast horizon.
+    validations:
+      required: true
+  - type: textarea
+    id: results
+    attributes:
+      label: Metrics summary
+      description: Use synthetic or sanitized local data. Share a short JSON summary such as IC and sample counts. Omit raw market data and credentials.
+    validations:
+      required: true
+  - type: textarea
+    id: feedback
+    attributes:
+      label: Friction and suggestions
+      description: Where did you or the agent get stuck? What would make the workflow easier?

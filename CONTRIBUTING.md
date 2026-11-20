@@ -5,11 +5,11 @@
 修改前先阅读 [AGENTS](AGENTS.md) 及相关接口文档。因子代码会被执行，只使用可信模块；不要提交行情、凭证、账户、预训练模型、研究结果或个人机器路径。使用临时目录和合成数据验证，不连接真实账户。
 
 ```bash
-python -m pip install -e '.[dev,synthesis]'
-python -m pytest -q
-python -m examples.generate_data --output data/demo.csv
-python -m tools.demo_cli single-factor-analysis --config config/demo.json --output-dir outputs/contribution-analysis
-python -m tools.demo_cli factor-synthesis-demo --output-dir outputs/contribution-synthesis
+python3 -m pip install -e '.[dev,synthesis]'
+python3 -m pytest -q
+jq-factor-lab daily-demo
+jq-factor-lab bar-demo
+jq-factor-lab factor-synthesis-demo
 ```
 
 输出目录必须尚不存在。影响标签、日历、预处理或选模的修改应覆盖错误路径与边界，并说明行为变化；不能关闭退出日隔离校验来让测试或示例通过。提交时列出实际通过的检查和未验证环境，更新相关文档及 [CHANGELOG](CHANGELOG.md)。云端运行和完整交易回测仍需独立验证。

@@ -21,7 +21,8 @@
    - 对应 `CS_COLUMNS`，仅 `cross_sectional` 模式有行（`signal_timestamp TIMESTAMPTZ NOT NULL`），`time_series` 模式写入 0 行。
 
 **`result_schema_version` 演进约定**：
-- 当前唯一支持版本为 `bar_evaluation.v1`。
+- 入库仅消费四份全样本 `bar_evaluation.v1` 文件及其哈希。`evaluation_v2.json`
+  和独立诊断文件通过 Harness 产物登记交付，无需新增表或列。
 - 未支持的 `result_schema_version` 一律拒绝写入，本阶段不自动迁移已有表。未来版本须单独评审迁移方案，保留历史版本的列、类型与行；新增列应可空，历史行保留 `NULL`。若库中已有表缺少当前必需列，事务失败并回滚，不修改该表结构。
 
 ### 写入规则、锁选择与幂等/冲突语义
@@ -100,13 +101,13 @@
 ### CLI 入口
 
 ```bash
-python -m tools.agent_harness.cli write-factor-values --factor-values-store work/NERE-748/store \
+python3 -m tools.agent_harness.cli write-factor-values --factor-values-store work/NERE-748/store \
   --input work/NERE-748/factors.csv --factor-id alpha_001 --frequency 15min \
   --analysis-mode time_series --bucket-strategy segment_anchored --calendar XSHG \
   --calendar-start 2026-01-05 --calendar-end 2026-01-05 --source-build-id build-1
-python -m tools.agent_harness.cli read-factor-values --factor-values-store work/NERE-748/store \
+python3 -m tools.agent_harness.cli read-factor-values --factor-values-store work/NERE-748/store \
   --factor-identity-hash <sha256> --list-identities
-python -m tools.agent_harness.cli verify-factor-values --factor-values-store work/NERE-748/store
+python3 -m tools.agent_harness.cli verify-factor-values --factor-values-store work/NERE-748/store
 ```
 
 三者均强制传 `--factor-values-store <dir>`，支持 `--dry-run` / `--json-out`，遵循 `EVAL_POLICY.md` 退出码（`0` 成功/dry-run，`2` 前置校验失败，`3` 执行失败，`4` 冲突拒绝或 `verify_store()` 校验未通过）。
@@ -144,7 +145,7 @@ importer 的该列可选，缺省写 NULL；提供时必须为有限、非负实
 ### 离线换月决定
 
 ```bash
-python -m tools.agent_harness.cli build-roll-schedule --db work/NERE-743/input.duckdb \
+python3 -m tools.agent_harness.cli build-roll-schedule --db work/NERE-743/input.duckdb \
   --product-roots CU,AU --start 2026-01-06 --end 2026-01-30 \
   --rule max_oi --confirm-days 1 --forward-only
 ```
@@ -425,10 +426,10 @@ start/end 可各自省略；旧表的每个日期边界独立按上海当地日�
 真正没有原始行时全局边界为 NaT。重建日历和标签使用同一份原始覆盖。
 
 ```bash
-python -m tools.agent_harness.cli build-bars --db work/NERE-728/input.duckdb \
+python3 -m tools.agent_harness.cli build-bars --db work/NERE-728/input.duckdb \
   --source 5min --targets 15min,60min --instruments A --start 2026-01-06 --end 2026-01-08
-python -m tools.agent_harness.cli audit-bars --db work/NERE-728/input.duckdb
-python -m tools.agent_harness.cli import-bars --db work/NERE-728/input.duckdb \
+python3 -m tools.agent_harness.cli audit-bars --db work/NERE-728/input.duckdb
+python3 -m tools.agent_harness.cli import-bars --db work/NERE-728/input.duckdb \
   --bars canonical.csv --metadata instruments.json --derive 15min,60min
 ```
 
@@ -584,10 +585,10 @@ Bar v1 的 `non_overlapping_ic` 先按候选信号时间排序、每隔 h 根取
 分位组按截面先计算、再等权汇总，范围为 `cross_sectional_time_aggregated`。
 重复值导致某些截面组数减少时，高分位组只汇总实际存在该组的截面；消费时同时检查
 `cross_section_count`、`min_actual_quantiles`、`max_actual_quantiles`，不能假设各组覆盖相同。
-两种模式均不输出未经修正的 p 值、t 值或显著性结论。
+四份 Bar v1 文件继续使用上述全样本统计。区间与候选选择证据由 v2 提供。
 
 ```bash
-python -m tools.agent_harness.cli time-series-analysis --config work/minute-bars/nq.json
+python3 -m tools.agent_harness.cli time-series-analysis --config work/minute-bars/nq.json
 # 同一 Bar 配置也可经 single-factor-analysis --config 分流
 ```
 
@@ -638,8 +639,8 @@ Bar 模式始终必须显式指定；缺失/非法分别返回 `missing_analysis
 避免覆盖任一级包装器摘要。目标为普通文件或完成标记为目录时返回结构化前置错误
 （退出码 2），不删除用户文件或递归删除目录；清理异常记录在 `error.details` 中。
 预演、模拟及实际执行均在写摘要前校验 `--json-out`。指向评估产物时返回退出码 2，
-保留已有产物与完成标记。即使本次未启用时序诊断报告，
-`diagnostics_report.csv` 和 `diagnostics_report.md` 也受路径校验保护。
+保留已有产物与完成标记。`diagnostics_report.csv`、`diagnostics_report.md` 和
+`evaluation_v2.json` 作为保留路径，在未请求这些额外产物时也参与校验。
 默认 Harness 摘要和运行级导航遵循 `docs/PUBLIC_SCOPE.md 的 Harness 输出布局`。
 
 | 标准文件 | 内容 / Harness artifact_type |
@@ -659,11 +660,13 @@ SHA256，核心摘要复制到 Harness `metrics`。评估 `summary.json` 最后�
 
 使用 `time-series-analysis --config <path> --diagnostics-report`，或设置 JSON 布尔字段
 `"diagnostics_report": true`。该选项适用于 `time_series`。默认仍发布四个 Bar v1 产物。
-启用后，评估 `summary.json` 和 Harness `metrics` 包含 `diagnostics_report` 对象，
-其子契约为 `time_series_diagnostics.v1`。同一次评估还发布 `diagnostics_report.csv`
-和 `diagnostics_report.md`，Harness 的 `artifact_type` 分别为
-`diagnostics_report_csv` 和 `diagnostics_report_markdown`。两份文件均登记 SHA256，
-并在完成标记之前发布。读取时以当前摘要的 `diagnostics_report` 和产物登记为准。
+全样本报告采用 `time_series_diagnostics.v1`。评估 `summary.json` 保留该全样本
+`diagnostics_report` 对象。配置训练/OOS 切分后，`evaluation_v2.json` 和 Harness
+`metrics.diagnostics_report` 使用 `time_series_diagnostics.v2`，诊断 CSV 增加
+`split`、`split_purged_count` 两列，Markdown 分别展示训练和 OOS。
+候选和剔除计数基于清除前的标签，清除数单列报告。`diagnostics_report.csv`
+和 `diagnostics_report.md` 分别以 `diagnostics_report_csv` 和
+`diagnostics_report_markdown` 登记 SHA256，在完成标记之前发布。
 CSV 的 `scope` 为 `overall`、`bucket` 或 `offset`，
 `index` 依次为空、从 1 开始的桶号或从 0 开始的网格偏移。
 JSON 用 null、CSV 用空字段、Markdown 用破折号表示不可计算的数值。
@@ -672,32 +675,95 @@ JSON 用 null、CSV 用空字段、Markdown 用破折号表示不可计算的数
 对每组标的和频率，所选视图的应有网格从首个到末个候选信号，包含中间缺 Bar 的槽位。
 各持有期在该网格上报告全部 `0..h-1` 个偏移的有效样本数、Spearman IC 与状态，
 并核对实际持仓区间在各偏移内互不重叠。候选及剔除计数沿用 Bar v1 的标签分类。
-块 bootstrap 在网格上重采样，按有效配对重新排名，采用最长持有期为块长，
-默认种子 0、999 次抽样、至少 900 次有效重复、双侧 95% 区间。
+块 bootstrap 在网格上重采样，按有效配对重新排名。块长缺省为最长持有期。
+可通过 `bootstrap.block_length` 显式配置，解释区间时以报告逐持有期记录的
+`bootstrap.block_length` 实际值为准。未配置切分时，即使指定了块长，全样本
+诊断仍采用 `time_series_diagnostics.v1`。其他默认值为种子 0、999 次抽样、
+至少 900 次有效重复和双侧 95% 区间。
 全局及各描述性分位桶均报告方向命中数、分母、上涨基准率、提升，
 以及条件收益 P5/P25/P50/P75/P95 和四个尾部均值，收益单位为百分数。
-该入口使用全样本描述性分桶。训练/OOS 验收见[统一评测引擎第 16 节](EVALUATION_ENGINE.md#16-s7-时序诊断与-nq-1min-验收)。
+全样本 v1 报告使用描述性分桶。训练/OOS 验收见[统一评测引擎第 16 节](EVALUATION_ENGINE.md#16-s7-时序诊断与-nq-1min-验收)。
 S7 的 NQ 1min 报告标记 `real_market_data_used=false`。真实 NQ 1min 在外置盘挂载后补跑。
 
-### 训练切分与统计推断
+### 统一引擎参数
 
-统一引擎的截面 `QuantileScheme` 为 `per_cross_section`。分桶只读取信号时刻可用
-的因子与资产池，退出价缺失只减少当前持有期的收益样本。时序切分采用
-`fitted_on_train`，冻结各品种分位边界、方向及可选标准化参数，训练与 OOS
-报告记录同一份 `fit_identity`。样本外极端值进入端点桶，空桶保留编号。
+[`evaluate_bars()`](../backtest_and_analysis/time_series/evaluator.py) 接收原始 Bar、
+可选因子长表、`BarReturnLabeler` 和显式 `analysis_mode`。通过标签器和交易日历构造
+应有网格、信号可用时刻，以及逐持有期的 `entry_timestamps` 和 `exit_timestamps`，
+再交给 [`EvaluationEngine.evaluate()`](../backtest_and_analysis/evaluation/engine.py)。
+这些时间数组由 Bar 适配器生成。预计算标签可直接交给对应模式的 v1 评估器。
 
-每个持有期按实际退出时间清除训练标签。以首个 OOS 应有信号的
-`signal_available_at` 为边界，退出恰好相等时保留，退出更晚时清除。
-日频使用退出交易日实际收盘，Bar 使用退出 Bar 实际结束。高周期特征仅在
-Bar 已收盘且已发布时可用。边界与前视篡改用例见
+| 参数 | Python API 与 JSON 配置语义 |
+| --- | --- |
+| `evaluation_v2` | 布尔开关，默认 `false`。设置为 `true` 或传入 `--evaluation-v2` 即显式启用。 |
+| `split` | `train_end` 与 `oos_start` 两个带时区的边界。Python API 也接受 `SplitConfig`。 |
+| `bootstrap` | 仅时序。支持 `block_length`、`n_boot`、`seed`、`min_valid_replicates` 和区间 `alpha`。 |
+| `hac_lag` | 仅截面。请求的最小 Bartlett HAC 滞后阶数，缺省 0，由引擎保证各持有期至少为 `h - 1`。 |
+| `direction`、`standardization` | 方向缺省为 1。可选标准化仅用于时序训练/OOS 切分。 |
+| `calibration_scenario` | 显式声明依赖场景，供区间匹配已登记的校准依据。 |
+| `trial_selection` | 配置候选族的 `method` 和 `alpha`，默认 `holm`、0.05。 |
+| `factor_id` | 账本中的候选因子标识，默认为 `factor_value`。单独设置此字段不会开启 v2。 |
+
+配置中的 `split`、`bootstrap`、`hac_lag`、`direction`、`standardization`、
+`calibration_scenario`、`trial_selection` 中任一项为非 null 即自动启用 v2。
+有效的空对象（如 `"trial_selection": {}`）也会启用 v2，并采用该项的默认设置。
+Python 调用方也可通过传入预登记的 `trial_family` 启用 v2。
+
+截面按频率和信号实际可用时刻对齐，于每个截面使用 `per_cross_section` 分桶。
+时序全样本使用 `full_sample_descriptive_only`。时序切分采用 `fitted_on_train`，
+每个频率和标的在训练期冻结分位边界、方向及可选标准化参数，训练和 OOS
+复用同一 `fit_identity`。样本外极端值进入端点桶，空桶保留编号。
+
+切分按日历上的实际信号可用时刻对齐。训练候选的计划退出晚于首个 OOS 应有信号的
+`signal_available_at` 时按持有期清除。退出恰好等于边界时保留。即便退出价缺失，
+跨界的计划退出仍计入清除数。各评估面板的训练与 OOS 段都须包含应有信号。
+时序区间使用持仓时间验证各非重叠相位，块重采样保留网格缺口并在每次复制中重排
+有效配对。块长至少覆盖评估的最长持有期。切分与推断细节见
 [统一评测引擎](EVALUATION_ENGINE.md#14-训练与样本外评测接口)。
 
-截面 IC 均值用保留网格缺口的 Bartlett HAC，时序 Spearman 用连续块重采样并
-在每次复制中重排成对有效样本。持有期为 `h` 时，最低要求为 HAC 滞后
-`h - 1` 与块长 `h`。区间覆盖率须按依赖结构和缺失机制预先校准。
-比较多个因子或持有期之前，以 `TrialLedger` 登记整个候选族并完成多重检验校正。
-规则和校准证据见[评测政策](EVAL_POLICY.md#unified-evaluation-engine)和
-[统一评测引擎第 6 节](EVALUATION_ENGINE.md#6-重叠收益反例与区间校准)。
+### evaluation.v2 产物契约
+
+[`evaluation_v2.py`](../backtest_and_analysis/time_series/evaluation_v2.py) 定义内存契约，
+由 [`artifacts.py`](../backtest_and_analysis/time_series/artifacts.py) 发布
+`evaluation_v2.json`。文件以 `evaluation_v2` 类型登记路径和 SHA256，与同次
+`bar_evaluation.v1` 复用 `data_identity`、`calendar_identity` 和
+`result_identity`。以评估 `summary.json` 为发布完成标记，消费时检查当前产物登记。
+可选报告独立携带 `schema_version="evaluation.v2"`，既有 ResultIdentity 仍使用
+`result_schema_version="bar_evaluation.v1"`。
+
+- 顶层包含 `analysis_mode`、`frequency="bar"`、`return_unit="percent"`、
+  上述身份、`splits` 和 `trial_ledger`，并可包含切分后的 `diagnostics_report`。
+- `splits` 为 `full` 或 `train` 与 `oos`。每段提供 `train_end`、
+  `oos_start`、`quantile_scheme`、`fit_identity`、逐持有期 `split_purged_count`
+  和 `horizons` 统计行。每行记录实际 Bar 频率、持有期和 UTC 网格边界，以及
+  对应的 IC、分桶、方向和区间。时序行还含 `intervals_verified` 和各非重叠相位，
+  `instrument_ic_summaries` 汇总各频率及持有期的多标的 IC 和逐相位 IC。
+- `hac` 或 `bootstrap` 中的 `reason` 说明能否估计。
+  `calibration_status` 默认为 `uncalibrated`。当声明的场景、估计方法、实际
+  窗口、应有样本数和标称覆盖率匹配已登记依据时，报告 `calibrated_pass` 或
+  `calibrated_fail` 及 `calibration_evidence`。每行的 `interval_usability`
+  独立报告 `descriptive_stats_usable` 与 `significance_interpretation_usable`。
+  后者还须满足区间可估计及登记校准的样本完整性、复制数等适用条件。
+  证据与门控见[评测政策](EVAL_POLICY.md#unified-evaluation-engine)和
+  [校准登记](EVALUATION_ENGINE.md#61-一次性合成校准)。
+- UTC 时间序列化为 ISO8601，无法计算的数值以 JSON `null` 表示，保留相应原因码。
+
+### TrialLedger 候选登记与校正
+
+启用 v2 即在评估前登记配置中的全部 `(factor_id, horizon)` 候选，切分时使用
+训练期统计，全样本运行则使用 `full`。Python 调用方可在查看结果前创建包含
+全部因子与持有期的 `BarTrialFamily`，再将同一实例作为 `trial_family` 随每个
+因子的 `factor_id` 传入。每次只记录该因子本次已登记的持有期。共享族首次成功
+记录时绑定全样本或训练窗口。复用时训练边界须按 UTC 一致。手工记录应使用独立候选族。
+
+`trial_ledger` 提供 `method`、`alpha`、`split`、`attempt_count`、
+`selection_complete` 和 `best`。逐候选记录统计量、`n_effective`、区间、
+原始 `p_value`、`adjusted_p_value` 和 `reason`。单流截面候选的原始 p 值
+是依据均值和 HAC 方差计算的双侧正态检验值，显著性解释仍受校准门控。时序移动块
+百分位区间本身不提供原始 p 值，同一候选涉及多个评估流时也不自动合并原始 p 值。
+未评测和缺原始 p 值的候选分别列入 `pending_candidates` 和
+`missing_p_value_candidates`。整族均有原始 p 值时才执行 Holm 或 BH 校正并报告
+最优候选。详见[尝试账本与多重检验](EVALUATION_ENGINE.md#62-择优的尝试账本与多重检验)。
 
 ### 身份绑定
 
@@ -724,11 +790,11 @@ CLI 的 `config_hash` 绑定合并命令行覆盖后的配置，递归排序、�
 
 ## 验证
 
-`python -m pytest tests/test_time_series_contracts.py -q` 验证合法/非法输入、
+`python3 -m pytest tests/test_time_series_contracts.py -q` 验证合法/非法输入、
 排序无损、重复键诊断、全部 32 种剔除原因组合、标签时间及百分比单位、身份稳定性。
-`python -m pytest tests/test_time_series_csv_reader.py tests/test_session_calendar.py -q`
+`python3 -m pytest tests/test_time_series_csv_reader.py tests/test_session_calendar.py -q`
 验证 CSV 输入、覆盖元数据、视图筛选、休市与缺 Bar/尾部不足及日历边界。
-`python -m pytest tests/test_bar_return_labeler.py -q` 验证偏移与多持有长度、
+`python3 -m pytest tests/test_bar_return_labeler.py -q` 验证偏移与多持有长度、
 面板六类状态隔离、跨市场午休/收盘对齐、频率独立覆盖、输入校验与日历先导入。
 CLI 双模式合成演示与失败重试见 `tests/test_time_series_cli_end_to_end.py`。
 冻结合成数据集见 `tests/fixtures/time_series/README.md`。

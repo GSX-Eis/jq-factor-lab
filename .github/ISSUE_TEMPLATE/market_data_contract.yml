@@ -1,0 +1,24 @@
+name: Market Calendar / Data Contract Request
+description: Request support for a new market calendar or a local data contract.
+body:
+  - type: input
+    id: market
+    attributes:
+      label: Market and trading calendar
+      description: Include the exchange, calendar identifier if known, and any relevant time zone or session rules.
+    validations:
+      required: true
+  - type: input
+    id: frequency
+    attributes:
+      label: Data frequency
+      description: Specify daily or minute/Bar data. For Bars, include the interval.
+    validations:
+      required: true
+  - type: textarea
+    id: contract
+    attributes:
+      label: Use case and expected data fields
+      description: Describe the workflow and the fields or types you expect in CSV, Parquet, or DuckDB. Use synthetic examples and omit real market data and credentials.
+    validations:
+      required: true

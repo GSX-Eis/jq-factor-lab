@@ -3,20 +3,27 @@
 from collections import Counter
 from collections.abc import Iterable
 from dataclasses import asdict, dataclass
-from math import asin, pi, sqrt
+from math import asin, isfinite, pi, sqrt
 from typing import Literal, NamedTuple
 
 import numpy as np
 import numpy.typing as npt
 
-from .cross_section import bartlett_hac
 from .kernels import _positive_int, spearman
-from .time_series import _bootstrap_spearman
-from .types import FloatArray
+from .types import (
+    BootstrapInterval,
+    CalibrationEvidence,
+    CalibrationMethod,
+    CalibrationStatus,
+    FloatArray,
+    HACInterval,
+    IntervalUsability,
+)
 
 _ALPHA = 0.05
 _NOMINAL_COVERAGE = 1 - _ALPHA
 _TOLERANCE_MCSE = 3
+_REGISTERED_BOOTSTRAP_REPLICATES = 399
 
 
 @dataclass(frozen=True)
@@ -80,6 +87,91 @@ def coverage_passes(covered: int, repetitions: int) -> bool:
     return (20 * covered - 19 * repetitions)**2 <= 171 * repetitions
 
 
+def _registered_evidence(
+    method: CalibrationMethod, scenario: str, window: int, covered: int,
+) -> CalibrationEvidence:
+    repetitions = 2000 if method == "cross_section_hac" else 500
+    return CalibrationEvidence(
+        scenario=scenario, method=method, window=window, sample_size=512,
+        nominal_coverage=_NOMINAL_COVERAGE, observed_coverage=covered / repetitions,
+        tolerance=_TOLERANCE_MCSE * _coverage_mcse(repetitions),
+        passes=coverage_passes(covered, repetitions),
+        report_ref="docs/EVALUATION_ENGINE.md#61-一次性合成校准",
+        bootstrap_replicates=_REGISTERED_BOOTSTRAP_REPLICATES if method == "time_series_mbb" else None,
+    )
+
+
+# Frozen coverage counts from §6.1, seed 791823. All simulated intervals were estimable.
+REGISTERED_CALIBRATIONS = (
+    _registered_evidence("cross_section_hac", "independent_null", 0, 1883),
+    _registered_evidence("cross_section_hac", "ar1_null", 0, 1305),
+    _registered_evidence("cross_section_hac", "ar1_null", 16, 1849),
+    _registered_evidence("cross_section_hac", "overlap_null", 4, 1839),
+    _registered_evidence("cross_section_hac", "overlap_null", 16, 1875),
+    _registered_evidence("cross_section_hac", "positive_effect", 0, 1897),
+    _registered_evidence("cross_section_hac", "negative_effect", 0, 1904),
+    _registered_evidence("time_series_mbb", "independent_null", 1, 470),
+    _registered_evidence("time_series_mbb", "ar1_null", 1, 310),
+    _registered_evidence("time_series_mbb", "ar1_null", 17, 457),
+    _registered_evidence("time_series_mbb", "overlap_null", 5, 458),
+    _registered_evidence("time_series_mbb", "overlap_null", 17, 466),
+    _registered_evidence("time_series_mbb", "positive_effect", 1, 469),
+    _registered_evidence("time_series_mbb", "negative_effect", 1, 484),
+)
+_CALIBRATION_BY_KEY = {
+    (row.scenario, row.method, row.window, row.sample_size, row.nominal_coverage): row
+    for row in REGISTERED_CALIBRATIONS
+}
+
+
+def resolve_interval_calibration(
+    *, scenario: str | None, method: CalibrationMethod, window: int, sample_size: int,
+    nominal_coverage: float,
+) -> tuple[CalibrationStatus, CalibrationEvidence | None]:
+    """Look up the explicitly declared scenario and the exact interval settings."""
+    evidence = _CALIBRATION_BY_KEY.get((scenario, method, window, sample_size, nominal_coverage))
+    if evidence is None:
+        return "uncalibrated", None
+    return ("calibrated_pass" if evidence.passes else "calibrated_fail"), evidence
+
+
+def evaluate_interval_usability(
+    interval: HACInterval | BootstrapInterval, *, point_estimate: float, point_reason: str | None = None,
+) -> IntervalUsability:
+    """Assess the point estimate and verify applicability of the frozen coverage evidence."""
+    status: CalibrationStatus = "uncalibrated"
+    evidence = None
+    applicable = False
+    candidate = interval.calibration_evidence
+    if isinstance(candidate, CalibrationEvidence):
+        method: CalibrationMethod
+        if isinstance(interval, HACInterval):
+            method, window = "cross_section_hac", interval.lag
+            applicable = interval.n_valid == interval.grid_size
+        else:
+            method, window = "time_series_mbb", interval.block_length
+            applicable = (
+                interval.n_valid_pairs == interval.grid_size
+                and interval.n_boot == interval.valid_replicates == candidate.bootstrap_replicates
+            )
+        registered_status, registered_evidence = resolve_interval_calibration(
+            scenario=candidate.scenario, method=method, window=window,
+            sample_size=interval.grid_size, nominal_coverage=1 - interval.alpha,
+        )
+        if candidate == registered_evidence and interval.calibration_status == registered_status:
+            status, evidence = registered_status, registered_evidence
+
+    return IntervalUsability(
+        reason=interval.reason,
+        calibration_status=status,
+        calibration_evidence=evidence,
+        descriptive_stats_usable=point_reason is None and isfinite(point_estimate),
+        significance_interpretation_usable=(
+            interval.reason is None and status == "calibrated_pass" and applicable
+        ),
+    )
+
+
 @dataclass
 class _CoverageCounts:
     covered: int = 0
@@ -97,9 +189,12 @@ class _CoverageCounts:
 def calibrate_coverage(
     *, seed: int = 791823, cross_section_repetitions: int = 2000,
     time_series_repetitions: int = 500, n_times: int = 512, n_assets: int = 32,
-    n_boot: int = 399,
+    n_boot: int = _REGISTERED_BOOTSTRAP_REPLICATES,
 ) -> dict:
     """Run the fixed synthetic scenarios through the S3-A and S3-B interval estimators."""
+    from .cross_section import bartlett_hac
+    from .time_series import _bootstrap_spearman
+
     seed = _positive_int(seed, "seed", minimum=0)
     n_times = _positive_int(n_times, "n_times", minimum=18)
     n_assets = _positive_int(n_assets, "n_assets", minimum=3)

@@ -8,6 +8,14 @@ from pathlib import Path
 from typing import Any
 
 
+_ADVANCED_OPTIONS = ('split', 'bootstrap', 'hac_lag', 'direction', 'standardization',
+                     'calibration_scenario', 'trial_selection')
+
+
+def evaluation_v2_requested(config: dict[str, Any]) -> bool:
+    return config.get('evaluation_v2') is True or any(config.get(key) is not None for key in _ADVANCED_OPTIONS)
+
+
 class AnalysisPreconditionError(ValueError):
     def __init__(self, code: str, message: str) -> None:
         super().__init__(message)
@@ -109,14 +117,17 @@ def evaluate(config: dict[str, Any], destination: Path) -> dict[str, Any]:
             boundary_policy=config.get('boundary_policy', 'same_session'), continuous_source=source)
         result = evaluate_bars(bars, factors, labeler, analysis_mode=mode,
             n_quantiles=config.get('n_quantiles', 5), min_ic_samples=config.get('min_ic_samples', 3),
-            min_cross_section_size=config.get('min_cross_section_size', 3))
-    diagnostics_report = None
+            min_cross_section_size=config.get('min_cross_section_size', 3),
+            factor_id=config.get('factor_id', 'factor_value'), evaluation_v2=config.get('evaluation_v2', False),
+            **{key: config[key] for key in _ADVANCED_OPTIONS if key in config})
+    diagnostics_report = split_diagnostics_report = None
     if diagnostics_requested:
         from backtest_and_analysis.time_series.diagnostics_report import evaluate_diagnostics
-        diagnostics_report = evaluate_diagnostics(
-            result, labeler, n_quantiles=config.get('n_quantiles', 5),
-            min_samples=config.get('min_ic_samples', 3),
-        )
+        options = dict(n_quantiles=config.get('n_quantiles', 5), min_samples=config.get('min_ic_samples', 3))
+        diagnostics_report = evaluate_diagnostics(result, labeler, **options)
+        if diagnostics_report['schema'] == 'time_series_diagnostics.v2':
+            split_diagnostics_report = diagnostics_report
+            diagnostics_report = evaluate_diagnostics(result, labeler, legacy_full=True, **options)
     # A changing source must not be bound to the digest from before it was read.
     if hashes != {str(path): sha256_file(path) for path in paths.values()}:
         raise ValueError('Input CSV changed during evaluation')
@@ -128,12 +139,15 @@ def evaluate(config: dict[str, Any], destination: Path) -> dict[str, Any]:
         input_file_hashes=hashes, calendar_hash=result.calendar_identity['calendar_hash'],
         code_version=code_version, result_schema_version=RESULT_SCHEMA_VERSION)
     outputs = write_evaluation_artifacts(result, destination, result_identity=identity, config=config,
-                                         code_version_source=code_version_source, diagnostics_report=diagnostics_report)
+                                         code_version_source=code_version_source, diagnostics_report=diagnostics_report,
+                                         split_diagnostics_report=split_diagnostics_report)
     summary = json.loads(outputs['summary'].read_text(encoding='utf-8'))
     metrics = {key: summary[key] for key in ('analysis_mode', 'exclusion_summary', 'ic_by_horizon',
                                             'quantile_stats', 'cross_sections', 'result_identity')}
     if diagnostics_requested:
-        metrics['diagnostics_report'] = summary['diagnostics_report']
+        diagnostics_source = (json.loads(outputs['evaluation_v2'].read_text(encoding='utf-8'))
+                              if split_diagnostics_report is not None else summary)
+        metrics['diagnostics_report'] = diagnostics_source['diagnostics_report']
     return dict(ok=True, exit_code=0, metrics=metrics,
         artifacts=[dict(artifact_type='evaluation_summary' if name == 'summary' else name,
                         path=str(path), sha256=sha256_file(path)) for name, path in outputs.items()])

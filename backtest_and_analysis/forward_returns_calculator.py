@@ -21,7 +21,10 @@ from backtest_and_analysis.evaluation.labels import (
 
 
 def newey_west_mean_test(values, max_lag: int) -> tuple[float | None, float | None]:
-    """Bartlett HAC mean test, with asymptotic normal p and no correction.
+    """Return legacy Bartlett HAC diagnostics with an asymptotic normal p value.
+
+    This mean test is uncalibrated. Finite outputs are descriptive diagnostics
+    and significance interpretation is unavailable.
 
     The caller must supply ordered, consecutive, equally spaced observations.
     Missing values must not be dropped here, since that would compress time.

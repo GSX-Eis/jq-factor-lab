@@ -9,6 +9,7 @@ import unittest
 
 import numpy as np
 import pandas as pd
+import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__)))))
 
@@ -145,6 +146,7 @@ class TestMarketCapNeutralization(unittest.TestCase):
 class TestLogMarketCapLoading(unittest.TestCase):
     """Test market cap data loading (requires DB access, may skip if unavailable)."""
     
+    @pytest.mark.external_data
     @unittest.skip("Requires database connection - run manually")
     def test_load_market_cap_shift(self):
         """Verify T-1 shift is correctly applied."""

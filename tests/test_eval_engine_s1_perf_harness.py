@@ -8,6 +8,7 @@ import sys
 import pytest
 
 
+@pytest.mark.perf_gate
 def test_eval_engine_perf_baseline_smoke(tmp_path: Path) -> None:
     output = tmp_path / "baseline.json"
     root = Path(__file__).resolve().parents[1]
@@ -76,6 +77,7 @@ def test_daily_benchmark_rejects_pair_loss_even_when_ic_is_unchanged(
         evaluate()
 
 
+@pytest.mark.perf_gate
 def test_preparation_timeout_preserves_completed_benchmarks(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

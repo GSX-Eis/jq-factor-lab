@@ -22,6 +22,15 @@
   synthetic nulls with a predetermined tolerance, plus known positive and
   negative effects. Report coverage failures and the tested settings. The
   frozen AR(1) simulation fell below tolerance at lag 16 and block length 17.
+- Default interval calibration to `uncalibrated`. Resolve registered evidence
+  only for an explicitly declared dependence scenario and matching method,
+  effective window, expected grid length and nominal coverage. A significance
+  claim requires an estimable interval and applicable evidence for
+  `calibrated_pass`, plus the research and multiple-testing gates. The frozen
+  coverage evidence requires a complete grid of ICs for HAC and a complete
+  grid of factor-return pairs with 399 requested and valid replicates for
+  moving-block Bootstrap. Report finite descriptive statistics independently.
+  Treat legacy daily HAC t and p values as uncalibrated diagnostics.
 - Register every factor/horizon tried in one selection in `TrialLedger` before
   inspecting outcomes. Record the statistic, sample count, raw p value and
   available interval for each attempt. Keep missing p values in the ledger.

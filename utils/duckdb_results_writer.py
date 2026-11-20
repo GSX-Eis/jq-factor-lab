@@ -1157,6 +1157,9 @@ class DuckDBResultsWriter:
     def _calculate_monthly_metrics(self, ic_data: pd.DataFrame) -> pd.DataFrame:
         """Summarize valid ICs; HAC requires a complete verified session sequence.
 
+        The persisted HAC t and p values are uncalibrated diagnostics.
+        Significance interpretation is unavailable.
+
         Calendar snapshot comes from ic_data.attrs['trading_calendar']. Missing
         ICs/sessions or unavailable calendar coverage leave t/p unset. Coverage
         is checked within each month's supplied date span, not a full month.

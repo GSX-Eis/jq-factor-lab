@@ -1,11 +1,13 @@
 """Instrument-level statistics on an expected signal grid for one split."""
 
-from collections.abc import Mapping
+from collections.abc import Hashable, Mapping
+from dataclasses import replace
 
 import numpy as np
 import numpy.typing as npt
 
 from . import kernels
+from .calibration import resolve_interval_calibration
 from .cross_section import _directional_accuracy, _time_mean
 from .kernels import CorrelationResult, QuantileResult
 from .panel import EvaluationPanel
@@ -55,6 +57,7 @@ def _bootstrap_spearman(
     return BootstrapInterval(
         size, block_length, seed, n_boot, n_valid, min_valid_replicates,
         alpha, float(lower), float(upper), reason,
+        n_valid_pairs=int(point.counts[0]),
     )
 
 
@@ -100,6 +103,20 @@ def _summarize_ics(ics: list[CorrelationResult]) -> InstrumentICSummary:
     )
 
 
+def summarize_time_series_horizon(
+    instruments: dict[Hashable, TimeSeriesInstrument], offsets: range,
+) -> TimeSeriesHorizon:
+    """Summarize per-instrument ICs with equal weights on each available phase."""
+    return TimeSeriesHorizon(
+        instruments,
+        _summarize_ics([result.ic for result in instruments.values()]),
+        {
+            offset: _summarize_ics([result.non_overlapping_ic[offset] for result in instruments.values()])
+            for offset in offsets
+        },
+    )
+
+
 def evaluate_time_series(
     panel: EvaluationPanel,
     holding_intervals: Mapping[int, tuple[npt.ArrayLike, npt.ArrayLike]] | None,
@@ -117,6 +134,7 @@ def evaluate_time_series(
     expected_grid: npt.ArrayLike | None = None,
     bucket_labels: npt.ArrayLike | None = None,
     quantile_fit: QuantileFit | None = None,
+    calibration_scenario: str | None = None,
     _bar_v1: bool = False,
 ) -> TimeSeriesResult:
     """Evaluate each instrument in a single frequency and split, retaining grid gaps.
@@ -228,6 +246,12 @@ def evaluate_time_series(
                 x, y, pairs, point=spearman, min_samples=min_samples, block_length=block_length,
                 seed=seed, n_boot=n_boot, min_valid_replicates=min_valid_replicates, alpha=alpha,
             )
+            if calibration_scenario is not None:
+                status, evidence = resolve_interval_calibration(
+                    scenario=calibration_scenario, method="time_series_mbb", window=bootstrap.block_length,
+                    sample_size=bootstrap.grid_size, nominal_coverage=bootstrap.confidence_level,
+                )
+                bootstrap = replace(bootstrap, calibration_status=status, calibration_evidence=evidence)
             distributions, directions = {}, {}
             if not unformed[column]:
                 labels = quantiles.labels[rows, column]
@@ -248,14 +272,7 @@ def evaluate_time_series(
                 direction_by_bucket=directions,
                 non_overlapping_ic=sampled,
             )
-        horizons[horizon] = TimeSeriesHorizon(
-            instruments,
-            _summarize_ics([result.ic for result in instruments.values()]),
-            {
-                offset: _summarize_ics([result.non_overlapping_ic[offset] for result in instruments.values()])
-                for offset in offsets
-            },
-        )
+        horizons[horizon] = summarize_time_series_horizon(instruments, offsets)
     return TimeSeriesResult(
         panel.datetimes, panel.assets, min_samples, ic_method, direction, quantiles, quantile_reasons, horizons,
         holding_intervals is not None,

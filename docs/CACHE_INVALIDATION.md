@@ -69,7 +69,7 @@ DuckDB 导入和 Parquet 导出是两个操作，后者失败不会撤销前者�
 维护完成后也可以显式失效：
 
 ```bash
-python -m utils.data_revision --database ./data/market.duckdb
+python3 -m utils.data_revision --database ./data/market.duckdb
 ```
 
 此命令只更新代号，不删数据、不自动迁移版本。手工 SQL、直接替换数据库文件、

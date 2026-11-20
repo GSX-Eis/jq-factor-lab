@@ -53,7 +53,7 @@ ETH 采用品种完整时段，去除 PMC 声明的午休和交易中断。RTH �
 先将本地重建结果与独立外部日历核对，保存单列 `date` CSV 和核验 JSON，然后运行：
 
 ```bash
-python -m scripts.import_trading_calendar \
+python3 -m scripts.import_trading_calendar \
   --database /data/input.duckdb \
   --csv /data/calendar/trading_days.csv \
   --verification /data/calendar/verification.json \

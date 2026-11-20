@@ -56,6 +56,7 @@ class EvaluationEngine:
         n_quantiles: int = 5,
         direction: int = 1,
         standardization: Standardization | None = None,
+        calibration_scenario: str | None = None,
         **statistics_options: Any,
     ) -> EngineResult:
         """Evaluate one labeled panel on its original return scale.
@@ -63,7 +64,8 @@ class EvaluationEngine:
         Pass the signal clock and scheduled exits for a split. Time-series
         inference also needs entries and uses integer horizons in grid steps.
         Forward mode-specific options to the S3 statistics layer, such as
-        `hac_lag` or the bootstrap settings.
+        `hac_lag` or the bootstrap settings. Declare calibration_scenario
+        only when it applies to the intervals being evaluated.
         """
         cross_sectional = self.analysis_mode == "cross_sectional"
         if return_mode not in ("raw", "cross_section_excess"):
@@ -103,6 +105,8 @@ class EvaluationEngine:
             statistics_options.setdefault("n_boot", 999)
             statistics_options.setdefault("min_valid_replicates", 900)
 
+        if calibration_scenario is not None:
+            statistics_options["calibration_scenario"] = calibration_scenario
         if split is not None:
             if signal_available_at is None or exit_timestamps is None:
                 raise ValueError("A split requires signal_available_at and exit_timestamps")

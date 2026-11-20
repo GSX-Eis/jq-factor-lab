@@ -1,10 +1,12 @@
+from dataclasses import asdict
+
 import pandas as pd
 import numpy as np
 import re
 from typing import Dict
 import logging
 from numbers import Real
-from backtest_and_analysis.evaluation import EvaluationEngine
+from backtest_and_analysis.evaluation import EvaluationEngine, evaluate_interval_usability
 from backtest_and_analysis.evaluation.panel import EvaluationPanel
 from backtest_and_analysis.forward_returns_calculator import ForwardReturnsValidationError
 
@@ -27,6 +29,17 @@ def _demean_float32_by_date(source: pd.Series) -> pd.Series:
             centers = sums / (~missing).sum(axis=1, dtype=np.float32)
             excess[positions] = day - centers[:, None]
     return pd.Series(excess, index=source.index)
+
+
+class InsufficientCrossSectionAssets(ValueError):
+    code = "insufficient_cross_section_assets"
+
+    def __init__(self) -> None:
+        super().__init__(
+            "Daily cross-sectional analysis requires at least 2 assets. "
+            "Provide prices for multiple assets, or supply Bar data to "
+            "jq-factor-lab time-series-analysis --analysis-mode time_series for one instrument."
+        )
 
 
 class MaxLossExceededError(ValueError):
@@ -131,6 +144,8 @@ class AlphalensRunner:
             date_level = 'date' if 'date' in pricing.index.names else -1
             dates = pd.to_datetime(pricing.index.get_level_values(date_level))
             calendar.validate_coverage(dates.min(), dates.max())
+        if not factor_df.empty and len(factor_df.columns.unique()) < 2:
+            raise InsufficientCrossSectionAssets()
         try:
             input_count = int(np.isfinite(factor_df.to_numpy(dtype=float, na_value=np.nan)).sum())
             # 0. 基本数据验证
@@ -152,14 +167,6 @@ class AlphalensRunner:
             if data_coverage < 0.05:  # 少于5%的数据覆盖率
                 self.logger.warning(f"Factor data coverage too low ({data_coverage:.2%}), returning minimal results")
                 return minimal_results()
-            
-            if factor_df.shape[1] == 1:
-                # 单股票情况，从pricing中获取正确的股票代码
-                if isinstance(pricing.index, pd.MultiIndex):
-                    assets = pricing.index.get_level_values(0).unique()
-                    if len(assets) == 1:
-                        factor_df = factor_df.rename(columns={factor_df.columns[0]: assets[0]})
-                        self.logger.info(f"Renamed column to asset code: {assets[0]}")
             
             # 2. 确保索引都是DatetimeIndex
             if not isinstance(factor_df.index, pd.DatetimeIndex):
@@ -577,6 +584,12 @@ class AlphalensRunner:
                     {names[h]: result.ic.values for h, result in statistics.horizons.items()},
                     index=panel.datetimes,
                 )
+                ic_data.attrs["hac_inference"] = {
+                    names[h]: asdict(evaluate_interval_usability(
+                        result.hac, point_estimate=result.ic_summary.mean,
+                    ))
+                    for h, result in statistics.horizons.items()
+                }
                 # Use the historical pandas variance and single-IC convention for the dictionary.
                 ir_by_period = {}
                 for name, values in ic_data.items():
