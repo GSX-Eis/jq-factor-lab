@@ -7,20 +7,18 @@
 [English](README.md) · 简体中文
 
 [![CI](https://img.shields.io/github/actions/workflow/status/GSX-Eis/jq-factor-lab/ci.yml?branch=dev&label=CI)](https://github.com/GSX-Eis/jq-factor-lab/actions/workflows/ci.yml?query=branch%3Adev)
-[![PyPI 版本](https://img.shields.io/pypi/v/jq-factor-lab)](https://pypi.org/project/jq-factor-lab/)
+[![版本](https://img.shields.io/badge/dynamic/toml?url=https%3A%2F%2Fraw.githubusercontent.com%2FGSX-Eis%2Fjq-factor-lab%2Fdev%2Fpyproject.toml&query=%24.project.version&label=version&prefix=v&color=blue)](CHANGELOG.md)
 ![Python 3.11–3.12](https://img.shields.io/badge/python-3.11%20%7C%203.12-blue)
 [![Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 
 </div>
 
-```mermaid
-flowchart TD
-    A["AI Agent · Claude Code / Cursor / Codex · stdio MCP"] --> B["Harness CLI · JSON / --dry-run / 退出码"]
-    B --> C["因子计算与合成 · 固定权重 / LASSO / LightGBM"]
-    C --> D["因子与策略回测 · Alphalens / VectorBT"]
-    D --> E["统计评测 · Purged OOS / Adaptive HAC / Bootstrap v2 / TrialLedger"]
-    E --> F["DuckDB Bar 结果 · 只读 Streamlit 看板"]
-```
+<div align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/architecture-zh-dark.svg">
+    <img src="docs/assets/architecture-zh-light.svg" width="100%" alt="JQ Factor Lab 架构图，从 AI Agent 经 CLI 契约和量化核心到本地证据与只读看板">
+  </picture>
+</div>
 
 ## 适用场景
 

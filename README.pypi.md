@@ -7,20 +7,18 @@
 English · [简体中文](https://github.com/GSX-Eis/jq-factor-lab/blob/v0.1.0/README.zh-CN.md)
 
 [![CI](https://img.shields.io/github/actions/workflow/status/GSX-Eis/jq-factor-lab/ci.yml?branch=dev&label=CI)](https://github.com/GSX-Eis/jq-factor-lab/actions/workflows/ci.yml?query=branch%3Adev)
-[![PyPI version](https://img.shields.io/pypi/v/jq-factor-lab)](https://pypi.org/project/jq-factor-lab/)
+[![Version](https://img.shields.io/badge/dynamic/toml?url=https%3A%2F%2Fraw.githubusercontent.com%2FGSX-Eis%2Fjq-factor-lab%2Fdev%2Fpyproject.toml&query=%24.project.version&label=version&prefix=v&color=blue)](https://github.com/GSX-Eis/jq-factor-lab/blob/v0.1.0/CHANGELOG.md)
 ![Python 3.11–3.12](https://img.shields.io/badge/python-3.11%20%7C%203.12-blue)
 [![Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](https://github.com/GSX-Eis/jq-factor-lab/blob/v0.1.0/LICENSE)
 
 </div>
 
-```mermaid
-flowchart TD
-    A["AI agent · Claude Code / Cursor / Codex · stdio MCP"] --> B["Harness CLI · JSON / --dry-run / exit codes"]
-    B --> C["Factor computation and synthesis · weighted sum / LASSO / LightGBM"]
-    C --> D["Factor and strategy backtests · Alphalens / VectorBT"]
-    D --> E["Statistical evaluation · Purged OOS / Adaptive HAC / Bootstrap v2 / TrialLedger"]
-    E --> F["Bar results in DuckDB · read-only Streamlit dashboard"]
-```
+<div align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://github.com/GSX-Eis/jq-factor-lab/raw/v0.1.0/docs/assets/architecture-dark.svg">
+    <img src="https://github.com/GSX-Eis/jq-factor-lab/raw/v0.1.0/docs/assets/architecture-light.svg" width="100%" alt="JQ Factor Lab architecture from AI agents through the CLI and quantitative core to local evidence and a read-only dashboard">
+  </picture>
+</div>
 
 ## Why this exists
 
