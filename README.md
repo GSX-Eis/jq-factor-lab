@@ -6,8 +6,8 @@
 
 English · [简体中文](README.zh-CN.md)
 
-[![CI](https://img.shields.io/github/actions/workflow/status/GSX-Eis/jq-factor-lab/ci.yml?branch=dev&label=CI)](https://github.com/GSX-Eis/jq-factor-lab/actions/workflows/ci.yml?query=branch%3Adev)
-[![Version](https://img.shields.io/badge/dynamic/toml?url=https%3A%2F%2Fraw.githubusercontent.com%2FGSX-Eis%2Fjq-factor-lab%2Fdev%2Fpyproject.toml&query=%24.project.version&label=version&prefix=v&color=blue)](CHANGELOG.md)
+[![CI](https://img.shields.io/github/actions/workflow/status/GSX-Eis/jq-factor-lab/ci.yml?branch=main&label=CI)](https://github.com/GSX-Eis/jq-factor-lab/actions/workflows/ci.yml?query=branch%3Amain)
+[![Version](https://img.shields.io/badge/dynamic/toml?url=https%3A%2F%2Fraw.githubusercontent.com%2FGSX-Eis%2Fjq-factor-lab%2Fmain%2Fpyproject.toml&query=%24.project.version&label=version&prefix=v&color=blue)](CHANGELOG.md)
 ![Python 3.11–3.12](https://img.shields.io/badge/python-3.11%20%7C%203.12-blue)
 [![Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 
@@ -33,10 +33,10 @@ JQ Factor Lab runs a local, inspectable research loop with DuckDB on one machine
 
 ## 60-second quickstart
 
-Use Python 3.11–3.12 on macOS or Linux. First-time dependency installation can take longer. Clone the release branch, then choose pip or uv.
+Use Python 3.11–3.12 on macOS or Linux. First-time dependency installation can take longer. Clone the repository, then choose pip or uv.
 
 ```bash
-git clone --branch dev https://github.com/GSX-Eis/jq-factor-lab.git
+git clone https://github.com/GSX-Eis/jq-factor-lab.git
 cd jq-factor-lab
 ```
 

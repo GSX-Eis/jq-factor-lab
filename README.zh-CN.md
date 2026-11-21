@@ -6,8 +6,8 @@
 
 [English](README.md) · 简体中文
 
-[![CI](https://img.shields.io/github/actions/workflow/status/GSX-Eis/jq-factor-lab/ci.yml?branch=dev&label=CI)](https://github.com/GSX-Eis/jq-factor-lab/actions/workflows/ci.yml?query=branch%3Adev)
-[![版本](https://img.shields.io/badge/dynamic/toml?url=https%3A%2F%2Fraw.githubusercontent.com%2FGSX-Eis%2Fjq-factor-lab%2Fdev%2Fpyproject.toml&query=%24.project.version&label=version&prefix=v&color=blue)](CHANGELOG.md)
+[![CI](https://img.shields.io/github/actions/workflow/status/GSX-Eis/jq-factor-lab/ci.yml?branch=main&label=CI)](https://github.com/GSX-Eis/jq-factor-lab/actions/workflows/ci.yml?query=branch%3Amain)
+[![版本](https://img.shields.io/badge/dynamic/toml?url=https%3A%2F%2Fraw.githubusercontent.com%2FGSX-Eis%2Fjq-factor-lab%2Fmain%2Fpyproject.toml&query=%24.project.version&label=version&prefix=v&color=blue)](CHANGELOG.md)
 ![Python 3.11–3.12](https://img.shields.io/badge/python-3.11%20%7C%203.12-blue)
 [![Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 
@@ -33,10 +33,10 @@ JQ Factor Lab 在单机上使用 DuckDB 完成可追溯的研究流程。日频�
 
 ## 60 秒快速开始
 
-使用 macOS 或 Linux 上的 Python 3.11–3.12。首次下载依赖可能需要更长时间。克隆发布分支后，选择 pip 或 uv。
+使用 macOS 或 Linux 上的 Python 3.11–3.12。首次下载依赖可能需要更长时间。克隆仓库后，选择 pip 或 uv。
 
 ```bash
-git clone --branch dev https://github.com/GSX-Eis/jq-factor-lab.git
+git clone https://github.com/GSX-Eis/jq-factor-lab.git
 cd jq-factor-lab
 ```
 

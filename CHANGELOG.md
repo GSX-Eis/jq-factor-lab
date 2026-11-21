@@ -9,7 +9,7 @@
 - GitHub Actions runs the public test suite, builds and checks the source distribution and wheel, and smoke-tests the installed wheel on both supported Python versions.
 - Local research uses the documented [CSV, Parquet and DuckDB contracts](docs/DATA_IMPORT.md). The [JoinQuant builder](docs/JOINQUANT.md) packages a strategy for offline use. Real market data, trained models, automated login or upload, and cloud or live trading validation are outside this release.
 
-Both READMEs show the version from the public dev branch. After the first PyPI release, switch the version badges to `img.shields.io/pypi/v/jq-factor-lab`.
+Both READMEs show the version from the public main branch. After the first PyPI release, switch the version badges to `img.shields.io/pypi/v/jq-factor-lab`.
 
 The distributions include the Apache 2.0 license and attribution notice.
 

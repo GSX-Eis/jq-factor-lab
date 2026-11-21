@@ -14,4 +14,4 @@ description: Plan, run, and review quantitative factor experiments with JQ Facto
 
 Never use future observations in signal construction, leak local data or credentials, open an unauthorized holdout, fabricate label exits, hide missing trials, or modify statistical gates to obtain a passing result. Synthetic runs verify the workflow and support no trading recommendation.
 
-For a complete offline example, see the [synthetic workflow](https://github.com/GSX-Eis/jq-factor-lab/blob/dev/docs/AI_WORKFLOW_SHOWCASE.md).
+For a complete offline example, see the [synthetic workflow](https://github.com/GSX-Eis/jq-factor-lab/blob/main/docs/AI_WORKFLOW_SHOWCASE.md).
