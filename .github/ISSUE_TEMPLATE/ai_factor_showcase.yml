@@ -1,0 +1,29 @@
+name: AI Agent Workflow
+description: Share a factor research workflow you ran with a coding agent.
+body:
+  - type: input
+    id: agent
+    attributes:
+      label: Coding agent
+      description: For example, Claude Code, Codex, or Cursor.
+    validations:
+      required: true
+  - type: textarea
+    id: factor
+    attributes:
+      label: Factor idea and evaluation horizon
+      description: State the hypothesis, factor formula, frequency, horizon, and frozen screening rule.
+    validations:
+      required: true
+  - type: textarea
+    id: results
+    attributes:
+      label: Metrics summary
+      description: Share the commands and short synthetic or redacted JSON excerpts with IC, sample counts, missing IC reasons, calibration status and trial outcome if available. Omit raw market data and credentials.
+    validations:
+      required: true
+  - type: textarea
+    id: feedback
+    attributes:
+      label: Friction and suggestions
+      description: Where did you or the agent get stuck? What would make the workflow easier?

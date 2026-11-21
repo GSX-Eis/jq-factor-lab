@@ -8,19 +8,19 @@
 
 ```bash
 # 日线、5 分钟行情：输入根目录下分别使用 daily/ 和 5m/
-python -m data_pipeline.loaders.price_data_to_duckdb --data-dir ./data/import/price_data --db-path ./data/market.duckdb
+python3 -m data_pipeline.loaders.price_data_to_duckdb --data-dir ./data/import/price_data --db-path ./data/market.duckdb
 
 # 已有因子 CSV：每个证券一个文件
-python -m data_pipeline.loaders.factor_data_to_duckdb --csv-dir ./data/import/factors --db-path ./data/market.duckdb
+python3 -m data_pipeline.loaders.factor_data_to_duckdb --csv-dir ./data/import/factors --db-path ./data/market.duckdb
 
 # 辅助数据：示例为证券基本信息；--help 列出其他数据集
-python -m data_pipeline.loaders.portfolio_data_to_duckdb --dataset security_master --source ./data/import/security_master --db ./data/market.duckdb
+python3 -m data_pipeline.loaders.portfolio_data_to_duckdb --dataset security_master --source ./data/import/security_master --db ./data/market.duckdb
 
 # 指数成分
-python -m data_pipeline.loaders.import_index_constituents_duckdb --csv ./data/import/index_constituents.csv --db ./data/market.duckdb
+python3 -m data_pipeline.loaders.import_index_constituents_duckdb --csv ./data/import/index_constituents.csv --db ./data/market.duckdb
 
 # 财务报表：调用方提供字段契约
-python -m data_pipeline.loaders.import_raw_financial_statements_duckdb --statement income --source ./data/import/financials --schema-contract ./data/import/financial_schema.json --db ./data/market.duckdb
+python3 -m data_pipeline.loaders.import_raw_financial_statements_duckdb --statement income --source ./data/import/financials --schema-contract ./data/import/financial_schema.json --db ./data/market.duckdb
 ```
 
 ## 输入约定
@@ -265,6 +265,14 @@ finally:
 ## Trading calendar
 
 Import an independently verified calendar into the input DuckDB before using stock-pool schedules, forward returns or Qlib exports. Price observations do not define exchange sessions. See [Trading calendar](TRADING_CALENDAR.md) for the import receipt, coverage, version bindings and Parquet-only usage.
+
+## 分钟 Bar 导入与读取
+
+`data_pipeline.loaders.market_bar_importer.import_market_bars(connection, bars, metadata)` 使用调用方提供的 DuckDB 连接，在同一事务内导入 `instrument_metadata` 和 `market_bars`；重复键或任何写入失败都会回滚。输入须明确 UTC Bar 开始时间、频率、来源和数据版本；期货须为单一到期合约并声明乘数，不接受连续/主力合约。
+
+外部文件先用 `ExternalBarSourceSpec` / `adapt_external_bars` 显式声明源时区、开始/结束时间戳语义、区间/Session 累计成交量和列映射，再提交标准结构。不要自行猜测时区、复权或累计量含义。
+
+`utils.market_bar_reader.MarketBarReader(connection=...)` 借用连接，`MarketBarReader(duckdb_path=...)` 只读打开文件并可作为 context manager。`read_bars` 依照 `SessionCalendar` 筛选 ETH/RTH，并保留原始覆盖和逐标的日历身份；缺 Bar 不填价。旧表通过 `read_legacy_price_table` 读取，不迁移或覆盖原表。完整字段、转换校验、旧表预设与双模式评估见 [分钟研究契约](TIME_SERIES_CONTRACT.md)。
 
 ## 已退役的滚动复权中间列接口
 

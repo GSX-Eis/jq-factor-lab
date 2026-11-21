@@ -591,16 +591,19 @@ def normalize_indexers_in_fstring_expressions(source_code: str) -> str:
 
 
 def lift_minimal_factor_base() -> str:
-    # Reuse the canonical FactorBase and fail the build if it cannot be normalized.
+    # Cloud runtime is frozen at the reviewed stage-5 boundary.
     repo = Path(__file__).resolve().parent.parent
-    fb_path = repo / "utils" / "factor_base.py"
+    fb_path = repo / "scripts/build/cloud_runtime/factor_base.py.txt"
     source = neutralize_numba_decorators(read_source(str(fb_path)))
     # The cloud adapter replaces local reads; never ship their config/DB dependencies.
     tree = ast.parse(source)
     base = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == 'FactorBase')
+    local_names = {'_fetch_raw_data', '_get_local_data_config', '_get_cache_key',
+                   '_fetch_market_bars', 'session_rolling', '_get_market_factor_values',
+                   'get_bar_factor_frame', 'get_session_daily_pricing', 'evaluate_bar_factor'}
     local_methods = [node for node in base.body if isinstance(node, ast.FunctionDef)
-                     and node.name in {'_fetch_raw_data', '_get_local_data_config', '_get_cache_key'}]
-    if len(local_methods) != 3:
+                     and node.name in local_names]
+    if len(local_methods) != len(local_names):
         raise ValueError('FactorBase local read boundary changed; review cloud bundling')
     lines = source.splitlines(keepends=True)
     for node in sorted(local_methods, key=lambda item: item.lineno, reverse=True):

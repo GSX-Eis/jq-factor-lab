@@ -1,151 +1,136 @@
+<div align="center">
+
 # JQ Factor Lab
 
-English | [简体中文](README.zh-CN.md)
+**An AI-native quantitative research harness for multi-factor computation and synthesis, backtesting, and anti-overfitting statistical evaluation through CLI and MCP.**
 
-**Local factor research with Python modules and a CLI for your research harness.**
+English · [简体中文](README.zh-CN.md)
 
-Run factor calculations and evaluations on your own compute, keep datasets and outputs local, and connect research steps to your existing scheduler, experiment runner, or agent. JQ Factor Lab provides a shared factor interface, DuckDB data access, point-in-time price adjustment, forward returns, Alphalens evaluation, and factor synthesis modules.
+[![CI](https://img.shields.io/github/actions/workflow/status/GSX-Eis/jq-factor-lab/ci.yml?branch=dev&label=CI)](https://github.com/GSX-Eis/jq-factor-lab/actions/workflows/ci.yml?query=branch%3Adev)
+[![Version](https://img.shields.io/badge/dynamic/toml?url=https%3A%2F%2Fraw.githubusercontent.com%2FGSX-Eis%2Fjq-factor-lab%2Fdev%2Fpyproject.toml&query=%24.project.version&label=version&prefix=v&color=blue)](CHANGELOG.md)
+![Python 3.11–3.12](https://img.shields.io/badge/python-3.11%20%7C%203.12-blue)
+[![Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 
-## What you can do
+</div>
 
-- **Use your own compute.** Work with local data and use your machine's CPU, memory, and storage for longer histories, larger universes, and repeated experiments.
-- **Connect a research harness.** Launch configuration-driven CLI jobs, parse JSON success summaries, check process exit codes, and collect results from a job-specific directory.
-- **Compose research workflows.** Combine factor calculation, evaluation, preprocessing, selection, and model modules through Python interfaces.
-- **Make data assumptions explicit.** Configure data sources, trading calendars, adjustment rules, and label timing so experiments can be inspected and reproduced against the same inputs.
+<div align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/architecture-dark.svg">
+    <img src="docs/assets/architecture-light.svg" width="100%" alt="JQ Factor Lab architecture from AI agents through the CLI and quantitative core to local evidence and a read-only dashboard">
+  </picture>
+</div>
 
-## Research workflow
+## Why this exists
 
-```mermaid
-flowchart LR
-    A[Local market data] --> B[DuckDB data layer]
-    B --> C[Factor calculation]
-    C --> D[Factor evaluation]
-    C --> E[Synthesis and model research]
-    D --> F[Result artifacts]
-    E --> F
-    H[Local research harness] --> C
-    H --> D
-    H --> E
-```
+JQ Factor Lab runs a local, inspectable research loop with DuckDB on one machine. The same evaluation engine covers daily cross-sections and minute-Bar time series. Agents can preflight a command, parse one strict JSON response, and trace the result to the artifacts and their statistical gates.
 
-The harness handles task scheduling and experiment decisions. This project supplies the execution modules, data interfaces, and outputs that it can build on.
+| Project | Primary workflow | Where JQ Factor Lab fits |
+| --- | --- | --- |
+| [Qlib](https://github.com/microsoft/qlib) | ML-based quantitative research and investment workflows | A local DuckDB workflow for evaluating daily cross-sections and minute Bars under one contract |
+| [RD-Agent](https://github.com/microsoft/RD-Agent) | Agent-driven research and development | An execution surface with deterministic inputs and output contracts, JSON, dry-run plans and exit codes |
+| [VectorBT](https://github.com/polakowo/vectorbt) | Vectorized portfolio backtesting | Factor evaluation with Adaptive HAC, Bootstrap v2, TrialLedger and a `calibration_status` gate, with VectorBT available for strategy backtests |
+| [TradingAgents](https://github.com/TauricResearch/TradingAgents) | Multi-agent trading analysis and decisions | Reproducible quantitative factor experiments with point-in-time timing, purged splits and auditable evidence |
 
-## Quick start
+## 60-second quickstart
 
-Supported environments: Python 3.11–3.12 on macOS or Linux. Some cache locks use POSIX `fcntl`; native Windows is currently unsupported.
+Use Python 3.11–3.12 on macOS or Linux. First-time dependency installation can take longer. Clone the release branch, then choose pip or uv.
 
 ```bash
-git clone https://github.com/GSX-Eis/jq-factor-lab.git
+git clone --branch dev https://github.com/GSX-Eis/jq-factor-lab.git
 cd jq-factor-lab
+```
 
-python -m venv .venv
+**pip**
+
+```bash
+python3 -m venv .venv
 source .venv/bin/activate
-python -m pip install -e '.[dev,synthesis]'
-
-# Generate synthetic prices and evaluate a sample factor
-python -m examples.generate_data --output data/demo.csv
-python -m tools.demo_cli single-factor-analysis \
-  --config config/demo.json --output-dir outputs/first-analysis
-
-# Run the fixed-weight synthesis example
-python -m tools.demo_cli factor-synthesis-demo \
-  --method weighted_sum --output-dir outputs/first-synthesis
+python3 -m pip install '.[synthesis,viz]'
 ```
 
-After installation, `jq-factor-lab` invokes the same CLI. Single-factor analysis writes `summary.json`, `factor_values.csv`, and evaluation CSV files, including IC, IR, and quantile-return results.
-
-The examples use synthetic prices and a fictional market calendar. Choose a new output directory for each run: existing directories are rejected. For real research, supply an explicit trading-calendar source; see [configuration](docs/CONFIG.md) and [trading calendars](docs/TRADING_CALENDAR.md).
-
-## Integrate with a local harness
-
-### Call the CLI
-
-A harness can start an evaluation job and read its summary:
-
-```python
-import json
-import subprocess
-import sys
-
-process = subprocess.run(
-    [sys.executable, "-m", "tools.demo_cli", "single-factor-analysis",
-     "--config", "config/demo.json", "--output-dir", "outputs/harness-job-001"],
-    check=True,
-    capture_output=True,
-    text=True,
-)
-summary = json.loads(process.stdout)
-```
-
-On success, stdout contains JSON with the factor name, input row count, asset count, mean IC, and calendar identity. Progress logs go to stderr. A failed job exits with a nonzero status; inspect stderr before consuming its outputs. Allocate output directories per job.
-
-The CLI currently exposes single-factor evaluation and a synthesis tutorial. Use the Python modules to integrate additional training and research workflows.
-
-### Compose Python modules
-
-| Area | Available interfaces and capabilities |
-| --- | --- |
-| Factor calculation | `FactorBase`, explicit factor-file loading, daily and five-minute data readers |
-| Data and artifacts | CSV-to-DuckDB import, caching, factor readers and writers, result persistence |
-| Evaluation | PIT price adjustment, forward returns, Alphalens metrics, stock-universe filtering |
-| Synthesis | Fixed weights, PCA, linear models, LightGBM, preprocessing, selection, cross-validation, and diagnostics |
-
-Training and model selection require verified label exit dates and valid time-isolation context from the caller. Interface details are documented in [synthesis](docs/SYNTHESIS.md).
-
-For agent-assisted work, start with [AGENTS.md](AGENTS.md). [CLAUDE.md](CLAUDE.md) points to the same documentation index.
-
-## Use your own data and factors
-
-1. Prepare market data, auxiliary inputs, and a verified calendar using the [data import guide](docs/DATA_IMPORT.md).
-2. Subclass `utils.factor_base.FactorBase` and implement data fetching and calculation. See the [factor interface](docs/FACTOR_INTERFACE.md) and [minimal template](docs/FACTOR_TEMPLATE.md).
-3. Configure dates, universe, data sources, and output locations in your harness, then call the calculation, evaluation, or synthesis modules.
-
-The daily evaluation CLI accepts CSV columns `date, stock_code, close` and an optional positive adjustment `factor`, which defaults to 1. It loads the input into an in-memory DuckDB database and calls the shared factor and evaluation modules. Python clients can also use persistent DuckDB stores and versioned storage interfaces.
-
-A complete synthetic example demonstrates data import, custom factors, fixed-weight synthesis, price-derived labels, and generation of a platform integration file:
+**uv**
 
 ```bash
-python -m examples.local_factor_workflow --output-dir outputs/local-workflow
+uv venv --python 3.12
+source .venv/bin/activate
+uv pip install '.[synthesis,viz]'
 ```
 
-See [the local workflow guide](docs/LOCAL_WORKFLOW.md) for inputs, artifacts, and how to replace the tutorial data.
+When the distribution is available on PyPI, use `python3 -m pip install 'jq-factor-lab[synthesis,viz]'` or `uv pip install 'jq-factor-lab[synthesis,viz]'`. Core includes daily and Bar evaluation. Add `[synthesis]` for the weighted demo and synthesis methods, `[viz]` for the dashboard, or `[mcp]` for the stdio server. `[all]` also installs heavier optional components such as Qlib and Torch, subject to platform wheel availability.
 
-## Scope and validation
-
-The repository contains reusable research modules, CLI commands, tutorials, and tests. Bring your own market data and research configuration. Existing research factors, trained models, and production strategies are not included.
-
-The fixed-weight synthesis tutorial runs directly. Its six other methods reject the tutorial's artificial targets because they lack verified label exit dates. To train with those modules, provide real labels and the required isolation context; see [synthesis contracts](docs/SYNTHESIS.md).
-
-Factor evaluation and synthetic examples do not establish investment performance or validate a complete trading backtest. Platform execution and trading behavior need separate verification.
-
-## Optional platform integration
-
-A JoinQuant adapter and a local single-file builder are available when your workflow needs them:
+Run these commands from a writable directory. All demos use synthetic data and allocate fresh run directories.
 
 ```bash
-python -m scripts.build_jq_strategy \
-  --factor-files examples/momentum.py \
-  --requirements config/factor_requirements.json \
-  --cloud-api-mapping config/cloud_api_mapping.json \
-  --single-file --out outputs/demo_jq_strategy.py
+jq-factor-lab daily-demo > daily.json
+jq-factor-lab bar-demo > bar.json
+jq-factor-lab factor-synthesis-demo --method weighted_sum > synthesis.json
+db="$(python3 -c 'import json; print(json.load(open("bar.json"))["metrics"]["results_db"]["path"])')"
+jq-factor-lab read-bar-evaluations --results-db "$db" > bar-read.json
+jq-factor-lab dashboard --results-db "$db" --dry-run
+# Drop --dry-run to open the read-only dashboard at http://127.0.0.1:8501.
 ```
 
-Building requires no platform login, requests no market data, and uploads no files. Run and validate the generated file separately in the target environment. Trained models require explicit integration. See [the integration guide](docs/JOINQUANT.md) for field mappings and runtime contracts.
+The Bar response includes this diagnostic for the 1-Bar horizon, excerpted from a synthetic run. Its constant returns leave Spearman IC undefined.
 
-## Documentation and contributing
+```json
+{
+  "ok": true,
+  "exit_code": 0,
+  "metrics": {
+    "diagnostics_report": {
+      "schema": "time_series_diagnostics.v1",
+      "horizons": [
+        {"horizon_bars": 1, "ic": {"sample_count": 39, "spearman_ic": null, "reason": "constant_return"}}
+      ]
+    }
+  },
+  "next_actions": ["Pass metrics.results_db.path to read-bar-evaluations --results-db."]
+}
+```
 
-The detailed reference guides below are currently written in Chinese.
+The [AI workflow showcase](docs/AI_WORKFLOW_SHOWCASE.md) follows several candidates through preflight, calibration and trial gates, synthesis, a toy backtest and DuckDB read-back.
 
-| Topic | Guide |
-| --- | --- |
-| Configuration and outputs | [CONFIG](docs/CONFIG.md) |
-| Factor interface and template | [FACTOR_INTERFACE](docs/FACTOR_INTERFACE.md) · [FACTOR_TEMPLATE](docs/FACTOR_TEMPLATE.md) |
-| Adjustment, missing values, and time boundaries | [SEMANTICS](docs/SEMANTICS.md) |
-| Local data and calendars | [DATA_IMPORT](docs/DATA_IMPORT.md) · [TRADING_CALENDAR](docs/TRADING_CALENDAR.md) |
-| Synthesis and label contracts | [SYNTHESIS](docs/SYNTHESIS.md) |
-| End-to-end example | [LOCAL_WORKFLOW](docs/LOCAL_WORKFLOW.md) |
-| Distribution scope | [PUBLIC_SCOPE](docs/PUBLIC_SCOPE.md) |
+## Plug into your AI agent
 
-Run `python -m pytest -q` in the development environment. See [CONTRIBUTING](CONTRIBUTING.md), [SECURITY](SECURITY.md), and [CHANGELOG](CHANGELOG.md) for contribution guidelines, vulnerability reporting, and changes.
+### Agent Skill or Claude Code plugin
 
-Licensed under the [Apache License 2.0](LICENSE). See [NOTICE](NOTICE) for attribution. Third-party components retain their own licenses.
+Copy the entire [Factor Research Skill](skills/factor-research/SKILL.md) directory, including its references, into your client's skills directory. With Claude Code, run `claude --plugin-dir .` from the checkout to load the [plugin manifest](.claude-plugin/plugin.json) and invoke `/jq-factor-lab:factor-research`. See [AGENTS.md](AGENTS.md) or [CLAUDE.md](CLAUDE.md) for project instructions.
+
+### Stdio MCP server
+
+With `uvx` on the MCP client's PATH, add this entry to `mcpServers` in Claude Desktop, Cursor, Claude Code or Windsurf. Use this package-based config once the distribution is on PyPI. For a local checkout, change the `--from` value to the absolute checkout path with `[mcp,synthesis]` appended. The synthesis extra lets the server run `run_factor_synthesis_demo`.
+
+```json
+{
+  "mcpServers": {
+    "jq-factor-lab": {
+      "command": "uvx",
+      "args": ["--python", "3.12", "--from", "jq-factor-lab[mcp,synthesis]", "jq-factor-lab-mcp"]
+    }
+  }
+}
+```
+
+The server runs locally. Use absolute paths for tool inputs. See the [CLI and MCP mapping](skills/factor-research/references/cli_contract.md).
+
+### Copy a research prompt
+
+```text
+Use the Factor Research Skill and run the AI workflow showcase in a fresh
+writable directory. Freeze the hypothesis, candidates, split and screening
+rule. Use only synthetic data. Preflight each evaluation, capture stdout and
+stderr, and report the IC and sample count, null reasons, calibration status
+and complete trial family. Combine only the candidates eligible for the
+synthetic backtest. Verify the DuckDB and dashboard plan. Report rejected
+candidates, artifact paths, and whether the evidence permits a significance claim.
+```
+
+## Bring your own data
+
+Use local [CSV, Parquet or DuckDB](docs/DATA_IMPORT.md), the [factor interface](docs/FACTOR_INTERFACE.md), the [Bar contract](docs/TIME_SERIES_CONTRACT.md), and a verified [trading calendar](docs/TRADING_CALENDAR.md) such as XSHG, CME or NYSE. See the [local workflow](docs/LOCAL_WORKFLOW.md) and [synthesis guide](docs/SYNTHESIS.md) for configuration and label isolation. [JoinQuant single-file packaging](docs/JOINQUANT.md) is an optional offline deployment adapter.
+
+## Feedback & Community
+
+[Open an issue](https://github.com/GSX-Eis/jq-factor-lab/issues/new/choose) to report a bug, request a market calendar or data contract, or share an AI workflow. Share synthetic or sanitized examples. See [contributing](CONTRIBUTING.md), [security](SECURITY.md), and the [changelog](CHANGELOG.md).
+
+Licensed under the [Apache License 2.0](LICENSE). See [NOTICE](NOTICE) for attribution.

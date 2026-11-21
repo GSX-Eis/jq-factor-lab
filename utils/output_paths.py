@@ -49,13 +49,14 @@ def diagnostic_file(name: str, *, directory=None) -> Path | None:
 
 
 @contextmanager
-def execution_environment(directory: Path):
+def execution_environment(directory: Path, *, task_root: Path | None = None):
     """Lease subprocess scratch/default cache; inherited env binds all children."""
     directory = directory.resolve()
+    owner_root = output_root(task_root)
     with ExitStack() as stack:
-        scratch, scratch_fd = stack.enter_context(managed_output(None, "execution"))
+        scratch, scratch_fd = stack.enter_context(managed_output(owner_root, "execution"))
         cache, cache_fd = stack.enter_context(
-            managed_output(None, "execution-inputs", kind="cache")
+            managed_output(owner_root, "execution-inputs", kind="cache")
         )
         env = os.environ | {
             "QUANT_EXECUTION_DIR": str(directory),

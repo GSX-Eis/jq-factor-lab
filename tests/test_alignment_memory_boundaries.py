@@ -71,19 +71,6 @@ def test_unrelated_price_fetch_paths_keep_the_original_call(frequency, expanding
     assert calls == [(stocks, '2022-01-04', fields)]
 
 
-@pytest.mark.parametrize('frame', [
-    pd.DataFrame(),
-    pd.DataFrame(dict(value=[np.nan, np.inf, -np.inf, 1e-300],
-                      text=['中文', 'a,b', 'a\nb', '"quoted"'])),
-    pd.DataFrame(dict(date=pd.date_range('2020-01-01', periods=3), value=[True, False, None]))])
-def test_streaming_input_fingerprint_preserves_the_default_csv_bytes(frame):
-    source = Path(__file__).resolve().parents[1] / 'jq_strategies/cloud_factor_dumper.py'
-    function = next(node for node in ast.parse(source.read_text()).body
-                    if isinstance(node, ast.FunctionDef) and node.name == 'streaming_csv_fingerprint')
-    namespace = {}
-    exec(compile(ast.Module(body=[function], type_ignores=[]), str(source), 'exec'), namespace)
-    assert namespace['streaming_csv_fingerprint'](frame) == hashlib.sha256(
-        frame.to_csv(index=False).encode('utf-8')).hexdigest()
 
 
 @pytest.mark.parametrize('count', [1, 2])

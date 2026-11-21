@@ -38,7 +38,7 @@
 
 `get_factor_values_unfiltered()` 的性能记录为已执行阶段保留耗时，包括失败阶段；总耗时覆盖提前返回和异常退出。未执行阶段不填充为零。`pit_seconds` 表示复权函数调用耗时，不是成功复权标志。
 
-先按 [README](../README.md) 运行教学示例。接入自定义因子时，复制示例分析配置，修改 `factor_file`、`factor_class`、`input_csv` 和 `output_dir`，再通过 `python -m tools.demo_cli single-factor-analysis --config <配置路径>` 调用。配置内路径相对配置文件解析；命令行 `--output-dir` 相对当前工作目录解析。输出目录必须尚不存在。
+先按 [README](../README.md) 运行教学示例。接入自定义因子时，复制示例分析配置，修改 `factor_file`、`factor_class`、`input_csv` 和 `output_dir`，再通过 `jq-factor-lab single-factor-analysis --config <配置路径>` 调用。配置内路径相对配置文件解析；命令行 `--output-dir` 相对当前工作目录解析。可省略输出目录以隔离每次运行，或对显式目录使用 `--overwrite` 更新本次的结果文件。
 
 ## requirements 声明
 
@@ -53,7 +53,7 @@
 
 不提供通用研究窗口或表现阈值。长度应覆盖算法的滞后和预热需求；声明不会自动实现滚动计算，也不能保证数据足够或无前瞻。涉及基类按名称读取窗口的路径时，更新仓库 `config/factor_requirements.json`；聚宽构建时通过 `--requirements` 显式传入配置。构建器会据此计算取数窗口并检查频率，细节见 [聚宽打包](JOINQUANT.md)。
 
-本模板只覆盖日频价格输入。5 分钟、多源或财务因子需要分别验证频率、数据可知时点和字段映射；公开单因子 CLI 不提供通用高频评估入口。复权、金额与成交量、缺失值及窗口约定见 [数据语义](SEMANTICS.md)。
+本模板只覆盖日频价格输入。分钟 Bar 可通过 `FactorBase.get_bar_factor_frame()` 与 `evaluate_bar_factor()` 接入，并通过 Harness `time-series-analysis` 显式选择 `time_series` 或 `cross_sectional` 评估。`1min`/`5min` 的交易时段、完整网格、预热、Session 日频聚合与标签定义见 [分钟研究契约](TIME_SERIES_CONTRACT.md)；旧 `5m` 路径应与新 Bar 接口分别验证。多源或财务因子仍需核验数据可知时点和字段映射。复权、金额与成交量、缺失值及窗口约定见 [数据语义](SEMANTICS.md)。
 
 本地基类使用 DuckDB：可提供 `duckdb_path`、版本化数据绑定，或内存 `duckdb.DuckDBPyConnection`。默认 `db_backend="duckdb"`；旧 `auto` 仅作为 DuckDB 别名，不做后端回退。`get_price_data()` 使用同一数据源。聚宽云端取数仍由 adapter 接管，不要求云端安装 DuckDB。
 

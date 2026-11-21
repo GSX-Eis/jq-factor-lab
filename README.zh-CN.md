@@ -1,148 +1,134 @@
+<div align="center">
+
 # JQ Factor Lab
 
-[English](README.md) | 简体中文
+**面向 AI Agent 的量化研究 Harness，通过 CLI 和 MCP 串联多因子计算与合成、回测和抗过拟合统计评测。**
 
-**把聚宽研究中的重计算迁到本地，并为本地 Harness 提供可调用的研究接口。**
+[English](README.md) · 简体中文
 
-研究涉及长历史、大股票池、分钟数据或反复训练时，聚宽研究环境的计算资源容易成为瓶颈。JQ Factor Lab 将数据读取、因子计算、单因子评估和算法合成组织为本地 Python 模块，让这些任务使用自己的 CPU、内存和存储资源。
+[![CI](https://img.shields.io/github/actions/workflow/status/GSX-Eis/jq-factor-lab/ci.yml?branch=dev&label=CI)](https://github.com/GSX-Eis/jq-factor-lab/actions/workflows/ci.yml?query=branch%3Adev)
+[![版本](https://img.shields.io/badge/dynamic/toml?url=https%3A%2F%2Fraw.githubusercontent.com%2FGSX-Eis%2Fjq-factor-lab%2Fdev%2Fpyproject.toml&query=%24.project.version&label=version&prefix=v&color=blue)](CHANGELOG.md)
+![Python 3.11–3.12](https://img.shields.io/badge/python-3.11%20%7C%203.12-blue)
+[![Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 
-本地 Harness 可以通过 CLI 或 Python 接口调度研究任务、读取结果，再决定下一步实验。需要回到聚宽验证的因子，可以通过共享接口和单文件构建器打包，形成“本地研究 → 聚宽验证”的工作流。
+</div>
 
-## 解决什么问题
+<div align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/architecture-zh-dark.svg">
+    <img src="docs/assets/architecture-zh-light.svg" width="100%" alt="JQ Factor Lab 架构图，从 AI Agent 经 CLI 契约和量化核心到本地证据与只读看板">
+  </picture>
+</div>
 
-- **让计算跟随本地资源扩展。** 数据保存在本地，因子计算、评估和模型研究在本机执行，减少对聚宽研究 Notebook 计算配额的依赖。
-- **让研究任务可以被 Harness 调用。** 提供配置驱动的 CLI、JSON 成功摘要、明确的进程退出状态和落盘结果，便于本地任务调度器、脚本或 agent 串联实验。
-- **衔接本地研究与聚宽运行。** 通过因子基类、数据 adapter、PIT 复权和显式构建入口组织同一套因子实现，减少两端各写一套计算逻辑的维护成本。
+## 适用场景
 
-数据来源、字段、交易日历和时间边界需要显式配置。把计算迁到本地后，仍需分别核验输入数据、因子数值和交易执行的一致性。
+JQ Factor Lab 在单机上使用 DuckDB 完成可追溯的研究流程。日频截面和分钟 Bar 时序共用一套评测引擎。Agent 可以先预检命令，再解析严格 JSON，并将指标追溯到产物和统计门禁。
 
-## 工作流
+| 项目 | 主要用途 | JQ Factor Lab 的切入点 |
+| --- | --- | --- |
+| [Qlib](https://github.com/microsoft/qlib) | 机器学习驱动的量化投研 | 单机 DuckDB 上按统一契约评测日频截面和分钟 Bar |
+| [RD-Agent](https://github.com/microsoft/RD-Agent) | Agent 驱动的研发流程 | 输入与输出契约明确的执行入口，提供 JSON、预检计划和退出码 |
+| [VectorBT](https://github.com/polakowo/vectorbt) | 向量化组合回测 | 使用 Adaptive HAC、Bootstrap v2、TrialLedger 和 `calibration_status` 门禁评测因子，可接入 VectorBT 做策略回测 |
+| [TradingAgents](https://github.com/TauricResearch/TradingAgents) | 多 Agent 交易分析与决策 | 按时点约束、净化切分和可追溯证据复现量化因子实验 |
 
-```mermaid
-flowchart LR
-    A[已有行情文件] --> B[本地 DuckDB 数据层]
-    B --> C[因子计算与评估]
-    C --> D[算法合成与模型研究]
-    H[本地 Harness] --> C
-    H --> D
-    C --> E[显式因子文件打包]
-    E --> F[聚宽环境验证]
-```
+## 60 秒快速开始
 
-数据通过本地文件导入；计算与评估在本地完成。Harness 负责外层任务编排，本项目提供可组合的执行模块。训练模型接入聚宽需要显式集成和验证。
-
-## 快速开始
-
-支持 Python 3.11–3.12、macOS / Linux。部分缓存锁依赖 POSIX `fcntl`，暂不支持原生 Windows。
+使用 macOS 或 Linux 上的 Python 3.11–3.12。首次下载依赖可能需要更长时间。克隆发布分支后，选择 pip 或 uv。
 
 ```bash
-git clone https://github.com/GSX-Eis/jq-factor-lab.git
+git clone --branch dev https://github.com/GSX-Eis/jq-factor-lab.git
 cd jq-factor-lab
+```
 
-python -m venv .venv
+**pip**
+
+```bash
+python3 -m venv .venv
 source .venv/bin/activate
-python -m pip install -e '.[dev,synthesis]'
-
-# 生成教学行情，运行本地单因子评估
-python -m examples.generate_data --output data/demo.csv
-python -m tools.demo_cli single-factor-analysis \
-  --config config/demo.json --output-dir outputs/first-analysis
-
-# 运行固定权重合成示例
-python -m tools.demo_cli factor-synthesis-demo \
-  --method weighted_sum --output-dir outputs/first-synthesis
+python3 -m pip install '.[synthesis,viz]'
 ```
 
-安装后也可使用 `jq-factor-lab` 命令调用同一 CLI。单因子分析会生成 `summary.json`、`factor_values.csv` 和评估结果 CSV，包含 IC、IR 与分层收益等结果。
-
-示例仅使用合成行情和虚构市场日历。每次运行应指定新的输出目录；已有目录会被拒绝。使用真实数据时，需要提供明确的交易日历来源，见 [配置参考](docs/CONFIG.md) 和 [交易日历](docs/TRADING_CALENDAR.md)。
-
-## 接入本地 Harness
-
-### 通过 CLI 调度单因子评估
-
-Harness 可以启动进程，传入配置和任务独立的输出目录：
-
-```python
-import json
-import subprocess
-import sys
-
-process = subprocess.run(
-    [sys.executable, "-m", "tools.demo_cli", "single-factor-analysis",
-     "--config", "config/demo.json", "--output-dir", "outputs/harness-job-001"],
-    check=True,
-    capture_output=True,
-    text=True,
-)
-summary = json.loads(process.stdout)
-```
-
-成功时 stdout 为 JSON 摘要，包含因子名、输入行数、股票数、IC 均值和日历身份；过程日志写到 stderr。失败时进程非零退出，Harness 应检查 stderr 并停止消费该任务的结果。输出目录应由调用方按任务分配。
-
-### 通过 Python 模块扩展研究流程
-
-| 接入层 | 提供的能力 |
-| --- | --- |
-| 因子计算 | `FactorBase`、显式因子文件加载、日频与五分钟数据读取接口 |
-| 数据与结果 | 本地 CSV → DuckDB 导入、缓存、因子读写与结果持久化 |
-| 单因子评价 | PIT 价格调整、前瞻收益、Alphalens 评价与股票池过滤 |
-| 合成研究 | 固定权重、PCA、线性模型、LightGBM，以及预筛选、预处理、交叉验证和诊断模块 |
-| 聚宽衔接 | `JQFactorAdapter` 与明确输入的单文件构建器 |
-
-公开 CLI 当前提供单因子评估和合成教学示例。自有 Harness 可调用底层模块扩展调度；训练与选模需要生产方提供真实标签退出上下文，具体合同见 [算法合成](docs/SYNTHESIS.md)。
-
-给 agent 接入时，从 [AGENTS.md](AGENTS.md) 开始；[CLAUDE.md](CLAUDE.md) 引用同一份文档索引。
-
-## 换成自己的数据与因子
-
-1. 按 [数据导入](docs/DATA_IMPORT.md) 准备本地行情、辅助数据和已验证日历，导入 DuckDB。
-2. 继承 `utils.factor_base.FactorBase`，实现取数和计算方法。因子接口见 [FACTOR_INTERFACE](docs/FACTOR_INTERFACE.md)，最小骨架见 [FACTOR_TEMPLATE](docs/FACTOR_TEMPLATE.md)。
-3. 在自己的 Harness 中配置日期、股票池、数据源和输出位置，调用计算、评估或合成模块。
-4. 对需要带回聚宽的因子，声明字段与历史窗口，再构建并验证运行文件。
-
-日频单因子 CLI 接受含 `date, stock_code, close` 的 CSV，可选正数复权字段 `factor`，缺省为 1。它将输入放入内存 DuckDB 后调用共享因子与评价模块；自有 Harness 可以另行使用持久化 DuckDB 和版本化存储接口。
-
-完整的“CSV → DuckDB → 自定义因子 → 固定权重合成 → 价格收益标签 → 聚宽文件”教学流程：
+**uv**
 
 ```bash
-python -m examples.local_factor_workflow --output-dir outputs/local-workflow
+uv venv --python 3.12
+source .venv/bin/activate
+uv pip install '.[synthesis,viz]'
 ```
 
-每一步的接口、产物和替换方法见 [LOCAL_WORKFLOW](docs/LOCAL_WORKFLOW.md)。
+PyPI 上架后，可改用 `python3 -m pip install 'jq-factor-lab[synthesis,viz]'` 或 `uv pip install 'jq-factor-lab[synthesis,viz]'`。基础包提供日频和 Bar 评测，`[synthesis]` 提供固定权重演示和合成依赖，`[viz]` 提供看板，`[mcp]` 提供 stdio 服务。 `[all]` 还会安装 Qlib 和 Torch 等较重依赖，取决于平台 wheel 的可用性。
 
-## 带回聚宽验证
+在可写目录运行以下命令。全部演示均使用合成数据，每次创建独立运行目录。
 
 ```bash
-python -m scripts.build_jq_strategy \
-  --factor-files examples/momentum.py \
-  --requirements config/factor_requirements.json \
-  --cloud-api-mapping config/cloud_api_mapping.json \
-  --single-file --out outputs/demo_jq_strategy.py
+jq-factor-lab daily-demo > daily.json
+jq-factor-lab bar-demo > bar.json
+jq-factor-lab factor-synthesis-demo --method weighted_sum > synthesis.json
+db="$(python3 -c 'import json; print(json.load(open("bar.json"))["metrics"]["results_db"]["path"])')"
+jq-factor-lab read-bar-evaluations --results-db "$db" > bar-read.json
+jq-factor-lab dashboard --results-db "$db" --dry-run
+# 去掉 --dry-run 即可在 http://127.0.0.1:8501 打开只读看板。
 ```
 
-构建在本地完成，无需聚宽账号，也不会请求行情或上传文件。生成文件需在聚宽环境另行运行；教学入口计算因子并记录日志。字段映射、依赖和构建合同见 [聚宽运行工具链](docs/JOINQUANT.md)。
+以下是合成 Bar 演示的 1-Bar 周期诊断摘录。常收益使 Spearman IC 无法估计。
 
-## 能力范围
+```json
+{
+  "ok": true,
+  "exit_code": 0,
+  "metrics": {
+    "diagnostics_report": {
+      "schema": "time_series_diagnostics.v1",
+      "horizons": [
+        {"horizon_bars": 1, "ic": {"sample_count": 39, "spearman_ic": null, "reason": "constant_return"}}
+      ]
+    }
+  },
+  "next_actions": ["Pass metrics.results_db.path to read-bar-evaluations --results-db."]
+}
+```
 
-本仓库提供通用研究模块、公开 CLI、教学示例和测试，不包含真实行情、已有研究因子、个人实验配置、预训练模型或生产策略。行情下载、平台登录和自动上传需另行安排。
+[AI 研究战报](docs/AI_WORKFLOW_SHOWCASE.md) 展示多个候选如何经历预检、校准与试验门禁、合成、示例回测及 DuckDB 回查。
 
-固定权重合成示例可以直接运行；其余六种教学方法的人工目标没有经核验的标签退出上下文，会在训练前拒绝执行。底层算法需要由调用方接入正确的标签与时间隔离合同。详见 [合成示例边界](docs/SYNTHESIS.md)。
+## 接入你的 AI Agent
 
-聚宽 adapter 和构建器已接入。公开版的真实聚宽云端运行与完整交易回测尚未验收；单因子评价和本地示例的通过不代表策略表现或两端交易结果已验证。
+### Agent Skill 或 Claude Code 插件
 
-## 文档与贡献
+将完整的 [Factor Research Skill](skills/factor-research/SKILL.md) 目录连同参考文件复制到客户端的 skills 目录。使用 Claude Code 时，可在源码根目录执行 `claude --plugin-dir .` 加载[插件清单](.claude-plugin/plugin.json)，再调用 `/jq-factor-lab:factor-research`。项目约定见 [AGENTS.md](AGENTS.md) 和 [CLAUDE.md](CLAUDE.md)。
 
-| 内容 | 文档 |
-| --- | --- |
-| 配置、默认值与输出 | [CONFIG](docs/CONFIG.md) |
-| 因子接口与最小模板 | [FACTOR_INTERFACE](docs/FACTOR_INTERFACE.md) · [FACTOR_TEMPLATE](docs/FACTOR_TEMPLATE.md) |
-| 复权、缺失值与时间边界 | [SEMANTICS](docs/SEMANTICS.md) |
-| 本地数据与日历 | [DATA_IMPORT](docs/DATA_IMPORT.md) · [TRADING_CALENDAR](docs/TRADING_CALENDAR.md) |
-| 合成算法与标签合同 | [SYNTHESIS](docs/SYNTHESIS.md) |
-| 本地到聚宽的完整示例 | [LOCAL_WORKFLOW](docs/LOCAL_WORKFLOW.md) · [JOINQUANT](docs/JOINQUANT.md) |
-| 公开范围 | [PUBLIC_SCOPE](docs/PUBLIC_SCOPE.md) |
+### Stdio MCP 服务
 
-开发环境安装后可运行 `python -m pytest -q`。贡献要求见 [CONTRIBUTING](CONTRIBUTING.md)，漏洞报告见 [SECURITY](SECURITY.md)，版本记录见 [CHANGELOG](CHANGELOG.md)。
+确保 MCP 客户端的 PATH 可找到 `uvx`。包上架 PyPI 后，将以下配置加入 Claude Desktop、Cursor、Claude Code 或 Windsurf 的 `mcpServers`。使用本地源码时，把 `--from` 的值改成源码目录的绝对路径并追加 `[mcp,synthesis]`。合成工具 `run_factor_synthesis_demo` 依赖 `[synthesis]`。
 
-本项目采用 [Apache License 2.0](LICENSE)，版权声明见 [NOTICE](NOTICE)。第三方依赖保留各自的许可证。
+```json
+{
+  "mcpServers": {
+    "jq-factor-lab": {
+      "command": "uvx",
+      "args": ["--python", "3.12", "--from", "jq-factor-lab[mcp,synthesis]", "jq-factor-lab-mcp"]
+    }
+  }
+}
+```
+
+服务在本机运行。工具输入使用绝对路径。参见 [CLI 与 MCP 映射](skills/factor-research/references/cli_contract.md)。
+
+### 可直接复制的研究提示词
+
+```text
+使用 Factor Research Skill，在新建的可写目录运行 AI 研究战报。
+先锁定假设、候选、切分和筛选规则，只使用合成数据。逐项预检，
+分开记录 stdout 和 stderr，并报告 IC、样本量、缺失原因、校准状态
+和完整试验家族。仅将符合合成回测条件的候选纳入组合。核对 DuckDB
+和看板启动计划，列出未通过的候选、产物路径和能否声称统计显著。
+```
+
+## 使用本地数据
+
+使用本地 [CSV、Parquet 或 DuckDB](docs/DATA_IMPORT.md)，遵循[因子接口](docs/FACTOR_INTERFACE.md)和 [Bar 契约](docs/TIME_SERIES_CONTRACT.md)，并核验 XSHG、CME、NYSE 等[交易日历](docs/TRADING_CALENDAR.md)。配置和标签隔离见[本地流程](docs/LOCAL_WORKFLOW.md)及[合成指南](docs/SYNTHESIS.md)。[聚宽单文件打包](docs/JOINQUANT.md)是可选的离线部署适配器。
+
+## 试用与反馈
+
+欢迎[提交 Issue](https://github.com/GSX-Eis/jq-factor-lab/issues/new/choose)报告问题、请求市场日历或数据契约，或分享 AI 工作流。请使用合成或脱敏样例。参见[贡献指南](CONTRIBUTING.md)、[安全说明](SECURITY.md)及[变更日志](CHANGELOG.md)。
+
+采用 [Apache License 2.0](LICENSE)。归属信息见 [NOTICE](NOTICE)。

@@ -65,7 +65,7 @@ CLOUD_API_MAPPING = {mapping_json}
 def compose_adapter_block(cloud_mapping=None) -> str:
     from pathlib import Path
 
-    source = Path(__file__).resolve().parents[2] / "utils/jq_factor_adapter.py"
+    source = Path(__file__).resolve().parent / "cloud_runtime/jq_factor_adapter.py.txt"
     return (
         source.read_text(encoding="utf-8")
         .replace("CLOUD_API_MAPPING = {}", "", 1)

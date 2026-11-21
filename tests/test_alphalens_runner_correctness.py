@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from backtest_and_analysis.alphalens_runner import AlphalensRunner
+from backtest_and_analysis.alphalens_runner import AlphalensRunner, InsufficientCrossSectionAssets
 
 
 def panel():
@@ -30,6 +30,14 @@ def test_constant_factor_has_no_valid_ic_or_quantile_returns():
     assert result['quantile_returns'].empty
 
 
+def test_daily_runner_rejects_single_asset_before_quantiling() -> None:
+    _, signal, pricing = panel()
+    one_asset = pricing.loc[['S00']]
+    one_asset.attrs['trading_calendar'] = pricing.attrs['trading_calendar']
+    with pytest.raises(InsufficientCrossSectionAssets, match='at least 2 assets.*time-series-analysis'):
+        AlphalensRunner(periods=(1,)).run(signal[['S00']], one_asset)
+
+
 def test_tied_values_retain_raw_spearman_ic():
     prices, _, pricing = panel()
     factor = pd.DataFrame(np.tile([0., 0., 0., 0., 0., 1., 1., 1., 1., 1.], (len(prices), 1)),
@@ -39,6 +47,20 @@ def test_tied_values_retain_raw_spearman_ic():
     returns = prices.shift(-2) / prices.shift(-1) - 1
     expected = factor.corrwith(returns, axis=1, method='spearman').dropna()
     pd.testing.assert_series_equal(result.dropna(), expected, check_names=False)
+
+
+def test_daily_ic_keeps_cross_sections_with_two_nonconstant_pairs() -> None:
+    days = pd.bdate_range('2024-01-02', periods=32, name='date')
+    factor = pd.DataFrame({'S1': 1., 'S2': 2.}, index=days[:30])
+    steps = np.arange(len(days))
+    prices = pd.DataFrame({'S1': 100 * 1.01**steps, 'S2': 100 * 1.02**steps}, index=days)
+    pricing = prices.rename_axis(columns='asset').stack()
+    pricing.attrs['trading_calendar'] = TradingCalendar(days, days.min(), days.max())
+    result = AlphalensRunner(n_quantiles=2, periods=(1,)).run(factor, pricing)
+
+    ic = result['ic']['1D']
+    assert ic.index.tolist() == factor.index.tolist()
+    np.testing.assert_allclose(ic, 1.0, rtol=0, atol=1e-14)
 
 
 def test_price_order_and_index_layout_do_not_change_results():

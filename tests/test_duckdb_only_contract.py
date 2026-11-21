@@ -3,7 +3,10 @@ import ast
 from pathlib import Path
 import subprocess
 
+import pytest
 
+
+@pytest.mark.slow
 def test_runtime_has_no_legacy_database_imports():
     root = Path(__file__).resolve().parents[1]
     if (root / '.git').exists():

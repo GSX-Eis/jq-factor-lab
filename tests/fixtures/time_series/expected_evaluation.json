@@ -1,0 +1,21 @@
+{
+  "source": "SYNTHETIC",
+  "data_version": "SYNTHETIC_NERE704_v1",
+  "case_id": "view_difference",
+  "views": {
+    "ETH": {
+      "valid": 4,
+      "excluded": 5,
+      "exclusion_counts": {
+        "insufficient_history": 5
+      }
+    },
+    "RTH": {
+      "valid": 1,
+      "excluded": 5,
+      "exclusion_counts": {
+        "insufficient_history": 5
+      }
+    }
+  }
+}

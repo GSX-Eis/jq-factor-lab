@@ -3,7 +3,8 @@
 运行完整教学流程：
 
 ```bash
-python -m examples.local_factor_workflow --output-dir outputs/local-workflow
+python3 -m pip install '.[synthesis]'
+python3 -m examples.local_factor_workflow
 ```
 
 每次使用新目录。流程只生成虚构行情，不访问账号、下载数据或提交交易。需要项目基础依赖；输出 JSON 汇总写到 stdout，过程日志写到 stderr。

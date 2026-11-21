@@ -1,16 +1,16 @@
-# 变更记录
+# Changelog
 
-## 未发布
+## v0.1.0
 
-- 明确单因子分析配置的必填项、路径与输出目录优先级、校验顺序。
-- 构建器对重复类名和未知类选择输出结构化错误；版本化读取示例对无效配置输出结构化错误。
-- 合成 demo 默认使用可运行的固定权重方法；其他六种方法说明标签退出上下文要求，移除无效调参选项。
-- 完善贡献、漏洞报告和能力边界说明。
+- The unified evaluation engine supports multi-asset daily cross-sections and single-instrument minute/Bar time series. The Bar CLI emits `diagnostics_report` with sample counts, Spearman IC and reasons for undefined metrics, and can store and query evaluations in DuckDB.
+- Trading calendars cover XSHG, CME and NYSE via pandas-market-calendars. The [calendar guide](docs/TRADING_CALENDAR.md) describes session alignment and verification.
+- The `jq-factor-lab` CLI ships two offline synthetic demos for the daily and Bar workflows. Python 3.11 and 3.12 use a lean core install, with development and research dependencies available as extras.
+- The [English Quickstart](README.md), [简体中文快速开始](README.zh-CN.md), and [AGENTS.md](AGENTS.md) / [CLAUDE.md](CLAUDE.md) show how to screen a factor, read structured metrics and state a reproducible screening decision.
+- GitHub Actions runs the public test suite, builds and checks the source distribution and wheel, and smoke-tests the installed wheel on both supported Python versions.
+- Local research uses the documented [CSV, Parquet and DuckDB contracts](docs/DATA_IMPORT.md). The [JoinQuant builder](docs/JOINQUANT.md) packages a strategy for offline use. Real market data, trained models, automated login or upload, and cloud or live trading validation are outside this release.
 
-## 0.1.0 — 初始功能范围（尚未正式发布）
+Both READMEs show the version from the public dev branch. After the first PyPI release, switch the version badges to `img.shields.io/pypi/v/jq-factor-lab`.
 
-- 因子接口、DuckDB、本地数据导入、时点复权、前向收益和 Alphalens 评估。
-- 通用合成算法与预筛选接口，包括工厂可获取的 MI；显式输入的聚宽代码构建器。
-- 合成输入演示与测试。真实云端运行、原生 Qlib/GPU 和完整交易回测尚未验收。
+The distributions include the Apache 2.0 license and attribution notice.
 
-许可证：Apache-2.0，随发行包提供 LICENSE 和 NOTICE。
+Try the offline demos from the [Quickstart](README.md#60-second-quickstart), then [share feedback](https://github.com/GSX-Eis/jq-factor-lab/issues/new/choose). The issue chooser has forms for bug reports, market calendar and data contract requests, and AI factor research showcases. Use synthetic or sanitized examples and keep real market data and credentials out of public issues.

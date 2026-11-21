@@ -6,22 +6,25 @@ import os
 import pickle
 import re
 import tempfile
-from numbers import Real
 from typing import List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 from scipy import stats as scipy_stats
 
-logger = logging.getLogger(__name__)
-
-
-class ForwardReturnsValidationError(ValueError):
-    """Invalid prices or absent labels must not become successful empty analysis."""
+from backtest_and_analysis.evaluation.labels import (
+    ForwardReturnsValidationError as ForwardReturnsValidationError,
+    label_daily_returns,
+    resolve_daily_calendar,
+    validate_daily_horizons,
+)
 
 
 def newey_west_mean_test(values, max_lag: int) -> tuple[float | None, float | None]:
-    """Bartlett HAC mean test, with asymptotic normal p and no correction.
+    """Return legacy Bartlett HAC diagnostics with an asymptotic normal p value.
+
+    This mean test is uncalibrated. Finite outputs are descriptive diagnostics
+    and significance interpretation is unavailable.
 
     The caller must supply ordered, consecutive, equally spaced observations.
     Missing values must not be dropped here, since that would compress time.
@@ -70,34 +73,10 @@ class ForwardReturnsCalculator:
         self.logger = logging.getLogger(self.__class__.__name__)
 
     def _calendar(self, pricing):
-        from utils.trading_calendar import load_trading_calendar
-        calendar = self.trading_calendar or pricing.attrs.get('trading_calendar')
-        return calendar if calendar is not None else load_trading_calendar()
+        return resolve_daily_calendar(pricing, self.trading_calendar)
 
-    @staticmethod
-    def _validate_horizons(
-        periods: Tuple[int, ...], execution_lag: int
-    ) -> Tuple[int, ...]:
-        """Validate discrete trading-row horizons before applying ``shift``."""
-        if isinstance(periods, (str, bytes)):
-            raise ValueError("periods must be a non-empty iterable of positive integers")
-        try:
-            normalized_periods = tuple(periods)
-        except TypeError as exc:
-            raise ValueError("periods must be a non-empty iterable of positive integers") from exc
-        if not normalized_periods or any(
-            isinstance(period, bool) or not isinstance(period, (int, np.integer)) or period <= 0
-            for period in normalized_periods
-        ):
-            raise ValueError("periods must be a non-empty iterable of positive integers")
-        if (
-            isinstance(execution_lag, bool)
-            or not isinstance(execution_lag, (int, np.integer))
-            or execution_lag < 0
-        ):
-            raise ValueError("execution_lag must be a non-negative integer")
-        return tuple(int(period) for period in normalized_periods)
-    
+    _validate_horizons = staticmethod(validate_daily_horizons)
+
     def calculate_forward_returns(
         self, 
         pricing: pd.Series, 
@@ -118,104 +97,8 @@ class ForwardReturnsCalculator:
         Raises:
             ForwardReturnsValidationError: 非法价格，或所有请求期间均无有效收益
         """
-        periods = self._validate_horizons(periods, execution_lag)
-        self.logger.info(f"开始计算前瞻收益率，期间: {periods}, 执行滞后: {execution_lag}天")
-        
-        # 转换价格数据格式为DataFrame (date, asset)
-        if not isinstance(pricing, pd.Series):
-            raise ValueError("价格数据必须是Series，并使用MultiIndex")
-        if isinstance(pricing.index, pd.MultiIndex) and pricing.index.nlevels == 2:
-            # 检查MultiIndex的结构
-            if pricing.index.names == ['asset', 'date'] or pricing.index.names == [None, None]:
-                asset_level, date_level = 0, 1
-            elif pricing.index.names == ['date', 'asset']:
-                asset_level, date_level = 1, 0
-            else:
-                raise ValueError(f"不支持的MultiIndex格式: {pricing.index.names}")
+        return label_daily_returns(pricing, self.trading_calendar, execution_lag, periods).returns
 
-            dates = pd.to_datetime(pricing.index.get_level_values(date_level), errors="coerce")
-            if dates.isna().any():
-                raise ValueError("价格数据包含无法解析的日期")
-            assets = pricing.index.get_level_values(asset_level)
-            if pd.isna(assets).any():
-                raise ValueError("价格数据包含空的 asset 键")
-            canonical_index = pd.MultiIndex.from_arrays(
-                [dates, assets], names=["date", "asset"]
-            )
-            canonical_prices = pd.Series(pricing.to_numpy(), index=canonical_index, name=pricing.name)
-            if canonical_prices.index.has_duplicates:
-                raise ValueError("价格数据包含重复的 (date, asset) 键")
-            # Validate observed values before arithmetic; missing observations
-            # remain missing and must never become zero or bridge a trading day.
-            if pd.api.types.is_object_dtype(canonical_prices.dtype):
-                real_values = canonical_prices.map(
-                    lambda value: isinstance(value, Real) and not isinstance(value, (bool, np.bool_))
-                )
-            else:
-                real_values = pd.Series(
-                    pd.api.types.is_numeric_dtype(canonical_prices.dtype)
-                    and not pd.api.types.is_bool_dtype(canonical_prices.dtype)
-                    and not pd.api.types.is_complex_dtype(canonical_prices.dtype),
-                    index=canonical_index,
-                )
-            numeric_prices = pd.to_numeric(canonical_prices.where(real_values), errors="coerce")
-            numeric_prices = numeric_prices.where(canonical_prices.notna())
-            invalid = canonical_prices.notna() & (
-                ~real_values | ~np.isfinite(numeric_prices) | numeric_prices.le(0)
-            )
-            if invalid.any():
-                key = invalid[invalid].index[0]
-                raise ForwardReturnsValidationError(
-                    f"Invalid price at date={key[0]}, asset={key[1]!r}: "
-                    f"{canonical_prices.loc[key]!r}; expected a finite positive real number or missing value"
-                )
-            canonical_prices = numeric_prices
-            # Preserve the existing wide-panel shift semantics: every asset
-            # shares the same sorted date rows and missing prices remain
-            # missing. Sorting only makes equivalent long inputs deterministic.
-            prices_df = canonical_prices.unstack("asset").sort_index()
-        else:
-            raise ValueError("价格数据必须是MultiIndex格式")
-        
-        calendar = self._calendar(pricing)
-        prices_df = calendar.align(prices_df)
-        self.logger.info(f"价格数据形状: {prices_df.shape}")
-        
-        # 计算各期间的前瞻收益率
-        forward_returns_dict = {}
-        
-        for period in periods:
-            self.logger.info(f"计算 {period} 天前瞻收益率 (Lag={execution_lag})...")
-            
-            # 计算收益率:
-            # Lag=0: (price_t+period / price_t) - 1
-            # Lag=k: (price_t+period+k / price_t+k) - 1
-            # 含义: 在 T+k 日收盘买入，持有 period 天，在 T+k+period 日收盘卖出
-            if execution_lag == 0:
-                forward_prices = prices_df.shift(-period)
-                returns = (forward_prices / prices_df) - 1
-            else:
-                forward_prices = prices_df.shift(-period - execution_lag)
-                entry_prices = prices_df.shift(-execution_lag)
-                returns = (forward_prices / entry_prices) - 1
-            
-            # 移除无效值
-            returns = returns.replace([np.inf, -np.inf], np.nan)
-            
-            # 转换为Series格式 (date, asset)
-            returns_series = returns.stack().dropna()
-            returns_series.index.names = ['date', 'asset']
-            
-            forward_returns_dict[f'{period}D'] = returns_series
-            self.logger.info(f"{period} 天前瞻收益率计算完成，有效数据点: {len(returns_series)}")
-        
-        # 合并所有期间的收益率
-        forward_returns_df = pd.DataFrame(forward_returns_dict)
-        if forward_returns_df.empty:
-            raise ForwardReturnsValidationError("未能计算出任何前瞻收益率：检查价格覆盖与请求的持有期/执行滞后")
-        self.logger.info(f"前瞻收益率计算完成 (Lag={execution_lag})，总形状: {forward_returns_df.shape}")
-        return forward_returns_df
-    
     def get_cache_key(
         self,
         code_list: List[str],
@@ -238,7 +121,8 @@ class ForwardReturnsCalculator:
         """
         # 创建唯一标识符
         key_data = {
-            'schema_version': 'forward_returns.v3',  # Input semantics and validated output schema.
+            # v3 could cache wrapped unsigned lags under the same key as Python integer lags.
+            'schema_version': 'forward_returns.v4',
             'code_list': sorted(code_list),  # 排序确保一致性
             'start_date': start_date,
             'end_date': end_date,

@@ -40,7 +40,7 @@ class TutorialComposite(FactorBase):
 '''
 
 
-def run_workflow(output_dir):
+def run_workflow(output_dir: Path | None = None) -> dict:
     import duckdb
     import numpy as np
     import pandas as pd
@@ -51,9 +51,13 @@ def run_workflow(output_dir):
     from factor_synthesis.pipeline.weighted_sum_method import run_weighted_sum_synthesis
     from scripts.build_jq_strategy import build_jq_strategy_main
     from utils.duckdb_results_writer import DuckDBResultsWriter
+    from utils.local_outputs import new_run_directory
 
-    root = Path(output_dir).resolve()
-    root.mkdir(parents=True, exist_ok=False)
+    if output_dir is None:
+        root = new_run_directory(Path("outputs/local-workflow"))
+    else:
+        root = Path(output_dir).resolve()
+        root.mkdir(parents=True, exist_ok=False)
     daily = root / 'csv' / 'daily'
     daily.mkdir(parents=True)
     dates = pd.bdate_range('2024-01-02', periods=80)
@@ -198,11 +202,15 @@ def run_workflow(output_dir):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--output-dir', type=Path, required=True)
+    parser.add_argument('--output-dir', type=Path, help='New directory (default: an isolated run under outputs/local-workflow)')
     args = parser.parse_args(argv)
     try:
         with redirect_stdout(sys.stderr):
             result = run_workflow(args.output_dir)
+    except ModuleNotFoundError as exc:
+        if exc.name not in {"sklearn", "dcor", "joblib", "threadpoolctl"}:
+            raise
+        parser.exit(1, "Install synthesis dependencies with python3 -m pip install 'jq-factor-lab[synthesis]'\n")
     except (ValueError, OSError, RuntimeError) as exc:
         parser.exit(1, f'Workflow failed: {exc}; use a new writable output directory and inspect the named input\n')
     print(json.dumps(result, indent=2))

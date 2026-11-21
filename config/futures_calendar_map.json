@@ -1,0 +1,254 @@
+{
+  "A": {
+    "calendar_id": "DCE_A",
+    "rth_reference_calendar": "DCE_Day"
+  },
+  "AG": {
+    "calendar_id": "SHFE_AG",
+    "rth_reference_calendar": "SHFE_Day"
+  },
+  "AL": {
+    "calendar_id": "SHFE_AL",
+    "rth_reference_calendar": "SHFE_Day"
+  },
+  "AO": {
+    "calendar_id": "SHFE_AO",
+    "rth_reference_calendar": "SHFE_Day"
+  },
+  "AP": {
+    "calendar_id": "CZCE_AP",
+    "rth_reference_calendar": "CZCE_Day"
+  },
+  "AU": {
+    "calendar_id": "SHFE_AU",
+    "rth_reference_calendar": "SHFE_Day"
+  },
+  "BC": {
+    "calendar_id": "INE_BC",
+    "rth_reference_calendar": "INE_Day"
+  },
+  "BU": {
+    "calendar_id": "SHFE_BU",
+    "rth_reference_calendar": "SHFE_Day"
+  },
+  "C": {
+    "calendar_id": "DCE_C",
+    "rth_reference_calendar": "DCE_Day"
+  },
+  "CF": {
+    "calendar_id": "CZCE_CF",
+    "rth_reference_calendar": "CZCE_Day"
+  },
+  "CU": {
+    "calendar_id": "SHFE_CU",
+    "rth_reference_calendar": "SHFE_Day"
+  },
+  "EB": {
+    "calendar_id": "DCE_EB",
+    "rth_reference_calendar": "DCE_Day"
+  },
+  "EC": {
+    "calendar_id": "INE_EC",
+    "rth_reference_calendar": "INE_Day"
+  },
+  "EG": {
+    "calendar_id": "DCE_EG",
+    "rth_reference_calendar": "DCE_Day"
+  },
+  "FG": {
+    "calendar_id": "CZCE_FG",
+    "rth_reference_calendar": "CZCE_Day"
+  },
+  "FU": {
+    "calendar_id": "SHFE_FU",
+    "rth_reference_calendar": "SHFE_Day"
+  },
+  "HC": {
+    "calendar_id": "SHFE_HC",
+    "rth_reference_calendar": "SHFE_Day"
+  },
+  "I": {
+    "calendar_id": "DCE_I",
+    "rth_reference_calendar": "DCE_Day"
+  },
+  "IC": {
+    "calendar_id": "CFFEX_IC",
+    "rth_reference_calendar": "CFFEX_IC"
+  },
+  "IF": {
+    "calendar_id": "CFFEX_IF",
+    "rth_reference_calendar": "CFFEX_IF"
+  },
+  "IH": {
+    "calendar_id": "CFFEX_IH",
+    "rth_reference_calendar": "CFFEX_IH"
+  },
+  "IM": {
+    "calendar_id": "CFFEX_IM",
+    "rth_reference_calendar": "CFFEX_IM"
+  },
+  "J": {
+    "calendar_id": "DCE_J",
+    "rth_reference_calendar": "DCE_Day"
+  },
+  "JM": {
+    "calendar_id": "DCE_JM",
+    "rth_reference_calendar": "DCE_Day"
+  },
+  "L": {
+    "calendar_id": "DCE_L",
+    "rth_reference_calendar": "DCE_Day"
+  },
+  "LC": {
+    "calendar_id": "GFEX_LC",
+    "rth_reference_calendar": "GFEX"
+  },
+  "LH": {
+    "calendar_id": "DCE_LH",
+    "rth_reference_calendar": "DCE_Day"
+  },
+  "LU": {
+    "calendar_id": "INE_LU",
+    "rth_reference_calendar": "INE_Day"
+  },
+  "M": {
+    "calendar_id": "DCE_M",
+    "rth_reference_calendar": "DCE_Day"
+  },
+  "MA": {
+    "calendar_id": "CZCE_MA",
+    "rth_reference_calendar": "CZCE_Day"
+  },
+  "NI": {
+    "calendar_id": "SHFE_NI",
+    "rth_reference_calendar": "SHFE_Day"
+  },
+  "NR": {
+    "calendar_id": "INE_NR",
+    "rth_reference_calendar": "INE_Day"
+  },
+  "OI": {
+    "calendar_id": "CZCE_OI",
+    "rth_reference_calendar": "CZCE_Day"
+  },
+  "P": {
+    "calendar_id": "DCE_P",
+    "rth_reference_calendar": "DCE_Day"
+  },
+  "PB": {
+    "calendar_id": "SHFE_PB",
+    "rth_reference_calendar": "SHFE_Day"
+  },
+  "PF": {
+    "calendar_id": "CZCE_PF",
+    "rth_reference_calendar": "CZCE_Day"
+  },
+  "PG": {
+    "calendar_id": "DCE_PG",
+    "rth_reference_calendar": "DCE_Day"
+  },
+  "PP": {
+    "calendar_id": "DCE_PP",
+    "rth_reference_calendar": "DCE_Day"
+  },
+  "PS": {
+    "calendar_id": "GFEX_PS",
+    "rth_reference_calendar": "GFEX"
+  },
+  "PT": {
+    "calendar_id": "GFEX_PT",
+    "rth_reference_calendar": "GFEX"
+  },
+  "PX": {
+    "calendar_id": "CZCE_PX",
+    "rth_reference_calendar": "CZCE_Day"
+  },
+  "RB": {
+    "calendar_id": "SHFE_RB",
+    "rth_reference_calendar": "SHFE_Day"
+  },
+  "RM": {
+    "calendar_id": "CZCE_RM",
+    "rth_reference_calendar": "CZCE_Day"
+  },
+  "RU": {
+    "calendar_id": "SHFE_RU",
+    "rth_reference_calendar": "SHFE_Day"
+  },
+  "SA": {
+    "calendar_id": "CZCE_SA",
+    "rth_reference_calendar": "CZCE_Day"
+  },
+  "SC": {
+    "calendar_id": "INE_SC",
+    "rth_reference_calendar": "INE_Day"
+  },
+  "SF": {
+    "calendar_id": "CZCE_SF",
+    "rth_reference_calendar": "CZCE_Day"
+  },
+  "SH": {
+    "calendar_id": "CZCE_SH",
+    "rth_reference_calendar": "CZCE_Day"
+  },
+  "SI": {
+    "calendar_id": "GFEX_SI",
+    "rth_reference_calendar": "GFEX"
+  },
+  "SM": {
+    "calendar_id": "CZCE_SM",
+    "rth_reference_calendar": "CZCE_Day"
+  },
+  "SN": {
+    "calendar_id": "SHFE_SN",
+    "rth_reference_calendar": "SHFE_Day"
+  },
+  "SP": {
+    "calendar_id": "SHFE_SP",
+    "rth_reference_calendar": "SHFE_Day"
+  },
+  "SR": {
+    "calendar_id": "CZCE_SR",
+    "rth_reference_calendar": "CZCE_Day"
+  },
+  "SS": {
+    "calendar_id": "SHFE_SS",
+    "rth_reference_calendar": "SHFE_Day"
+  },
+  "T": {
+    "calendar_id": "CFFEX_T",
+    "rth_reference_calendar": "CFFEX_T"
+  },
+  "TA": {
+    "calendar_id": "CZCE_TA",
+    "rth_reference_calendar": "CZCE_Day"
+  },
+  "TF": {
+    "calendar_id": "CFFEX_TF",
+    "rth_reference_calendar": "CFFEX_TF"
+  },
+  "TL": {
+    "calendar_id": "CFFEX_TL",
+    "rth_reference_calendar": "CFFEX_TL"
+  },
+  "TS": {
+    "calendar_id": "CFFEX_TS",
+    "rth_reference_calendar": "CFFEX_TS"
+  },
+  "UR": {
+    "calendar_id": "CZCE_UR",
+    "rth_reference_calendar": "CZCE_Day"
+  },
+  "V": {
+    "calendar_id": "DCE_V",
+    "rth_reference_calendar": "DCE_Day"
+  },
+  "Y": {
+    "calendar_id": "DCE_Y",
+    "rth_reference_calendar": "DCE_Day"
+  },
+  "ZN": {
+    "calendar_id": "SHFE_ZN",
+    "rth_reference_calendar": "SHFE_Day"
+  }
+}

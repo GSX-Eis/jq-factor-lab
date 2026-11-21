@@ -15,7 +15,64 @@ from collections.abc import Iterator, Mapping
 from contextlib import ExitStack, contextmanager
 from numbers import Integral, Real
 from pathlib import Path
+from tempfile import TemporaryDirectory, mkdtemp
 from typing import Any
+
+
+def check_output_directory(path: Path, *, overwrite: bool) -> Path:
+    path = path.expanduser().absolute()
+    path = path.parent.resolve() / path.name
+    if path.is_symlink() or (path.exists() and not path.is_dir()):
+        raise ValueError(f"Output must be a directory, not a file or symlink: {path}")
+    if path.exists() and not overwrite:
+        raise FileExistsError(f"Output already exists: {path}; pass --overwrite or choose a new directory")
+    ancestor = next(parent for parent in (path, *path.parents) if parent.exists())
+    if not ancestor.is_dir() or not os.access(ancestor, os.W_OK | os.X_OK):
+        raise ValueError(f"Output directory is not writable: {path}")
+    return path
+
+
+def new_run_directory(root: Path) -> Path:
+    """Reserve a distinct directory without a check-then-create race."""
+    root.mkdir(parents=True, exist_ok=True)
+    return Path(mkdtemp(prefix="run-", dir=root.resolve()))
+
+
+@contextmanager
+def reserve_output_directory(target: Path, *, overwrite: bool) -> Iterator[None]:
+    """Reserve an explicit output and serialize cooperating writers."""
+    try:
+        target.mkdir(parents=True, exist_ok=overwrite)
+    except FileExistsError as exc:
+        if target.is_dir() and not target.is_symlink():
+            raise FileExistsError(f"Output already exists: {target}; pass --overwrite or choose a new directory") from exc
+        raise ValueError(f"Output directory must be a directory, not a file or symlink: {target}") from exc
+    fd = os.open(target, os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
+@contextmanager
+def stage_demo_output(target: Path, *, overwrite: bool) -> Iterator[Path]:
+    """Replace only generated files and publish the completion marker last."""
+    with reserve_output_directory(target, overwrite=overwrite):
+        with TemporaryDirectory(prefix=".demo-", dir=target) as staging:
+            staged = Path(staging)
+            yield staged
+            summary = "summary.json"
+            files = [path for path in staged.iterdir() if path.name != summary]
+            marker = staged / summary
+            if not marker.is_file():
+                raise RuntimeError("Demo did not produce a summary")
+            for path in files:
+                if (target / path.name).is_dir():
+                    raise IsADirectoryError(f"Cannot replace output file with an existing directory: {target / path.name}")
+            (target / summary).unlink(missing_ok=True)
+            for path in [*files, marker]:
+                os.replace(path, target / path.name)
 
 
 def json_compatible(payload: Any) -> Any:

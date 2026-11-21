@@ -1,0 +1,113 @@
+name: CI
+
+"on":
+  push:
+    branches: [main, dev]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  checks:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    env:
+      PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
+      OPENBLAS_NUM_THREADS: "1"
+      OMP_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Build and check distributions
+        run: |
+          python3 -m pip install build twine
+          python3 -m build
+          python3 -m twine check --strict dist/*
+      - name: Run the installed wheel Quickstart
+        run: |
+          wheel_dir="$PWD/dist"
+          smoke="$(mktemp -d "$RUNNER_TEMP/jq-factor-lab.XXXXXX")"
+          trap 'rm -rf -- "$smoke"' EXIT
+          cd "$smoke"
+          python3 -m venv .venv
+          source .venv/bin/activate
+          python3 -m pip install "$wheel_dir"/*.whl
+          python3 -m pip check
+          jq-factor-lab daily-demo --dry-run --compact > daily-plan.json
+          test ! -e outputs
+          jq-factor-lab daily-demo > daily.json
+          jq-factor-lab bar-demo > bar.json
+          db="$(python3 -c 'import json; print(json.load(open("bar.json"))["metrics"]["results_db"]["path"])')"
+          jq-factor-lab read-bar-evaluations --results-db "$db" > bar-read.json
+          if jq-factor-lab dashboard --dry-run --results-db "$db" > dashboard-missing.json; then
+            exit 1
+          else
+            test "$?" -eq 1
+          fi
+          wheel=("$wheel_dir"/*.whl)
+          python3 -m pip install "${wheel[0]}[viz,mcp]"
+          python3 -m pip check
+          jq-factor-lab dashboard --dry-run --compact --results-db "$db" > dashboard-plan.json
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          def compact_payload(name):
+              text = Path(name).read_text()
+              assert len(text.splitlines()) == 1, text
+              return json.loads(text)
+
+          plan = compact_payload("daily-plan.json")
+          assert plan["ok"] is True and plan["exit_code"] == 0 and plan["dry_run"] is True, plan
+          missing = json.loads(Path("dashboard-missing.json").read_text())
+          assert missing["error"]["code"] == "missing_optional_dependency", missing
+          assert "[viz]" in missing["error"]["fix"] and missing["exit_code"] == 1, missing
+          dashboard = compact_payload("dashboard-plan.json")
+          assert dashboard["ok"] is True and dashboard["plan"]["read_only"] is True, dashboard
+
+          daily = json.loads(Path("daily.json").read_text())
+          assert daily["ok"] is True and daily["exit_code"] == 0, daily
+          assert daily["factor"] == "DemoMomentum" and daily["assets"] > 1, daily
+          assert daily["ic_observations"]["1D"] > 0, daily
+          assert (Path(daily["output_dir"]) / "summary.json").is_file(), daily
+
+          bar = json.loads(Path("bar.json").read_text())
+          assert bar["ok"] is True and bar["exit_code"] == 0, bar
+          diagnostics = bar["metrics"]["diagnostics_report"]
+          assert diagnostics["schema"] == "time_series_diagnostics.v1", diagnostics
+          assert diagnostics["horizons"], diagnostics
+
+          read = json.loads(Path("bar-read.json").read_text())
+          assert read["ok"] is True and read["exit_code"] == 0, read
+          assert read["metrics"]["run_count"] == 1, read
+          PY
+      - name: Run the public test suite
+        run: |
+          python3 -m pip install '.[dev,synthesis]'
+          python3 -m pytest -q -p no:cacheprovider
+      - name: Exercise the MCP stdio protocol
+        run: |
+          python3 -m pip install '.[mcp]'
+          python3 -m pytest -q -p no:cacheprovider tests/test_public_mcp.py

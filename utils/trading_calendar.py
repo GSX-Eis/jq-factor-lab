@@ -8,11 +8,9 @@ from pathlib import Path
 
 import pandas as pd
 
+from utils.session_calendar import CalendarCoverageError
+
 DEFAULT_CONFIG = Path(__file__).resolve().parent.parent / 'config' / 'trading_calendar.json'
-
-
-class CalendarCoverageError(ValueError):
-    """Requested dates/history are outside the verified calendar."""
 
 
 def _day(value):
@@ -41,6 +39,16 @@ class TradingCalendar:
         self.fingerprint = hashlib.sha256(json.dumps([
             calendar_id, str(self.start), str(self.end), days.strftime('%Y-%m-%d').tolist()
         ]).encode()).hexdigest()
+
+    @classmethod
+    def from_pmc(cls, start: str = '2016-01-04', end: str = '2026-09-30', *,
+                 calendar_id: str = 'LOCAL_A_SHARE_XSHG_CROSSCHECKED',
+                 overrides_path: str | Path | None = None) -> TradingCalendar:
+        """Build daily sessions from the shared XSHG session core."""
+        from utils.session_calendar import SessionCalendar
+        options = {} if overrides_path is None else {'overrides_path': overrides_path}
+        core = SessionCalendar('XSHG', start, end, **options)
+        return cls(core.sessions(), start, end, calendar_id)
 
     def validate_coverage(self, start, end):
         start, end = _day(start), _day(end)

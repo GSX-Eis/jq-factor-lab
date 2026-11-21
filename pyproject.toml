@@ -1,52 +1,84 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "jq-factor-lab"
 version = "0.1.0"
-description = "JoinQuant and local multi-factor research framework"
-readme = "README.md"
-license = {file = "LICENSE"}
-requires-python = ">=3.11"
+description = "Agent-ready quantitative factor research harness"
+readme = {file = "README.pypi.md", content-type = "text/markdown"}
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+requires-python = ">=3.11,<3.13"
+keywords = ["quantitative-finance", "factor-research", "ai-agent", "time-series", "duckdb"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Science/Research",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Scientific/Engineering :: Information Analysis",
+]
 dependencies = [
-  "numpy>=1.24,<3",
-  "pandas>=2.0,<3",
+  # Keep the NumPy 1.x ABI used by the optional native extensions.
+  "numpy>=1.26.4,<2",
+  "pandas>=2.3.3,<3",
+  # Calendar corrections and session fingerprints are verified against this release.
+  "pandas_market_calendars==5.6.0",
   "scipy>=1.10,<2",
-  "alphalens-reloaded>=0.4,<0.5",
+  # Preserve the tested DuckDB storage and catalog behavior.
   "duckdb==1.5.3",
-  "pyarrow>=14",
+  "pyarrow>=19.0.1,<20",
   "python-dateutil>=2.8",
+]
+
+[project.urls]
+Homepage = "https://github.com/GSX-Eis/jq-factor-lab"
+Repository = "https://github.com/GSX-Eis/jq-factor-lab"
+Issues = "https://github.com/GSX-Eis/jq-factor-lab/issues"
+Changelog = "https://github.com/GSX-Eis/jq-factor-lab/blob/main/CHANGELOG.md"
+
+[project.optional-dependencies]
+dev = ["pytest>=7", "alphalens-reloaded>=0.4,<0.5"]
+synthesis = [
   "scikit-learn>=1.3,<1.8",
   "dcor>=0.6,<0.7",
   "threadpoolctl>=3",
   "joblib>=1.3",
+  "lightgbm>=4,<5",
+  "matplotlib",
+  "seaborn",
 ]
-
-[project.optional-dependencies]
-dev = ["pytest>=7"]
-synthesis = ["lightgbm>=4,<5"]
-qlib = ["pyqlib>=0.9.6,<0.10", "filelock>=3"]
+# pyqlib 0.9.7 ships CPython 3.11/3.12 wheels for Linux x86_64, macOS and Windows x64.
+qlib = ["pyqlib>=0.9.7,<0.10", "filelock>=3"]
 acceleration = ["numba>=0.59"]
 backtest = ["vectorbt>=0.26"]
 mining = ["torch>=2.0"]
+viz = ["streamlit>=1.40,<2", "plotly>=5,<7"]
+mcp = ["mcp>=1.13,<2"]
+# Qlib and Torch are heavy, platform-specific installs. Use individual extras
+# when the target platform lacks compatible wheels or needs a custom Torch index.
+all = ["jq-factor-lab[synthesis,qlib,acceleration,backtest,mining,viz,mcp]"]
 
 [project.scripts]
 jq-factor-lab = "tools.demo_cli:main"
 factorpilot = "tools.demo_cli:main"
+jq-factor-lab-mcp = "tools.mcp_server:main"
+factorpilot-mcp = "tools.mcp_server:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["backtest_and_analysis*", "utils*", "tools*", "examples*", "factor_synthesis*", "factor_mining*", "jq_strategies*", "data_pipeline*", "scripts*", "config"]
+include = ["backtest_and_analysis*", "utils*", "tools*", "examples*", "factor_synthesis*", "factor_mining*", "data_pipeline*", "scripts*", "config"]
 exclude = ["*.tests", "*.tests.*"]
 
 [tool.setuptools.package-data]
-config = ["data_access.json"]
+config = ["data_access.json", "calendar_overrides.json", "futures_calendar_map.json", "demo_calendar.json"]
+utils = ["legacy_cache_identity.json"]
+"scripts.build" = ["cloud_runtime/*.py.txt"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests", "factor_synthesis", "data_pipeline/loaders/tests"]
 pythonpath = ["."]
 
 [tool.setuptools]
-license-files = ["LICENSE", "NOTICE"]
 py-modules = ["run_analysis_main", "run_factor_synthesis", "run_symbolic_factor_mining"]

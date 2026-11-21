@@ -2480,7 +2480,7 @@ class FactorSynthesizer:
         factor_name: str,
         max_loss: float = 0.35,
     ) -> dict:
-        """运行alphalens分析"""
+        """Evaluate the daily composite via the engine-backed legacy result adapter."""
         try:
             runner = AlphalensRunner(
                 n_quantiles=self.config["performance_evaluation"].get("quantiles", 10),
@@ -2499,7 +2499,7 @@ class FactorSynthesizer:
 
                 returns_calculator = ForwardReturnsCalculator(cache_dir="./cache")
 
-                periods = tuple(self.config["performance_evaluation"]["ic_periods"])
+                periods = runner.periods
                 stock_list = list(factor_df.columns)
                 start_date = factor_df.index.min().strftime("%Y-%m-%d")
                 end_date = factor_df.index.max().strftime("%Y-%m-%d")

@@ -420,17 +420,8 @@ class JQFactorAdapter:
             self._probed = True
 
     def _bars_per_day(self, freq: str) -> int:
-        if freq == "1m":
-            return 240
-        if freq == "5m":
-            return 48
-        if freq == "15m":
-            return 16
-        if freq == "30m":
-            return 8
-        if freq == "60m":
-            return 4
-        return 1
+        from utils.time_axis.stock_requirements import stock_bars_per_session
+        return stock_bars_per_session(freq)
 
     def _fetch_valuation_data(self, securities, start_date, end_date, target_fields):
         if not target_fields:

@@ -3,7 +3,7 @@
 公开版提供 JQFactorAdapter、共用因子运行模块和单文件构建器。它允许用户将自己的因子打包到聚宽运行。本地构建不联网；生成文件运行时会请求聚宽数据。
 
 ```bash
-python -m scripts.build_jq_strategy \
+python3 -m scripts.build_jq_strategy \
   --factor-files examples/momentum.py \
   --requirements config/factor_requirements.json \
   --cloud-api-mapping config/cloud_api_mapping.json \

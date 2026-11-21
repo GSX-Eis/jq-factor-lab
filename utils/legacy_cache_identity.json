@@ -1,0 +1,20 @@
+{
+  "baseline_sha256": "42d2f3542e45acffef616254d290c0789df8687e2fa7feb9930ef0f7269ab52d",
+  "equivalent_sha256": "a38f6ed74c458ddd01ab8905c1dd030a6794b9ad6582403b09bc93c105eb2dfa",
+  "dependencies": {
+    "bar_source.py": "33199c50c8bc14fae45bef8fd489a58b6ba1b24aeffce4c28b025a692bf3e05d",
+    "bar_catalog.py": "5d042a9a9890638777a9940d2b209539d94a1a9c7463f30eb75ceb32649e8b2c",
+    "time_axis/frequency.py": "1a8a2e83ec6d353dd90d2eed09158f83c8b11ae02063ced0274a728c2a405c1e",
+    "time_axis/schedule.py": "b660d5b9e1bff7e9269532e590be78d35e2343454518b4be1d16f79420b486e1",
+    "time_axis/stock_requirements.py": "146b9813cab3e1800f0f423c7bb3904b34ace1a3901951eca88363be0522aeea",
+    "legacy_cache_identity.py": "1e5a31dc7bb0ac02714d3584ea50ecff77bfba355c33408e630501c32e4e1c4e",
+    "bars/source.py": "589edda63d4554ece40a344b5197d442a095380e5629aa3a42d2603d97b4dd6c",
+    "bars/catalog.py": "c1f3cd6638206a9cf0d0cc2618b699a847185a972e34c5fcc21e5d00f4b37e27",
+    "bars/quality.py": "f4ae8c6c63dd3516d83a430f96cbfe0685427c42b304a538acad3ef9aae94a4e",
+    "factor_core/__init__.py": "94ec5f1d33820bff319fcc58e49384372d16c1178a7e6937a9522928f58564d7",
+    "factor_core/bar_bridge.py": "631b1e4b2c6709e4188168000b4f0193b7b95b75fb6ca19cb5b2e31ef349f587",
+    "factor_core/cache.py": "0f069d66d92be60123213799479cde058fdb610e0b68e12ae0e404044844e5b9",
+    "factor_core/execution.py": "2ba3db52602fa30a2f7031ac0c694715b90d5bc4388a45b3b5973ad83322f6b4",
+    "factor_core/legacy_storage.py": "aed500d0db4dfcc194dd55fb69f9f9e9c4933887e22b70f2b3e05f0c3d7a4b88"
+  }
+}

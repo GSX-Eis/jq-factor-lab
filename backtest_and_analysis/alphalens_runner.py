@@ -1,10 +1,45 @@
+from dataclasses import asdict
+
 import pandas as pd
 import numpy as np
-import alphalens
+import re
 from typing import Dict
 import logging
 from numbers import Real
+from backtest_and_analysis.evaluation import EvaluationEngine, evaluate_interval_usability
+from backtest_and_analysis.evaluation.panel import EvaluationPanel
 from backtest_and_analysis.forward_returns_calculator import ForwardReturnsValidationError
+
+
+def _demean_float32_by_date(source: pd.Series) -> pd.Series:
+    """Match the legacy float32 reduction in the original order and day width."""
+    codes = source.index.codes[0]
+    order = np.argsort(codes, kind="stable")
+    _, widths = np.unique(codes[order], return_counts=True)
+    starts = np.cumsum(widths) - widths
+    values = source.to_numpy()
+    excess = np.empty_like(values)
+    for width in np.unique(widths):
+        positions = order[starts[widths == width, None] + np.arange(width)]
+        day = values[positions]
+        missing = np.isnan(day)
+        # Zero-fill as pandas nanmean does, retaining NumPy's width-dependent summation.
+        sums = np.where(missing, np.float32(0), day).sum(axis=1)
+        with np.errstate(invalid="ignore"):
+            centers = sums / (~missing).sum(axis=1, dtype=np.float32)
+            excess[positions] = day - centers[:, None]
+    return pd.Series(excess, index=source.index)
+
+
+class InsufficientCrossSectionAssets(ValueError):
+    code = "insufficient_cross_section_assets"
+
+    def __init__(self) -> None:
+        super().__init__(
+            "Daily cross-sectional analysis requires at least 2 assets. "
+            "Provide prices for multiple assets, or supply Bar data to "
+            "jq-factor-lab time-series-analysis --analysis-mode time_series for one instrument."
+        )
 
 
 class MaxLossExceededError(ValueError):
@@ -12,13 +47,15 @@ class MaxLossExceededError(ValueError):
 
 
 class AlphalensRunner:
-    """执行 Alphalens 分析的类"""
+    """Adapt daily evaluation to the historical Alphalens-style dictionary."""
     
     def __init__(
         self,
         n_quantiles: int = 5,
         periods: tuple = (1, 5, 10),
         execution_lag: int = 1,
+        *,
+        _force_raw_quantiles: bool = False,
     ):
         """
         初始化 Alphalens 运行器
@@ -30,6 +67,7 @@ class AlphalensRunner:
         self.n_quantiles = n_quantiles
         self.periods = periods
         self.execution_lag = execution_lag
+        self._force_raw_quantiles = _force_raw_quantiles
         self.logger = logging.getLogger(self.__class__.__name__)
     
     def run(self, factor_df: pd.DataFrame, pricing: pd.Series, forward_returns: pd.DataFrame = None, max_loss: float = 0.35) -> Dict[str, pd.DataFrame]:
@@ -106,6 +144,8 @@ class AlphalensRunner:
             date_level = 'date' if 'date' in pricing.index.names else -1
             dates = pd.to_datetime(pricing.index.get_level_values(date_level))
             calendar.validate_coverage(dates.min(), dates.max())
+        if not factor_df.empty and len(factor_df.columns.unique()) < 2:
+            raise InsufficientCrossSectionAssets()
         try:
             input_count = int(np.isfinite(factor_df.to_numpy(dtype=float, na_value=np.nan)).sum())
             # 0. 基本数据验证
@@ -127,14 +167,6 @@ class AlphalensRunner:
             if data_coverage < 0.05:  # 少于5%的数据覆盖率
                 self.logger.warning(f"Factor data coverage too low ({data_coverage:.2%}), returning minimal results")
                 return minimal_results()
-            
-            if factor_df.shape[1] == 1:
-                # 单股票情况，从pricing中获取正确的股票代码
-                if isinstance(pricing.index, pd.MultiIndex):
-                    assets = pricing.index.get_level_values(0).unique()
-                    if len(assets) == 1:
-                        factor_df = factor_df.rename(columns={factor_df.columns[0]: assets[0]})
-                        self.logger.info(f"Renamed column to asset code: {assets[0]}")
             
             # 2. 确保索引都是DatetimeIndex
             if not isinstance(factor_df.index, pd.DatetimeIndex):
@@ -265,9 +297,9 @@ class AlphalensRunner:
                     self.logger.warning(f"Insufficient data points ({len(factor_series)}) for proper analysis")
                     return minimal_results()
                 
-                # 使用alphalens进行分析
+                # Align daily labels for the evaluation engine
                 try:
-                    self.logger.info("Attempting alphalens get_clean_factor_and_forward_returns...")
+                    self.logger.info("Preparing daily factor and forward returns...")
                     
                     # Fix timezone issues - ensure both factor and price indices are timezone-naive
                     if hasattr(factor_series.index.get_level_values(0), 'tz') and factor_series.index.get_level_values(0).tz is not None:
@@ -293,7 +325,7 @@ class AlphalensRunner:
                             execution_lag=self.execution_lag,
                         )
                     
-                    # Try the main alphalens function
+                    # Prepare the legacy eligible sample before evaluating the panel.
                     try:
                         self.logger.info("使用真实交易日预计算前瞻收益率...")
                         clean_factor = self._prepare_factor_data_with_precomputed_returns(
@@ -487,19 +519,14 @@ class AlphalensRunner:
         
         self.logger.info(f"Future data: {len(future_dates)} days available (sufficient: {future_sufficient})")
         
-        # Check data completeness for each stock
-        missing_data_count = 0
-        total_points = 0
-        for stock in common_stocks:
-            for date in common_dates:
-                total_points += 1
-                if date in prices_df.index and (pd.isna(prices_df.loc[date, stock]) or prices_df.loc[date, stock] == 0):
-                    missing_data_count += 1
-        
-        if total_points > 0:
+        # Check data completeness across the overlapping price panel.
+        prices = prices_df.loc[common_dates, common_stocks]
+        total_points = prices.size
+        if total_points:
+            missing_data_count = (prices.isna() | prices.eq(0)).to_numpy().sum()
             missing_pct = missing_data_count / total_points * 100
             self.logger.info(f"Price data missing rate: {missing_pct:.1f}% ({missing_data_count}/{total_points})")
-        
+
         # Log data info
         self.logger.info(f"Factor index type: {type(factor_series.index)}")
         self.logger.info(f"Price index type: {type(prices_df.index)}")
@@ -531,114 +558,91 @@ class AlphalensRunner:
                 # This is real alphalens results
                 self.logger.info("Processing full Alphalens results")
                 
-                # Pairwise Spearman IC keeps shorter horizons available when a
-                # longer horizon has already run out of future observations.
-                period_columns = [
-                    col for col in factor_data.columns
-                    if col not in ('factor', 'factor_quantile')
-                ]
-                ic_data = pd.DataFrame({
-                    period: factor_data.groupby(level=0, observed=True).apply(
-                        lambda group, column=period: group['factor'].corr(
-                            group[column], method='spearman'
-                        )
-                    )
-                    for period in period_columns
-                })
-                
-                # Convert periods to standardized format for IC data
-                ic_data_formatted = {}
-                for period in ic_data.columns:
-                    period_key = f'{period}D' if isinstance(period, int) else str(period)
-                    ic_data_formatted[period_key] = ic_data[period]
-                
-                ic_data = pd.DataFrame(ic_data_formatted)
-                
-                # Calculate IR (Information Ratio)
-                ir_data = {}
-                for period in ic_data.columns:
-                    period_ic = ic_data[period].dropna()
-                    if not period_ic.empty and len(period_ic) > 1:
-                        mean_ic = period_ic.mean()
-                        ic_std = period_ic.std()
-                        ir = mean_ic / ic_std if ic_std != 0 else np.nan
-                    else:
-                        ir = period_ic.mean() if not period_ic.empty else np.nan
-                    ir_data[period] = ir
-                
-                # Convert periods for IR data  
-                ir_data_formatted = {}
-                for period, ir_val in ir_data.items():
-                    period_key = f'{period}D' if isinstance(period, int) else str(period)
-                    ir_data_formatted[period_key] = ir_val
-                
-                ir_df = pd.DataFrame.from_dict(ir_data_formatted, orient='index', columns=['ir'])
-                ir_df.index.name = 'period'
-                
-                # Calculate quantile returns using alphalens - FIXED: Proper error handling and fallback
-                try:
-                    mean_return_by_q, std_err = alphalens.performance.mean_return_by_quantile(
-                        factor_data, 
-                        by_date=True
-                    )
-                    self.logger.info(f"Successfully calculated quantile returns using alphalens: {mean_return_by_q.shape}")
-                    
-                    # Ensure column names are properly formatted
-                    if hasattr(mean_return_by_q.columns, 'levels'):
-                        # MultiIndex columns - rename period level
-                        new_columns = []
-                        for period, quantile in mean_return_by_q.columns:
-                            period_key = f'{period}D' if isinstance(period, int) else str(period)
-                            new_columns.append((period_key, quantile))
-                        mean_return_by_q.columns = pd.MultiIndex.from_tuples(new_columns, names=['period', 'quantile'])
-                    else:
-                        # Single level columns - add 'D' suffix if needed
-                        new_columns = {}
-                        for col in mean_return_by_q.columns:
-                            period_key = f'{col}D' if isinstance(col, int) else str(col)
-                            new_columns[col] = period_key
-                        mean_return_by_q = mean_return_by_q.rename(columns=new_columns)
-                    
-                except Exception as e:
-                    self.logger.warning(f"Standard alphalens quantile returns calculation failed: {e}")
-                    # Try manual calculation as fallback
-                    try:
-                        self.logger.info("Attempting manual quantile returns calculation...")
-                        quantile_returns_dict = {}
-                        
-                        # Get period columns (forward returns)
-                        period_cols = [col for col in factor_data.columns if str(col).endswith('D') or isinstance(col, int)]
-                        if not period_cols:
-                            period_cols = [col for col in factor_data.columns if col not in ['factor', 'factor_quantile']]
-                        
-                        self.logger.info(f"Found period columns: {period_cols}")
-                        
-                        for period_col in period_cols:
-                            if period_col in factor_data.columns and 'factor_quantile' in factor_data.columns:
-                                # Calculate quantile returns for this period
-                                quantile_returns = factor_data.groupby([
-                                    factor_data.index.get_level_values(0),  # date
-                                    'factor_quantile'
-                                ])[period_col].mean().unstack(fill_value=np.nan)
-                                
-                                # Standardize period name
-                                period_key = f'{period_col}D' if isinstance(period_col, int) else str(period_col)
-                                quantile_returns_dict[period_key] = quantile_returns
-                            
-                        if quantile_returns_dict:
-                            mean_return_by_q = pd.concat(quantile_returns_dict, axis=1)
-                            mean_return_by_q.columns.names = ['period', 'quantile']
-                            self.logger.info(f"Manual quantile returns calculation succeeded: {mean_return_by_q.shape}")
-                        else:
-                            self.logger.warning("Manual quantile returns calculation found no data")
-                            mean_return_by_q = pd.DataFrame()
-                            
-                    except Exception as e2:
-                        self.logger.error(f"Manual quantile returns calculation also failed: {e2}")
-                        mean_return_by_q = pd.DataFrame()
-                    
+                values = factor_data.drop(columns="factor_quantile")
+                panel = EvaluationPanel.from_long(pd.DataFrame(
+                    values.to_numpy(dtype=float, na_value=np.nan),
+                    index=values.index, columns=values.columns,
+                ))
+                buckets = factor_data["factor_quantile"].unstack().reindex(
+                    index=panel.datetimes, columns=panel.assets,
+                ).fillna(0).to_numpy(dtype=np.intp)
+                names = {h: f"{h}D" if isinstance(h, int) else str(h) for h in panel.returns}
+                periods = [h for h in panel.returns
+                           if re.fullmatch(r"(?:\d+(?:[Dhms]|ms|us|ns]))+", names[h], re.IGNORECASE)]
+                # Legacy pandas produced object standard-deviation arrays for
+                # nullable Float32, selecting the raw quantile table.
+                raw_quantiles = self._force_raw_quantiles or any(
+                    isinstance(factor_data[h].dtype, pd.Float32Dtype) for h in periods
+                )
+                statistics = EvaluationEngine("cross_sectional").evaluate(
+                    panel, n_quantiles=max(2, self.n_quantiles, buckets.max(initial=0)),
+                    bucket_labels=buckets, _legacy_ic_rounding=True,
+                    return_mode="raw" if raw_quantiles else "cross_section_excess",
+                    bucket_standard_errors=not raw_quantiles,
+                ).splits["full"].statistics
+                ic_data = pd.DataFrame(
+                    {names[h]: result.ic.values for h, result in statistics.horizons.items()},
+                    index=panel.datetimes,
+                )
+                ic_data.attrs["hac_inference"] = {
+                    names[h]: asdict(evaluate_interval_usability(
+                        result.hac, point_estimate=result.ic_summary.mean,
+                    ))
+                    for h, result in statistics.horizons.items()
+                }
+                # Use the historical pandas variance and single-IC convention for the dictionary.
+                ir_by_period = {}
+                for name, values in ic_data.items():
+                    observed = values.dropna()
+                    deviation = observed.std()
+                    ir_by_period[name] = (observed.mean() if len(observed) == 1 else
+                                          observed.mean() / deviation if deviation > 0 else np.nan)
+                ir_df = pd.Series(ir_by_period, name="ir").rename_axis("period").to_frame()
+
+                if raw_quantiles:
+                    # Keep occupied buckets even when a particular horizon lacks labels.
+                    occupied = sorted(factor_data["factor_quantile"].unique())
+                    periods = [h for h in panel.returns if str(h).endswith("D") or isinstance(h, int)]
+                    mean_return_by_q = pd.concat({
+                        names[h]: pd.DataFrame(
+                            statistics.horizons[h].bucket_returns[:, np.asarray(occupied) - 1],
+                            index=panel.datetimes, columns=occupied,
+                        ) for h in periods
+                    }, axis=1)
+                    mean_return_by_q.columns.names = ["period", "quantile"]
                     std_err = pd.DataFrame()
-                
+                else:
+                    # Match the (bucket, date) layout, including buckets where
+                    # every label for a given horizon is missing.
+                    present = np.zeros((len(panel.datetimes), statistics.turnover.shape[1] + 1), dtype=bool)
+                    rows, cols = np.nonzero(buckets)
+                    present[rows, buckets[rows, cols]] = True
+                    bucket, date = np.nonzero(present.T)
+                    index = pd.MultiIndex.from_arrays(
+                        [bucket, panel.datetimes.take(date)], names=["factor_quantile", "date"],
+                    )
+                    mean_return_by_q = pd.DataFrame({
+                        names[h]: statistics.horizons[h].bucket_returns[date, bucket - 1]
+                        for h in periods
+                    }, index=index)
+                    std_err = pd.DataFrame({
+                        names[h]: statistics.horizons[h].bucket_standard_errors[date, bucket - 1]
+                        for h in periods
+                    }, index=index)
+
+                    # The legacy adapter rounded demeaning, bucket means, and bucket
+                    # standard deviations in the input's single precision.
+                    for h in periods:
+                        if factor_data[h].dtype != np.dtype("float32"):
+                            continue
+                        source = factor_data[h]
+                        excess = _demean_float32_by_date(source)
+                        moments = excess.groupby([factor_data["factor_quantile"],
+                                                  source.index.get_level_values(0)]).agg(["mean", "std", "count"])
+                        mean_return_by_q[names[h]] = moments["mean"].astype(float)
+                        std_err[names[h]] = moments["std"].astype(float) / np.sqrt(moments["count"])
+
+
             elif isinstance(factor_data, pd.DataFrame) and 'forward_returns' in factor_data.columns:
                 # This is our improved basic fallback result
                 self.logger.info("Processing improved basic fallback results")
@@ -863,6 +867,6 @@ class AlphalensRunner:
         clean_factor = clean_factor.dropna(subset=return_columns, how='all')
         
         self.logger.info(f"最终因子数据形状: {clean_factor.shape}")
-        self.logger.info(f"包含的前瞻收益率期间: {[col for col in clean_factor.columns if col.endswith('D')]}")
+        self.logger.info(f"包含的前瞻收益率期间: {[col for col in clean_factor.columns if str(col).endswith('D')]}")
         
         return clean_factor

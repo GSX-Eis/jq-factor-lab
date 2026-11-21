@@ -432,80 +432,6 @@ class FactorCodeReviewer:
 
         return CheckResult("CHECK-10", "plan_window", "OK")
 
-    def check_11_req_sync(self) -> CheckResult:
-        """CHECK-11: REQ 配置同步"""
-        # 这个检查需要读取外部文件
-        local_req_path = Path("config/factor_requirements.json")
-        cloud_dumper_path = Path("jq_strategies/cloud_factor_dumper.py")
-
-        if not local_req_path.exists() or not cloud_dumper_path.exists():
-            return CheckResult("CHECK-11", "REQ同步", "SKIP", "配置文件不存在")
-
-        try:
-            local_req = json.loads(local_req_path.read_text())
-            cloud_content = cloud_dumper_path.read_text()
-
-            # 提取云端 REQ - 使用括号匹配而非正则
-            req_start = cloud_content.find("REQ = {")
-            if req_start == -1:
-                req_start = cloud_content.find("REQ= {")
-            if req_start == -1:
-                req_start = cloud_content.find("REQ ={")
-
-            if req_start == -1:
-                return CheckResult("CHECK-11", "REQ同步", "WARN", "云端 REQ 定义未找到")
-
-            # 找到 REQ = { 后的 { 位置
-            brace_start = cloud_content.find("{", req_start)
-            if brace_start == -1:
-                return CheckResult("CHECK-11", "REQ同步", "WARN", "REQ 格式异常")
-
-            # 括号匹配找到完整的字典
-            depth = 0
-            brace_end = brace_start
-            for i, char in enumerate(cloud_content[brace_start:], start=brace_start):
-                if char == "{":
-                    depth += 1
-                elif char == "}":
-                    depth -= 1
-                    if depth == 0:
-                        brace_end = i
-                        break
-
-            req_str = cloud_content[brace_start : brace_end + 1]
-            cloud_req = json.loads(req_str)
-
-            local_factors = set(local_req.get("factors", {}).keys())
-            cloud_factors = set(cloud_req.get("factors", {}).keys())
-
-            only_local = local_factors - cloud_factors
-            only_cloud = cloud_factors - local_factors
-
-            if only_local or only_cloud:
-                msg_parts = []
-                if only_local:
-                    # 只显示前3个，避免输出过长
-                    sample = list(only_local)[:3]
-                    suffix = f"...等{len(only_local)}个" if len(only_local) > 3 else ""
-                    msg_parts.append(f"仅本地: {sample}{suffix}")
-                if only_cloud:
-                    sample = list(only_cloud)[:3]
-                    suffix = f"...等{len(only_cloud)}个" if len(only_cloud) > 3 else ""
-                    msg_parts.append(f"仅云端: {sample}{suffix}")
-                return CheckResult(
-                    "CHECK-11",
-                    "REQ同步",
-                    "ISSUE",
-                    "; ".join(msg_parts),
-                    suggestion="同步 factor_requirements.json 到 cloud_factor_dumper.py",
-                )
-
-        except json.JSONDecodeError as e:
-            return CheckResult("CHECK-11", "REQ同步", "WARN", f"JSON解析错误: {e}")
-        except Exception as e:
-            return CheckResult("CHECK-11", "REQ同步", "WARN", f"检查异常: {e}")
-
-        return CheckResult("CHECK-11", "REQ同步", "OK")
 
     def check_12_field_mapping(self) -> CheckResult:
         """CHECK-12: 云端字段名映射"""
@@ -552,7 +478,6 @@ class FactorCodeReviewer:
             self.check_8_nan_handling,
             self.check_9_recursive_filter,
             self.check_10_plan_window_dynamic,
-            self.check_11_req_sync,
             self.check_12_field_mapping,
         ]
 

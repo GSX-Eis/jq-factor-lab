@@ -26,8 +26,10 @@ def test_mining_only_ic_returns_daily_rank_ic_without_future_prices() -> None:
     ic = _compute_mining_only_ic(factor, pricing, (5,))
 
     assert list(ic.columns) == ["5D"]
-    assert not ic.dropna().empty
-    assert ic.index.max() <= dates.max()
+    pd.testing.assert_frame_equal(
+        ic, pd.DataFrame({"5D": 1.0}, index=dates[:-6].rename("date")),
+        check_freq=False, rtol=0, atol=1e-12,
+    )
 
 
 def test_mining_only_rejects_post_2023_window() -> None:

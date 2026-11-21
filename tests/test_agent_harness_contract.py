@@ -10,9 +10,9 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
-def _run(*args: str) -> subprocess.CompletedProcess[str]:
+def _run(output_root: Path, *args: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        [sys.executable, "-m", "tools.agent_harness.cli", *args],
+        [sys.executable, "-m", "tools.agent_harness.cli", *args, "--output-root", str(output_root)],
         cwd=str(REPO_ROOT),
         text=True,
         capture_output=True,
@@ -26,6 +26,7 @@ def _payload(proc: subprocess.CompletedProcess[str]) -> dict:
 
 def test_dry_run_shape_for_all_commands(tmp_path: Path) -> None:
     commands = [
+        ["time-series-analysis", "--dry-run", "--config", "missing.json"],
         ["single-factor-analysis", "--dry-run", "--factor", "factors/exp/example.py"],
         ["factor-synthesis", "--dry-run", "--config", "missing.json"],
         ["monitor-refresh", "--dry-run"],
@@ -42,12 +43,14 @@ def test_dry_run_shape_for_all_commands(tmp_path: Path) -> None:
 
     for idx, command in enumerate(commands):
         json_out = tmp_path / f"dry_run_{idx}.json"
-        proc = _run(*command, "--json-out", str(json_out))
+        output_root = tmp_path / f"harness_{idx}"
+        proc = _run(output_root, *command, "--json-out", str(json_out))
         assert proc.returncode == 0, proc.stderr
         payload = _payload(proc)
         assert required_top_level.issubset(payload.keys())
         assert payload["ok"] is True
         assert payload["summary"]["reason"] == "dry_run"
+        assert next(output_root.rglob("summary.json"), None) is not None
         assert json_out.exists()
         mirrored = json.loads(json_out.read_text(encoding="utf-8"))
         assert mirrored["command"]["name"] == payload["command"]["name"]
@@ -109,16 +112,17 @@ def test_symbolic_quality_gate_failure_preserves_explicit_reason(
 
 
 
-def test_fake_result_is_machine_readable() -> None:
-    proc = _run("single-factor-analysis", "--fake-result", "success")
+def test_fake_result_is_machine_readable(tmp_path: Path) -> None:
+    proc = _run(tmp_path, "single-factor-analysis", "--fake-result", "success")
     payload = _payload(proc)
     assert proc.returncode == 0
     assert payload["ok"] is True
     assert payload["command"]["name"] == "single-factor-analysis"
 
 
-def test_single_factor_materialize_only_is_forwarded() -> None:
+def test_single_factor_materialize_only_is_forwarded(tmp_path: Path) -> None:
     proc = _run(
+        tmp_path,
         "single-factor-analysis",
         "--dry-run",
         "--config",
@@ -134,8 +138,9 @@ def test_single_factor_materialize_only_is_forwarded() -> None:
     assert payload["metrics"]["planned_materialize_only"] is True
 
 
-def test_single_factor_materialize_only_requires_explicit_factor() -> None:
+def test_single_factor_materialize_only_requires_explicit_factor(tmp_path: Path) -> None:
     proc = _run(
+        tmp_path,
         "single-factor-analysis",
         "--dry-run",
         "--config",
@@ -147,8 +152,9 @@ def test_single_factor_materialize_only_requires_explicit_factor() -> None:
     assert "--materialize-only requires --factor" in proc.stderr
 
 
-def test_single_factor_mining_only_is_forwarded() -> None:
+def test_single_factor_mining_only_is_forwarded(tmp_path: Path) -> None:
     proc = _run(
+        tmp_path,
         "single-factor-analysis",
         "--dry-run",
         "--factor",
