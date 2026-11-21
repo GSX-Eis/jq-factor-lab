@@ -9,7 +9,7 @@ from typing import Any
 import pandas as pd
 
 from backtest_and_analysis.evaluation.calibration import Trial, TrialLedger
-from backtest_and_analysis.evaluation.types import BootstrapInterval, HACInterval
+from backtest_and_analysis.evaluation.types import BOOTSTRAP_V2, BootstrapInterval, HACInterval
 
 from .grid_validation import LabelGrid, build_label_grid, matching_calendars, resolve_bucket_strategy
 from .interval_validation import _interval_fields, _usability, _verified_interval
@@ -145,7 +145,7 @@ def _split_row(
     row: dict[str, Any], *, split: str, key: StreamKey, time_series: bool,
     trial: dict[str, Any], fit: dict[str, Any] | None, field: str, labels: pd.DataFrame, grid: LabelGrid,
     cutoffs: tuple[pd.Timestamp | None, pd.Timestamp | None], oos_grid_start: pd.Timestamp | None,
-    minimum: SampleMinimum, config: dict[str, Any],
+    minimum: SampleMinimum, config: dict[str, Any], code_version: str,
 ) -> dict[str, Any]:
     frequency, horizon, instrument = key
     method = "bootstrap" if time_series else "hac"
@@ -178,10 +178,11 @@ def _split_row(
     if split == "train":
         _require(oos_grid_start is not None and end < oos_grid_start, f"{field}.grid_end_utc",
                  "a clock strictly before the matching OOS grid_start_utc")
-    actual, observed_count, section_sizes, section_ics = check_split_labels(
+    actual, observed_count, section_sizes, section_ics, pair_pattern = check_split_labels(
         labels, grid=grid, time_series=time_series, split=split, start=start, end=end, train_end=cutoffs[0],
         oos_start=cutoffs[1], oos_grid_start=oos_grid_start, grid_size=grid_size,
         minimum=minimum, claimed_count=n, point_reason=ic["reason"], field=field,
+        bootstrap_v2=time_series and interval["method_version"] == BOOTSTRAP_V2[0],
     )
     check_point(statistic, actual, f"{field}.ic.{ic_field}")
     _require(n == observed_count, field, "IC observation count matching the split label pairs")
@@ -192,8 +193,9 @@ def _split_row(
         interval, use, time_series=time_series, horizon=horizon,
         statistic=statistic if statistic is not None else float("nan"),
         point_reason=ic["reason"] if time_series else None, n=n, cross_section_sizes=section_sizes,
-        section_ics=section_ics, bounds=bounds, p_value=p, p_method=p_method, alpha=alpha,
+        section_ics=section_ics, pair_pattern=pair_pattern, bounds=bounds, p_value=p, p_method=p_method, alpha=alpha,
         config=config, field=f"{field}.interval_usability", legacy=legacy,
+        raw_interval=raw_interval, code_version=code_version,
     )
     if trial:
         _require(
@@ -219,7 +221,7 @@ def _split_row(
 
 def prepare_inference(
     summary: dict[str, Any], identity_hash: str, label_streams: dict[StreamKey, pd.DataFrame], minimum: SampleMinimum,
-    *, instruments: pd.Index, frequencies: pd.Index,
+    *, instruments: pd.Index, frequencies: pd.Index, code_version: str,
 ) -> tuple[dict[str, Any], list[tuple[Any, ...]]]:
     """Check the summary-only v2 sections and retain the whole report alongside projections."""
     _object(summary, "", "splits", "interval_usability", "trial_ledger")
@@ -329,6 +331,7 @@ def prepare_inference(
                 fit=fits[frequency][instrument] if fits is not None else None, labels=label_streams[key],
                 grid=grids[grid_key],
                 cutoffs=cutoffs, oos_grid_start=oos_grid_starts.get(key), minimum=minimum, config=config,
+                code_version=code_version,
             )
             purged[str(horizon)] += record["split_purged_count"]
             record.update(identity_hash=identity_hash, row_index=len(tuples))

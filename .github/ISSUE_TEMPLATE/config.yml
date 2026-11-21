@@ -1,8 +1,8 @@
 blank_issues_enabled: true
 contact_links:
-  - name: 3-minute Quickstart
-    url: https://github.com/GSX-Eis/jq-factor-lab/blob/main/README.md#3-minute-quickstart
-    about: Run the daily and Bar demos with offline synthetic data.
+  - name: 60-second Quickstart
+    url: https://github.com/GSX-Eis/jq-factor-lab/blob/dev/README.md#60-second-quickstart
+    about: Run the offline daily, Bar and synthesis demos.
   - name: Coding agent guide
-    url: https://github.com/GSX-Eis/jq-factor-lab/blob/main/AGENTS.md
+    url: https://github.com/GSX-Eis/jq-factor-lab/blob/dev/AGENTS.md
     about: Find the CLI commands and evaluation rules for coding agents.

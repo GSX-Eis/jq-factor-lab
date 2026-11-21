@@ -64,6 +64,11 @@ def _pairs(
     return x, y, paired
 
 
+def _validate_direction(direction: int) -> None:
+    if isinstance(direction, (bool, np.bool_)) or direction not in (-1, 1):
+        raise ValueError("direction must be -1 or 1")
+
+
 def _positive_int(value: int, name: str, minimum: int = 1) -> int:
     if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, np.integer)) or value < minimum:
         raise ValueError(f"{name} must be an integer >= {minimum}")

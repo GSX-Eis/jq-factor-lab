@@ -385,8 +385,7 @@ def evaluate_cross_section(
         raise ValueError("ic_method must be 'spearman' or 'pearson'")
     if return_mode not in ("raw", "cross_section_excess"):
         raise ValueError("return_mode must be 'raw' or 'cross_section_excess'")
-    if isinstance(direction, (bool, np.bool_)) or direction not in (-1, 1):
-        raise ValueError("direction must be -1 or 1")
+    kernels._validate_direction(direction)
     if min_samples is None:
         min_samples = 2 if frequency == "daily" else 3
     min_samples = kernels._positive_int(min_samples, "min_samples", minimum=2)

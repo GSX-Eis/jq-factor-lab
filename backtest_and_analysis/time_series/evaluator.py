@@ -20,10 +20,14 @@ import pandas as pd
 from backtest_and_analysis.evaluation import (
     EvaluationEngine, IntervalUsability, evaluate_interval_usability,
 )
-from backtest_and_analysis.evaluation.engine import DescriptiveSample
+from backtest_and_analysis.evaluation.engine import DescriptiveSample, _validate_hac_lag
+from backtest_and_analysis.evaluation.kernels import _validate_direction
 from backtest_and_analysis.evaluation.panel import EvaluationPanel
-from backtest_and_analysis.evaluation.quantiles import Standardization
+from backtest_and_analysis.evaluation.quantiles import Standardization, _validate_standardization
 from backtest_and_analysis.evaluation.split import SplitConfig, SplitEvaluation
+from backtest_and_analysis.evaluation.time_series import (
+    _validate_block_length_for_horizon, _validate_bootstrap_options,
+)
 from backtest_and_analysis.evaluation.types import CrossSectionResult, TimeSeriesResult
 
 from .contracts import (
@@ -32,7 +36,7 @@ from .contracts import (
     _validate_aligned_factor_frame, validate_bar_frame,
 )
 from .inference import (
-    BarTrialFamily, _bar_panel, _record_trials, _selection_window, build_bar_splits,
+    BarTrialFamily, _SelectionWindow, _bar_panel, _record_trials, _selection_window, build_bar_splits,
 )
 from .labels import BarReturnLabeler, LABEL_COLUMNS
 
@@ -611,10 +615,9 @@ class BarCrossSectionalEvaluator:
 
 def _evaluate_bar_groups(
     prepared: _PreparedLabels, evaluator: TimeSeriesEvaluator | BarCrossSectionalEvaluator, *,
-    labeler: BarReturnLabeler, split: SplitConfig | None, options: dict[str, Any],
+    labeler: BarReturnLabeler, window: _SelectionWindow, options: dict[str, Any],
     family: BarTrialFamily | None, factor_id: str,
 ) -> EvaluationResult:
-    window = _selection_window(split)
     selection_split, split = window
     if family is not None:
         family._validate_evaluation_window(window)
@@ -689,6 +692,65 @@ def _calendar_mapping_hash(calendars: Mapping[str, Mapping[str, Any]]) -> str:
     return hashlib.sha256(json.dumps(identities, sort_keys=True).encode()).hexdigest()
 
 
+def _prepare_bar_evaluation(
+    labeler: BarReturnLabeler | None, *, analysis_mode: str | None, n_quantiles: int,
+    min_ic_samples: int, min_cross_section_size: int,
+    split: SplitConfig | Mapping[str, str | pd.Timestamp] | None = None,
+    bootstrap: Mapping[str, Any] | None = None, hac_lag: int | Literal['auto'] | None = None,
+    direction: int | None = None, standardization: Standardization | None = None,
+    calibration_scenario: str | None = None, trial_selection: Mapping[str, Any] | None = None,
+    factor_id: str = 'factor_value', trial_family: BarTrialFamily | None = None,
+    diagnostics: bool = False,
+) -> tuple[TimeSeriesEvaluator | BarCrossSectionalEvaluator, _SelectionWindow, BarTrialFamily | None]:
+    mode = _mode(analysis_mode)
+    evaluator = (TimeSeriesEvaluator(analysis_mode=mode, n_quantiles=n_quantiles,
+                                     min_ic_samples=min_ic_samples) if mode == 'time_series' else
+                 BarCrossSectionalEvaluator(analysis_mode=mode, n_quantiles=n_quantiles,
+                                             min_cross_section_size=min_cross_section_size))
+    if not isinstance(labeler, BarReturnLabeler):
+        raise ContractValidationError('labeler must be a BarReturnLabeler')
+    if not isinstance(diagnostics, bool) or (diagnostics and mode != 'time_series'):
+        raise ContractValidationError('diagnostics must be a boolean and requires time_series when enabled')
+    for name, value, supported in (
+        ('bootstrap', bootstrap, {'block_length', 'n_boot', 'seed', 'min_valid_replicates', 'alpha'}),
+        ('trial_selection', trial_selection, {'method', 'alpha'}),
+    ):
+        if value is not None and (not isinstance(value, Mapping) or value.keys() - supported):
+            raise ContractValidationError(f'{name} must be a mapping with keys from {sorted(supported)}')
+    if bootstrap is not None and mode != 'time_series':
+        raise ContractValidationError('bootstrap requires time_series analysis')
+    if hac_lag is not None and mode != 'cross_sectional':
+        raise ContractValidationError('hac_lag requires cross_sectional analysis')
+    if standardization is not None and (mode != 'time_series' or split is None):
+        raise ContractValidationError('standardization requires a time_series train/oos split')
+    if isinstance(split, Mapping):
+        split = SplitConfig(**split)
+    if split is not None and not isinstance(split, SplitConfig):
+        raise ContractValidationError('split must specify train_end and oos_start')
+    window = _selection_window(split)
+    _validate_standardization(standardization)
+    if direction is not None:
+        _validate_direction(direction)
+    if bootstrap is not None:
+        block_length, _, _, _ = _validate_bootstrap_options(**bootstrap)
+        for horizon in labeler.horizons:
+            _validate_block_length_for_horizon(block_length, horizon)
+    if hac_lag is not None:
+        _validate_hac_lag(hac_lag)
+    if trial_family is not None:
+        if not isinstance(trial_family, BarTrialFamily):
+            raise ContractValidationError('trial_family must be a BarTrialFamily')
+        if trial_selection is not None:
+            raise ContractValidationError('Configure method and alpha on trial_family for a shared selection')
+        trial_family._validate_registration((factor_id, h) for h in labeler.horizons)
+    family = trial_family
+    if family is None and any(value is not None for value in (
+        split, bootstrap, hac_lag, direction, standardization, calibration_scenario, trial_selection,
+    )):
+        family = BarTrialFamily(((factor_id, h) for h in labeler.horizons), **(trial_selection or {}))
+    return evaluator, window, family
+
+
 def evaluate_bars(bars: pd.DataFrame, factors: pd.DataFrame | None = None,
                   labeler: BarReturnLabeler | None = None, *, analysis_mode: str | None = None,
                   n_quantiles: int = 5, min_ic_samples: int = 3,
@@ -715,42 +777,15 @@ def evaluate_bars(bars: pd.DataFrame, factors: pd.DataFrame | None = None,
     selection window. Each result carries a snapshot of family progress. Enable
     diagnostics to retain time-series statistics when no inference options are set.
     """
-    mode = _mode(analysis_mode)
-    evaluator = (TimeSeriesEvaluator(analysis_mode=mode, n_quantiles=n_quantiles,
-                                     min_ic_samples=min_ic_samples) if mode == 'time_series' else
-                 BarCrossSectionalEvaluator(analysis_mode=mode, n_quantiles=n_quantiles,
-                                             min_cross_section_size=min_cross_section_size))
-    if not isinstance(labeler, BarReturnLabeler):
-        raise ContractValidationError('labeler must be a BarReturnLabeler')
-    if not isinstance(diagnostics, bool) or (diagnostics and mode != 'time_series'):
-        raise ContractValidationError('diagnostics must be a boolean and requires time_series when enabled')
-    for name, value, supported in (
-        ('bootstrap', bootstrap, {'block_length', 'n_boot', 'seed', 'min_valid_replicates', 'alpha'}),
-        ('trial_selection', trial_selection, {'method', 'alpha'}),
-    ):
-        if value is not None and (not isinstance(value, Mapping) or value.keys() - supported):
-            raise ContractValidationError(f'{name} must be a mapping with keys from {sorted(supported)}')
-    if bootstrap is not None and mode != 'time_series':
-        raise ContractValidationError('bootstrap requires time_series analysis')
-    if hac_lag is not None and mode != 'cross_sectional':
-        raise ContractValidationError('hac_lag requires cross_sectional analysis')
-    if standardization is not None and (mode != 'time_series' or split is None):
-        raise ContractValidationError('standardization requires a time_series train/oos split')
-    if isinstance(split, Mapping):
-        split = SplitConfig(**split)
-    if split is not None and not isinstance(split, SplitConfig):
-        raise ContractValidationError('split must specify train_end and oos_start')
-    if trial_family is not None:
-        if not isinstance(trial_family, BarTrialFamily):
-            raise ContractValidationError('trial_family must be a BarTrialFamily')
-        if trial_selection is not None:
-            raise ContractValidationError('Configure method and alpha on trial_family for a shared selection')
-        trial_family._validate_registration((factor_id, h) for h in labeler.horizons)
-    family = trial_family
-    if family is None and any(value is not None for value in (
-        split, bootstrap, hac_lag, direction, standardization, calibration_scenario, trial_selection,
-    )):
-        family = BarTrialFamily(((factor_id, h) for h in labeler.horizons), **(trial_selection or {}))
+    evaluator, window, family = _prepare_bar_evaluation(
+        labeler, analysis_mode=analysis_mode, n_quantiles=n_quantiles, min_ic_samples=min_ic_samples,
+        min_cross_section_size=min_cross_section_size, split=split, bootstrap=bootstrap,
+        hac_lag=hac_lag, direction=direction, standardization=standardization,
+        calibration_scenario=calibration_scenario, trial_selection=trial_selection,
+        factor_id=factor_id, trial_family=trial_family, diagnostics=diagnostics,
+    )
+    mode = evaluator.analysis_mode
+    _, split = window
     frame = validate_bar_frame(bars)
     labeling = labeler
     if split is not None and not labeler.include_scheduled_exit:
@@ -774,7 +809,7 @@ def evaluate_bars(bars: pd.DataFrame, factors: pd.DataFrame | None = None,
             options.update(min_samples=min_cross_section_size, hac_lag=hac_lag,
                            signal_diagnostics=False)
         result = _evaluate_bar_groups(
-            _prepare(labels, factors), evaluator, labeler=labeler, split=split, family=family,
+            _prepare(labels, factors), evaluator, labeler=labeler, window=window, family=family,
             factor_id=factor_id, options=options,
         )
     else:

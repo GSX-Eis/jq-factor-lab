@@ -374,6 +374,7 @@ def _validate_and_prepare_payload(
     label_streams, minimum, instruments, frequencies = check_labels(paths["per_bar_labels"], summary)
     inference, split_tuples = prepare_inference(
         summary, identity_hash, label_streams, minimum, instruments=instruments, frequencies=frequencies,
+        code_version=reconstructed.code_version,
     )
 
     ic_tuples: list[tuple[Any, ...]] = []

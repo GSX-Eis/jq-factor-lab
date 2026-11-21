@@ -13,15 +13,17 @@ import pandas as pd
 from backtest_and_analysis.evaluation import evaluate_interval_usability
 from backtest_and_analysis.evaluation.calibration import (
     REGISTERED_CALIBRATIONS, Correction, Trial, TrialKey, TrialLedger, _registered_adaptive_evidence,
+    _bootstrap_observation_shape, _finite_real,
 )
 from backtest_and_analysis.evaluation.cross_section import hac_p_value
 from backtest_and_analysis.evaluation.kernels import CorrelationResult
 from backtest_and_analysis.evaluation.panel import EvaluationPanel
-from backtest_and_analysis.evaluation.split import SplitConfig, SplitEvaluation
+from backtest_and_analysis.evaluation.split import SplitConfig, SplitEvaluation, _validate_split_order
 from backtest_and_analysis.evaluation.time_series import summarize_time_series_horizon
 from backtest_and_analysis.evaluation.types import (
+    BOOTSTRAP_FIXED, BOOTSTRAP_V1, BOOTSTRAP_V2,
     AdaptiveCalibrationObservation, CalibrationEvidence, CrossSectionResult, IntervalUsability,
-    TimeSeriesInstrument, TimeSeriesResult,
+    TimeSeriesInstrument, TimeSeriesResult, interval_usability_payload,
 )
 
 from .contracts import ContractValidationError, _numeric_column
@@ -36,6 +38,7 @@ def _selection_window(split: SplitConfig | None) -> _SelectionWindow:
     train_end, oos_start = pd.Timestamp(split.train_end), pd.Timestamp(split.oos_start)
     if train_end.tzinfo is None or oos_start.tzinfo is None:
         raise ContractValidationError('Use timezone-aware split bounds for Bar evaluation')
+    _validate_split_order(train_end, oos_start)
     return 'train', SplitConfig(train_end.tz_convert('UTC'), oos_start.tz_convert('UTC'))
 
 
@@ -109,12 +112,15 @@ class BarTrialFamily:
         candidates = []
         for key in self.candidates:
             trial, row = records.get(key), adjusted.get(key)
+            trial_payload = asdict(trial) if trial is not None else dict(
+                statistic=None, p_value=None, n_effective=None, interval=None, interval_usability=None,
+                p_value_method=None,
+            )
+            if trial is not None and trial.interval_usability is not None:
+                trial_payload["interval_usability"] = interval_usability_payload(trial.interval_usability)
             candidates.append(dict(
                 factor_id=key[0], horizon=key[1],
-                **(asdict(trial) if trial is not None else dict(
-                    statistic=None, p_value=None, n_effective=None, interval=None, interval_usability=None,
-                    p_value_method=None,
-                )),
+                **trial_payload,
                 n_observations=trial.n_observations if trial is not None else None,
                 n_dependence_adjusted=None,
                 reason=reasons.get(key, 'not_evaluated'),
@@ -208,7 +214,7 @@ def _time_series_rows(stats: TimeSeriesResult, instrument: str, frequency: str) 
             instrument_id=instrument, frequency=frequency, horizon_bars=h,
             grid_start_utc=stats.datetimes[0], grid_end_utc=stats.datetimes[-1],
             intervals_verified=stats.intervals_verified, ic=ic,
-            bootstrap=asdict(row.bootstrap), interval_usability=asdict(usability),
+            bootstrap=asdict(row.bootstrap), interval_usability=interval_usability_payload(usability),
             direction=asdict(row.direction), return_distribution=asdict(row.returns),
             quantile_reason=stats.quantile_reasons[0],
             buckets={q: dict(direction=asdict(row.direction_by_bucket[q]), return_distribution=asdict(dist))
@@ -235,7 +241,7 @@ def _cross_section_rows(stats: CrossSectionResult, frequency: str) -> list[dict[
         rows.append(dict(
             frequency=frequency, horizon_bars=h, grid_start_utc=stats.datetimes[0],
             grid_end_utc=stats.datetimes[-1], ic=asdict(summary), hac=interval,
-            interval_usability=asdict(usability), p_value=p_value,
+            interval_usability=interval_usability_payload(usability), p_value=p_value,
             p_value_method=p_value_method,
             buckets={q: asdict(value) for q, value in horizon.bucket_summary.items()},
             spread=asdict(horizon.spread_summary), direction=asdict(horizon.direction),
@@ -270,6 +276,41 @@ def _hac_observation_matches(interval: Mapping[str, Any], observation: AdaptiveC
     )
 
 
+def _bootstrap_observation_matches(
+    interval: Mapping[str, Any], observation: AdaptiveCalibrationObservation, *,
+    horizon: int, count: int, intervals_verified: bool,
+) -> bool:
+    o = observation
+    tags = BOOTSTRAP_V2 if o.method_version == BOOTSTRAP_V2[0] else BOOTSTRAP_V1
+    tag_fields = ('method_version', 'block_length_method', 'resample_method', 'interval_method')
+    integers = {
+        'grid_size': o.grid_size, 'n_valid_pairs': o.n_valid, 'block_length': o.window,
+        'min_block_length': o.structural_minimum, 'n_boot': o.n_boot,
+        'min_valid_replicates': o.min_valid_replicates, 'valid_replicates': o.valid_replicates,
+        'min_pairs_per_replicate': o.min_pairs_per_replicate,
+    }
+    reals = {'effective_blocks': o.effective_blocks, 'alpha': o.alpha}
+    se = interval.get('fisher_z_standard_error')
+    if tags == BOOTSTRAP_V2:
+        reals['fisher_z_standard_error'] = o.fisher_z_standard_error
+    lower, upper = interval.get('lower'), interval.get('upper')
+    return (
+        intervals_verified is True and _bootstrap_observation_shape(o)
+        and tuple(interval.get(key) for key in tag_fields) == tags and o.method_version == tags[0]
+        and all(isinstance(v, Integral) and not isinstance(v, (bool, np.bool_)) for v in (horizon, count))
+        and o.horizon == horizon and o.n_valid == count
+        and 'reason' in interval and interval['reason'] is None
+        and interval.get('calibration_scenario') == o.scenario and interval.get('missing_pattern') == o.missing_pattern
+        and all(
+            isinstance(interval.get(field), Integral) and not isinstance(interval[field], (bool, np.bool_))
+            and interval[field] == expected for field, expected in integers.items()
+        )
+        and all(_finite_real(interval.get(field)) and interval[field] == expected for field, expected in reals.items())
+        and _finite_real(se) and se > 0
+        and _finite_real(lower) and _finite_real(upper) and -1 <= lower <= upper <= 1
+    )
+
+
 def _read_trial_usability(row: Mapping[str, Any], interval: Mapping[str, Any], usability: Mapping[str, Any], *,
                           mode: str, count: int, has_bounds: bool, point_usable: bool) -> IntervalUsability:
     status = usability.get('calibration_status')
@@ -297,16 +338,23 @@ def _read_trial_usability(row: Mapping[str, Any], interval: Mapping[str, Any], u
             observation = AdaptiveCalibrationObservation(**payload)
         except TypeError:
             pass
-    adaptive = (
-        payload is not None or interval.get('method_version') is not None
-        or interval.get('bandwidth_method', 'fixed') != 'fixed'
-        or row.get('p_value_method') == 'two_sided_student_t_hac'
-    )
-    invalid_observation = adaptive and (observation is None or (
-        mode != 'time_series' and not _hac_observation_matches(
+    time_series = mode == 'time_series'
+    adaptive = payload is not None or interval.get('method_version') is not None
+    if time_series:
+        adaptive = adaptive or tuple(interval.get(field, default) for field, default in zip(
+            ('method_version', 'block_length_method', 'resample_method', 'interval_method'), BOOTSTRAP_FIXED,
+        )) != BOOTSTRAP_FIXED
+        statistic = row.get('ic', {}).get('spearman_ic')
+        observation_matches = observation is not None and _bootstrap_observation_matches(
+            interval, observation, horizon=horizon, count=count, intervals_verified=row.get('intervals_verified'),
+        ) and point_usable and _finite_real(statistic) and -1 <= statistic <= 1
+    else:
+        adaptive = (adaptive or interval.get('bandwidth_method', 'fixed') != 'fixed'
+                    or row.get('p_value_method') == 'two_sided_student_t_hac')
+        observation_matches = observation is not None and _hac_observation_matches(
             interval, observation, horizon=horizon, count=count,
         )
-    ))
+    invalid_observation = adaptive and not observation_matches
     evidence_payload = usability.get('calibration_evidence')
     evidence = None
     if isinstance(evidence_payload, Mapping):
@@ -315,11 +363,29 @@ def _read_trial_usability(row: Mapping[str, Any], interval: Mapping[str, Any], u
         except TypeError:
             pass
     claims_calibration = evidence_payload is not None or status != 'uncalibrated'
-    if not declaration_valid or invalid_observation or (claims_calibration and (
+    registered = _registered_adaptive_evidence(observation) if observation_matches and adaptive else None
+    if time_series and registered is not None and isinstance(evidence_payload, Mapping):
+        evidence_counts_valid = all(
+            isinstance(evidence_payload.get(key), Integral) and not isinstance(evidence_payload[key], (bool, np.bool_))
+            for key in ('window', 'sample_size', 'bootstrap_replicates')
+        )
+    else:
+        evidence_counts_valid = True
+    inconsistent_bootstrap = time_series and adaptive and (
+        not evidence_counts_valid
+        or status != ('calibrated_pass' if registered is not None else 'uncalibrated')
+        or evidence_payload != (asdict(registered) if registered is not None else None)
+        or verified_horizon != (horizon if registered is not None else None)
+        or reason is not None or descriptive is not True or significant is not (registered is not None)
+        or row.get('p_value') is not None or row.get('p_value_method') is not None
+        or interval.get('calibration_status', 'uncalibrated') != 'uncalibrated'
+        or interval.get('calibration_evidence') is not None
+    )
+    if not declaration_valid or invalid_observation or inconsistent_bootstrap or (claims_calibration and (
         evidence is None or status == 'uncalibrated' or evidence.passes is not (status == 'calibrated_pass')
         or not {'lower', 'upper', 'reason'} <= interval.keys() or (significant and not has_bounds)
         or (
-            (not horizon_matches or evidence != _registered_adaptive_evidence(observation)) if adaptive
+            (not horizon_matches or evidence != registered) if adaptive
             else evidence not in REGISTERED_CALIBRATIONS
         )
     )):
@@ -327,7 +393,9 @@ def _read_trial_usability(row: Mapping[str, Any], interval: Mapping[str, Any], u
             reason=interval.get('reason') or (reason if isinstance(reason, str) else None),
             calibration_status='uncalibrated',
             calibration_evidence=None,
-            descriptive_stats_usable=descriptive if isinstance(descriptive, bool) else point_usable,
+            descriptive_stats_usable=point_usable if time_series and adaptive else (
+                descriptive if isinstance(descriptive, bool) else point_usable
+            ),
             significance_interpretation_usable=False,
         )
     return IntervalUsability(
@@ -352,7 +420,7 @@ def _record_trials(family: BarTrialFamily, rows: list[dict[str, Any]], *,
         row = matches[0]
         ic = row['ic']
         if mode == 'time_series':
-            statistic, count, interval = ic['spearman_ic'], ic['sample_count'], row['bootstrap']
+            statistic, count, interval = ic['spearman_ic'], ic.get('sample_count'), row['bootstrap']
         else:
             statistic, count, interval = ic['mean'], ic['n_valid'], row['hac']
         lower, upper = interval.get('lower'), interval.get('upper')
@@ -369,7 +437,36 @@ def _record_trials(family: BarTrialFamily, rows: list[dict[str, Any]], *,
             row, interval, declared, mode=mode, count=count, has_bounds=bounds is not None,
             point_usable=point_usable,
         )
-        if mode == 'cross_sectional' and count == 0:
+        trial_reason = interval.get('reason') or ic['reason']
+        if mode == 'time_series':
+            paired_count = interval.get('n_valid_pairs')
+            valid_count = isinstance(count, Integral) and not isinstance(count, (bool, np.bool_)) and count >= 0
+            valid_paired_count = (
+                isinstance(paired_count, Integral) and not isinstance(paired_count, (bool, np.bool_))
+                and paired_count >= 0
+            )
+            if (
+                not valid_count or (count == 0 and bounds is not None)
+                or (paired_count is not None and (not valid_paired_count or count != paired_count))
+            ):
+                # A point estimate can remain descriptive without inferring a count from a single field.
+                payload = declared.get('adaptive_observation')
+                observed_count = payload.get('n_valid') if isinstance(payload, Mapping) else None
+                grid_size = interval.get('grid_size')
+                corroborated = (
+                    valid_paired_count
+                    and all(isinstance(n, Integral) and not isinstance(n, (bool, np.bool_))
+                            for n in (observed_count, grid_size))
+                    and 0 < paired_count == observed_count <= grid_size
+                )
+                count = int(paired_count) if corroborated else 0
+                bounds = None
+                trial_reason = 'inconsistent_sample_count'
+                usability = IntervalUsability(
+                    reason=trial_reason, calibration_status='uncalibrated', calibration_evidence=None,
+                    descriptive_stats_usable=point_usable, significance_interpretation_usable=False,
+                )
+        elif count == 0:
             # Corroborate the count for the ledger only after checking the conflict.
             payload = declared.get('adaptive_observation')
             observed_count = payload.get('n_valid') if isinstance(payload, Mapping) else None
@@ -380,11 +477,11 @@ def _record_trials(family: BarTrialFamily, rows: list[dict[str, Any]], *,
             ):
                 count = int(hac_count)
         trials[key] = (Trial(
-            statistic, row.get('p_value'), count,
+            statistic, None if mode == 'time_series' else row.get('p_value'), count,
             bounds,
             usability,
-            p_value_method=row.get('p_value_method'),
-        ), interval.get('reason') or ic['reason'])
+            p_value_method=None if mode == 'time_series' else row.get('p_value_method'),
+        ), trial_reason)
     family._record_trials(trials, window=window)
 
 

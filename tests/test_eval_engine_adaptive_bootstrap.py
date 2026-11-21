@@ -1,4 +1,4 @@
-"""Frozen S3 bootstrap formula, sampling and public entry point checks."""
+"""Frozen adaptive bootstrap formula, sampling and public entry point checks."""
 
 from pathlib import Path
 
@@ -14,12 +14,12 @@ from backtest_and_analysis.time_series import BarReturnLabeler, evaluate_bars, r
 from utils.session_calendar import SessionCalendar
 
 
-def _bootstrap(x, y, valid=None, **options):
+def _bootstrap(x, y, valid=None, *, block_length="auto", **options):
     mask = np.ones(len(x), dtype=bool) if valid is None else valid
     point = kernels.spearman(x[:, None], y[:, None], valid=mask[:, None], axis=0, min_samples=3)
     settings = dict(min_samples=3, seed=53, n_boot=49, min_valid_replicates=35, alpha=0.10)
     return time_series._bootstrap_spearman(
-        x, y, mask, point=point, block_length="auto", **(settings | options),
+        x, y, mask, point=point, block_length=block_length, **(settings | options),
     )
 
 
@@ -34,7 +34,7 @@ def test_default_bootstrap_is_adaptive_with_shared_replicate_counts():
     full = engine.evaluate(panel, entry_timestamps={5: entries}, exit_timestamps={5: exits})
     interval = full.splits["full"].statistics.horizons[5].instruments["A"].bootstrap
     assert interval.reason is None
-    assert interval.method_version == "ts_boot_adaptive_v1"
+    assert interval.method_version == "ts_boot_adaptive_v2"
     assert 5 == interval.min_block_length <= interval.block_length
     assert interval.n_boot == interval.valid_replicates == 999
     assert interval.min_valid_replicates == 900
@@ -94,12 +94,12 @@ def test_circular_blocks_use_uniform_starts_and_keep_missing_slots():
     assert np.all(np.abs(counts[:, [0, size - 1]] - counts[:, [5]]) < 70)
 
 
-def _reference_fisher(x, y, valid, length):
+def _reference_fisher(x, y, valid, length, *, historical_v1, residual_ratio=None):
     """Compute pairwise H matrices and enumerate circular windows directly."""
     x, y = x[valid], y[valid]
     n, size = len(x), len(valid)
     if n < 4 or min(len(set(x)), len(set(y))) < 2:
-        return np.nan, np.nan
+        return np.nan, np.nan, np.nan
     fx, fy = (rankdata(x) - 0.5) / n, (rankdata(y) - 0.5) / n
     sx, sy = np.sqrt(np.mean((fx - 0.5)**2)), np.sqrt(np.mean((fy - 0.5)**2))
     u, v = (fx - 0.5) / sx, (fy - 0.5) / sy
@@ -116,11 +116,27 @@ def _reference_fisher(x, y, valid, length):
     def sums(width):
         return np.array([np.roll(scores, -j)[:width].sum() for j in range(size)])
 
-    var = (q * np.mean(sums(length)**2) + np.mean(sums(r)**2)) / n**2
-    return np.arctanh(clipped), np.sqrt(var)
+    v0 = np.sum(scores**2) / n**2
+    if v0 <= 1e-24 / n:
+        return np.nan, np.nan, np.nan
+    full = np.mean(sums(length)**2)
+    if historical_v1:
+        var = (q * full + np.mean(sums(r)**2)) / n**2
+    elif residual_ratio is None:
+        residual_ratio = np.mean(sums(r)**2) / full if r else 0
+        k = length // 2
+        spectrum = (np.mean(sums(2 * k)**2) - np.mean(sums(k)**2)) / k / (1 - 3 * k / size) if k else 0
+        if spectrum <= 1e-12 * np.mean(scores**2):
+            spectrum = full / length / (1 - length / size)
+        var = size * spectrum / n**2
+    else:
+        blocks = np.array([scores[j * length:(j + 1) * length].sum() for j in range(q)])
+        var = (q + residual_ratio) * np.sum((blocks - blocks.mean())**2) / (n**2 * (q - 1))
+    return np.arctanh(clipped), np.sqrt(var) if var > 1e-12 * v0 else np.nan, residual_ratio
 
 
-def test_fisher_z_studentization_matches_reference_and_reflects_under_sign_change():
+@pytest.mark.parametrize("historical_v1", [False, True], ids=["v2", "historical-v1"])
+def test_fisher_z_studentization_matches_reference_and_reflects_under_sign_change(historical_v1):
     x, noise = np.random.default_rng(123).normal(size=(2, 67))
     y = np.round(0.5 * x + noise, 1)
     x = np.round(x, 1)
@@ -128,25 +144,33 @@ def test_fisher_z_studentization_matches_reference_and_reflects_under_sign_chang
     # A masked observation and a non-finite observation yield the same grid gap.
     missing_y = y.copy()
     missing_y[~valid] = np.inf
-    interval = _bootstrap(x, missing_y, min_block_length=5, calibration_scenario="ar1_null")
-    assert interval == _bootstrap(x, y, valid, min_block_length=5, calibration_scenario="ar1_null")
+    interval = _bootstrap(x, missing_y, min_block_length=5, calibration_scenario="ar1_null", historical_v1=historical_v1)
+    assert interval == _bootstrap(x, y, valid, min_block_length=5, calibration_scenario="ar1_null", historical_v1=historical_v1)
     assert interval.reason is None and interval.calibration_status == "uncalibrated"
     assert interval.calibration_evidence is None and interval.calibration_scenario == "ar1_null"
     assert interval.missing_pattern == "periodic_17_3"
     assert interval.n_valid_pairs == valid.sum()
-    assert interval.interval_method == "fisher_z_bootstrap_t"
+    assert interval.interval_method == (
+        "fisher_z_bootstrap_t" if historical_v1 else "fisher_z_bootstrap_t_flat_top_block"
+    )
     assert interval.resample_method == "circular_block"
     assert -1 <= interval.lower < interval.upper <= 1
 
     size, length = len(x), interval.block_length
     rng = np.random.Generator(np.random.PCG64(interval.seed))
-    f, se = _reference_fisher(x, y, valid, length)
+    f, se, ratio = _reference_fisher(x, y, valid, length, historical_v1=historical_v1)
+    assert size % length != 0
+    valid_pair_counts = set()
     pivots = []
     for _ in range(interval.n_boot):
         starts = rng.integers(0, size, size=(size + length - 1) // length, dtype=np.int64)
         rows = [(start + j) % size for start in starts for j in range(length)][:size]
-        f_star, se_star = _reference_fisher(x[rows], y[rows], valid[rows], length)
+        valid_pair_counts.add(valid[rows].sum())
+        f_star, se_star, _ = _reference_fisher(
+            x[rows], y[rows], valid[rows], length, historical_v1=historical_v1, residual_ratio=ratio,
+        )
         pivots.append((f_star - f) / se_star)
+    assert len(valid_pair_counts) > 1
     finite = np.asarray(pivots)[np.isfinite(pivots)]
     upper_q, lower_q = np.quantile(finite, [0.95, 0.05])
     assert interval.valid_replicates == len(finite)
@@ -154,10 +178,10 @@ def test_fisher_z_studentization_matches_reference_and_reflects_under_sign_chang
     assert (interval.lower, interval.upper) == pytest.approx(
         np.tanh(f - np.array([upper_q, lower_q]) * se), abs=1e-13,
     )
-    mirrored = _bootstrap(x, -y, valid, min_block_length=5)
+    mirrored = _bootstrap(x, -y, valid, min_block_length=5, historical_v1=historical_v1)
     assert mirrored.block_length == length
     assert (mirrored.lower, mirrored.upper) == pytest.approx((-interval.upper, -interval.lower), abs=1e-13)
-    changed_seed = _bootstrap(x, y, valid, min_block_length=5, seed=54)
+    changed_seed = _bootstrap(x, y, valid, min_block_length=5, seed=54, historical_v1=historical_v1)
     assert changed_seed.block_length == length
     assert (changed_seed.lower, changed_seed.upper) != (interval.lower, interval.upper)
 
@@ -172,7 +196,7 @@ def test_fisher_z_studentization_matches_reference_and_reflects_under_sign_chang
 ])
 def test_adaptive_bootstrap_reason_codes(x, y, minimum, reason, block):
     interval = _bootstrap(np.array(x), np.array(y), min_samples=minimum)
-    assert interval.method_version == "ts_boot_adaptive_v1"
+    assert interval.method_version == "ts_boot_adaptive_v2"
     assert interval.missing_pattern == "none"
     assert interval.min_pairs_per_replicate == max(4, minimum)
     assert interval.reason == reason
@@ -221,3 +245,39 @@ def test_bar_bootstrap_config_forwards_auto_and_tuning_options(block_options):
     assert (interval["seed"], interval["n_boot"], interval["min_valid_replicates"], interval["alpha"]) == (
         72, 39, 20, 0.1,
     )
+
+
+def test_flat_top_hand_calculation_and_bartlett_fallback():
+    # Integer scores make the circular window energies directly enumerable.
+    scores = np.array([1., 1., 0., 0., -1., -1., 0., 0., 0., 0., 0., 0.])
+    # T A_1=4, T A_2=12, T A_3=18, b=3 and r=0.
+    v0 = 4 / 12**2
+    variance, ratio = time_series._flat_top_variance(scores, 12, 3, 0, v0)
+    assert variance == pytest.approx((12 - 4) / (1 - 3 / 12) / 12**2)
+    assert ratio == 0
+    # A_2=0 with alternating scores triggers the residual guard if r>0.
+    alternating = np.tile([1., -1.], 4)
+    assert np.isnan(time_series._flat_top_variance(alternating, 8, 2, 1, 1 / 8)[0])
+    assert time_series._flat_top_variance(alternating, 8, 2, 0, 1 / 8)[0] == 0
+    # Negative flat-top spectrum and a strictly positive Bartlett spectrum.
+    scores = np.tile([2., -1., 1., -2.], 2)
+    variance, ratio = time_series._flat_top_variance(scores, 8, 2, 0, 20 / 64)
+    # T A_2=4 and T A_1=20.
+    assert variance == pytest.approx((4 / 2) / (1 - 2 / 8) / 8**2)
+    assert ratio == 0
+    variance, _ = time_series._flat_top_variance(scores, 8, 1, 0, 20 / 64)
+    assert variance == pytest.approx(20 / (8 * 7))
+
+
+def test_fixed_blocks_keep_the_original_seed_draws_and_percentiles():
+    x, y = np.random.default_rng(166).normal(size=(2, 37))
+    n, length = len(x), 5
+    interval = _bootstrap(x, y, block_length=length)
+    rng = np.random.default_rng(interval.seed)
+    estimates = []
+    for _ in range(interval.n_boot):
+        starts = rng.integers(n - length + 1, size=8)
+        rows = [start + offset for start in starts for offset in range(length)][:n]
+        estimates.append(kernels.spearman(x[rows, None], y[rows, None], axis=0, min_samples=3).values.item())
+    np.testing.assert_array_equal([interval.lower, interval.upper], np.quantile(estimates, [.05, .95]))
+    assert interval.method_version is None and interval.fisher_z_standard_error is None

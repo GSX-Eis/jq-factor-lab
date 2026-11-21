@@ -2,6 +2,7 @@
 
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, replace
+from hashlib import sha256
 from itertools import cycle, product
 import json
 from math import inf, nextafter, sqrt
@@ -19,8 +20,12 @@ from backtest_and_analysis.evaluation import calibration
 from backtest_and_analysis.evaluation.calibration import Trial, TrialLedger
 from backtest_and_analysis.evaluation.cross_section import hac_p_value
 from backtest_and_analysis.evaluation.panel import EvaluationPanel
-from backtest_and_analysis.evaluation.types import BootstrapInterval, HACInterval
-from backtest_and_analysis.time_series.inference import BarTrialFamily, _cross_section_rows, _record_trials
+from backtest_and_analysis.evaluation.types import (
+    BOOTSTRAP_V1, BOOTSTRAP_V2, BootstrapInterval, HACInterval, interval_usability_payload,
+)
+from backtest_and_analysis.time_series.inference import (
+    BarTrialFamily, _cross_section_rows, _read_trial_usability, _record_trials, _time_series_rows,
+)
 from backtest_and_analysis.time_series.artifacts import _json_value
 from tools.benchmarks import adaptive_inference_calibration as benchmark
 
@@ -161,6 +166,7 @@ def evidence_registry(monkeypatch: pytest.MonkeyPatch) -> tuple[calibration.Adap
     domains = tuple(replace(
         calibration._candidate_adaptive_domain(
             cross_section=cross_section, scenario="generalized_ar_heteroskedastic", horizon=1, gap=0,
+            v2_boot=not cross_section,
         ),
         report_ref="fixture.json", report_sha256="a" * 64, coverage_cell_ids=("2:000" if cross_section else "3:000",),
         covered=475, repetitions=500,
@@ -186,9 +192,9 @@ def hac() -> HACInterval:
 def bootstrap() -> BootstrapInterval:
     return BootstrapInterval(
         512, 5, 0, 1000, 900, 900, .05, -.1, .2, None, n_valid_pairs=512,
-        method_version="ts_boot_adaptive_v1", missing_pattern="none",
+        method_version=BOOTSTRAP_V2[0], missing_pattern="none",
         calibration_scenario="generalized_ar_heteroskedastic", block_length_method="ppw2009",
-        resample_method="circular_block", interval_method="fisher_z_bootstrap_t", min_block_length=5,
+        resample_method="circular_block", interval_method=BOOTSTRAP_V2[-1], min_block_length=5,
         min_pairs_per_replicate=4, effective_blocks=512 / 5, fisher_z_standard_error=.02,
     )
 
@@ -254,7 +260,11 @@ def test_hac_width_must_be_constant_across_effective_grid(evidence_registry, hac
 
 
 @pytest.mark.parametrize(("patch", "verified"), [
-    ({"method_version": "ts_boot_adaptive_v2"}, True),
+    ({"method_version": BOOTSTRAP_V1[0]}, True),
+    ({"fisher_z_standard_error": None}, True),
+    ({"fisher_z_standard_error": True}, True),
+    ({"fisher_z_standard_error": inf}, True),
+    ({"grid_size": 768, "n_valid_pairs": 768, "effective_blocks": 768 / 5}, True),
     ({"resample_method": "moving_block"}, True),
     ({"interval_method": "percentile"}, True),
     ({"n_valid_pairs": None}, True),
@@ -349,7 +359,10 @@ def _v2_hac_row(
 
 
 def test_s5_production_registry_is_bound_to_formal_hac_evidence() -> None:
-    *core, generalized = calibration.REGISTERED_ADAPTIVE_CALIBRATIONS
+    *core, generalized = (
+        domain for domain in calibration.REGISTERED_ADAPTIVE_CALIBRATIONS
+        if domain.method_version == "cs_hac_adaptive_v1"
+    )
     assert [domain.scenario for domain in core] == [design.scenario for design in benchmark.CORE]
     assert generalized.scenario == "generalized_ar_heteroskedastic"
     for index, domain in enumerate(core):
@@ -407,8 +420,43 @@ def test_s5_production_hac_domain_through_v2_and_trial_ledger(grid, mismatches) 
     assert candidate["inference_adjusted_p_value"] == (row["p_value"] if eligible else None)
 
 
-@pytest.mark.parametrize("size", [128, 256, 512])
-def test_s5_production_bootstrap_domain_on_verified_grid(size: int) -> None:
+def test_s3_production_registry_is_bound_to_formal_bootstrap_evidence() -> None:
+    *core, generalized = (
+        domain for domain in calibration.REGISTERED_ADAPTIVE_CALIBRATIONS
+        if domain.method_version == BOOTSTRAP_V2[0]
+    )
+    assert [domain.scenario for domain in core] == [design.scenario for design in benchmark.CORE]
+    assert generalized.scenario == "generalized_ar_heteroskedastic"
+    assert generalized.grid_sizes == (512, 1024)
+    assert generalized.horizons == (1, 5, 20)
+    assert generalized.missing_patterns == ("none", "periodic_17_3", "periodic_17_5")
+    assert generalized.coverage_cell_ids == tuple(f"3:{index:03d}" for index in range(18))
+    assert all(domain.report_ref == "reports/NERE-962/adaptive-calibration-v2.json" for domain in (*core, generalized))
+    report_path = Path(__file__).resolve().parents[1] / generalized.report_ref
+    if not report_path.is_file():
+        pytest.skip('Formal calibration receipt is kept in the private source repository')
+    report_bytes = report_path.read_bytes()
+    digest = sha256(report_bytes).hexdigest()
+    report = json.loads(report_bytes)
+    assert report["bootstrap_release_passes"] is True and report["repetitions"] == 500
+    rows = {row["cell_id"]: row for row in report["coverage"]}
+    for index, domain in enumerate(core):
+        row = rows[f"1:{index:03d}"]
+        assert domain.coverage_cell_ids == (row["cell_id"],)
+        assert domain.grid_size_min == domain.grid_size_max == row["n_times"]
+        assert domain.horizons == (row["horizon"],)
+        assert domain.missing_patterns == (("none" if row["gap"] == 0 else f"periodic_17_{row['gap']}"),)
+    for domain in (*core, generalized):
+        assert domain.report_sha256 == digest and domain.repetitions == report["repetitions"]
+        support = [rows[cell_id] for cell_id in domain.coverage_cell_ids]
+        assert all(row["passes"] is True and row["scenario"] == domain.scenario for row in support)
+        weakest = min(support, key=lambda row: (-abs(row["adaptive"]["covered"] - 475), row["cell_id"]))
+        assert domain.covered == weakest["adaptive"]["covered"]
+    assert not any(domain.method_version == BOOTSTRAP_V1[0] for domain in calibration.REGISTERED_ADAPTIVE_CALIBRATIONS)
+
+
+@pytest.mark.parametrize("size", [128, 256, 512, 768, 1024])
+def test_v2_production_bootstrap_domain_on_verified_grid(size: int) -> None:
     x, noise = np.random.default_rng(64).normal(size=(2, size))
     dates = pd.date_range("2025-01-06", periods=size, freq="D")
     index = pd.MultiIndex.from_product([dates, ["A"]], names=["datetime", "asset"])
@@ -418,21 +466,48 @@ def test_s5_production_bootstrap_domain_on_verified_grid(size: int) -> None:
     result = EvaluationEngine("time_series", "daily").evaluate(
         panel, entry_timestamps={5: entries}, exit_timestamps={5: entries + np.timedelta64(5, "D")},
         calibration_scenario=scenario,
-    ).splits["full"].statistics.horizons[5].instruments["A"]
-    interval = result.bootstrap
-    assert interval.reason is None and interval.n_valid_pairs == size
-    use = evaluate_interval_usability(
-        interval, point_estimate=float(result.ic.values[0]), horizon=5, ic_method="spearman", intervals_verified=True,
-    )
-    domain = calibration._candidate_adaptive_domain(
-        cross_section=False, scenario=scenario, horizon=5, gap=0, s5=True,
-    )
-    reasons = calibration._adaptive_domain_mismatches(domain, use.adaptive_observation)
-    assert reasons == (("grid_size", "n_valid") if size < 512 else ())
-    assert use.calibration_status == "uncalibrated" and use.calibration_evidence is None
-    assert not use.significance_interpretation_usable
-    trial = Trial(float(result.ic.values[0]), None, size, (interval.lower, interval.upper), use)
-    assert not trial.inference_eligible(horizon=5, alpha=.05)
+    ).splits["full"].statistics
+    row, = json.loads(json.dumps(_json_value(_time_series_rows(result, "A", "1D")), allow_nan=False))
+    raw = row["bootstrap"]
+    assert raw["reason"] is None and raw["n_valid_pairs"] == size
+    declared = row["interval_usability"]
+
+    def read(interval, usability):
+        return _read_trial_usability(
+            row, interval, usability, mode="time_series", count=size, has_bounds=True, point_usable=True,
+        )
+
+    eligible = size in (512, 1024)
+    use = read(raw, declared)
+    assert use.calibration_status == ("calibrated_pass" if eligible else "uncalibrated")
+    assert use.significance_interpretation_usable is eligible
+    assert use.verified_horizon == (5 if eligible else None)
+    if eligible:
+        assert use.calibration_evidence.domain_id == f"{BOOTSTRAP_V2[0]}:{scenario}"
+        assert use.calibration_evidence.observed_coverage == 462 / 500
+        for changed in (
+            raw | {"fisher_z_standard_error": raw["fisher_z_standard_error"] * 2},
+            {key: value for key, value in raw.items() if key != "min_pairs_per_replicate"},
+        ):
+            assert read(changed, declared).calibration_status == "uncalibrated"
+        for changes in ({"min_pairs_per_replicate": 5}, {"missing_pattern": "other"}):
+            outside = replace(BootstrapInterval(**raw), **changes)
+            outside_use = evaluate_interval_usability(
+                outside, point_estimate=row["ic"]["spearman_ic"], horizon=5,
+                ic_method="spearman", intervals_verified=True,
+            )
+            assert outside_use.calibration_status == "uncalibrated"
+            assert read(asdict(outside), interval_usability_payload(outside_use)).calibration_status == "uncalibrated"
+
+    key = ("candidate", 5)
+    family = BarTrialFamily([key])
+    _record_trials(family, [row], keys=(key,), mode="time_series", window=("full", None))
+    assert family.report()["best"] is None
+    trial = Trial(row["ic"]["spearman_ic"], None, size, (raw["lower"], raw["upper"]), use)
+    ledger = TrialLedger([key])
+    ledger.record(key, trial)
+    with pytest.raises(ValueError, match="Missing raw p-value"):
+        ledger.select_best(method="holm")
 
 
 def test_v2_evidence_round_trip_selects_and_rejects_tampering(evidence_registry) -> None:
@@ -652,3 +727,182 @@ def test_time_series_interval_pass_does_not_supply_a_trial_p_value(evidence_regi
     )
     assert use.significance_interpretation_usable
     assert not Trial(.1, None, 512, (-.1, .2), use).inference_eligible(horizon=5, alpha=.05)
+
+
+def test_bootstrap_read_requires_exact_v2_observation_and_evidence(evidence_registry, bootstrap):
+    use = evaluate_interval_usability(
+        bootstrap, point_estimate=.1, horizon=5, ic_method="spearman", intervals_verified=True,
+    )
+    raw_use = interval_usability_payload(use)
+    interval = asdict(bootstrap)
+    row = {"horizon_bars": 5, "intervals_verified": True,
+           "ic": {"sample_count": 512, "spearman_ic": .1, "reason": None}}
+
+    def read(row, interval, payload):
+        return _read_trial_usability(
+            row, interval, payload, mode="time_series", count=row["ic"]["sample_count"],
+            has_bounds=True, point_usable=True,
+        )
+
+    assert read(row, interval, raw_use) == use
+    for field in (
+        "method_version", "block_length_method", "resample_method", "interval_method", "calibration_scenario",
+        "grid_size", "n_valid_pairs", "block_length", "min_block_length", "min_pairs_per_replicate",
+        "n_boot", "min_valid_replicates", "valid_replicates", "alpha", "effective_blocks", "missing_pattern",
+        "fisher_z_standard_error", "reason",
+    ):
+        incomplete = {key: value for key, value in interval.items() if key != field}
+        assert read(row, incomplete, raw_use).calibration_status == "uncalibrated"
+    for changed_row, changed_interval, changed_use in (
+        (row | {"intervals_verified": 1}, interval, raw_use),
+        (row | {"horizon_bars": 5.0}, interval, raw_use),
+        (row, interval | {"grid_size": 512.0}, raw_use),
+        (row, interval | {"min_block_length": True}, raw_use),
+        (row, interval | {"alpha": np.nan}, raw_use),
+        (row, interval | {"fisher_z_standard_error": .03}, raw_use),
+        (row, interval | {"lower": -1.01}, raw_use),
+        (row, interval, raw_use | {"adaptive_observation": None}),
+        (row, interval, raw_use | {"calibration_evidence": raw_use["calibration_evidence"] | {"report_sha256": "b" * 64}}),
+        (row, interval, raw_use | {"adaptive_observation": raw_use["adaptive_observation"] | {"n_valid": 512.0}}),
+        (row, interval, raw_use | {"significance_interpretation_usable": False}),
+    ):
+        downgraded = read(changed_row, changed_interval, changed_use)
+        assert downgraded.calibration_status == "uncalibrated"
+        assert downgraded.calibration_evidence is downgraded.verified_horizon is None
+        assert downgraded.descriptive_stats_usable and not downgraded.significance_interpretation_usable
+    assert use.adaptive_observation.fisher_z_standard_error == .02
+
+
+@pytest.mark.parametrize(("recorded_count", "corroborated"), [(0, True), (512.0, True), (511, True), (0, False)])
+def test_trial_family_reads_conflicting_bootstrap_sample_count(
+    evidence_registry, bootstrap, recorded_count, corroborated,
+):
+    keys = (("candidate", 1), ("candidate", 5))
+    rows = []
+    for _, horizon in keys:
+        interval = replace(bootstrap, min_block_length=horizon)
+        use = evaluate_interval_usability(
+            interval, point_estimate=.1, horizon=horizon, ic_method="spearman", intervals_verified=True,
+        )
+        assert use.calibration_status == "calibrated_pass"
+        rows.append({
+            "horizon_bars": horizon, "intervals_verified": True, "bootstrap": asdict(interval),
+            "ic": {"sample_count": 512 if horizon == 1 else recorded_count, "spearman_ic": .1, "reason": None},
+            "interval_usability": interval_usability_payload(use),
+        })
+    if not corroborated:
+        rows[1]["interval_usability"]["adaptive_observation"]["n_valid"] = 510
+    family = BarTrialFamily(keys)
+    _record_trials(family, rows, keys=keys, mode="time_series", window=("full", None))
+    valid, conflicted = family.report()["candidates"]
+    assert valid["interval_usability"]["calibration_status"] == "calibrated_pass"
+    assert valid["n_observations"] == 512 and valid["interval"] == (-.1, .2)
+    assert conflicted["n_observations"] == (512 if corroborated else 0)
+    assert conflicted["statistic"] == .1 and conflicted["reason"] == "inconsistent_sample_count"
+    assert conflicted["interval"] is None
+    use = conflicted["interval_usability"]
+    assert use["descriptive_stats_usable"] is True and use["calibration_status"] == "uncalibrated"
+    assert use["significance_interpretation_usable"] is False
+    assert use["calibration_evidence"] is use["verified_horizon"] is None
+
+
+@pytest.mark.parametrize(
+    "corruption", ["zero_coverage", "fixed_zero_coverage", "in_domain", "budget_reasons", "valid_fraction"],
+)
+def test_v2_quick_cli_resume_rejects_impossible_counts(tmp_path, monkeypatch, corruption):
+    output = tmp_path / "quick.json"
+    monkeypatch.setenv("QUANTATION_CODE_VERSION", "a" * 40)
+    monkeypatch.setattr(benchmark, "ProcessPoolExecutor", ThreadPoolExecutor)
+    benchmark.run_benchmark(quick=True, output=output, workers=2, profile_name="v2_boot")
+    checkpoints = output.with_suffix(".cells")
+    path = checkpoints / "1:000.json"
+    pending = checkpoints / "3:017.json"
+    pending.unlink()
+    row = json.loads(path.read_text())
+    adaptive = row["adaptive"]
+    if corruption in ("zero_coverage", "fixed_zero_coverage"):
+        estimate = adaptive if corruption == "zero_coverage" else row["fixed"][0]
+        assert estimate["unavailable_count"] == 0
+        estimate["rejects_zero"] = (estimate["rejects_zero"] + 1) % 4
+    elif corruption == "in_domain":
+        adaptive.update(in_domain_count=3, in_domain_covered=adaptive["covered"], out_of_domain_count=0,
+                        domain_passes=True, out_of_domain_reasons={})
+    elif corruption == "budget_reasons":
+        adaptive["out_of_domain_reasons"].pop("n_boot")
+    else:
+        adaptive["out_of_domain_reasons"]["valid_fraction"] = row["repetitions"]
+    benchmark.write_json(path, row)
+    result = subprocess.run(
+        [sys.executable, "-m", "tools.benchmarks.adaptive_inference_calibration", "--profile", "v2_boot",
+         "--quick", "--resume", "--output", str(output), "--workers", "1"],
+        capture_output=True, text=True, timeout=60,
+    )
+    assert result.returncode != 0 and "does not match frozen cell 1:000" in result.stderr
+    assert not pending.exists() and not output.exists()
+
+
+def test_v2_quick_profile_checkpoint_binds_matrix_and_budget(tmp_path, monkeypatch):
+    output = tmp_path / "quick.json"
+    monkeypatch.setenv("QUANTATION_CODE_VERSION", "a" * 40)
+    monkeypatch.setattr(benchmark, "ProcessPoolExecutor", ThreadPoolExecutor)
+    options = dict(quick=True, output=output, workers=2, profile_name="v2_boot")
+    report = benchmark.run_benchmark(**options)
+    assert report["release_passes"] is report["bootstrap_release_passes"] is None
+    assert report["multiplicity"] == []
+    rows = report["coverage"]
+    assert [row["cell_id"] for row in rows] == [
+        *(f"1:{i:03}" for i in range(8)), *(f"3:{i:03}" for i in range(18)),
+    ]
+    assert [tuple(row[key] for key in ("n_times", "horizon", "gap")) for row in rows[8:]] == list(
+        product((512, 1024), (1, 5, 20), (0, 3, 5))
+    )
+    assert all(row["passes"] is None and row["n_assets"] == 1 for row in rows)
+    assert all(row["adaptive"]["unavailable_count"] == 0 for row in rows)
+    assert all(row["adaptive"]["out_of_domain_reasons"] == {"n_boot": 3, "min_valid_replicates": 3} for row in rows)
+    assert [[r["window"] for r in row["fixed"]] for row in rows[:8]] == [
+        [1], [1, 17], [5, 17], [1], [1], [17], [1], [1],
+    ]
+    checkpoints = output.with_suffix(".cells")
+    manifest = checkpoints / "profile.json"
+    metadata = json.loads(manifest.read_text())
+    fingerprint = sha256(json.dumps(metadata, sort_keys=True).encode("utf-8")).hexdigest()
+    assert report["run_fingerprint"] == fingerprint
+    assert metadata["output"] == str(output.resolve()) and metadata["source_revision"] == "a" * 40
+    assert (metadata["seed"], metadata["repetitions"], metadata["adaptive_boot"],
+            metadata["adaptive_min_valid"], metadata["fixed_boot"], metadata["fixed_min_valid"]) == (
+        1538543278954444760, 3, 19, 18, 19, 19,
+    )
+    with pytest.raises(FileExistsError):
+        benchmark.run_benchmark(**options)
+    cell = checkpoints / "1:000.json"
+    saved = json.loads(cell.read_text())
+    other = checkpoints / "3:017.json"
+    other.unlink()
+    for patch in (
+        {"run_fingerprint": "b" * 64}, {"seed_spawn_prefix": [1, 1]}, {"n_assets": True}, {"passes": False},
+        {"adaptive_boot": 20}, {"adaptive": saved["adaptive"] | {"covered": True}},
+        {"adaptive": saved["adaptive"] | {"in_domain_covered": 4}},
+    ):
+        benchmark.write_json(cell, saved | patch)
+        with pytest.raises(ValueError, match="does not match frozen cell"):
+            benchmark.run_benchmark(**options, resume=True)
+        assert not other.exists()
+    cell.write_text("{")
+    with pytest.raises(ValueError, match="does not match frozen cell"):
+        benchmark.run_benchmark(**options, resume=True)
+    benchmark.write_json(cell, saved)
+    foreign = checkpoints / "0:000.json"
+    benchmark.write_json(foreign, saved)
+    with pytest.raises(ValueError, match="outside the frozen matrix"):
+        benchmark.run_benchmark(**options, resume=True)
+    foreign.unlink()
+    benchmark.write_json(manifest, metadata | {"source_revision": "b" * 40})
+    with pytest.raises(ValueError, match="Checkpoint profile does not match"):
+        benchmark.run_benchmark(**options, resume=True)
+    benchmark.write_json(manifest, metadata)
+    mtime = cell.stat().st_mtime_ns
+    assert benchmark.run_benchmark(**options, resume=True) == report
+    assert cell.stat().st_mtime_ns == mtime and other.is_file()
+    benchmark.write_json(output, report)
+    with pytest.raises(FileExistsError):
+        benchmark.run_benchmark(**options, resume=True)

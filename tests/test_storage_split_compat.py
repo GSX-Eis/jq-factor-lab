@@ -102,13 +102,14 @@ def test_storage_module_sizes_and_import_graph(package: str) -> None:
 @pytest.mark.parametrize("first", [
     ("utils.bar_evaluation_store", "utils.market_factor_store"),
     ("utils.bar_evaluation.ingest", "utils.market_factor.writer"),
-    ("tools.agent_harness.cli",),
+    ("utils.bar_evaluation_app", "tools.agent_harness.cli"),
 ], ids=["legacy-first", "implementation-first", "integration-first"])
 def test_storage_integrations_import_in_fresh_process(first: tuple[str, str]) -> None:
     modules = [
         *first,
         "utils.bar_evaluation_store",
         "utils.market_factor_store",
+        "utils.bar_evaluation_app",
         "tools.agent_harness.cli",
     ]
     command = (

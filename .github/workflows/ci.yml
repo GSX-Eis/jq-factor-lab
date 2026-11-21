@@ -55,15 +55,40 @@ jobs:
           source .venv/bin/activate
           python3 -m pip install "$wheel_dir"/*.whl
           python3 -m pip check
+          jq-factor-lab daily-demo --dry-run --compact > daily-plan.json
+          test ! -e outputs
           jq-factor-lab daily-demo > daily.json
           jq-factor-lab bar-demo > bar.json
           db="$(python3 -c 'import json; print(json.load(open("bar.json"))["metrics"]["results_db"]["path"])')"
           jq-factor-lab read-bar-evaluations --results-db "$db" > bar-read.json
+          if jq-factor-lab dashboard --dry-run --results-db "$db" > dashboard-missing.json; then
+            exit 1
+          else
+            test "$?" -eq 1
+          fi
+          wheel=("$wheel_dir"/*.whl)
+          python3 -m pip install "${wheel[0]}[viz,mcp]"
+          python3 -m pip check
+          jq-factor-lab dashboard --dry-run --compact --results-db "$db" > dashboard-plan.json
           python3 - <<'PY'
           import json
           from pathlib import Path
 
+          def compact_payload(name):
+              text = Path(name).read_text()
+              assert len(text.splitlines()) == 1, text
+              return json.loads(text)
+
+          plan = compact_payload("daily-plan.json")
+          assert plan["ok"] is True and plan["exit_code"] == 0 and plan["dry_run"] is True, plan
+          missing = json.loads(Path("dashboard-missing.json").read_text())
+          assert missing["error"]["code"] == "missing_optional_dependency", missing
+          assert "[viz]" in missing["error"]["fix"] and missing["exit_code"] == 1, missing
+          dashboard = compact_payload("dashboard-plan.json")
+          assert dashboard["ok"] is True and dashboard["plan"]["read_only"] is True, dashboard
+
           daily = json.loads(Path("daily.json").read_text())
+          assert daily["ok"] is True and daily["exit_code"] == 0, daily
           assert daily["factor"] == "DemoMomentum" and daily["assets"] > 1, daily
           assert daily["ic_observations"]["1D"] > 0, daily
           assert (Path(daily["output_dir"]) / "summary.json").is_file(), daily
@@ -82,3 +107,7 @@ jobs:
         run: |
           python3 -m pip install '.[dev,synthesis]'
           python3 -m pytest -q -p no:cacheprovider
+      - name: Exercise the MCP stdio protocol
+        run: |
+          python3 -m pip install '.[mcp]'
+          python3 -m pytest -q -p no:cacheprovider tests/test_public_mcp.py

@@ -1,117 +1,138 @@
+<div align="center">
+
 # JQ Factor Lab
 
-English | [简体中文](README.zh-CN.md)
+**An AI-native quantitative research harness for multi-factor computation and synthesis, backtesting, and anti-overfitting statistical evaluation through CLI and MCP.**
 
-**An agent-ready quantitative factor research harness** with one evaluation engine for multi-asset daily cross-sections and single-instrument minute/Bar time series, multi-market calendars (XSHG, CME, NYSE) via pandas-market-calendars (PMC), and structured Bar diagnostics (`diagnostics_report`).
+English · [简体中文](README.zh-CN.md)
 
-- **Try it offline** with two built-in synthetic demos, no account required.
-- **Bring local data** under explicit [CSV, Parquet and DuckDB contracts](docs/DATA_IMPORT.md), the [Bar schema](docs/TIME_SERIES_CONTRACT.md), and a verified [trading calendar](docs/TRADING_CALENDAR.md). The daily CLI takes a multi-asset CSV. The Bar CLI takes Bar and factor CSVs and can persist evaluations in DuckDB. Python readers also support Parquet.
-- **Package for JoinQuant** with the optional [offline single-file builder](docs/JOINQUANT.md). Real market data, trained models, automated login and upload, and cloud or live trading validation are outside the public release.
+[![CI](https://img.shields.io/github/actions/workflow/status/GSX-Eis/jq-factor-lab/ci.yml?branch=dev&label=CI)](https://github.com/GSX-Eis/jq-factor-lab/actions/workflows/ci.yml?query=branch%3Adev)
+[![PyPI version](https://img.shields.io/pypi/v/jq-factor-lab)](https://pypi.org/project/jq-factor-lab/)
+![Python 3.11–3.12](https://img.shields.io/badge/python-3.11%20%7C%203.12-blue)
+[![Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 
-The built-in demos evaluate 3,600 fictional daily prices and produce minute-Bar diagnostics with sample counts, Spearman IC and explicit reasons for undefined metrics.
+</div>
 
-## 3-minute quickstart
+```mermaid
+flowchart TD
+    A["AI agent · Claude Code / Cursor / Codex · stdio MCP"] --> B["Harness CLI · JSON / --dry-run / exit codes"]
+    B --> C["Factor computation and synthesis · weighted sum / LASSO / LightGBM"]
+    C --> D["Factor and strategy backtests · Alphalens / VectorBT"]
+    D --> E["Statistical evaluation · Purged OOS / Adaptive HAC / Bootstrap v2 / TrialLedger"]
+    E --> F["Bar results in DuckDB · read-only Streamlit dashboard"]
+```
 
-Use Python 3.11–3.12 on macOS or Linux. Allow extra time for the first dependency download.
+## Why this exists
+
+JQ Factor Lab runs a local, inspectable research loop with DuckDB on one machine. The same evaluation engine covers daily cross-sections and minute-Bar time series. Agents can preflight a command, parse one strict JSON response, and trace the result to the artifacts and their statistical gates.
+
+| Project | Primary workflow | Where JQ Factor Lab fits |
+| --- | --- | --- |
+| [Qlib](https://github.com/microsoft/qlib) | ML-based quantitative research and investment workflows | A local DuckDB workflow for evaluating daily cross-sections and minute Bars under one contract |
+| [RD-Agent](https://github.com/microsoft/RD-Agent) | Agent-driven research and development | An execution surface with deterministic inputs and output contracts, JSON, dry-run plans and exit codes |
+| [VectorBT](https://github.com/polakowo/vectorbt) | Vectorized portfolio backtesting | Factor evaluation with Adaptive HAC, Bootstrap v2, TrialLedger and a `calibration_status` gate, with VectorBT available for strategy backtests |
+| [TradingAgents](https://github.com/TauricResearch/TradingAgents) | Multi-agent trading analysis and decisions | Reproducible quantitative factor experiments with point-in-time timing, purged splits and auditable evidence |
+
+## 60-second quickstart
+
+Use Python 3.11–3.12 on macOS or Linux. First-time dependency installation can take longer. Clone the release branch, then choose pip or uv.
 
 ```bash
-git clone https://github.com/GSX-Eis/jq-factor-lab.git
+git clone --branch dev https://github.com/GSX-Eis/jq-factor-lab.git
 cd jq-factor-lab
+```
+
+**pip**
+
+```bash
 python3 -m venv .venv
 source .venv/bin/activate
-python3 -m pip install .
+python3 -m pip install '.[synthesis,viz]'
+```
 
+**uv**
+
+```bash
+uv venv --python 3.12
+source .venv/bin/activate
+uv pip install '.[synthesis,viz]'
+```
+
+When the distribution is available on PyPI, use `python3 -m pip install 'jq-factor-lab[synthesis,viz]'` or `uv pip install 'jq-factor-lab[synthesis,viz]'`. Core includes daily and Bar evaluation. Add `[synthesis]` for the weighted demo and synthesis methods, `[viz]` for the dashboard, or `[mcp]` for the stdio server. `[all]` also installs heavier optional components such as Qlib and Torch, subject to platform wheel availability.
+
+Run these commands from a writable directory. All demos use synthetic data and allocate fresh run directories.
+
+```bash
 jq-factor-lab daily-demo > daily.json
 jq-factor-lab bar-demo > bar.json
+jq-factor-lab factor-synthesis-demo --method weighted_sum > synthesis.json
 db="$(python3 -c 'import json; print(json.load(open("bar.json"))["metrics"]["results_db"]["path"])')"
 jq-factor-lab read-bar-evaluations --results-db "$db" > bar-read.json
+jq-factor-lab dashboard --results-db "$db" --dry-run
+# Drop --dry-run to open the read-only dashboard at http://127.0.0.1:8501.
 ```
 
-Both demos allocate a fresh output directory on each run. The daily JSON gives the `output_dir` containing `summary.json`, factor values and IC, IR and quantile CSVs. The Bar JSON lists artifact paths and hashes and points to the demo DuckDB in `metrics.results_db.path`.
-
-### What the demos return
-
-`daily.json` from `daily-demo`, excerpt from a synthetic run.
-
-```json
-{
-  "factor": "DemoMomentum",
-  "rows": 3600,
-  "assets": 20,
-  "execution_lag": 1,
-  "calendar_id": "DEMO_SYNTHETIC_WEEKDAYS",
-  "ic_mean": {"1D": -0.04302664174888087, "5D": -0.05662677403568091, "10D": -0.054942233632862644},
-  "ic_observations": {"1D": 173, "5D": 169, "10D": 164}
-}
-```
-
-`bar.json` from `bar-demo`, showing two of the three diagnostic horizons. The 1-Bar return is constant, so its IC is undefined. The 2-Bar horizon has 38 usable observations. The same run writes `diagnostics_report.csv` and `diagnostics_report.md`.
+The Bar response includes this diagnostic for the 1-Bar horizon, excerpted from a synthetic run. Its constant returns leave Spearman IC undefined.
 
 ```json
 {
   "ok": true,
   "exit_code": 0,
   "metrics": {
-    "analysis_mode": "time_series",
     "diagnostics_report": {
       "schema": "time_series_diagnostics.v1",
       "horizons": [
-        {"instrument_id": "DEMO", "frequency": "1min", "horizon_bars": 1,
-         "ic": {"sample_count": 39, "spearman_ic": null, "reason": "constant_return"}},
-        {"instrument_id": "DEMO", "frequency": "1min", "horizon_bars": 2,
-         "ic": {"sample_count": 38, "spearman_ic": 0.8658496553233396, "reason": null}}
+        {"horizon_bars": 1, "ic": {"sample_count": 39, "spearman_ic": null, "reason": "constant_return"}}
       ]
+    }
+  },
+  "next_actions": ["Pass metrics.results_db.path to read-bar-evaluations --results-db."]
+}
+```
+
+The [AI workflow showcase](docs/AI_WORKFLOW_SHOWCASE.md) follows several candidates through preflight, calibration and trial gates, synthesis, a toy backtest and DuckDB read-back.
+
+## Plug into your AI agent
+
+### Agent Skill or Claude Code plugin
+
+Copy the entire [Factor Research Skill](skills/factor-research/SKILL.md) directory, including its references, into your client's skills directory. With Claude Code, run `claude --plugin-dir .` from the checkout to load the [plugin manifest](.claude-plugin/plugin.json) and invoke `/jq-factor-lab:factor-research`. See [AGENTS.md](AGENTS.md) or [CLAUDE.md](CLAUDE.md) for project instructions.
+
+### Stdio MCP server
+
+With `uvx` on the MCP client's PATH, add this entry to `mcpServers` in Claude Desktop, Cursor, Claude Code or Windsurf. Use this package-based config once the distribution is on PyPI. For a local checkout, change the `--from` value to the absolute checkout path with `[mcp,synthesis]` appended. The synthesis extra lets the server run `run_factor_synthesis_demo`.
+
+```json
+{
+  "mcpServers": {
+    "jq-factor-lab": {
+      "command": "uvx",
+      "args": ["--python", "3.12", "--from", "jq-factor-lab[mcp,synthesis]", "jq-factor-lab-mcp"]
     }
   }
 }
 ```
 
-`bar-read.json` from `read-bar-evaluations`, excerpt. Its `metrics.ic_by_horizon` also contains the persisted 2-Bar Spearman IC shown above.
+The server runs locally. Use absolute paths for tool inputs. See the [CLI and MCP mapping](skills/factor-research/references/cli_contract.md).
 
-```json
-{
-  "ok": true,
-  "exit_code": 0,
-  "metrics": {"run_count": 1}
-}
-```
-
-## Give your coding agent one factor to research
-
-Start in [AGENTS.md](AGENTS.md), or use [CLAUDE.md](CLAUDE.md) with Claude Code. Copy this prompt into Claude Code, Codex or Cursor after setup.
+### Copy a research prompt
 
 ```text
-In three minutes, screen one synthetic daily factor with JQ Factor Lab. Read
-AGENTS.md and run its standalone example in a fresh writable directory. Create
-the ThreeSessionReversal FactorBase class, generate the fictional prices and use
-the shipped synthetic calendar with execution_lag=1. Run single-factor-analysis
-and check the exit code, JSON stdout, stderr log and the run's summary.json.
-Set the rule before evaluation. Keep for further study only if 1D mean IC is
-at least 0.02 on at least 100 observations. Report keep or drop with the 1D
-and 5D ICs, counts and output path. On failure, report the error and defer the
-verdict. Run bar-demo and read-bar-evaluations to verify the diagnostics and
-persisted run. Keep the experiment offline and use synthetic data only.
+Use the Factor Research Skill and run the AI workflow showcase in a fresh
+writable directory. Freeze the hypothesis, candidates, split and screening
+rule. Use only synthetic data. Preflight each evaluation, capture stdout and
+stderr, and report the IC and sample count, null reasons, calibration status
+and complete trial family. Combine only the candidates eligible for the
+synthetic backtest. Verify the DuckDB and dashboard plan. Report rejected
+candidates, artifact paths, and whether the evidence permits a significance claim.
 ```
 
-```mermaid
-flowchart LR
-    A["FactorBase + local data + calendar"] --> B["Run the evaluation CLI"]
-    B --> C["Check exit code and summary.json"]
-    C --> D["Compare metrics with the screening rule"]
-    D --> E["Keep for further study or drop"]
-```
+## Bring your own data
 
-For a daily CSV provide `date`, `stock_code` and positive `close`. Include the positive PIT adjustment `factor` for real adjusted-price research. The CLI defaults that column to 1 when omitted. For prices and labels, verify calendar coverage through the actual label exits and pick an `execution_lag` that reflects when the signal can be traded. Synthetic and single-factor results support screening only. Strategy backtests and platform execution require separate validation.
-
-## Further workflows
-
-- [Factor interface](docs/FACTOR_INTERFACE.md) and [minimal factor template](docs/FACTOR_TEMPLATE.md)
-- [Configuration and outputs](docs/CONFIG.md), [public scope](docs/PUBLIC_SCOPE.md) and [data semantics](docs/SEMANTICS.md)
-- [Synthetic factor synthesis and label requirements](docs/SYNTHESIS.md) and the [full local workflow](docs/LOCAL_WORKFLOW.md)
-- [Contributing and tests](CONTRIBUTING.md), [security](SECURITY.md), and [changelog](CHANGELOG.md)
+Use local [CSV, Parquet or DuckDB](docs/DATA_IMPORT.md), the [factor interface](docs/FACTOR_INTERFACE.md), the [Bar contract](docs/TIME_SERIES_CONTRACT.md), and a verified [trading calendar](docs/TRADING_CALENDAR.md) such as XSHG, CME or NYSE. See the [local workflow](docs/LOCAL_WORKFLOW.md) and [synthesis guide](docs/SYNTHESIS.md) for configuration and label isolation. [JoinQuant single-file packaging](docs/JOINQUANT.md) is an optional offline deployment adapter.
 
 ## Feedback & Community
 
-After trying the offline demos or your own factor, [open an issue](https://github.com/GSX-Eis/jq-factor-lab/issues/new/choose) to report a bug, request a market calendar or data contract, or share an AI-assisted factor research workflow. Use synthetic or sanitized examples and remove real market data and credentials before posting.
+[Open an issue](https://github.com/GSX-Eis/jq-factor-lab/issues/new/choose) to report a bug, request a market calendar or data contract, or share an AI workflow. Share synthetic or sanitized examples. See [contributing](CONTRIBUTING.md), [security](SECURITY.md), and the [changelog](CHANGELOG.md).
 
 Licensed under the [Apache License 2.0](LICENSE). See [NOTICE](NOTICE) for attribution.

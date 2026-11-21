@@ -1,8 +1,9 @@
 """Verify published interval fields, p values and applicable calibration evidence."""
 from __future__ import annotations
 
-from dataclasses import MISSING, asdict
-from math import isclose, sqrt
+from dataclasses import MISSING, asdict, replace
+from math import ceil, isclose, sqrt
+import re
 from statistics import NormalDist
 from typing import Any
 
@@ -14,7 +15,9 @@ from backtest_and_analysis.evaluation.calibration import (
     resolve_interval_calibration,
 )
 from backtest_and_analysis.evaluation.cross_section import bartlett_hac, hac_p_value
+from backtest_and_analysis.time_series.inference import _bootstrap_observation_matches
 from backtest_and_analysis.evaluation.types import (
+    BOOTSTRAP_FIXED, BOOTSTRAP_V1, BOOTSTRAP_V2,
     AdaptiveCalibrationObservation, BootstrapInterval, CalibrationEvidence, HACInterval, IntervalUsability,
 )
 
@@ -22,8 +25,15 @@ from .normalization import _array, _count, _metric, _nullable_text, _object, _re
 from .schema import _CALIBRATION_STATUSES
 
 
+# Populate at first v2 registration with the reviewed 0-domain source SHA.
+_PRE_REGISTRATION_BOOTSTRAP_V2_CODE_VERSIONS: frozenset[str] = frozenset((
+    "1f062ecd1a1bcc6518e22c97779e704674487be7",
+    "8f84c483abec9a117af50c3dfff355157875b74a",
+))
+
+
 def _interval_fields(value: Any, field: str, interval_type: type) -> dict[str, Any]:
-    # Earlier v2 publishers omitted the adaptive fields.
+    # Earlier publishers omitted fields that now have dataclass defaults.
     fields = interval_type.__dataclass_fields__
     required = [name for name, member in fields.items() if member.default is MISSING]
     payload = _object(value, field, *required)
@@ -44,8 +54,10 @@ def _usability(value: Any, field: str, horizon: int) -> IntervalUsability:
     evidence = payload["calibration_evidence"]
     observation = payload.get("adaptive_observation")
     if observation is not None:
-        observation = _object(observation, f"{field}.adaptive_observation",
-                              *AdaptiveCalibrationObservation.__dataclass_fields__)
+        observation = _interval_fields(observation, f"{field}.adaptive_observation", AdaptiveCalibrationObservation)
+        se = _metric(observation["fisher_z_standard_error"], f"{field}.adaptive_observation.fisher_z_standard_error")
+        _require((se is not None and se > 0) if observation["method_version"] == BOOTSTRAP_V2[0] else se is None,
+                 field, "positive Fisher-z standard error for v2 observations only")
         for name in ("grid_size", "n_valid", "horizon", "window", "structural_minimum",
                      "cross_section_width_min", "cross_section_width_max", "n_boot",
                      "min_valid_replicates", "valid_replicates", "min_pairs_per_replicate"):
@@ -65,6 +77,9 @@ def _usability(value: Any, field: str, horizon: int) -> IntervalUsability:
     else:
         evidence = _interval_fields(evidence, f"{field}.calibration_evidence", CalibrationEvidence)
         _require(evidence["passes"] is (status == "calibrated_pass"), field, "evidence consistent with status")
+        if observation is not None and observation.method_version == BOOTSTRAP_V2[0]:
+            for name in ("window", "sample_size", "bootstrap_replicates"):
+                _count(evidence[name], f"{field}.calibration_evidence.{name}", minimum=1)
         evidence = CalibrationEvidence(**{name: evidence[name] for name in CalibrationEvidence.__dataclass_fields__})
         _require(
             evidence == _registered_adaptive_evidence(observation) if observation is not None
@@ -83,8 +98,9 @@ def _usability(value: Any, field: str, horizon: int) -> IntervalUsability:
 def _verified_interval(
     interval: dict[str, Any], use: IntervalUsability, *, time_series: bool, horizon: int,
     statistic: float, point_reason: str | None, n: int, cross_section_sizes: np.ndarray | None,
-    section_ics: np.ndarray | None, bounds: list[float] | None, p_value: float | None,
+    section_ics: np.ndarray | None, pair_pattern: str | None, bounds: list[float] | None, p_value: float | None,
     p_method: str | None, alpha: float, config: dict[str, Any], field: str, legacy: bool,
+    raw_interval: dict[str, Any], code_version: str,
 ) -> None:
     grid_size = interval["grid_size"]
     _require((interval["reason"] is None) == (bounds is not None), field, "interval reason matching bounds")
@@ -102,6 +118,10 @@ def _verified_interval(
     _nullable_text(scenario, field)
 
     if time_series:
+        tags = (interval["method_version"], selector, interval["resample_method"], interval["interval_method"])
+        _require(tags in (BOOTSTRAP_FIXED, BOOTSTRAP_V1, BOOTSTRAP_V2), field, "a recognized Bootstrap method")
+        _require(-1 <= statistic <= 1 if point_reason is None else bounds is None, field, "a valid Spearman IC")
+        _require(bounds is None or -1 <= bounds[0] <= bounds[1] <= 1, field, "bounds in [-1, 1]")
         options = _object(config.get("bootstrap") or {}, "config.bootstrap")
         explicit = options.get("block_length", "auto")
         if explicit != "auto":
@@ -110,16 +130,33 @@ def _verified_interval(
         _require((not adaptive and window >= horizon) or (adaptive and (
             (window == 0 and bounds is None) or horizon <= window < grid_size
         )), field, "a valid Bootstrap block length")
-        _require(
-            (not adaptive and selector == "fixed" and interval["method_version"] is None
-             and interval["resample_method"] == "moving_block" and interval["interval_method"] == "percentile")
-            or (selector == "ppw2009" and interval["method_version"] == "ts_boot_adaptive_v1"
-                and interval["resample_method"] == "circular_block"
-                and interval["interval_method"] == "fisher_z_bootstrap_t"
-                and _count(interval["min_block_length"], field) == horizon
-                and _count(interval["min_pairs_per_replicate"], field, minimum=4) >= 4),
-            field, "Bootstrap method and structural minimum matching the interval",
-        )
+        if adaptive:
+            _require(
+                _count(interval["min_block_length"], field) == horizon
+                and _count(interval["min_pairs_per_replicate"], field, minimum=4) >= 4,
+                field, "Bootstrap structural minimum matching the interval",
+            )
+            if "min_ic_samples" in config:
+                minimum_pairs = max(4, _count(config["min_ic_samples"], "config.min_ic_samples", minimum=2))
+                _require(interval["min_pairs_per_replicate"] == minimum_pairs,
+                         field, "Bootstrap pair minimum matching the published configuration")
+            if tags == BOOTSTRAP_V2:
+                _require(window <= min(n // 4, ceil(min(3 * sqrt(grid_size), grid_size / 3))),
+                         field, "v2 Bootstrap block length within the PPW cap")
+                pattern = interval["missing_pattern"]
+                _require(pattern in ("none", "periodic_17_3", "periodic_17_5", "other"),
+                         field, "a v2 Bootstrap missing pattern")
+                _require((pattern == "none") == (n == grid_size) and (pair_pattern is None or pattern == pair_pattern),
+                         field, "a v2 Bootstrap missing pattern matching the split label pairs")
+                unverified_periodic = pair_pattern is None and pattern in ("periodic_17_3", "periodic_17_5")
+                _require(not unverified_periodic or use.calibration_status == "uncalibrated",
+                         field, "a verified split grid for the v2 Bootstrap missing pattern")
+            if use.adaptive_observation is not None:
+                _require(
+                    _bootstrap_observation_matches(
+                        raw_interval, use.adaptive_observation, horizon=horizon, count=n, intervals_verified=True,
+                    ), field, "Bootstrap observation matching the interval fields",
+                )
         if "block_length" in options or ("analysis_mode" in config and not legacy):
             _require(adaptive if explicit == "auto" else (not adaptive and window == explicit),
                      field, "Bootstrap block length matching the published configuration")
@@ -230,4 +267,14 @@ def _verified_interval(
         typed, point_estimate=statistic, point_reason=point_reason, horizon=horizon,
         cross_section_sizes=cross_section_sizes, ic_method="spearman", intervals_verified=time_series,
     )
+    if (
+        time_series and tags == BOOTSTRAP_V2 and expected.calibration_status == "calibrated_pass"
+        and use.calibration_status == "uncalibrated"
+        and re.fullmatch(r"[0-9a-f]{40}", code_version)
+        and code_version in _PRE_REGISTRATION_BOOTSTRAP_V2_CODE_VERSIONS
+    ):
+        expected = replace(
+            expected, calibration_status="uncalibrated", calibration_evidence=None,
+            verified_horizon=None, significance_interpretation_usable=False,
+        )
     _require(use == expected, field, "interval usability matching the verified interval and observed design")

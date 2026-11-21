@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 from collections.abc import Sequence
 from contextlib import contextmanager
+from hashlib import sha256
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -131,6 +132,7 @@ def _query_runs_on_conn(
     calendar_id: str | None = None,
     start_utc: str | None = None,
     end_utc: str | None = None,
+    validate_only: bool = False,
 ) -> list[dict[str, Any]]:
     _require_bar_evaluation_tables(conn)
     if analysis_mode is not None and analysis_mode not in VALID_ANALYSIS_MODES:
@@ -158,6 +160,9 @@ def _query_runs_on_conn(
     if end_ts is not None:
         clauses.append("ingested_at_utc <= ?")
         params.append(end_ts.to_pydatetime())
+
+    if validate_only:
+        return []
 
     where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     run_columns = _catalog_columns(conn).get("bar_evaluation_runs", {})
@@ -214,6 +219,29 @@ def query_bar_evaluation_detail(
     return {"run": runs[0], **detail}
 
 
+def _run_factor_name(run: dict[str, Any]) -> str | None:
+    # Reuse the ledger when it identifies the evaluated factor. Older runs without
+    # a ledger can still be filtered using their verified published summary.
+    ledger = run["trial_ledger_json"] or {}
+    evaluated = {row["factor_id"] for row in ledger.get("candidates", []) if row["reason"] != "not_evaluated"}
+    if len(evaluated) == 1:
+        return next(iter(evaluated))
+    path = Path(run["summary_path"])
+    try:
+        if not path.is_file():
+            return None
+        evidence = path.read_bytes()
+        if sha256(evidence).hexdigest() != run["summary_sha256"]:
+            return None
+        config = json.loads(evidence)["config"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    if not isinstance(config, dict):
+        return None
+    default = "factor_value" if "bars_csv" in config or "continuous_futures" in config else None
+    return config.get("factor_id", default)
+
+
 def query_bar_evaluations(
     db_path: str | Path,
     *,
@@ -229,8 +257,15 @@ def query_bar_evaluations(
     descriptive_stats_usable: bool | None = None,
     significance_interpretation_usable: bool | None = None,
     has_trial_ledger: bool | None = None,
+    factor_name: str | None = None,
+    limit: int | None = None,
+    validate_only: bool = False,
 ) -> dict[str, Any]:
     """Filter runs and split rows by their inference fields. Legacy tables remain run-scoped."""
+    if limit is not None and (type(limit) is not int or limit < 1):
+        raise BarEvaluationPreconditionError("limit must be a positive integer")
+    if factor_name is not None and not factor_name.strip():
+        raise BarEvaluationPreconditionError("factor_name must be nonempty")
     if split is not None and split not in _SPLIT_NAMES:
         raise BarEvaluationPreconditionError(f"split must be one of {_SPLIT_NAMES}, got {split!r}")
     if calibration_status is not None and calibration_status not in _CALIBRATION_STATUSES:
@@ -257,7 +292,12 @@ def query_bar_evaluations(
             calendar_id=calendar_id,
             start_utc=start_utc,
             end_utc=end_utc,
+            validate_only=validate_only,
         )
+        if validate_only:
+            return {}
+        if factor_name is not None:
+            runs = [run for run in runs if _run_factor_name(run) == factor_name]
         if has_trial_ledger is not None:
             runs = [run for run in runs if (run["trial_ledger_json"] is not None) == has_trial_ledger]
         hashes = [run["identity_hash"] for run in runs]
@@ -281,6 +321,11 @@ def query_bar_evaluations(
                 )
             ]
             hashes = [run["identity_hash"] for run in runs]
+        if limit is not None:
+            runs = runs[:limit]
+            hashes = [run["identity_hash"] for run in runs]
+            selected = set(hashes)
+            split_rows = [row for row in split_rows if row["identity_hash"] in selected]
         if not hashes:
             return {
                 "run_count": 0,

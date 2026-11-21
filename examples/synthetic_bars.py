@@ -17,7 +17,11 @@ def write_demo_bars(path: Path) -> dict[str, Any]:
         "volume": 100, "source": "SYNTHETIC", "data_version": "demo-v1",
         "factor_value": np.cos(steps / 3),
     }).to_csv(path, index=False)
+    return {"bars_csv": str(path.resolve()), **demo_bar_config()}
+
+
+def demo_bar_config() -> dict[str, Any]:
     return {
-        "bars_csv": str(path.resolve()), "analysis_mode": "time_series", "calendar": "NYSE",
+        "analysis_mode": "time_series", "calendar": "NYSE",
         "start_date": "2026-12-01", "end_date": "2026-12-01", "horizons": [1, 2, 5],
     }

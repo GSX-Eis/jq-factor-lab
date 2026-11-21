@@ -25,7 +25,7 @@ body:
     id: output
     attributes:
       label: Output and exit code
-      description: Share the relevant stdout and stderr excerpts with sensitive details removed, plus the exit code.
+      description: Share the exit code, error.code from JSON stdout if available, and the relevant stderr excerpt. Redact sensitive details.
   - type: checkboxes
     id: privacy
     attributes:

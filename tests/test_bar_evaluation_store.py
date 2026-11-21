@@ -7,6 +7,7 @@ import json
 import math
 import subprocess
 import sys
+from shutil import copytree
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -15,6 +16,8 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from backtest_and_analysis.evaluation import calibration
+from backtest_and_analysis.time_series.contracts import ResultIdentity
 from utils import bar_evaluation_store as store
 from utils.bar_evaluation_store import (
     BAR_EVALUATION_TABLES,
@@ -203,7 +206,7 @@ def test_train_oos_round_trip_and_inference_filters(tmp_path: Path) -> None:
             assert row["fit_identity_json"] == report["fit_identity"]["1min"]["000001"]
             assert row["interval_lower"] == metrics["bootstrap"]["lower"]
             assert row["n_observations"] == metrics["ic"]["sample_count"]
-            assert metrics["bootstrap"]["method_version"] == "ts_boot_adaptive_v1"
+            assert metrics["bootstrap"]["method_version"] == "ts_boot_adaptive_v2"
             assert row["calibration_status"] == "uncalibrated"
             assert row["significance_interpretation_usable"] is False
             assert row["p_value"] is None
@@ -578,9 +581,164 @@ def test_adaptive_bootstrap_observation_round_trips_without_calibration(tmp_path
     assert train["interval_lower"] is not None
     assert train["p_value"] is None and train["calibration_status"] == "uncalibrated"
     assert train["significance_interpretation_usable"] is False
-    assert use["adaptive_observation"]["method_version"] == "ts_boot_adaptive_v1"
+    assert use["adaptive_observation"]["method_version"] == "ts_boot_adaptive_v2"
     assert use["adaptive_observation"]["n_valid"] == 512
+    assert use["adaptive_observation"]["fisher_z_standard_error"] == train["metrics_json"]["bootstrap"]["fisher_z_standard_error"]
     assert use["calibration_evidence"] is None
+
+
+@pytest.mark.parametrize("layout", ["periodic", "shifted", "unverified"])
+def test_v2_store_binds_periodic_gaps_to_split_label_clock(tmp_path, monkeypatch, layout):
+    from backtest_and_analysis.evaluation.types import BootstrapInterval, interval_usability_payload
+    from tools.agent_harness.time_series_analysis import evaluate
+    from utils.bar_evaluation.grid_validation import LabelGrid
+
+    config = json.loads(_make_calibrated_hac_config(tmp_path).read_text())
+    bars = pd.read_csv(config["bars_csv"])
+    bars = bars.loc[bars["instrument_id"] == "A00"].reset_index(drop=True)
+    slots = np.arange(len(bars))
+    missing = (slots < 512) & (slots % 17 >= 14)
+    if layout == "shifted":
+        missing[[13, 14]] = missing[[14, 13]]
+    bars.loc[missing, "factor_value"] = np.nan
+    bars.to_csv(config["bars_csv"], index=False)
+    config.update(analysis_mode="time_series", calibration_scenario="gaps")
+
+    output = tmp_path / "periodic"
+    payload = evaluate(config, output)
+    hashes = {a["artifact_type"]: a["sha256"] for a in payload["artifacts"]}
+    summary_path = output / "summary.json"
+    summary = json.loads(summary_path.read_text())
+    train, = summary["splits"]["train"]["horizons"]
+    assert train["ic"]["sample_count"] == 422
+    interval = train["bootstrap"]
+    assert interval["missing_pattern"] == ("other" if layout == "shifted" else "periodic_17_3")
+    db = tmp_path / "periodic.duckdb"
+    if layout == "periodic":
+        assert ingest_evaluation(db, output, expected_hashes=hashes).status == "inserted"
+        train, = query_bar_evaluations(db, split="train")["split_metrics"]
+        assert train["calibration_status"] == "calibrated_pass" and train["significance_interpretation_usable"]
+        use = train["metrics_json"]["interval_usability"]
+        assert use["verified_horizon"] == 1 and train["p_value"] is None
+        assert use["calibration_evidence"]["domain_id"] == "ts_boot_adaptive_v2:gaps"
+        return
+    if layout == "shifted":
+        assert ingest_evaluation(db, output, expected_hashes=hashes).status == "inserted"
+        saved, = query_bar_evaluations(db, split="train")["split_metrics"]
+        assert saved["calibration_status"] == "uncalibrated" and not saved["significance_interpretation_usable"]
+        interval["missing_pattern"] = "periodic_17_3"
+        usability = interval_usability_payload(calibration.evaluate_interval_usability(
+            BootstrapInterval(**interval), point_estimate=train["ic"]["spearman_ic"], horizon=1,
+            ic_method="spearman", intervals_verified=True,
+        ))
+        assert usability["calibration_status"] == "calibrated_pass"
+        train["interval_usability"] = usability
+        summary["trial_ledger"]["candidates"][0]["interval_usability"] = usability
+        summary_path.write_text(json.dumps(summary))
+        hashes["evaluation_summary"] = store.sha256_file(summary_path)
+    else:
+        original_check = LabelGrid.check
+
+        def without_complete_train_grid(self, **options):
+            verified = original_check(self, **options)
+            return None if options["split"] == "train" else verified
+
+        monkeypatch.setattr(LabelGrid, "check", without_complete_train_grid)
+
+    with pytest.raises(BarEvaluationIntegrityError, match="Bootstrap missing pattern"):
+        ingest_evaluation(tmp_path / "invalid.duckdb", output, expected_hashes=hashes)
+
+
+@pytest.mark.parametrize("missing_calendar", [False, True], ids=["complete", "without-calendar"])
+def test_pre_registration_v2_packages_require_the_sealed_source_sha(tmp_path, monkeypatch, missing_calendar):
+    from tools.agent_harness.time_series_analysis import evaluate
+    from utils.bar_evaluation.grid_validation import matching_calendars
+
+    config = _make_calibrated_hac_config(tmp_path)
+    settings = json.loads(config.read_text())
+    bars = pd.read_csv(settings["bars_csv"])
+    bars = bars.loc[bars["instrument_id"] == "A00"].reset_index(drop=True)
+    if missing_calendar:
+        slots = np.arange(len(bars))
+        bars.loc[(slots < 512) & (slots % 17 >= 14), "factor_value"] = np.nan
+        # The omitted Bar and its affected predecessors lie inside the same missing run.
+        bars = bars.drop(index=16)
+        settings["calibration_scenario"] = "gaps"
+    bars.to_csv(settings["bars_csv"], index=False)
+    settings.update(analysis_mode="time_series")
+
+    source = tmp_path / "pre-registration"
+    with monkeypatch.context() as previous:
+        previous.setattr(calibration, "REGISTERED_ADAPTIVE_CALIBRATIONS", tuple(
+            domain for domain in calibration.REGISTERED_ADAPTIVE_CALIBRATIONS
+            if domain.method_version != "ts_boot_adaptive_v2"
+        ))
+        evaluate(settings, source)
+    frozen = ("8f84c483abec9a117af50c3dfff355157875b74a" if missing_calendar
+              else "1f062ecd1a1bcc6518e22c97779e704674487be7")
+    unknown = "b" * 40
+    packages = {}
+    for version in (frozen, unknown, frozen[:12]):
+        package = tmp_path / version
+        copytree(source, package)
+        summary_path = package / "summary.json"
+        summary = json.loads(summary_path.read_text())
+        rid = summary["result_identity"]
+        rid["code_version"] = version
+        if missing_calendar:
+            del summary["calendar_identity"]["schedule"]
+            del summary["config"]["end_date"]
+            config_bytes = json.dumps(summary["config"], sort_keys=True, separators=(",", ":")).encode()
+            rid["config_hash"] = hashlib.sha256(config_bytes).hexdigest()
+            assert matching_calendars(summary) == {}
+        identity = ResultIdentity(**{name: rid[name] for name in ResultIdentity.__dataclass_fields__})
+        rid["identity_hash"] = identity.identity_hash()
+        summary_path.write_text(json.dumps(summary))
+        hashes = {key: store.sha256_file(package / filename) for key, filename in (
+            ("summary", "summary.json"), ("per_bar_labels", "per_bar_labels.csv"),
+            ("ic_by_horizon", "ic_by_horizon.csv"), ("quantile_stats", "quantile_stats.csv"),
+        )}
+        packages[version] = package, hashes, summary
+
+    def publish(version):
+        package, hashes, _ = packages[version]
+        return ingest_evaluation(tmp_path / "after.duckdb", package, expected_hashes=hashes)
+
+    def train_use(version):
+        return packages[version][2]["splits"]["train"]["horizons"][0]["interval_usability"]
+
+    assert train_use(frozen) == train_use(unknown) == train_use(frozen[:12])
+    use = train_use(frozen)
+    observation = use["adaptive_observation"]
+    assert observation["fisher_z_standard_error"] > 0
+    assert observation["missing_pattern"] == ("periodic_17_3" if missing_calendar else "none")
+    assert observation["n_valid"] == (422 if missing_calendar else 512)
+    assert observation["grid_size"] == 512
+    assert use["calibration_status"] == "uncalibrated"
+    assert publish(frozen).status == "inserted"
+    train, = query_bar_evaluations(tmp_path / "after.duckdb", split="train")["split_metrics"]
+    assert train["metrics_json"]["interval_usability"] == use
+    assert train["descriptive_stats_usable"] and not train["significance_interpretation_usable"]
+    for version in (unknown, frozen[:12]):
+        with pytest.raises(BarEvaluationIntegrityError, match="interval usability matching"):
+            publish(version)
+    if missing_calendar:
+        return
+
+    # Historical v1 payloads carry the legacy tags and omit the v2 observation key.
+    package, hashes, summary = packages[unknown]
+    for split in summary["splits"].values():
+        for row in split["horizons"]:
+            row["bootstrap"].update(method_version="ts_boot_adaptive_v1", interval_method="fisher_z_bootstrap_t")
+            obs = row["interval_usability"]["adaptive_observation"]
+            if obs is not None:
+                obs["method_version"] = "ts_boot_adaptive_v1"
+                obs.pop("fisher_z_standard_error")
+    summary["trial_ledger"]["candidates"][0]["interval_usability"] = train_use(unknown)
+    summary_path = package / "summary.json"
+    summary_path.write_text(json.dumps(summary))
+    hashes["summary"] = store.sha256_file(summary_path)
+    assert publish(unknown).status == "inserted"
 
 
 def test_split_grid_keeps_missing_slots_and_truncated_bars_across_closure(tmp_path: Path) -> None:
@@ -1210,6 +1368,82 @@ def test_monitor_refresh_three_database_states(tmp_path: Path) -> None:
     assert bar_eval["latest_ingested_at_utc"].endswith("Z")
 
 
+@pytest.mark.parametrize("legacy", [False, True])
+def test_streamlit_page_importable_pure_queries_and_read_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    dashboard_capture: tuple[SimpleNamespace, list[tuple[str | None, pd.DataFrame]], list[dict]],
+    legacy: bool,
+) -> None:
+    results_db = tmp_path / "viewer.duckdb"
+    ts_bars = _make_ts_bars(tmp_path)
+    cfg_path = tmp_path / "cfg.json"
+    cfg_path.write_text(
+        json.dumps(
+            {
+                "bars_csv": str(ts_bars),
+                "analysis_mode": "time_series",
+                "calendar": "NQ",
+                "start_date": "2026-12-01",
+                "end_date": "2026-12-01",
+                "horizons": [1, 2],
+                "n_quantiles": 3,
+                "trial_selection": {"method": "holm"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    rc, payload = _run_cli(tmp_path, "--config", str(cfg_path), "--results-db", str(results_db))
+    assert rc == 0
+    id_hash = payload["metrics"]["result_identity"]["identity_hash"]
+    if legacy:
+        with duckdb.connect(str(results_db)) as conn:
+            id_hash = _make_legacy_schema(conn)
+
+    # Importing utils.bar_evaluation_app must not touch or write any DB
+    connect = duckdb.connect
+
+    def readonly_connect(*args, **kwargs):
+        assert kwargs.get("read_only") is True
+        return connect(*args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(duckdb, "connect", lambda *a, **kw: pytest.fail("database accessed during import"))
+        app_mod = importlib.reload(importlib.import_module("utils.bar_evaluation_app"))
+    monkeypatch.setattr(duckdb, "connect", readonly_connect)
+    assert app_mod.resolve_results_db_path(
+        ["--results-db", str(results_db)],
+        environ={app_mod.RESULTS_DB_ENV_VAR: str(tmp_path / "other.duckdb")},
+    ) == results_db.resolve()
+    assert app_mod.resolve_results_db_path(
+        [],
+        environ={app_mod.RESULTS_DB_ENV_VAR: str(results_db)},
+    ) == results_db.resolve()
+
+    # Pure query helpers return expected data without altering DB bytes
+    before_bytes = hashlib.sha256(results_db.read_bytes()).hexdigest()
+    opts = get_bar_evaluation_filter_options(results_db)
+    assert opts == {
+        "analysis_modes": ["time_series"],
+        "frequencies": ["1min"],
+        "calendar_ids": ["CME Globex Equity"],
+    }
+    runs = query_bar_evaluation_runs(results_db, analysis_mode="time_series")
+    assert len(runs) == 1 and runs[0]["identity_hash"] == id_hash
+    all_data = query_bar_evaluations(results_db, identity_hash=id_hash)
+    assert all_data["run_count"] == 1
+
+    fake_st, recorded_frames, recorded_json = dashboard_capture
+    monkeypatch.setattr(app_mod, "st", fake_st)
+    app_mod.main(["--results-db", str(results_db)])
+    assert len(recorded_frames) == (3 if legacy else 4)
+    assert recorded_json[0]["has_split"] is (None if legacy else False)
+    if not legacy:
+        assert recorded_json[2]["method"] == "holm"
+        split_frame = dict(recorded_frames)["full"]
+        assert "significance_interpretation_usable" in split_frame
+        assert "split_purged_count" in split_frame
+    after_bytes = hashlib.sha256(results_db.read_bytes()).hexdigest()
+    assert after_bytes == before_bytes
 
 
 @pytest.fixture

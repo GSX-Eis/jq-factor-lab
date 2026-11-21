@@ -2,7 +2,7 @@
 
 ## 阶段 6.6：Bar 评估结果入库（`bar_evaluation_*`、`--results-db`、只读查询与监控）
 
-由模块 [`utils/bar_evaluation_store.py`](../utils/bar_evaluation_store.py) 与只读监控页 `utils/bar_evaluation_app.py`（私有监控入口） 实现。零引入 SQLite，零改动日频 `factor_analysis_results`、`factor_values`、`price_data_daily`、`price_data_5m` 及既有缓存键。
+由模块 [`utils/bar_evaluation_store.py`](../utils/bar_evaluation_store.py) 与只读监控页 [`utils/bar_evaluation_app.py`](../utils/bar_evaluation_app.py) 实现。零引入 SQLite，零改动日频 `factor_analysis_results`、`factor_values`、`price_data_daily`、`price_data_5m` 及既有缓存键。
 
 ### 表结构与双模式兼容性
 

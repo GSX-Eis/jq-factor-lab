@@ -6,7 +6,6 @@ import json
 import math
 import os
 from collections.abc import Mapping
-from dataclasses import asdict
 from enum import Enum
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -14,6 +13,8 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+
+from backtest_and_analysis.evaluation.types import interval_usability_payload
 
 from .contracts import ContractValidationError, ResultIdentity
 from .evaluator import EvaluationResult, RESULT_SCHEMA_VERSION, _mode, _prepare
@@ -118,7 +119,7 @@ def write_evaluation_artifacts(evaluation_result: EvaluationResult, output_dir: 
         exclusion_summary=result.exclusion_summary,
         cross_sections=result.cross_sections.to_dict('records'),
         interval_usability=[
-            dict(frequency=frequency, horizon_bars=horizon, instrument_id=instrument, **asdict(usability))
+            dict(frequency=frequency, horizon_bars=horizon, instrument_id=instrument, **interval_usability_payload(usability))
             for (frequency, horizon, instrument), usability in result.ic_inference.items()
         ],
         splits=result.splits, trial_ledger=result.trial_ledger)

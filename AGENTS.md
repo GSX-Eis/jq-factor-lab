@@ -1,6 +1,8 @@
 # JQ Factor Lab agent guide
 
-Use [the quickstart](README.md) to install JQ Factor Lab with Python 3.11–3.12. Work in a writable directory you own. Start with the synthetic fixtures, then follow the [data import](docs/DATA_IMPORT.md), [factor interface](docs/FACTOR_INTERFACE.md), [Bar input](docs/TIME_SERIES_CONTRACT.md), and [calendar](docs/TRADING_CALENDAR.md) contracts when switching to your own inputs.
+Use [the quickstart](README.md#60-second-quickstart) to install JQ Factor Lab with Python 3.11–3.12. Work in a writable directory you own. Start with the synthetic fixtures, then follow the [data import](docs/DATA_IMPORT.md), [factor interface](docs/FACTOR_INTERFACE.md), [Bar input](docs/TIME_SERIES_CONTRACT.md), and [calendar](docs/TRADING_CALENDAR.md) contracts when switching to your own inputs.
+
+Use the [Factor Research Skill](skills/factor-research/SKILL.md) for the research loop and the [AI workflow showcase](docs/AI_WORKFLOW_SHOWCASE.md) for a reproducible example.
 
 ## Commands
 
@@ -12,14 +14,15 @@ Use [the quickstart](README.md) to install JQ Factor Lab with Python 3.11–3.12
 | Evaluate local Bar inputs in a declared mode and request diagnostics in time-series mode | `jq-factor-lab time-series-analysis --config bar-config.json --diagnostics-report` |
 | Query a persisted Bar evaluation read-only | `jq-factor-lab read-bar-evaluations --results-db evaluations.duckdb` |
 | Try synthetic fixed-weight synthesis after installing `.[synthesis]` | `jq-factor-lab factor-synthesis-demo --method weighted_sum` |
+| Inspect the local read-only dashboard plan after installing `.[viz]` | `jq-factor-lab dashboard --results-db evaluations.duckdb --dry-run` |
 | Package trusted factor files into one JoinQuant Python file offline | `python3 -m scripts.build_jq_strategy --help` |
 
 For the full builder invocation and platform inputs, see [JoinQuant packaging](docs/JOINQUANT.md).
 
 ## Automation and outputs
 
-- Capture stdout and stderr separately. A successful evaluation emits one JSON summary on stdout. Process logs go to stderr, and Bar wrapper JSON may also include child log tails. `--help` prints help text. Check the process exit code before consuming artifacts. For nonzero exits, read the error JSON when present and stderr, which may be the only diagnostic. Bar wrapper responses expose `ok`, `exit_code`, `error`, `metrics` and `artifacts`. The daily summary exposes `output_dir`, `ic_mean` and `ic_observations` directly. For a daily horizon whose IC cannot be estimated, stdout can contain Python's nonstandard `NaN` token. Use the persisted `summary.json` for strict JSON, where non-finite values are represented as `null`.
-- **0** means success, including a requested Bar dry run. For a real Bar evaluation require `ok: true` and the current evaluation artifacts. **1** means a daily analysis or demo failure, including `insufficient_cross_section_assets` in `error.code` for a daily CSV with a single asset. Supply multiple assets or prepare Bar inputs for `time-series-analysis`. **2** means bad CLI arguments or a Bar precondition failure. **3** means Bar execution failed, for example a worker crash or unexpected database write failure. **4** can signal a Bar result identity conflict. See the [evaluation exit codes](docs/EVAL_POLICY.md#exit-code-semantics).
+- Preflight with `--dry-run`. Capture stdout and stderr separately. Operational commands emit strict JSON with `ok` and `exit_code`. Success includes `next_actions`, and failures include `error.code`, `message`, `fix`, and `retryable`. Daily metrics stay at the top level, and non-finite values are `null`. Bar results include `metrics` and `artifacts`.
+- **0** means completion, including a dry run. **1** means an execution or dependency failure, for example `insufficient_cross_section_assets` on a single-asset daily input. **2** means invalid arguments or preconditions. See the [CLI and MCP mapping](skills/factor-research/references/cli_contract.md) for details.
 - Let the demos allocate fresh runs. For explicit output directories use a new path per experiment. An existing directory requires `--overwrite` to update generated artifacts. Keep output and DuckDB paths disjoint. Relative paths in public Bar commands, including config values, resolve from the caller's current working directory (cwd). Daily config paths are relative to the config file. The daily CLI flag `--output-dir` resolves from cwd.
 - In a Bar result, find `artifact_type == "evaluation_summary"`. This evaluation `summary.json` is written atomically last and marks publication of the four files (the summary plus `per_bar_labels.csv`, `ic_by_horizon.csv` and `quantile_stats.csv`). Verify the files and recorded hashes for the same attempt. The separate Harness summary records process status. When requested, `metrics.diagnostics_report` and its CSV and Markdown artifacts describe IC, sample exclusions and uncertainty. Keep a missing IC as `null` and inspect its reason.
 - From a read-only wheel installation, use writable caller-owned paths for outputs, scratch and cache. Public Bar commands place them under the caller's Harness `--output-root`, which defaults to `outputs/agent_harness` under cwd. See the [output layout](docs/PUBLIC_SCOPE.md) and [daily configuration](docs/CONFIG.md).
@@ -33,20 +36,7 @@ For the full builder invocation and platform inputs, see [JoinQuant packaging](d
 
 ## Three-minute autonomous factor screen
 
-Copy this prompt into Claude Code, Codex or Cursor after setup.
-
-```text
-In three minutes, screen one synthetic daily factor with JQ Factor Lab. Read
-AGENTS.md and run its standalone example in a fresh writable directory. Create
-the ThreeSessionReversal FactorBase class, generate the fictional prices and use
-the shipped synthetic calendar with execution_lag=1. Run single-factor-analysis
-and check the exit code, JSON stdout, stderr log and the run's summary.json.
-Set the rule before evaluation. Keep for further study only if 1D mean IC is
-at least 0.02 on at least 100 observations. Report keep or drop with the 1D
-and 5D ICs, counts and output path. On failure, report the error and defer the
-verdict. Run bar-demo and read-bar-evaluations to verify the diagnostics and
-persisted run. Keep the experiment offline and use synthetic data only.
-```
+The following standalone example shows a descriptive daily IC screen. For the multi-candidate Bar workflow with a frozen split, calibration and DuckDB read-back, use the [AI workflow showcase](docs/AI_WORKFLOW_SHOWCASE.md).
 
 ### Standalone example
 

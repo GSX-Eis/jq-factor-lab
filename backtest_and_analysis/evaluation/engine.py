@@ -157,6 +157,10 @@ class EngineResult:
     descriptive: dict[int, TimeSeriesResult | CrossSectionResult] = field(default_factory=dict)
 
 
+def _validate_hac_lag(value: int | Literal["auto"]) -> int | Literal["auto"]:
+    return "auto" if isinstance(value, str) and value == "auto" else _positive_int(value, "hac_lag", minimum=0)
+
+
 @dataclass(frozen=True)
 class EvaluationEngine:
     analysis_mode: AnalysisMode
@@ -242,10 +246,11 @@ class EvaluationEngine:
             requested_lag = statistics_options.pop("hac_lag", None)
             if requested_lag is None:
                 requested_lag = 0 if legacy else "auto"
-            adaptive = isinstance(requested_lag, str) and requested_lag == "auto"
+            requested_lag = _validate_hac_lag(requested_lag)
+            adaptive = requested_lag == "auto"
             if adaptive and legacy:
                 raise ValueError('hac_lag="auto" is incompatible with _legacy_ic_rounding')
-            minimum_lag = 0 if adaptive else _positive_int(requested_lag, "hac_lag", minimum=0)
+            minimum_lag = 0 if adaptive else requested_lag
             lags: dict[Hashable, int] = {}
             for horizon in panel.returns:
                 steps = _daily_horizon_steps(horizon) if self.frequency == "daily" else horizon

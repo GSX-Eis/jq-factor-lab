@@ -20,12 +20,15 @@ classifiers = [
   "Topic :: Scientific/Engineering :: Information Analysis",
 ]
 dependencies = [
-  "numpy==1.26.4",
-  "pandas==2.3.3",
+  # Keep the NumPy 1.x ABI used by the optional native extensions.
+  "numpy>=1.26.4,<2",
+  "pandas>=2.3.3,<3",
+  # Calendar corrections and session fingerprints are verified against this release.
   "pandas_market_calendars==5.6.0",
   "scipy>=1.10,<2",
+  # Preserve the tested DuckDB storage and catalog behavior.
   "duckdb==1.5.3",
-  "pyarrow==19.0.1",
+  "pyarrow>=19.0.1,<20",
   "python-dateutil>=2.8",
 ]
 
@@ -46,14 +49,22 @@ synthesis = [
   "matplotlib",
   "seaborn",
 ]
-qlib = ["pyqlib>=0.9.6,<0.10", "filelock>=3"]
+# pyqlib 0.9.7 ships CPython 3.11/3.12 wheels for Linux x86_64, macOS and Windows x64.
+qlib = ["pyqlib>=0.9.7,<0.10", "filelock>=3"]
 acceleration = ["numba>=0.59"]
 backtest = ["vectorbt>=0.26"]
 mining = ["torch>=2.0"]
+viz = ["streamlit>=1.40,<2", "plotly>=5,<7"]
+mcp = ["mcp>=1.13,<2"]
+# Qlib and Torch are heavy, platform-specific installs. Use individual extras
+# when the target platform lacks compatible wheels or needs a custom Torch index.
+all = ["jq-factor-lab[synthesis,qlib,acceleration,backtest,mining,viz,mcp]"]
 
 [project.scripts]
 jq-factor-lab = "tools.demo_cli:main"
 factorpilot = "tools.demo_cli:main"
+jq-factor-lab-mcp = "tools.mcp_server:main"
+factorpilot-mcp = "tools.mcp_server:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

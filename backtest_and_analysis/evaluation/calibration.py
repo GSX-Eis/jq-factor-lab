@@ -14,6 +14,8 @@ from scipy.stats import t as student_t
 
 from .kernels import _positive_int, spearman
 from .types import (
+    BOOTSTRAP_V1,
+    BOOTSTRAP_V2,
     AdaptiveCalibrationObservation,
     BootstrapInterval,
     CalibrationEvidence,
@@ -168,6 +170,7 @@ class AdaptiveCalibrationDomain:
     coverage_cell_ids: tuple[str, ...]
     covered: int
     repetitions: int
+    grid_sizes: tuple[int, ...] | None = None
 
 
 _PATTERN_GAPS = {"none": 0, "periodic_17_3": 3, "periodic_17_5": 5}
@@ -175,6 +178,33 @@ _PATTERN_GAPS = {"none": 0, "periodic_17_3": 3, "periodic_17_5": 5}
 
 def _expected_mask(size: int, pattern: str) -> npt.NDArray[np.bool_]:
     return np.arange(size) % 17 < 17 - _PATTERN_GAPS[pattern]
+
+
+def _finite_real(value: object) -> bool:
+    return isinstance(value, Real) and not isinstance(value, (bool, np.bool_)) and isfinite(value)
+
+
+def _bootstrap_observation_shape(observation: AdaptiveCalibrationObservation) -> bool:
+    o = observation
+    counts = (
+        o.grid_size, o.n_valid, o.horizon, o.window, o.structural_minimum, o.n_boot,
+        o.min_valid_replicates, o.valid_replicates, o.min_pairs_per_replicate,
+    )
+    if not all(isinstance(v, (int, np.integer)) and not isinstance(v, (bool, np.bool_)) for v in counts):
+        return False
+    se = o.fisher_z_standard_error
+    return (
+        isinstance(o.scenario, str) and bool(o.scenario.strip())
+        and isinstance(o.missing_pattern, str) and o.missing_pattern in _PATTERN_GAPS
+        and 4 <= o.n_valid <= o.grid_size and 1 <= o.horizon == o.structural_minimum <= o.window
+        and 4 <= o.min_pairs_per_replicate <= o.n_valid
+        and 2 <= o.min_valid_replicates <= o.valid_replicates <= o.n_boot
+        and _finite_real(o.alpha) and 0 < o.alpha < 1 and o.alpha / 2 > 0
+        and _finite_real(o.effective_blocks) and o.effective_blocks > 0
+        and o.cross_section_width_min is None and o.cross_section_width_max is None
+        and o.effective_df is None and o.hac_variance is None
+        and (_finite_real(se) and se > 0 if o.method_version == BOOTSTRAP_V2[0] else se is None)
+    )
 
 
 def _adaptive_calibration_observation(
@@ -217,23 +247,24 @@ def _adaptive_calibration_observation(
             n_boot=None, min_valid_replicates=None, valid_replicates=None, min_pairs_per_replicate=None,
             **common,
         )
+    tags = (interval.method_version, interval.block_length_method, interval.resample_method, interval.interval_method)
+    se = interval.fisher_z_standard_error
     if (
-        not intervals_verified or interval.method_version != "ts_boot_adaptive_v1"
-        or interval.block_length_method != "ppw2009" or interval.resample_method != "circular_block"
-        or interval.interval_method != "fisher_z_bootstrap_t" or interval.n_valid_pairs is None
-        or interval.min_block_length is None or interval.min_pairs_per_replicate is None
-        or interval.effective_blocks is None or interval.fisher_z_standard_error is None
-        or not isfinite(interval.fisher_z_standard_error) or interval.fisher_z_standard_error <= 0
+        intervals_verified is not True or tags not in (BOOTSTRAP_V1, BOOTSTRAP_V2)
+        or not all(_finite_real(v) for v in (point_estimate, interval.lower, interval.upper, se))
+        or not -1 <= point_estimate <= 1 or not -1 <= interval.lower <= interval.upper <= 1 or se <= 0
     ):
         return None
-    return AdaptiveCalibrationObservation(
+    observation = AdaptiveCalibrationObservation(
         method_version=interval.method_version, n_valid=interval.n_valid_pairs, window=interval.block_length,
         structural_minimum=interval.min_block_length, cross_section_width_min=None, cross_section_width_max=None,
         effective_df=None, hac_variance=None, effective_blocks=interval.effective_blocks,
         n_boot=interval.n_boot, min_valid_replicates=interval.min_valid_replicates,
         valid_replicates=interval.valid_replicates, min_pairs_per_replicate=interval.min_pairs_per_replicate,
+        fisher_z_standard_error=se if tags == BOOTSTRAP_V2 else None,
         **common,
     )
+    return observation if _bootstrap_observation_shape(observation) else None
 
 
 def _adaptive_domain_mismatches(
@@ -246,6 +277,8 @@ def _adaptive_domain_mismatches(
     size, n = int(o.grid_size), int(o.n_valid)
     if not 0 < n <= size:
         return ("invalid_observation_counts",)
+    if domain.method_version == BOOTSTRAP_V2[0] and not _bootstrap_observation_shape(o):
+        return ("invalid_bootstrap_observation",)
     if not isinstance(o.missing_pattern, str):
         return ("missing_pattern",)
     gaps = _PATTERN_GAPS.get(o.missing_pattern)
@@ -254,7 +287,10 @@ def _adaptive_domain_mismatches(
     checks = {
         "method_version": o.method_version == domain.method_version,
         "scenario": o.scenario == domain.scenario,
-        "grid_size": domain.grid_size_min <= size <= domain.grid_size_max,
+        "grid_size": (
+            size in domain.grid_sizes if domain.grid_sizes is not None
+            else domain.grid_size_min <= size <= domain.grid_size_max
+        ),
         "n_valid": n == expected_n and n >= domain.min_n_valid,
         "missing_fraction": 1 - n / size <= domain.max_missing_fraction,
         "missing_pattern": o.missing_pattern in domain.missing_patterns,
@@ -298,14 +334,17 @@ def _adaptive_domain_mismatches(
 
 
 def _candidate_adaptive_domain(
-    *, cross_section: bool, scenario: str, horizon: int, gap: int, s5: bool = False,
+    *, cross_section: bool, scenario: str, horizon: int, gap: int, s5: bool = False, v2_boot: bool = False,
 ) -> AdaptiveCalibrationDomain:
     generalized = scenario == "generalized_ar_heteroskedastic"
     mode = "none" if gap == 0 else f"periodic_17_{gap}"
     core_valid = int(_expected_mask(512, mode).sum())
-    version = "cs_hac_adaptive_v1" if cross_section else "ts_boot_adaptive_v1"
+    if cross_section:
+        version = "cs_hac_adaptive_v1"
+    else:
+        version = BOOTSTRAP_V2[0] if v2_boot else BOOTSTRAP_V1[0]
     grid_min, valid_min, width_min = (128, 90, 16)
-    if s5:
+    if s5 or v2_boot:
         grid_min, valid_min, width_min = (256, 180, 32) if cross_section else (512, 360, 32)
     return AdaptiveCalibrationDomain(
         domain_id=f"{version}:{scenario}", method_version=version, scenario=scenario,
@@ -323,10 +362,11 @@ def _candidate_adaptive_domain(
         min_pairs_per_replicate=None if cross_section else 4,
         nominal_coverage=_NOMINAL_COVERAGE, report_ref="", report_sha256="",
         coverage_cell_ids=(), covered=0, repetitions=0,
+        grid_sizes=(512, 1024) if v2_boot and generalized else None,
     )
 
 
-# S5 released HAC. Bootstrap missed the coverage gate in three generalization cells.
+# NERE-936 S5 released HAC. NERE-962 S3 separately released Bootstrap v2.
 REGISTERED_ADAPTIVE_CALIBRATIONS: tuple[AdaptiveCalibrationDomain, ...] = tuple(
     replace(
         _candidate_adaptive_domain(cross_section=True, scenario=scenario, horizon=horizon, gap=gap, s5=True),
@@ -346,6 +386,26 @@ REGISTERED_ADAPTIVE_CALIBRATIONS: tuple[AdaptiveCalibrationDomain, ...] = tuple(
         ("positive_effect", 1, 0, ("0:006",), 468),
         ("negative_effect", 1, 0, ("0:007",), 480),
         ("generalized_ar_heteroskedastic", 1, 0, tuple(f"2:{index:03d}" for index in range(54)), 461),
+    )
+) + tuple(
+    replace(
+        _candidate_adaptive_domain(cross_section=False, scenario=scenario, horizon=horizon, gap=gap, v2_boot=True),
+        report_ref="reports/NERE-962/adaptive-calibration-v2.json",
+        report_sha256="cc48e87355e919aa19d0cc1ce2590a05a0428b222a5bbec48446bd505cd29a81",
+        coverage_cell_ids=cell_ids,
+        covered=covered,
+        repetitions=500,
+    )
+    for scenario, horizon, gap, cell_ids, covered in (
+        ("iid", 1, 0, ("1:000",), 477),
+        ("strong_ar", 1, 0, ("1:001",), 468),
+        ("overlap", 5, 0, ("1:002",), 467),
+        ("gaps", 1, 3, ("1:003",), 477),
+        ("heteroskedastic", 1, 0, ("1:004",), 479),
+        ("combined", 5, 3, ("1:005",), 471),
+        ("positive_effect", 1, 0, ("1:006",), 477),
+        ("negative_effect", 1, 0, ("1:007",), 471),
+        ("generalized_ar_heteroskedastic", 1, 0, tuple(f"3:{index:03d}" for index in range(18)), 462),
     )
 )
 

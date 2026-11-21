@@ -8,9 +8,10 @@ from tools.agent_harness import runner
 from tools.agent_harness._cli_compat import _cli_bindings
 
 
-def build_parser(*, public_bar_cli: bool = False) -> argparse.ArgumentParser:
+def build_parser(*, public_bar_cli: bool = False, parser_class: type[argparse.ArgumentParser] = argparse.ArgumentParser) -> argparse.ArgumentParser:
     cli = _cli_bindings(__name__, runner)
-    parser = argparse.ArgumentParser(
+    parser = parser_class(
+        prog="jq-factor-lab" if public_bar_cli else None,
         description="Agent-native harness wrappers for quantation_factor_database"
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -166,7 +167,7 @@ def build_parser(*, public_bar_cli: bool = False) -> argparse.ArgumentParser:
     bar_analysis = subparsers.add_parser("time-series-analysis", help="Evaluate CSV Bar factors in an explicit mode")
     add_common(bar_analysis)
     bar_analysis.add_argument("--config", default="", help="Bar analysis JSON config")
-    bar_analysis.add_argument("--diagnostics-report", action="store_true",
+    bar_analysis.add_argument("--diagnostics-report", action=argparse.BooleanOptionalAction,
                               help="Publish time-series diagnostics in JSON, CSV and Markdown")
     for subparser in (bar_analysis, analyze):
         subparser.add_argument("--bars-csv")
@@ -198,6 +199,8 @@ def build_parser(*, public_bar_cli: bool = False) -> argparse.ArgumentParser:
     read_bar_eval.add_argument("--significance-interpretation-usable", action=argparse.BooleanOptionalAction)
     read_bar_eval.add_argument("--has-trial-ledger", action=argparse.BooleanOptionalAction)
     if public_bar_cli:
+        read_bar_eval.add_argument("--factor-name", help="Recorded factor ID")
+        read_bar_eval.add_argument("--limit", type=int, help="Maximum latest matching runs")
         output_root = str(Path("outputs/agent_harness").resolve())
         for command in (bar_analysis, read_bar_eval):
             command.set_defaults(output_root=output_root)

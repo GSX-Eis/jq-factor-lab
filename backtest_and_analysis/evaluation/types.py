@@ -1,7 +1,7 @@
 """Results of cross-sectional and time-series factor evaluation."""
 
 from collections.abc import Hashable
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Literal
 
 import numpy as np
@@ -16,6 +16,10 @@ ICMethod = Literal["spearman", "pearson"]
 
 DEFAULT_BOOTSTRAP_REPLICATES = 999
 DEFAULT_MIN_VALID_REPLICATES = 900
+
+BOOTSTRAP_FIXED = (None, "fixed", "moving_block", "percentile")
+BOOTSTRAP_V1 = ("ts_boot_adaptive_v1", "ppw2009", "circular_block", "fisher_z_bootstrap_t")
+BOOTSTRAP_V2 = ("ts_boot_adaptive_v2", "ppw2009", "circular_block", "fisher_z_bootstrap_t_flat_top_block")
 
 CalibrationStatus = Literal["uncalibrated", "calibrated_pass", "calibrated_fail"]
 CalibrationMethod = Literal[
@@ -43,6 +47,7 @@ class AdaptiveCalibrationObservation:
     min_valid_replicates: int | None
     valid_replicates: int | None
     min_pairs_per_replicate: int | None
+    fisher_z_standard_error: float | None = None
 
 
 @dataclass(frozen=True)
@@ -71,6 +76,14 @@ class IntervalUsability:
     significance_interpretation_usable: bool
     verified_horizon: int | None = None
     adaptive_observation: AdaptiveCalibrationObservation | None = None
+
+
+def interval_usability_payload(use: IntervalUsability) -> dict:
+    payload = asdict(use)
+    observation = payload["adaptive_observation"]
+    if observation is not None and observation["method_version"] != BOOTSTRAP_V2[0]:
+        del observation["fisher_z_standard_error"]
+    return payload
 
 
 @dataclass(frozen=True)
@@ -179,7 +192,7 @@ class BootstrapInterval:
     calibration_scenario: str | None = None
     block_length_method: Literal["fixed", "ppw2009"] = "fixed"
     resample_method: Literal["moving_block", "circular_block"] = "moving_block"
-    interval_method: Literal["percentile", "fisher_z_bootstrap_t"] = "percentile"
+    interval_method: Literal["percentile", "fisher_z_bootstrap_t", "fisher_z_bootstrap_t_flat_top_block"] = "percentile"
     min_block_length: int | None = None
     min_pairs_per_replicate: int | None = None
     effective_blocks: float | None = None

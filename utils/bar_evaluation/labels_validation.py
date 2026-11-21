@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 
 from backtest_and_analysis.evaluation.kernels import spearman
+from backtest_and_analysis.evaluation.time_series import _missing_pattern
 from backtest_and_analysis.time_series.evaluator import (
     COUNT_COLUMNS, _PreparedLabels, _counts, _observed_panel, _prepare,
 )
@@ -180,8 +181,9 @@ def check_split_labels(
     labels: pd.DataFrame, *, grid: LabelGrid, time_series: bool, split: str, start: pd.Timestamp, end: pd.Timestamp,
     train_end: pd.Timestamp | None, oos_start: pd.Timestamp | None, oos_grid_start: pd.Timestamp | None,
     grid_size: int, minimum: SampleMinimum, claimed_count: int, point_reason: str | None, field: str,
-) -> tuple[float, int, np.ndarray | None, np.ndarray | None]:
-    """Bind a split to the observed clocks and return its IC and section data."""
+    bootstrap_v2: bool,
+) -> tuple[float, int, np.ndarray | None, np.ndarray | None, str | None]:
+    """Bind a split to the label clock and derive applicable HAC or Bootstrap audit data."""
     available = labels["signal_available_at"]
     clock = labels["signal_timestamp"] if time_series else available
     in_window = pd.Series(True, index=labels.index)
@@ -218,19 +220,26 @@ def check_split_labels(
             raise BarEvaluationIntegrityError(f"Missing per_bar_labels.csv {exit_col} for a valid pair")
         pairs = pairs.loc[exits <= oos_grid_start]
 
+    pair_pattern = None
+    if bootstrap_v2 and expected is not None:
+        pair_mask = expected.isin(pairs["signal_timestamp"])
+        if pair_mask.sum() != len(pairs):
+            raise BarEvaluationIntegrityError(f"{field} label pairs fall outside the verified split grid")
+        pair_pattern = _missing_pattern(pair_mask)
+
     if pairs.empty:
         if time_series:
             minimum.observe(0, point_reason == "insufficient_samples", field)
-            return np.nan, 0, None, None
+            return np.nan, 0, None, None, pair_pattern
         if expected is None:
-            return np.nan, 0, np.empty(0, dtype=int), None
-        return np.nan, 0, np.zeros(grid_size, dtype=int), np.full(grid_size, np.nan)
+            return np.nan, 0, np.empty(0, dtype=int), None, None
+        return np.nan, 0, np.zeros(grid_size, dtype=int), np.full(grid_size, np.nan), None
     prepared = _prepare(pairs, None)
     if time_series:
         point = spearman(prepared.factor[:, None], prepared.returns[:, None], axis=0, min_samples=2)
         count = int(point.counts[0])
         minimum.observe(count, point_reason == "insufficient_samples", field)
-        return (point.values[0] if count >= minimum.lower else np.nan), count, None, None
+        return (point.values[0] if count >= minimum.lower else np.nan), count, None, None, pair_pattern
 
     # Cross-sectional inference groups by when each signal becomes available.
     times = pd.DatetimeIndex(pairs["signal_available_at"])
@@ -247,11 +256,11 @@ def check_split_labels(
     valid = values[np.isfinite(values)]
     mean = valid.mean() if valid.size else np.nan
     if expected is None:
-        return mean, len(valid), point.counts, None
+        return mean, len(valid), point.counts, None, None
     positions = expected.get_indexer(panel.datetimes)
     if (positions < 0).any():
         raise BarEvaluationIntegrityError(f"{field} label sections fall outside the verified split grid")
     sizes = np.zeros(grid_size, dtype=int)
     aligned = np.full(grid_size, np.nan)
     sizes[positions], aligned[positions] = point.counts, values
-    return mean, len(valid), sizes, aligned
+    return mean, len(valid), sizes, aligned, None

@@ -114,6 +114,8 @@ def test_python_bar_store_rejects_impossible_sparse_split_grid(tmp_path, case):
     train, oos = (summary['splits'][split]['horizons'][0] for split in ('train', 'oos'))
     assert pd.Timestamp(train['grid_end_utc']) == START + pd.Timedelta(minutes=5)
     assert pd.Timestamp(oos['grid_start_utc']) == START + pd.Timedelta(minutes=6)
+    assert train['bootstrap']['method_version'] is None
+    assert train['bootstrap']['interval_method'] == 'percentile'
     assert train['bootstrap']['grid_size'] == 6
     if case == 'capacity':
         train['bootstrap']['grid_size'] = 999999

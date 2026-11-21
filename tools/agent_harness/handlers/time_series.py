@@ -61,6 +61,7 @@ def _handle_time_series_analysis(
         _validate_db_target_path,
         ingest_evaluation,
     )
+    from utils.local_outputs import check_output_directory
     from utils.output_paths import execution_environment
 
     cli = _cli_bindings(__name__, _json_io, runner)
@@ -89,7 +90,9 @@ def _handle_time_series_analysis(
             guard_config = cli._safe_read_json(config_path)
         except (OSError, ValueError, TypeError):
             pass
-    diagnostics_requested = bool(getattr(args, 'diagnostics_report', False) or guard_config.get('diagnostics_report') is True)
+    diagnostics_override = getattr(args, 'diagnostics_report', None)
+    diagnostics_requested = (guard_config.get('diagnostics_report') is True
+                             if diagnostics_override is None else diagnostics_override)
     guard_reason = "time_series_precondition_failed"
     try:
         requested_destination = None
@@ -100,16 +103,14 @@ def _handle_time_series_analysis(
                                      else cli._resolve_repo_relative_path(guard_config["output_dir"]))
         if requested_destination is not None:
             if public_output is not None:
-                if requested_destination.is_symlink():
-                    raise ValueError(f"Output directory must not be a symlink: {requested_destination}")
-                if not args.overwrite and requested_destination.exists():
-                    raise FileExistsError(
-                        f"Output already exists: {requested_destination}. Pass --overwrite or choose a new directory."
-                    )
+                requested_destination = check_output_directory(
+                    requested_destination, overwrite=args.overwrite)
             requested_destination = requested_destination.resolve()
         guarded_destination = requested_destination or destination
         if guarded_destination in harness_summary_dirs:
             guarded_destination = destination
+        if public_output is not None:
+            check_output_directory(output_dir, overwrite=True)
         validate_evaluation_output_dir(guarded_destination)
 
         # A retry can target an artifact published by an earlier attempt.
@@ -144,9 +145,9 @@ def _handle_time_series_analysis(
             metrics={"error": str(exc)}, artifacts=[])
         result.error["message"] = str(exc)
         return result
-    if args.fake_result:
+    if args.fake_result and not (public_output is not None and args.dry_run):
         return cli._fake_result(**common, fake_result=args.fake_result, json_out=args.json_out)
-    if args.dry_run:
+    if args.dry_run and public_output is None:
         dry_metrics: Dict[str, Any] = {"planned_config": args.config}
         if getattr(args, "results_db", None) is not None:
             dry_metrics["planned_results_db"] = str(Path(args.results_db).expanduser().resolve())
@@ -157,7 +158,7 @@ def _handle_time_series_analysis(
         if public_output is not None and config_error is not None:
             raise config_error
         # Clear an explicit CLI retry's marker even if config loading itself fails.
-        if args.output_dir or (config_error is None and config.get("output_dir")):
+        if (args.output_dir or (config_error is None and config.get("output_dir"))) and not args.dry_run:
             destination = guarded_destination
             (destination / "summary.json").unlink(missing_ok=True)
         if config_error is not None:
@@ -187,8 +188,18 @@ def _handle_time_series_analysis(
             config["horizons"] = [int(h.strip()) for h in args.horizons.split(",")]
         if args.calendar is not None:
             config.pop("calendar_by_instrument", None)
-        if getattr(args, 'diagnostics_report', False):
-            config['diagnostics_report'] = True
+        if diagnostics_override is not None:
+            config['diagnostics_report'] = diagnostics_override
+        if args.dry_run:
+            from tools.agent_harness.time_series_analysis import evaluate
+
+            plan = evaluate(config, None)
+            plan.update(config=str(config_path) if args.config else None,
+                        output_dir=str(guarded_destination), output_root=str(output_root),
+                        results_db=str(results_db_path) if results_db_path else None,
+                        overwrite=args.overwrite, diagnostics_report=diagnostics_requested)
+            return cli._success_result(**common, mode='dry_run', reason='dry_run',
+                                       metrics=plan, artifacts=[])
         output_dir.mkdir(parents=True, exist_ok=True)
         resolved_config = output_dir / "config" / "resolved.json"
         cli._write_json(resolved_config, config)
@@ -246,7 +257,7 @@ def _handle_time_series_analysis(
             )
             result.error["message"] = str(exc)
         else:
-            precondition = phase == "preflight" and isinstance(exc, (OSError, ValueError, TypeError))
+            precondition = phase == "preflight" and isinstance(exc, (OSError, ValueError, TypeError, KeyError))
             reason = (
                 "bar_evaluation_store_precondition_failed"
                 if isinstance(exc, BarEvaluationPreconditionError)
@@ -258,6 +269,8 @@ def _handle_time_series_analysis(
                 metrics={"exception_type": type(exc).__name__, "error": str(exc)},
                 artifacts=cli._common_artifacts(output_dir))
             result.error["message"] = str(exc)
+    if args.dry_run:
+        return result
     if not result.ok:
         try:
             (destination / "summary.json").unlink(missing_ok=True)
@@ -266,7 +279,7 @@ def _handle_time_series_analysis(
     return cli._complete_result(result, args.json_out)
 
 
-def _handle_read_bar_evaluations(args: argparse.Namespace) -> HarnessResult:
+def _handle_read_bar_evaluations(args: argparse.Namespace, *, public_read: bool = False) -> HarnessResult:
     from utils.bar_evaluation_store import (
         BarEvaluationPreconditionError,
         query_bar_evaluations,
@@ -280,7 +293,7 @@ def _handle_read_bar_evaluations(args: argparse.Namespace) -> HarnessResult:
     started_at = cli._utc_now()
     db_path = Path(args.results_db).expanduser().resolve()
     command = [action, "--results-db", str(db_path)]
-    artifacts = cli._common_artifacts(output_dir)
+    artifacts = [] if public_read and (args.dry_run or not args.json_out) else cli._common_artifacts(output_dir)
     common = dict(
         action=action,
         output_dir=output_dir,
@@ -289,6 +302,11 @@ def _handle_read_bar_evaluations(args: argparse.Namespace) -> HarnessResult:
         started_at=started_at,
         artifacts=artifacts,
     )
+    def finish(result: HarnessResult, json_out: str) -> HarnessResult:
+        if public_read and (args.dry_run or not json_out):
+            return result
+        return cli._complete_result(result, json_out)
+
     try:
         cli._validate_bar_output_paths(db_path, output_dir, args.json_out)
     except (OSError, ValueError, TypeError) as exc:
@@ -297,7 +315,7 @@ def _handle_read_bar_evaluations(args: argparse.Namespace) -> HarnessResult:
             metrics={"results_db": str(db_path), "error": str(exc)})
         result.error["message"] = str(exc)
         return result
-    if args.fake_result:
+    if args.fake_result and not (public_read and args.dry_run):
         return cli._fake_result(
             action=action,
             fake_result=args.fake_result,
@@ -307,8 +325,8 @@ def _handle_read_bar_evaluations(args: argparse.Namespace) -> HarnessResult:
             command=command,
             json_out=args.json_out,
         )
-    if args.dry_run:
-        return cli._complete_result(
+    if args.dry_run and not public_read:
+        return finish(
             cli._success_result(
                 **common,
                 mode="dry_run",
@@ -332,8 +350,14 @@ def _handle_read_bar_evaluations(args: argparse.Namespace) -> HarnessResult:
             descriptive_stats_usable=args.descriptive_stats_usable,
             significance_interpretation_usable=args.significance_interpretation_usable,
             has_trial_ledger=args.has_trial_ledger,
+            factor_name=getattr(args, "factor_name", None),
+            limit=getattr(args, "limit", None),
+            validate_only=public_read and args.dry_run,
         )
-        return cli._complete_result(
+        if args.dry_run:
+            return cli._success_result(**common, mode="dry_run", reason="dry_run",
+                                       metrics={"results_db": str(db_path)})
+        return finish(
             cli._success_result(
                 **common,
                 mode="local",
@@ -350,7 +374,7 @@ def _handle_read_bar_evaluations(args: argparse.Namespace) -> HarnessResult:
             metrics={"results_db": str(db_path), "error": str(exc)},
         )
         result.error["message"] = str(exc)
-        return cli._complete_result(result, json_out=args.json_out)
+        return finish(result, json_out=args.json_out)
     except Exception as exc:
         result = cli._failure_result(
             **common,
@@ -360,4 +384,4 @@ def _handle_read_bar_evaluations(args: argparse.Namespace) -> HarnessResult:
             metrics={"results_db": str(db_path), "error": str(exc)},
         )
         result.error["message"] = str(exc)
-        return cli._complete_result(result, json_out=args.json_out)
+        return finish(result, json_out=args.json_out)

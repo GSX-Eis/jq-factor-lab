@@ -27,12 +27,9 @@ def synthetic_panel():
 
 
 def run_demo(
-    method: str, output_dir: Path | None = None, *, overwrite: bool = False,
+    method: str, output_dir: Path | None = None, *, overwrite: bool = False, dry_run: bool = False,
 ) -> dict[str, Any]:
     """Run one teaching window with a completion marker for its outputs."""
-    import numpy as np
-    from utils.local_outputs import new_run_directory, stage_demo_output
-
     if method not in METHODS:
         raise ValueError(f"Unknown synthesis method: {method}")
     # The artificial same-row response has no verified forward-label exit.
@@ -49,6 +46,11 @@ def run_demo(
             "fixed-weight synthesis and labels, not supervised training. Do not invent "
             "exit dates or disable strict validation. See docs/SYNTHESIS.md."
         )
+    if dry_run:
+        return {"dry_run": True, "plan": {"method": method, "data": "synthetic"}}
+
+    import numpy as np
+    from utils.local_outputs import new_run_directory, stage_demo_output
     from factor_synthesis.core.factor_ops import apply_feature_preprocessing
     from factor_synthesis.pipeline import run_weighted_sum_synthesis
 

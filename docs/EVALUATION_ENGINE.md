@@ -191,10 +191,13 @@ $$
 
 ### IC 的块 bootstrap 置信区间
 
-统一入口默认使用 `ts_boot_adaptive_v1`。它用标准化秩乘积的依赖结构选择块长，
-以当前持有期的 `h` 为下界。圆形块复制保留缺口并重新排名，Fisher-z 尺度的
+统一入口默认使用 `ts_boot_adaptive_v2`。它用标准化秩乘积的依赖结构选择块长，
+以当前持有期的 `h` 为下界。圆形块复制保留缺口并重新排名。原样本在保留缺口的
+网格上用经自由度校正的平顶窗估计 Fisher-z 标准误，平顶谱底未过护栏时回退到
+经自由度校正的 Bartlett 估计。复制样本用独立完整块的贡献及残块权重估计标准误，Fisher-z 尺度的
 学生化枢轴经反演后给出 Spearman 区间。默认请求 999 次复制，至少 900 次有效。
 `BootstrapInterval` 报告版本、抽样与区间方法、实际块长、有效块数和复制计数。
+校准实验的实现与参数见 [tools/benchmarks/adaptive_inference_calibration.py](../tools/benchmarks/adaptive_inference_calibration.py)。
 显式整数块长使用以下移动块百分位区间。
 
 在该品种当前切分的应有网格上做移动块 bootstrap。设网格有 $N$ 个槽位，原始 IC 可估计且 $h\le b<N$ 时，取长度 $b$ 的连续块。从 $N-b+1$ 个可用起点均匀有放回抽取 $\lceil N/b\rceil$ 个块，连接后截取前 $N$ 个槽位。因子、收益和有效掩码共同移动，缺失槽位占据原块位置，块不跨切分边界，也不循环拼接原序列首尾。
@@ -370,9 +373,21 @@ Bootstrap 的 8 个核心格和 2 个方向判据通过，18 个泛化格中有 
   `T=128`、`N=16` 或其他超域观测保持 `uncalibrated`。
 - `ts_boot_adaptive_v1` 登记 0 域，生产一律返回 `uncalibrated`。
   `T=128` 和 `T=256` 同时低于 S5 泛化候选域的 `T=512` 下界。
+- `ts_boot_adaptive_v2` 在 NERE-962 S3 以独立根种子完成每格 500 次复验，8 个核心格、
+  18 个泛化格及正负方向判据全部通过，登记 8 个核心域和 1 个泛化域。核心沿用上述
+  8 个场景名，每域精确绑定 `T=512`、单品种及对应的持有期与缺口模式。
+  泛化域 `generalized_ar_heteroskedastic` 仅支持单品种的 `T ∈ {512, 1024}`、
+  `h ∈ {1, 5, 20}` 与缺口模式 `none`、`periodic_17_3`、`periodic_17_5`，
+  至少 360 个有效配对、缺失率至多 30%。泛化域证据取偏离 95% 最大的
+  `3:008` 格，覆盖 462/500。
+  所有域要求验证持仓区间和精确缺口位置，至少 4 个有效块，请求复制数至少 999，
+  配置的最少有效复制数至少 900，有效复制同时达到配置下限与 90%，每复制最少配对数
+  精确等于 4。域内且估计有效的观测回读为 `calibrated_pass` 并绑定 `verified_horizon`。
+  域外、缺少核验字段或声明与观测不符的区间保持 `uncalibrated`。时序区间无独立原始 p 值，
+  因此即使区间已通过校准也无法参与 `TrialLedger.select_best()` 显著性择优。
 
 可运行公开基准脚本
-[tools/benchmarks/adaptive_inference_calibration.py](../tools/benchmarks/adaptive_inference_calibration.py)复现 S4 与 S5 的合成覆盖率和多重检验实验。
+[tools/benchmarks/adaptive_inference_calibration.py](../tools/benchmarks/adaptive_inference_calibration.py)复现自适应区间的合成覆盖率和多重检验实验。
 
 ## 7. 不可估计状态
 

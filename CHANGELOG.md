@@ -11,4 +11,4 @@
 
 The distributions include the Apache 2.0 license and attribution notice.
 
-Try the offline demos from the [Quickstart](README.md#3-minute-quickstart), then [share feedback](https://github.com/GSX-Eis/jq-factor-lab/issues/new/choose). The issue chooser has forms for bug reports, market calendar and data contract requests, and AI factor research showcases. Use synthetic or sanitized examples and keep real market data and credentials out of public issues.
+Try the offline demos from the [Quickstart](README.md#60-second-quickstart), then [share feedback](https://github.com/GSX-Eis/jq-factor-lab/issues/new/choose). The issue chooser has forms for bug reports, market calendar and data contract requests, and AI factor research showcases. Use synthetic or sanitized examples and keep real market data and credentials out of public issues.

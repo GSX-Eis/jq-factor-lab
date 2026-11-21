@@ -59,6 +59,11 @@ def align_released_features(
     return aligned.set_axis(signals.rename("signal_available_at"), axis=0)
 
 
+def _validate_split_order(train_end: pd.Timestamp, oos_start: pd.Timestamp) -> None:
+    if train_end >= oos_start:
+        raise ValueError("Expected train_end < oos_start")
+
+
 def evaluate_splits(
     panel: EvaluationPanel,
     split: SplitConfig | Mapping[str, str | pd.Timestamp],
@@ -108,8 +113,7 @@ def evaluate_splits(
         split_axis = panel.datetimes
     else:
         raise ValueError("Use timezone-aware split bounds or daily trading date keys")
-    if train_end >= oos_start:
-        raise ValueError("Expected train_end < oos_start")
+    _validate_split_order(train_end, oos_start)
     train_rows, oos_rows = split_axis <= train_end, split_axis >= oos_start
     eligible = np.isfinite(panel.factor)
     grid = None

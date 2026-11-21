@@ -61,10 +61,10 @@ def test_public_algorithm_packages_import():
 @pytest.mark.parametrize("method", [m for m in METHODS if m != "weighted_sum"])
 def test_public_cli_rejects_unverified_artificial_label(method, tmp_path, capsys):
     target = tmp_path / method
-    with pytest.raises(SystemExit) as exc:
-        main(["factor-synthesis-demo", "--method", method, "--output-dir", str(target)])
-    assert exc.value.code == 1
-    error = capsys.readouterr().err
+    assert main(["factor-synthesis-demo", "--method", method, "--output-dir", str(target)]) == 1
+    captured = capsys.readouterr()
+    assert json.loads(captured.out)["error"]["fix"]
+    error = captured.err
     assert "verified label exit context" in error
     assert "--method weighted_sum" in error
     assert "examples.local_factor_workflow" in error
@@ -86,7 +86,29 @@ def test_public_synthesis_cli_explains_missing_optional_dependency(tmp_path, mon
         raise ModuleNotFoundError("scikit-learn is absent", name="sklearn")
 
     monkeypatch.setattr(synthesis_demo, "run_demo", missing)
-    with pytest.raises(SystemExit) as error:
-        main(["factor-synthesis-demo", "--output-dir", str(tmp_path / "out")])
-    assert error.value.code == 1
-    assert "jq-factor-lab[synthesis]" in capsys.readouterr().err
+    assert main(["factor-synthesis-demo", "--output-dir", str(tmp_path / "out")]) == 1
+    captured = capsys.readouterr()
+    error = json.loads(captured.out)["error"]
+    assert error["code"] == "missing_optional_dependency" and error["retryable"] is False
+    assert "jq-factor-lab[synthesis]" in error["fix"] and "jq-factor-lab[synthesis]" in captured.err
+
+
+def test_synthesis_dry_run_checks_dependencies_and_does_not_write(tmp_path, monkeypatch, capsys):
+    from tools import demo_cli
+
+    monkeypatch.chdir(tmp_path)
+    args = ["factor-synthesis-demo", "--dry-run", "--compact", "--output-dir", "out"]
+    assert main(args) == 0
+    output = capsys.readouterr().out
+    assert len(output.splitlines()) == 1
+    result = json.loads(output)
+    assert result["dry_run"] and result["ok"] and result["exit_code"] == 0
+    assert result["plan"]["method"] == "weighted_sum"
+    assert result["plan"]["output_dir"] == str(tmp_path / "out")
+    assert list(tmp_path.iterdir()) == []
+
+    monkeypatch.setattr(demo_cli, "find_spec", lambda name: None)
+    assert main(args) == 1
+    result = json.loads(capsys.readouterr().out)
+    assert result["error"]["code"] == "missing_optional_dependency"
+    assert list(tmp_path.iterdir()) == []

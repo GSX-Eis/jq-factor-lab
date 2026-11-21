@@ -4,11 +4,15 @@
 
 合成部分保留：LASSO、Ridge、ElasticNet、Quantile ElasticNet、PCA、LightGBM、固定权重、动态混合、市值条件合成；因子预筛选、特征与目标预处理、样本加权、交叉验证、诊断和组合权重接口。详见 [合成算法](SYNTHESIS.md)。
 
-不包含：已有研究因子、个人合成实验配置、研究结果和已训练模型、专项实验脚本、真实行情、生产策略、自动登录上传及 dashboard。合成目录中绑定具体研究项目的脚本也不导出。
+不包含：已有研究因子、个人合成实验配置、研究结果和已训练模型、专项实验脚本、真实行情、生产策略、自动登录上传及私有监控界面。合成目录中绑定具体研究项目的脚本也不导出。
 
 示例因子、合成数据和演示参数是公开版教学材料；保留测试中的小型合成输入与测试参数用于验证算法，不是个人实验配置。个人研究配置排除；公开 config 包含教学示例和需求/字段映射，以及通用 data_access.json、stock_pool.json、trading_calendar.json、calendar_overrides.json。
 
 教学示例的执行范围为单因子 CLI 和固定权重合成。合成示例使用同日人工响应，其余六种方法缺少严格隔离所需的真实退出上下文，会在创建输出和进入 pipeline 前抛出 `LabelIsolationError`；不为该响应伪造下一交易日退出。所保留算法的回归测试与导出边界测试另行验收，不能把算法接口仍然存在解释为这六种教学调用已通过。Qlib 原生运行时、MPS 加速、真实数据接入、完整交易回测和云端执行没有在本版本中验收。
+
+## 公开入口
+
+`jq-factor-lab` 提供严格 JSON、预检和退出码契约。 `[viz]` 提供本机回环地址上的只读 Bar DuckDB 看板，`[mcp]` 提供同一 CLI 的 stdio 工具。详见 [CLI 与 MCP 映射](../skills/factor-research/references/cli_contract.md)。
 
 ## 研究后端
 

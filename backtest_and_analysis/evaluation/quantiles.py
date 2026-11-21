@@ -8,7 +8,7 @@ from typing import Literal
 import numpy as np
 import pandas as pd
 
-from .kernels import QuantileResult, _positive_int
+from .kernels import QuantileResult, _positive_int, _validate_direction
 from .types import FloatArray
 
 QuantileScheme = Literal["per_cross_section", "fitted_on_train"]
@@ -100,6 +100,11 @@ def _median(values: FloatArray) -> float:
     return total / 2 if np.isfinite(total) else lower / 2 + upper / 2
 
 
+def _validate_standardization(standardization: Standardization | None) -> None:
+    if standardization not in (None, "zscore", "median_mad"):
+        raise ValueError("standardization must be None, 'zscore', or 'median_mad'")
+
+
 def fit_quantiles(
     factor: FloatArray,
     assets: pd.Index,
@@ -111,10 +116,8 @@ def fit_quantiles(
 ) -> QuantileFit:
     """Fit one set of parameters per instrument from eligible training factors."""
     n_quantiles = _positive_int(n_quantiles, "n_quantiles", minimum=2)
-    if isinstance(direction, (bool, np.bool_)) or direction not in (-1, 1):
-        raise ValueError("direction must be -1 or 1")
-    if standardization not in (None, "zscore", "median_mad"):
-        raise ValueError("standardization must be None, 'zscore', or 'median_mad'")
+    _validate_direction(direction)
+    _validate_standardization(standardization)
     if (factor.ndim != 2 or factor.shape[1] != len(assets)
             or eligible.shape != factor.shape or eligible.dtype.kind != "b" or not assets.is_unique):
         raise ValueError("Expected a factor panel, a matching boolean mask and a unique asset axis")

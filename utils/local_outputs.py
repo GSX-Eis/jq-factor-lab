@@ -19,6 +19,19 @@ from tempfile import TemporaryDirectory, mkdtemp
 from typing import Any
 
 
+def check_output_directory(path: Path, *, overwrite: bool) -> Path:
+    path = path.expanduser().absolute()
+    path = path.parent.resolve() / path.name
+    if path.is_symlink() or (path.exists() and not path.is_dir()):
+        raise ValueError(f"Output must be a directory, not a file or symlink: {path}")
+    if path.exists() and not overwrite:
+        raise FileExistsError(f"Output already exists: {path}; pass --overwrite or choose a new directory")
+    ancestor = next(parent for parent in (path, *path.parents) if parent.exists())
+    if not ancestor.is_dir() or not os.access(ancestor, os.W_OK | os.X_OK):
+        raise ValueError(f"Output directory is not writable: {path}")
+    return path
+
+
 def new_run_directory(root: Path) -> Path:
     """Reserve a distinct directory without a check-then-create race."""
     root.mkdir(parents=True, exist_ok=True)

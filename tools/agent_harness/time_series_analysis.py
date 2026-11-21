@@ -33,7 +33,7 @@ def load_config(path: Path) -> dict[str, Any]:
     return {**payload, **block}
 
 
-def evaluate(config: dict[str, Any], destination: Path) -> dict[str, Any]:
+def evaluate(config: dict[str, Any], destination: Path | None) -> dict[str, Any]:
     from backtest_and_analysis.time_series import (
         RESULT_SCHEMA_VERSION, BarReturnLabeler, ResultIdentity, evaluate_bars, read_bar_csv, read_factor_csv,
         sha256_file, write_evaluation_artifacts,
@@ -74,7 +74,7 @@ def evaluate(config: dict[str, Any], destination: Path) -> dict[str, Any]:
         if not isinstance(value, str) or not value.strip():
             raise ValueError(f'{name} must be a nonempty CSV path')
         paths[name] = Path(value).expanduser().resolve()
-    hashes = {str(path): sha256_file(path) for path in paths.values()}
+    hashes = {str(path): sha256_file(path) for path in paths.values()} if destination is not None else {}
     bars = read_bar_csv(paths['bars_csv']) if continuous is None else None
     factors = read_factor_csv(paths['factors_csv']) if 'factors_csv' in paths else None
     calendar_options = {name: config[name] for name in ('start_date', 'end_date') if name in config}
@@ -115,11 +115,26 @@ def evaluate(config: dict[str, Any], destination: Path) -> dict[str, Any]:
             entry_offset_bars=config.get('entry_offset_bars', 1),
             bucket_strategy=(bars.attrs['continuous']['bucket_strategy'] if source else config.get('bucket_strategy')),
             boundary_policy=config.get('boundary_policy', 'same_session'), continuous_source=source)
-        result = evaluate_bars(bars, factors, labeler, analysis_mode=mode,
+        evaluation_options = dict(analysis_mode=mode,
             n_quantiles=config.get('n_quantiles', 5), min_ic_samples=config.get('min_ic_samples', 3),
             min_cross_section_size=config.get('min_cross_section_size', 3),
             factor_id=config.get('factor_id', 'factor_value'), diagnostics=diagnostics_requested,
             **{key: config[key] for key in _INFERENCE_OPTIONS if key in config})
+        if destination is None:
+            from backtest_and_analysis.time_series.evaluator import _prepare_bar_evaluation
+
+            _prepare_bar_evaluation(labeler, **evaluation_options)
+            if factors is None and "factor_value" not in bars:
+                raise ValueError("Supply factors_csv or a factor_value Bar column")
+            for instrument, group in bars.groupby("instrument_id"):
+                session_calendar = calendars.get(instrument) if isinstance(calendars, dict) else calendars
+                if session_calendar is None:
+                    raise ValueError(f"Calendar is missing for instrument {instrument}")
+                for timestamp in (group.timestamp_utc.min(), group.timestamp_utc.max()):
+                    session_calendar.session_at(timestamp, "ETH")
+            return {"analysis_mode": mode, "inputs": {key: str(path) for key, path in paths.items()},
+                    "horizons": list(labeler.horizons), "view": labeler.view}
+        result = evaluate_bars(bars, factors, labeler, **evaluation_options)
     diagnostics_report = None
     if diagnostics_requested:
         from backtest_and_analysis.time_series.diagnostics_report import evaluate_diagnostics

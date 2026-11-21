@@ -14,6 +14,8 @@ from .kernels import CorrelationResult, QuantileResult
 from .panel import EvaluationPanel
 from .quantiles import QuantileFit
 from .types import (
+    BOOTSTRAP_V1,
+    BOOTSTRAP_V2,
     DEFAULT_BOOTSTRAP_REPLICATES,
     DEFAULT_MIN_VALID_REPLICATES,
     BootstrapInterval,
@@ -97,15 +99,22 @@ def _spearman_scores(x: FloatArray, y: FloatArray) -> tuple[float, FloatArray, F
     return rho, score - rho, influence
 
 
+def _fisher_grid_scores(
+    rho: float, influence: FloatArray, valid: npt.NDArray[np.bool_],
+) -> tuple[float, FloatArray, float]:
+    clipped = float(np.clip(rho, -1 + 1e-6, 1 - 1e-6))
+    n = len(influence)
+    scores = np.zeros(len(valid))
+    scores[valid] = (influence - influence.mean()) / (1 - clipped**2)
+    return clipped, scores, float(np.dot(scores, scores) / n**2)
+
+
 def _fisher_studentization(
     rho: float, influence: FloatArray, valid: npt.NDArray[np.bool_], block_length: int,
 ) -> tuple[float, float]:
-    """Use circular window sums to compute the linearized Fisher-z standard error."""
-    clipped = float(np.clip(rho, -1 + 1e-6, 1 - 1e-6))
+    """Historical v1 circular-window studentization."""
     n, size = len(influence), len(valid)
-    scores = np.zeros(size)
-    scores[valid] = (influence - influence.mean()) / (1 - clipped**2)
-    v0 = np.dot(scores, scores) / n**2
+    clipped, scores, v0 = _fisher_grid_scores(rho, influence, valid)
     if not np.isfinite(v0) or v0 <= 1e-24 / n:
         return np.nan, np.nan
     prefix = np.r_[0.0, np.cumsum(np.r_[scores, scores[:block_length - 1]])]
@@ -119,6 +128,58 @@ def _fisher_studentization(
     if not np.isfinite(variance) or variance <= 1e-12 * v0:
         return np.nan, np.nan
     return float(np.arctanh(clipped)), float(np.sqrt(variance))
+
+
+def _flat_top_variance(
+    scores: FloatArray, n: int, length: int, remainder: int, v0: float,
+) -> tuple[float, float]:
+    """Return the original variance and frozen residual-to-full block variance ratio."""
+    size = len(scores)
+    prefix = np.r_[0.0, np.cumsum(np.r_[scores, scores[:length - 1]])]
+
+    def window_energy(width: int) -> float:
+        sums = prefix[width:width + size] - prefix[:size]
+        return float(np.dot(sums, sums) / size)
+
+    floor = 1e-12 * v0 * n**2 / size
+    full = window_energy(length)
+    ratio = 0.0
+    if remainder:
+        if not np.isfinite(full) or full / length <= floor:
+            return np.nan, np.nan
+        ratio = window_energy(remainder) / full
+        if not np.isfinite(ratio) or ratio < 0:
+            return np.nan, np.nan
+    k = length // 2
+    spectrum = np.nan
+    if k:
+        spectrum = (2 * window_energy(2 * k) / (2 * k) - window_energy(k) / k) / (1 - 3 * k / size)
+    if not np.isfinite(spectrum) or spectrum <= floor:
+        spectrum = (full / length) / (1 - length / size)
+    return size * spectrum / n**2, ratio
+
+
+def _independent_block_variance(scores: FloatArray, n: int, length: int, ratio: float) -> float:
+    q = len(scores) // length
+    sums = scores[:q * length].reshape(q, length).sum(axis=1)
+    return float((q + ratio) * np.var(sums, ddof=1) / n**2)
+
+
+def _fisher_v2_studentization(
+    rho: float, influence: FloatArray, valid: npt.NDArray[np.bool_], length: int,
+    *, residual_ratio: float | None = None,
+) -> tuple[float, float, float]:
+    n = len(influence)
+    clipped, scores, v0 = _fisher_grid_scores(rho, influence, valid)
+    if not np.isfinite(v0) or v0 <= 1e-24 / n:
+        return np.nan, np.nan, np.nan
+    if residual_ratio is None:
+        variance, residual_ratio = _flat_top_variance(scores, n, length, len(valid) % length, v0)
+    else:
+        variance = _independent_block_variance(scores, n, length, residual_ratio)
+    if not np.isfinite(variance) or variance <= 1e-12 * v0:
+        return np.nan, np.nan, np.nan
+    return float(np.arctanh(clipped)), float(np.sqrt(variance)), residual_ratio
 
 
 def _missing_pattern(valid: npt.NDArray[np.bool_]) -> str:
@@ -135,17 +196,18 @@ def _adaptive_bootstrap_spearman(
     factor: FloatArray, returns: FloatArray, valid: npt.NDArray[np.bool_],
     *, point: CorrelationResult, min_samples: int, min_block_length: int, seed: int,
     n_boot: int, min_valid_replicates: int, alpha: float, calibration_scenario: str | None,
-    intervals_verified: bool,
+    intervals_verified: bool, historical_v1: bool,
 ) -> BootstrapInterval:
     valid = valid & np.isfinite(factor) & np.isfinite(returns)
     size, n = len(valid), int(valid.sum())
     min_pairs = max(4, min_samples)
+    version, selector, resampler, interval_method = BOOTSTRAP_V1 if historical_v1 else BOOTSTRAP_V2
     result = BootstrapInterval(
         size, 0, seed, n_boot if intervals_verified else 0, 0, min_valid_replicates, alpha,
         np.nan, np.nan, point.reasons[0] if intervals_verified else "holding_intervals_unavailable",
-        n_valid_pairs=n, method_version="ts_boot_adaptive_v1", missing_pattern=_missing_pattern(valid),
-        calibration_scenario=calibration_scenario, block_length_method="ppw2009",
-        resample_method="circular_block", interval_method="fisher_z_bootstrap_t",
+        n_valid_pairs=n, method_version=version, missing_pattern=_missing_pattern(valid),
+        calibration_scenario=calibration_scenario, block_length_method=selector,
+        resample_method=resampler, interval_method=interval_method,
         min_block_length=min_block_length, min_pairs_per_replicate=min_pairs,
     )
     if result.reason is not None:
@@ -164,7 +226,10 @@ def _adaptive_bootstrap_spearman(
     grid_scores[valid] = scores
     length = _ppw_block_length(grid_scores, n, min_block_length, maximum)
     result = replace(result, block_length=length, effective_blocks=n / length)
-    fisher_z, standard_error = _fisher_studentization(rho, influence, valid, length)
+    if historical_v1:
+        fisher_z, standard_error = _fisher_studentization(rho, influence, valid, length)
+    else:
+        fisher_z, standard_error, residual_ratio = _fisher_v2_studentization(rho, influence, valid, length)
     if not np.isfinite(standard_error):
         return replace(result, reason="degenerate_bootstrap_standard_error")
 
@@ -181,7 +246,12 @@ def _adaptive_bootstrap_spearman(
         if sample is None:
             continue
         rho_star, _, influence_star = sample
-        fisher_star, se_star = _fisher_studentization(rho_star, influence_star, paired, length)
+        if historical_v1:
+            fisher_star, se_star = _fisher_studentization(rho_star, influence_star, paired, length)
+        else:
+            fisher_star, se_star, _ = _fisher_v2_studentization(
+                rho_star, influence_star, paired, length, residual_ratio=residual_ratio,
+            )
         pivot = (fisher_star - fisher_z) / se_star
         if np.isfinite(pivot):
             pivots.append(pivot)
@@ -202,6 +272,7 @@ def _bootstrap_spearman(
     min_block_length: int = 1, seed: int = 0, n_boot: int = DEFAULT_BOOTSTRAP_REPLICATES,
     min_valid_replicates: int = DEFAULT_MIN_VALID_REPLICATES, alpha: float = 0.05,
     calibration_scenario: str | None = None, intervals_verified: bool = True,
+    historical_v1: bool = False,
 ) -> BootstrapInterval:
     if isinstance(block_length, str) and block_length == "auto":
         if not 0 < alpha < 1 or alpha / 2 <= 0:
@@ -212,6 +283,7 @@ def _bootstrap_spearman(
             seed=kernels._positive_int(seed, "seed", 0), n_boot=kernels._positive_int(n_boot, "n_boot"),
             min_valid_replicates=kernels._positive_int(min_valid_replicates, "min_valid_replicates", 2),
             alpha=alpha, calibration_scenario=calibration_scenario, intervals_verified=intervals_verified,
+            historical_v1=historical_v1,
         )
     block_length = kernels._positive_int(block_length, "block_length")
     size = len(factor)
@@ -306,6 +378,31 @@ def summarize_time_series_horizon(
     )
 
 
+def _validate_bootstrap_options(
+    *, block_length: int | Literal["auto"] = "auto", seed: int = 0,
+    n_boot: int = DEFAULT_BOOTSTRAP_REPLICATES, min_valid_replicates: int = DEFAULT_MIN_VALID_REPLICATES,
+    alpha: float = 0.05,
+) -> tuple[int | Literal["auto"], int, int, int]:
+    if not 0 < alpha < 1:
+        raise ValueError("alpha must be in (0, 1)")
+    auto_block = isinstance(block_length, str) and block_length == "auto"
+    if auto_block:
+        if alpha / 2 <= 0:
+            raise ValueError("alpha must have a positive representable half-tail")
+    else:
+        block_length = kernels._positive_int(block_length, "block_length")
+    seed = kernels._positive_int(seed, "seed", 0)
+    n_boot = kernels._positive_int(n_boot, "n_boot")
+    min_valid_replicates = kernels._positive_int(min_valid_replicates, "min_valid_replicates", 2)
+
+    return block_length, seed, n_boot, min_valid_replicates
+
+
+def _validate_block_length_for_horizon(block_length: int | Literal["auto"], horizon: int) -> None:
+    if block_length != "auto" and block_length < horizon:
+        raise ValueError(f"block_length must be >= horizon ({horizon})")
+
+
 def evaluate_time_series(
     panel: EvaluationPanel,
     holding_intervals: Mapping[int, tuple[npt.ArrayLike, npt.ArrayLike]] | None,
@@ -342,21 +439,12 @@ def evaluate_time_series(
         raise ValueError("return_diagnostics must be a boolean")
     if ic_method not in ("spearman", "pearson"):
         raise ValueError("ic_method must be 'spearman' or 'pearson'")
-    if isinstance(direction, (bool, np.bool_)) or direction not in (-1, 1):
-        raise ValueError("direction must be -1 or 1")
-    if not 0 < alpha < 1:
-        raise ValueError("alpha must be in (0, 1)")
+    kernels._validate_direction(direction)
     min_samples = kernels._positive_int(min_samples, "min_samples", 2)
     n_quantiles = kernels._positive_int(n_quantiles, "n_quantiles", 2)
-    auto_block = isinstance(block_length, str) and block_length == "auto"
-    if auto_block:
-        if alpha / 2 <= 0:
-            raise ValueError("alpha must have a positive representable half-tail")
-    else:
-        block_length = kernels._positive_int(block_length, "block_length")
-    seed = kernels._positive_int(seed, "seed", 0)
-    n_boot = kernels._positive_int(n_boot, "n_boot")
-    min_valid_replicates = kernels._positive_int(min_valid_replicates, "min_valid_replicates", 2)
+    block_length, seed, n_boot, min_valid_replicates = _validate_bootstrap_options(
+        block_length=block_length, seed=seed, n_boot=n_boot, min_valid_replicates=min_valid_replicates, alpha=alpha)
+    auto_block = block_length == "auto"
     if holding_intervals is not None and holding_intervals.keys() != panel.returns.keys():
         raise ValueError("holding_intervals must contain the same horizons as the panel")
 
@@ -397,8 +485,7 @@ def evaluate_time_series(
     horizons = {}
     for key, returns in panel.returns.items():
         horizon = kernels._positive_int(key, "horizon")
-        if block_length != "auto" and block_length < horizon:
-            raise ValueError(f"block_length must be >= horizon ({horizon})")
+        _validate_block_length_for_horizon(block_length, horizon)
         if holding_intervals is not None:
             entry, exit = (np.asarray(timestamps) for timestamps in holding_intervals[horizon])
             if any(a.shape != factor.shape or a.dtype.kind != "M" for a in (entry, exit)):

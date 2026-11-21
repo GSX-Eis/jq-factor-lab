@@ -1,16 +1,18 @@
-"""Run the frozen NERE-936 independent synthetic calibration matrix."""
+"""Run the frozen synthetic calibration matrices for adaptive inference."""
 
 import argparse
 from collections import Counter
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, replace
+from fractions import Fraction
 from hashlib import sha256
 from itertools import product
 import json
-from math import asin, isfinite, pi, sqrt
+from math import asin, ceil, isfinite, pi, sqrt
 import os
 from pathlib import Path
 import platform
+import re
 from typing import Literal
 
 import numpy as np
@@ -29,7 +31,8 @@ from backtest_and_analysis.evaluation.cross_section import bartlett_hac, hac_p_v
 from backtest_and_analysis.evaluation.kernels import spearman
 from backtest_and_analysis.evaluation.time_series import _bootstrap_spearman
 from backtest_and_analysis.evaluation.types import (
-    BootstrapInterval, DEFAULT_BOOTSTRAP_REPLICATES, DEFAULT_MIN_VALID_REPLICATES, HACInterval,
+    BOOTSTRAP_V1, BOOTSTRAP_V2, BootstrapInterval, DEFAULT_BOOTSTRAP_REPLICATES,
+    DEFAULT_MIN_VALID_REPLICATES, HACInterval,
 )
 from utils.local_outputs import write_json
 
@@ -109,6 +112,8 @@ QUICK = Profile(93673, 3, 19, 19, 18)
 FORMAL = Profile(93620261120, 500, 399, DEFAULT_BOOTSTRAP_REPLICATES, DEFAULT_MIN_VALID_REPLICATES)
 S5_QUICK = Profile(93679, 3, 19, 19, 18)
 S5_FORMAL = Profile(93620261125, 500, 399, 999, 900)
+V2_BOOT_QUICK = Profile(1538543278954444760, 3, 19, 19, 18)
+V2_BOOT_FORMAL = Profile(9120514705368137011, 500, 399, 999, 900)
 
 
 @dataclass(frozen=True)
@@ -163,14 +168,18 @@ def _interval_reason(interval: HACInterval | BootstrapInterval) -> str | None:
     return None
 
 
-def _coverage(cell: Cell, profile: Profile, *, s5: bool = False) -> dict:
+def _coverage(cell: Cell, profile: Profile, *, s5: bool = False, v2_boot: bool = False) -> dict:
     design = cell.design
     cross_section = cell.section in (0, 2)
-    version = "cs_hac_adaptive_v1" if cross_section else "ts_boot_adaptive_v1"
+    if cross_section:
+        version = "cs_hac_adaptive_v1"
+    else:
+        version = BOOTSTRAP_V2[0] if v2_boot else BOOTSTRAP_V1[0]
     fixed_windows = tuple(lag + int(not cross_section) for lag in design.fixed_lags)
     truth = _truth(design, cross_section)
     domain = _candidate_adaptive_domain(
         cross_section=cross_section, scenario=design.scenario, horizon=design.horizon, gap=design.gap, s5=s5,
+        v2_boot=v2_boot,
     )
     windows = ("auto", *fixed_windows)
     counts = {window: _CoverageCounts() for window in windows}
@@ -200,6 +209,7 @@ def _coverage(cell: Cell, profile: Profile, *, s5: bool = False) -> dict:
                     n_boot=profile.adaptive_boot if adaptive else profile.fixed_boot,
                     min_valid_replicates=profile.adaptive_min_valid if adaptive else profile.fixed_boot,
                     alpha=ALPHA, calibration_scenario=design.scenario, intervals_verified=True,
+                    historical_v1=not v2_boot,
                 )
             reason = _interval_reason(interval)
             if reason is None:
@@ -242,14 +252,16 @@ def _coverage(cell: Cell, profile: Profile, *, s5: bool = False) -> dict:
         method_version=version, selected_windows=dict(sorted(selected_windows.items())),
         domain_id=domain.domain_id, in_domain_count=in_domain_count, in_domain_covered=in_domain_covered,
         out_of_domain_reasons=dict(sorted(mismatches.items())),
-        domain_passes=in_domain_count == repetitions and (not s5 or in_domain_covered == adaptive["covered"]),
+        domain_passes=in_domain_count == repetitions and (not (s5 or v2_boot) or in_domain_covered == adaptive["covered"]),
     )
+    if v2_boot:
+        adaptive["out_of_domain_count"] = repetitions - in_domain_count
+    passes = adaptive["interval_passes"] and adaptive["domain_passes"] and adaptive["direction_passes"] is not False
     return dict(
         cell_id=cell.cell_id, seed_spawn_prefix=[cell.section, cell.index], repetitions=repetitions,
         **asdict(design), true_ic=truth, method="hac" if cross_section else "bootstrap",
-        fixed=list(estimates.values()), adaptive=adaptive, passes=(
-            adaptive["interval_passes"] and adaptive["domain_passes"] and adaptive["direction_passes"] is not False
-        ),
+        fixed=list(estimates.values()), adaptive=adaptive,
+        passes=None if v2_boot and profile == V2_BOOT_QUICK else passes,
     )
 
 
@@ -375,12 +387,125 @@ def _read_s5_checkpoint(path: Path, cell: Cell, profile: Profile, fingerprint: s
     return row
 
 
+def _checkpoint_counts(value: object, limit: int) -> bool:
+    return isinstance(value, dict) and all(
+        bool(key) and type(count) is int and 0 < count <= limit for key, count in value.items()
+    )
+
+
+def _valid_coverage_counts(row: dict, repetitions: int, truth: float) -> bool:
+    names = (*_CoverageCounts.__dataclass_fields__, "unavailable_count", "reverse_direction")
+    if any(type(row.get(key)) is not int or not 0 <= row[key] <= repetitions for key in names):
+        return False
+    available = repetitions - row["unavailable_count"]
+    reasons = row.get("unavailable_reasons")
+    within = coverage_passes(row["covered"], repetitions)
+    direction = (
+        20 * row["point_sign_correct"] >= 19 * repetitions and 20 * row["correct_direction"] >= 19 * repetitions
+    ) if truth else None
+    return (
+        _checkpoint_counts(reasons, repetitions) and sum(reasons.values()) == row["unavailable_count"]
+        and row["covered"] <= available and row["rejects_zero"] <= available
+        and row["correct_direction"] + row["reverse_direction"] <= row["rejects_zero"]
+        and (truth != 0 or (
+            row["covered"] + row["rejects_zero"] == available
+            and row["point_sign_correct"] == row["correct_direction"] == row["reverse_direction"] == 0
+        ))
+        and type(row.get("coverage")) is float and row["coverage"] == row["covered"] / repetitions
+        and row.get("within_tolerance") is within and "direction_passes" in row and row["direction_passes"] is direction
+        and row.get("interval_passes") is (within and row["unavailable_count"] == 0)
+    )
+
+
+def _read_v2_checkpoint(path: Path, cell: Cell, profile: Profile, fingerprint: str, *, quick: bool) -> dict:
+    failure = f"Checkpoint data does not match frozen cell {cell.cell_id}"
+    try:
+        row = json.loads(path.read_text())
+    except ValueError as exc:
+        raise ValueError(failure) from exc
+    repetitions = profile.repetitions
+    truth = _truth(cell.design, False)
+    expected = dict(
+        asdict(cell.design), cell_id=cell.cell_id, seed_spawn_prefix=[cell.section, cell.index], true_ic=truth,
+        **asdict(profile), fixed_min_valid=profile.fixed_boot, method="bootstrap", run_fingerprint=fingerprint,
+        fixed_windows=[lag + 1 for lag in cell.design.fixed_lags],
+    )
+    expected["fixed_lags"] = list(cell.design.fixed_lags)
+    if not isinstance(row, dict) or any(
+        field not in row or json.dumps(row[field]) != json.dumps(value) for field, value in expected.items()
+    ):
+        raise ValueError(failure)
+    adaptive, fixed = row.get("adaptive"), row.get("fixed")
+    fixed_windows = expected["fixed_windows"]
+    if (
+        not isinstance(adaptive, dict) or adaptive.get("window") != "auto"
+        or adaptive.get("method_version") != BOOTSTRAP_V2[0]
+        or adaptive.get("domain_id") != f"{BOOTSTRAP_V2[0]}:{cell.design.scenario}"
+        or not isinstance(fixed, list) or len(fixed) != len(fixed_windows)
+        or any(
+            not isinstance(result, dict) or type(result.get("window")) is not int or result["window"] != window
+            or not _valid_coverage_counts(result, repetitions, truth)
+            for result, window in zip(fixed, fixed_windows, strict=True)
+        )
+        or not _valid_coverage_counts(adaptive, repetitions, truth)
+    ):
+        raise ValueError(failure)
+    available = repetitions - adaptive["unavailable_count"]
+    windows, reasons = adaptive.get("selected_windows"), adaptive.get("out_of_domain_reasons")
+    in_count, in_covered, out_count = (adaptive.get(key) for key in (
+        "in_domain_count", "in_domain_covered", "out_of_domain_count",
+    ))
+    if (
+        not _checkpoint_counts(windows, repetitions) or sum(windows.values()) != available
+        or any(
+            not re.fullmatch(r"[1-9][0-9]*", key)
+            or not cell.design.horizon <= int(key) <= ceil(min(3 * sqrt(cell.design.n_times), cell.design.n_times / 3))
+            for key in windows
+        )
+        or not all(type(count) is int for count in (in_count, in_covered, out_count))
+        or not 0 <= in_count <= available or out_count != repetitions - in_count
+        or not max(0, adaptive["covered"] - (available - in_count)) <= in_covered <= min(in_count, adaptive["covered"])
+        or not _checkpoint_counts(reasons, out_count) or sum(reasons.values()) < out_count
+        or reasons.get("observation_unavailable", 0) < adaptive["unavailable_count"]
+    ):
+        raise ValueError(failure)
+    domain = _candidate_adaptive_domain(
+        cross_section=False, scenario=cell.design.scenario, horizon=cell.design.horizon,
+        gap=cell.design.gap, v2_boot=True,
+    )
+    budget_failures = {
+        "n_boot": profile.adaptive_boot < domain.min_n_boot,
+        "min_valid_replicates": profile.adaptive_min_valid < domain.min_valid_replicates,
+    }
+    fraction = Fraction(str(domain.min_valid_fraction))
+    fraction_can_fail = profile.adaptive_min_valid * fraction.denominator < profile.adaptive_boot * fraction.numerator
+    if (
+        (any(budget_failures.values()) and in_count != 0)
+        or any(reasons.get(field, 0) != (available if failed else 0)
+               for field, failed in budget_failures.items())
+        or reasons.get("valid_fraction", 0) > (available if fraction_can_fail else 0)
+    ):
+        raise ValueError(failure)
+    domain_ok = in_count == repetitions and in_covered == adaptive["covered"]
+    passes = adaptive["interval_passes"] and domain_ok and adaptive["direction_passes"] is not False
+    if adaptive.get("domain_passes") is not domain_ok or "passes" not in row or row["passes"] is not (
+        None if quick else passes
+    ):
+        raise ValueError(failure)
+    return row
+
+
 def run_benchmark(
-    *, quick: bool, output: Path, workers: int, resume: bool = False, profile_name: Literal["s4", "s5"] = "s4",
+    *, quick: bool, output: Path, workers: int, resume: bool = False, profile_name: Literal["s4", "s5", "v2_boot"] = "s4",
 ) -> dict:
-    s5 = profile_name == "s5"
-    profile = (S5_QUICK if quick else S5_FORMAL) if s5 else (QUICK if quick else FORMAL)
-    matrix = _matrix(s5=s5)
+    s5, v2_boot = profile_name == "s5", profile_name == "v2_boot"
+    if v2_boot:
+        profile = V2_BOOT_QUICK if quick else V2_BOOT_FORMAL
+        matrix = [cell for cell in _matrix(s5=True) if cell.section in (1, 3)]
+        output = output.resolve()
+    else:
+        profile = (S5_QUICK if quick else S5_FORMAL) if s5 else (QUICK if quick else FORMAL)
+        matrix = _matrix(s5=s5)
     checkpoints = output.with_suffix(".cells")
     output.parent.mkdir(parents=True, exist_ok=True)
     if output.exists():
@@ -391,17 +516,28 @@ def run_benchmark(
         source_revision=os.getenv("QUANTATION_CODE_VERSION"),
     )
     fingerprint = None
-    if s5:
+    if v2_boot:
+        source = metadata["source_revision"]
+        if source is None or not re.fullmatch(r"[0-9a-f]{40}", source):
+            raise ValueError("v2_boot requires a complete Git SHA in QUANTATION_CODE_VERSION")
+        metadata.update(method_version=BOOTSTRAP_V2[0], alpha=ALPHA, output=str(output),
+                        fixed_min_valid=profile.fixed_boot)
+    if s5 or v2_boot:
         metadata["benchmark_profile"] = profile_name
         metadata["matrix"] = [asdict(cell) for cell in matrix]
+        if v2_boot:
+            for cell, record in zip(matrix, metadata["matrix"], strict=True):
+                record.update(cell_id=cell.cell_id, fixed_windows=[lag + 1 for lag in cell.design.fixed_lags])
         # Compare the serialized representation after a process restart.
         metadata = json.loads(json.dumps(metadata))
         fingerprint = sha256(json.dumps(metadata, sort_keys=True).encode()).hexdigest()
     manifest = checkpoints / "profile.json"
     if resume:
-        if json.loads(manifest.read_text()) != metadata:
+        saved = json.loads(manifest.read_text())
+        matches = (json.dumps(saved, sort_keys=True) == json.dumps(metadata, sort_keys=True)) if v2_boot else saved == metadata
+        if not matches:
             raise ValueError("Checkpoint profile does not match the frozen run")
-        if s5 and {path.stem for path in checkpoints.glob("*.json")} - {"profile", *(c.cell_id for c in matrix)}:
+        if (s5 or v2_boot) and {path.stem for path in checkpoints.glob("*.json")} - {"profile", *(c.cell_id for c in matrix)}:
             raise ValueError("Checkpoint directory contains cells outside the frozen matrix")
     else:
         checkpoints.mkdir()
@@ -412,15 +548,25 @@ def run_benchmark(
         path = checkpoints / f"{cell.cell_id}.json"
         if not path.exists():
             pending.append(cell)
+        elif v2_boot:
+            retained[cell.cell_id] = _read_v2_checkpoint(path, cell, profile, fingerprint, quick=quick)
         elif fingerprint is not None:
             retained[cell.cell_id] = _read_s5_checkpoint(path, cell, profile, fingerprint)
+    if resume and v2_boot:
+        print(f"Resuming {output} with {len(retained)}/{len(matrix)} verified cells", flush=True)
     # Start the costly Bootstrap cells first, longest grids first, to reduce the idle tail.
     pending.sort(key=lambda cell: (cell.section in (1, 3), cell.design.n_times), reverse=True)
     with ProcessPoolExecutor(max_workers=workers) as executor:
-        futures = {executor.submit(_run_cell, cell, profile, s5): cell for cell in pending}
+        futures = {
+            (executor.submit(_coverage, cell, profile, v2_boot=True) if v2_boot
+             else executor.submit(_run_cell, cell, profile, s5)): cell for cell in pending
+        }
         for completed, future in enumerate(as_completed(futures), start=len(matrix) - len(pending) + 1):
             cell = futures[future]
             row = future.result()
+            if v2_boot:
+                row.update(asdict(profile), fixed_min_valid=profile.fixed_boot,
+                           fixed_windows=[lag + 1 for lag in cell.design.fixed_lags])
             if fingerprint is not None:
                 row = dict(row, run_fingerprint=fingerprint)
             write_json(checkpoints / f"{cell.cell_id}.json", row)
@@ -432,6 +578,8 @@ def run_benchmark(
         path = checkpoints / f"{cell.cell_id}.json"
         if cell.cell_id in retained:
             row = retained[cell.cell_id]
+        elif v2_boot:
+            row = _read_v2_checkpoint(path, cell, profile, fingerprint, quick=quick)
         elif fingerprint is not None:
             row = _read_s5_checkpoint(path, cell, profile, fingerprint)
         else:
@@ -443,6 +591,11 @@ def run_benchmark(
         error_rate_upper_bound=ALPHA + tolerance, coverage=cells[:-4], multiplicity=cells[-4:],
         release_passes=None if quick else all(cell["passes"] for cell in cells),
     )
+    if v2_boot:
+        report.update(
+            coverage=cells, multiplicity=[], run_fingerprint=fingerprint,
+            bootstrap_release_passes=report["release_passes"],
+        )
     if s5:
         del report["matrix"]  # The final rows already include every cell's design.
         by_method = {"hac": [], "bootstrap": []}
@@ -461,7 +614,7 @@ def run_benchmark(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--profile", choices=("s4", "s5"), default="s4")
+    parser.add_argument("--profile", choices=("s4", "s5", "v2_boot"), default="s4")
     parser.add_argument("--quick", action="store_true", help="Run the preregistered smoke profile")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--resume", action="store_true", help="Resume only interrupted cells on the frozen source")

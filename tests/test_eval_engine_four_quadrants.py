@@ -148,6 +148,7 @@ def test_daily_closes_to_engine_result(prices_and_scores, mode):
             if time_series:
                 for col, asset in enumerate(ASSETS):
                     row = stats.instruments[asset]
+                    assert row.bootstrap.method_version == "ts_boot_adaptive_v2"
                     assert row.bootstrap.block_length_method == "ppw2009"
                     assert row.bootstrap.min_block_length == h
                     if h == 2:
@@ -276,6 +277,7 @@ def test_minute_csv_to_published_evaluation(tmp_path, prices_and_scores, mode):
                 for row in stats:
                     col = ASSETS.index(row["instrument_id"])
                     assert row["intervals_verified"]
+                    assert row["bootstrap"]["interval_method"] == "fisher_z_bootstrap_t_flat_top_block"
                     assert row["bootstrap"]["block_length_method"] == "ppw2009"
                     assert row["bootstrap"]["min_block_length"] == h
                     assert row["ic"]["sample_count"] == row["return_distribution"]["n_samples"] == len(pairs)
