@@ -30,9 +30,13 @@ from .normalization import (
     _coerce_optional_int,
     _coerce_optional_json_str,
     _coerce_optional_str,
+    _factor_id_from_config,
+    _factor_id_from_ledger,
     _is_missing,
     _json_safe,
     _parse_utc_timestamp,
+    _summary_float,
+    _summary_object,
 )
 from .schema import (
     _CROSS_SECTION_TABLE_COLUMNS,
@@ -237,20 +241,6 @@ def _resolve_frequency_field(data_identity: Mapping[str, Any], ic_rows: list[dic
     if len(clean) == 1:
         return clean[0]
     return _canonical_json(clean)
-
-
-def _summary_object(items: list[tuple[str, Any]]) -> dict[str, Any]:
-    result = dict(items)
-    if len(result) != len(items):
-        raise ValueError("duplicate object key")
-    return result
-
-
-def _summary_float(value: str) -> float:
-    number = float(value)
-    if not math.isfinite(number):
-        raise ValueError(f"non-finite JSON number {value}")
-    return number
 
 
 def _validate_and_prepare_payload(
@@ -473,6 +463,7 @@ def _validate_and_prepare_payload(
         "quantile_stats_sha256": hashes["quantile_stats"],
         "run_id": _coerce_optional_str(run_id),
         "ingested_at_utc": ingested_at,
+        "factor_id": _factor_id_from_ledger(summary["trial_ledger"]) or _factor_id_from_config(config),
         **inference,
     }
     return run_record, ic_tuples, q_tuples, cs_tuples, split_tuples

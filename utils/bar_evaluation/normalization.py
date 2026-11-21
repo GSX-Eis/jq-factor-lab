@@ -19,6 +19,34 @@ from .schema import (
 )
 
 
+def _factor_id_from_ledger(ledger: Mapping[str, Any] | None) -> str | None:
+    evaluated = {
+        row["factor_id"] for row in (ledger or {}).get("candidates", [])
+        if row["reason"] != "not_evaluated"
+    }
+    return next(iter(evaluated)) if len(evaluated) == 1 else None
+
+
+def _factor_id_from_config(config: Mapping[str, Any]) -> str | None:
+    default = "factor_value" if "bars_csv" in config or "continuous_futures" in config else None
+    factor_id = config.get("factor_id", default)
+    return factor_id if isinstance(factor_id, str) else None
+
+
+def _summary_object(items: list[tuple[str, Any]]) -> dict[str, Any]:
+    result = dict(items)
+    if len(result) != len(items):
+        raise ValueError("duplicate object key")
+    return result
+
+
+def _summary_float(value: str) -> float:
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError(f"non-finite JSON number {value}")
+    return number
+
+
 def _require(condition: bool, field: str, expected: str) -> None:
     if not condition:
         raise BarEvaluationIntegrityError(f"summary.json {field}: expected {expected}")

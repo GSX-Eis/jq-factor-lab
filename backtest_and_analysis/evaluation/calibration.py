@@ -391,7 +391,7 @@ REGISTERED_ADAPTIVE_CALIBRATIONS: tuple[AdaptiveCalibrationDomain, ...] = tuple(
     replace(
         _candidate_adaptive_domain(cross_section=False, scenario=scenario, horizon=horizon, gap=gap, v2_boot=True),
         report_ref="reports/NERE-962/adaptive-calibration-v2.json",
-        report_sha256="cc48e87355e919aa19d0cc1ce2590a05a0428b222a5bbec48446bd505cd29a81",
+        report_sha256="f6ffd98efb29cd155589b24cb8396214ddab505d119139ac4a5c5b2b97370dc7",
         coverage_cell_ids=cell_ids,
         covered=covered,
         repetitions=500,

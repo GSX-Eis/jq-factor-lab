@@ -328,6 +328,31 @@ def test_bar_cli_rejects_s1_output_directory_and_succeeds_in_fresh_directory(tmp
     assert read['metrics']['split_metrics'][0]['metrics_json'] == summary['splits']['full']['horizons'][0]
 
 
+def test_read_bar_evaluations_pages_matching_factors(tmp_path):
+    path, _ = nq_bars(tmp_path)
+    db = tmp_path / 'pages.duckdb'
+    common = ('--results-db', str(db))
+    first = run_cli(tmp_path, base_config(path, factor_id='selected'), *common,
+                    '--output-dir', str(tmp_path / 'first'))
+    second = run_cli(tmp_path, base_config(path, factor_id='selected', view='RTH'), *common,
+                     '--output-dir', str(tmp_path / 'second'))
+    other = run_cli(tmp_path, base_config(path, factor_id='other'), *common,
+                    '--output-dir', str(tmp_path / 'other'))
+    assert all(run['ok'] for run in (first, second, other)), (first, second, other)
+
+    for offset, run in enumerate((second, first)):
+        page = run_cli(tmp_path, None, *common, '--factor-name', 'selected', '--limit', '1',
+                       '--offset', str(offset), command='read-bar-evaluations')
+        assert page['ok'] and page['metrics']['run_count'] == 1, page
+        record, = page['metrics']['runs']
+        assert record['factor_id'] == 'selected'
+        assert record['identity_hash'] == run['metrics']['result_identity']['identity_hash']
+
+    invalid = run_cli(tmp_path, None, *common, '--offset', '-1', command='read-bar-evaluations')
+    assert invalid['exit_code'] == 2
+    assert invalid['error']['message'] == 'offset must be a non-negative integer'
+
+
 @pytest.mark.parametrize('flag', ['--json-out', '--results-db'])
 def test_bar_cli_reserves_retired_sidecar_path(tmp_path, flag):
     path, _ = nq_bars(tmp_path)

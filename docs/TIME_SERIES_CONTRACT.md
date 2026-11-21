@@ -844,6 +844,8 @@ Harness 复制摘要字段至 `metrics`（配置见冻结的 `config/resolved.js
   `calibrated_fail` 及 `calibration_evidence`。每行的 `interval_usability`
   独立报告 `descriptive_stats_usable` 与 `significance_interpretation_usable`。
   后者还须满足区间可估计及登记校准的样本完整性、复制数等适用条件。
+  `calibrated_pass` 仅表示命中已验证的合成适用域（Registered Synthetic Calibration Domain）。
+  该结论不自动外推到超出校准矩阵前提的真实市场重尾跳跃或信息性缺失场景。
   证据与门控见[评测政策](EVAL_POLICY.md#unified-evaluation-engine)和
   [校准登记](EVALUATION_ENGINE.md#61-一次性合成校准)。
 - UTC 时间序列化为 ISO8601，无法计算的数值以 JSON `null` 表示，保留相应原因码。
@@ -863,8 +865,9 @@ Harness 复制摘要字段至 `metrics`（配置见冻结的 `config/resolved.js
 `reason`。单流截面候选的原始 p 值由 HAC 区间的分布计算。`p_value_method` 记录
 `two_sided_student_t_hac`（自动窗口，有效自由度）或 `two_sided_normal_hac`（固定窗口）。
 显著性解释仍受校准门控。自适应 HAC 依据方法版本和可核验的网格、缺失模式、截面宽度等观测匹配
-已登记适用域。自适应 Bootstrap 当前没有已登记适用域，保持 `uncalibrated`。
-时序区间不提供原始 p 值，同一候选涉及多个评估流时也不自动合并原始 p 值。
+已登记适用域。NERE-962 已为 `ts_boot_adaptive_v2` 登记合成适用域，区间须匹配
+登记条件才可获得 `calibrated_pass`。时序区间仍不提供独立尾部检验的原始 p 值，
+同一候选涉及多个评估流时也不自动合并原始 p 值。
 未评测和缺原始 p 值的候选分别列入 `pending_candidates` 和
 `missing_p_value_candidates`。整族均有原始 p 值时才执行 Holm 或 BH 校正并报告
 最优候选。详见[尝试账本与多重检验](EVALUATION_ENGINE.md#62-择优的尝试账本与多重检验)。
@@ -888,8 +891,10 @@ Harness 复制摘要字段至 `metrics`（配置见冻结的 `config/resolved.js
 对 UTF-8 字节计算 SHA256；输入映射插入顺序不影响结果，任一字段变化会改变身份。
 CLI 的 `config_hash` 绑定合并命令行覆盖后的配置，递归排序、紧凑 JSON 编码；
 `input_file_hashes` 使用解析后的绝对 CSV 路径，并在评估前后复查源文件未变化。
-`code_version` 为 Git HEAD，已跟踪的计算代码有未提交改动时附加 `-dirty`；正式证据应使用
-已提交版本。`calendar_hash` 来自真实日历身份（含覆盖、依赖版本和修正表），
+`code_version` 取 Git HEAD。已跟踪文件相对 HEAD 有未提交差异时附加 `-dirty`。
+`backtest_and_analysis/`、`factor_synthesis/`、`factors/`、`data_pipeline/`、
+`utils/` 或 `tools/` 下有未跟踪且未被 Git 忽略的 `.py` 文件时也附加 `-dirty`。
+正式证据应使用已提交版本。`calendar_hash` 来自真实日历身份（含覆盖、依赖版本和修正表），
 多市场不同日历时绑定整个映射，`result_schema_version` 使用评估器当前格式版本。
 
 ## 验证

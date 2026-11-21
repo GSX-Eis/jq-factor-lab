@@ -132,6 +132,7 @@ _RUN_V2_COLUMN_TYPES = {
     "trial_ledger_json": "VARCHAR",
     "calibration_summary_json": "VARCHAR",
 }
+_RUN_OPTIONAL_COLUMN_TYPES = _RUN_V2_COLUMN_TYPES | {"factor_id": "VARCHAR"}
 _RUN_BOOL_COLUMNS = frozenset({"has_split"})
 _RUN_JSON_COLUMNS = frozenset({
     "input_file_hashes", "data_identity", "exclusion_summary",
@@ -221,7 +222,7 @@ _RUN_ALL_COLUMNS: tuple[str, ...] = (
     "quantile_stats_sha256",
     "run_id",
     "ingested_at_utc",
-    *_RUN_V2_COLUMN_TYPES,
+    *_RUN_OPTIONAL_COLUMN_TYPES,
 )
 
 _IC_INT_COLUMNS = frozenset({
@@ -287,7 +288,7 @@ class BarEvaluationIngestReceipt:
 
 
 def _create_tables(conn: duckdb.DuckDBPyConnection) -> None:
-    v2_columns = ", ".join(f"{name} {kind}" for name, kind in _RUN_V2_COLUMN_TYPES.items())
+    optional_columns = ", ".join(f"{name} {kind}" for name, kind in _RUN_OPTIONAL_COLUMN_TYPES.items())
     conn.execute(
         f"""CREATE TABLE IF NOT EXISTS bar_evaluation_runs (
             identity_hash VARCHAR PRIMARY KEY,
@@ -315,7 +316,7 @@ def _create_tables(conn: duckdb.DuckDBPyConnection) -> None:
             quantile_stats_sha256 VARCHAR NOT NULL,
             run_id VARCHAR,
             ingested_at_utc TIMESTAMPTZ NOT NULL,
-            {v2_columns}
+            {optional_columns}
         )"""
     )
     conn.execute(
@@ -444,7 +445,7 @@ def _require_write_schema(
         "str": "VARCHAR", "int": "BIGINT", "float": "DOUBLE", "bool": "BOOLEAN",
         "timestamp": "TIMESTAMP WITH TIME ZONE",
     }
-    runs = {col: "VARCHAR" for col in _RUN_ALL_COLUMNS if col not in _RUN_V2_COLUMN_TYPES}
+    runs = {col: "VARCHAR" for col in _RUN_ALL_COLUMNS if col not in _RUN_OPTIONAL_COLUMN_TYPES}
     runs["ingested_at_utc"] = types["timestamp"]
     required = {"bar_evaluation_runs": runs}
     for table, columns, ints, floats, bools in (
@@ -456,7 +457,7 @@ def _require_write_schema(
     ):
         required[table] = {col: types[_column_kind(col, ints, floats, bools, frozenset())] for col in columns}
     if not legacy_only:
-        runs.update(_RUN_V2_COLUMN_TYPES)
+        runs.update(_RUN_OPTIONAL_COLUMN_TYPES)
         required[_SPLIT_TABLE] = {col: kind.removesuffix(" NOT NULL") for col, kind in _SPLIT_COLUMN_TYPES.items()}
     primary_keys = dict(conn.execute("""
         SELECT table_name, constraint_column_names FROM duckdb_constraints()
@@ -477,7 +478,7 @@ def _require_write_schema(
             elif actual != expected:
                 missing.append(f"{table}.{column} (expected {expected}, found {actual})")
     if missing:
-        hint = "" if legacy_only else "; upgrade a v1 database explicitly with migrate_bar_evaluation_db(db_path)"
+        hint = "" if legacy_only else "; upgrade an older database explicitly with migrate_bar_evaluation_db(db_path)"
         raise BarEvaluationPreconditionError(
             f"Bar evaluation schema missing required tables/columns or has incompatible types: {', '.join(missing)}{hint}"
         )

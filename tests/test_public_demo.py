@@ -366,6 +366,10 @@ def test_bar_cli_config_database_resolves_from_caller_for_guard_write_and_read(
     latest = json.loads(capsys.readouterr().out)["metrics"]
     assert latest["run_count"] == 1
     assert Path(latest["runs"][0]["summary_path"]).parent == tmp_path / "evaluation-2"
+    assert main([*read_args, "--offset", "1"]) == 0
+    previous = json.loads(capsys.readouterr().out)["metrics"]
+    assert previous["run_count"] == 1
+    assert Path(previous["runs"][0]["summary_path"]).parent == tmp_path / "evaluation"
     assert main([*read_args, "--factor-name", "factor_value"]) == 0
     matching = json.loads(capsys.readouterr().out)["metrics"]
     assert matching["run_count"] == 1
@@ -373,6 +377,14 @@ def test_bar_cli_config_database_resolves_from_caller_for_guard_write_and_read(
 
     summary = Path(latest["runs"][0]["summary_path"])
     summary.write_text(summary.read_text() + "\n")
+    assert main([*read_args, "--factor-name", "second_signal"]) == 0
+    assert json.loads(capsys.readouterr().out)["metrics"]["run_count"] == 1
+
+    import duckdb
+
+    # Legacy rows still require verified summary evidence when the stored ID is absent.
+    with duckdb.connect(str(database)) as conn:
+        conn.execute("UPDATE bar_evaluation_runs SET factor_id = NULL WHERE factor_id = 'second_signal'")
     assert main([*read_args, "--factor-name", "second_signal"]) == 0
     assert json.loads(capsys.readouterr().out)["metrics"]["run_count"] == 0
 
@@ -552,9 +564,10 @@ def test_bar_analysis_dry_run_rejects_unusable_output(output, message, tmp_path,
 @pytest.mark.parametrize(("database_exists", "filters", "message"), [
     (False, [], "results_db does not exist"),
     (True, ["--limit", "0"], "limit must be a positive integer"),
+    (True, ["--offset", "-1"], "offset must be a non-negative integer"),
     (True, ["--factor-name", " "], "factor_name must be nonempty"),
     (True, ["--start-utc", "2026-02-02", "--end-utc", "2026-02-01"], "start_utc must not follow end_utc"),
-], ids=["missing-db", "invalid-limit", "blank-factor", "reversed-dates"])
+], ids=["missing-db", "invalid-limit", "invalid-offset", "blank-factor", "reversed-dates"])
 def test_bar_read_dry_run_rejects_invalid_inputs(
     database_exists, filters, message, tmp_path, monkeypatch, capsys,
 ):

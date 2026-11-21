@@ -155,7 +155,7 @@ def _republished_artifacts(payload: dict) -> list[dict]:
 
 def _make_legacy_schema(conn: duckdb.DuckDBPyConnection) -> str:
     conn.execute("DROP TABLE bar_evaluation_split_metrics")
-    for col in ("has_split", "split_config_json", "trial_ledger_json", "calibration_summary_json"):
+    for col in ("has_split", "split_config_json", "trial_ledger_json", "calibration_summary_json", "factor_id"):
         conn.execute(f"ALTER TABLE bar_evaluation_runs DROP COLUMN {col}")
     current, config, inputs, calendar, version = conn.execute("""
         SELECT identity_hash, config_hash, input_file_hashes, calendar_hash, code_version
@@ -192,6 +192,7 @@ def test_train_oos_round_trip_and_inference_filters(tmp_path: Path) -> None:
     run = detail["run"]
     assert run["has_split"] is True
     assert run["trial_ledger_json"] == summary["trial_ledger"]
+    assert run["factor_id"] == "factor_value"
     assert run["calibration_summary_json"] == summary["interval_usability"]
     assert run["trial_ledger_json"]["split"] == "train"
     assert run["trial_ledger_json"]["selection_complete"] is False
@@ -251,6 +252,11 @@ def test_train_oos_round_trip_and_inference_filters(tmp_path: Path) -> None:
         with duckdb.connect(str(db)) as conn:
             conn.execute("UPDATE bar_evaluation_runs SET has_split = true")
 
+    with duckdb.connect(str(db)) as conn:
+        conn.execute("UPDATE bar_evaluation_runs SET factor_id = NULL")
+    (output / "summary.json").unlink()
+    assert query_bar_evaluation_runs(db, factor_name="factor_value")[0]["identity_hash"] == identity
+
 
 def test_legacy_read_only_and_explicit_migration_preserve_history(tmp_path: Path) -> None:
     db = tmp_path / "legacy.duckdb"
@@ -279,8 +285,12 @@ def test_legacy_read_only_and_explicit_migration_preserve_history(tmp_path: Path
     assert read["metrics"]["cross_sections"]
     run, = read["metrics"]["runs"]
     assert run["result_schema_version"] == "bar_evaluation.v1"
-    new_columns = ("has_split", "split_config_json", "trial_ledger_json", "calibration_summary_json")
+    new_columns = ("has_split", "split_config_json", "trial_ledger_json", "calibration_summary_json", "factor_id")
     assert all(run[c] is None for c in new_columns)
+    assert query_bar_evaluation_runs(db, factor_name="factor_value") == [run]
+    assert query_bar_evaluation_runs(db, factor_name="factor_value", offset=1) == []
+    assert query_bar_evaluations(db, has_trial_ledger=True)["run_count"] == 0
+    assert query_bar_evaluations(db, has_trial_ledger=False)["runs"] == [run]
     assert query_bar_evaluation_detail(db, identity)["split_metrics"] == []
     code, report = _run_cli(tmp_path, "--database-path", str(db), command="monitor-refresh")
     assert code == 0, report
@@ -321,6 +331,146 @@ def test_legacy_read_only_and_explicit_migration_preserve_history(tmp_path: Path
     assert row["n_dependence_adjusted"] is None
     assert row["significant"] is False
     assert query_bar_evaluation_detail(db, identity)["run"] == run
+
+
+def test_v2_factor_metadata_migration_and_verified_fallback(tmp_path: Path, monkeypatch) -> None:
+    db = tmp_path / "v2.duckdb"
+    config = tmp_path / "config.json"
+    config.write_text(json.dumps({
+        "bars_csv": str(_make_ts_bars(tmp_path)), "analysis_mode": "time_series",
+        "calendar": "NQ", "start_date": "2026-12-01", "end_date": "2026-12-01",
+        "horizons": [1], "factor_id": "explicit_factor",
+    }))
+    code, result = _run_cli(tmp_path, "--config", str(config), "--results-db", str(db))
+    assert code == 0, result
+    run, = query_bar_evaluation_runs(db)
+    assert run["factor_id"] == "explicit_factor" and run["trial_ledger_json"] is None
+    summary = Path(run["summary_path"])
+
+    with monkeypatch.context() as patch:
+        def reject_summary_read(path: Path) -> bytes:
+            raise AssertionError(f"Unexpected read: {path}")
+
+        patch.setattr(Path, "read_bytes", reject_summary_read)
+        assert query_bar_evaluation_runs(db, factor_name="explicit_factor") == [run]
+        assert query_bar_evaluation_runs(db, factor_name="factor_value") == []
+
+    with duckdb.connect(str(db)) as conn:
+        conn.execute("ALTER TABLE bar_evaluation_runs DROP COLUMN factor_id")
+    before = db.read_bytes()
+    legacy, = query_bar_evaluation_runs(db, factor_name="explicit_factor")
+    assert legacy["factor_id"] is None
+    assert db.read_bytes() == before
+    store.migrate_bar_evaluation_db(db)
+    store.migrate_bar_evaluation_db(db)
+    assert query_bar_evaluation_runs(db, factor_name="explicit_factor") == [legacy]
+    assert ingest_evaluation(db, artifacts=_republished_artifacts(result)).status == "noop"
+
+    summary.write_text('{"config":{"factor_id":"forged"}}')
+    assert query_bar_evaluation_runs(db, factor_name="explicit_factor") == []
+    assert query_bar_evaluation_runs(db, factor_name="forged") == []
+
+
+@pytest.mark.parametrize("query, empty", [(query_bar_evaluation_runs, []), (query_bar_evaluations, {})])
+def test_read_bar_page_preconditions(tmp_path: Path, query, empty) -> None:
+    db = tmp_path / "query.duckdb"
+    duckdb.connect(str(db)).close()
+    with pytest.raises(BarEvaluationPreconditionError, match="Missing bar evaluation table"):
+        query(db, validate_only=True)
+    with duckdb.connect(str(db)) as conn:
+        store._create_tables(conn)
+        conn.execute("""
+            INSERT INTO bar_evaluation_runs (
+                identity_hash, analysis_mode, frequency, calendar_hash, config_hash, input_file_hashes,
+                data_identity, code_version, result_schema_version, exclusion_summary, summary_path,
+                summary_sha256, per_bar_labels_path, per_bar_labels_sha256, ic_by_horizon_path,
+                ic_by_horizon_sha256, quantile_stats_path, quantile_stats_sha256, ingested_at_utc
+            )
+            SELECT 'bad', 'time_series', '1min', 'a', 'b', 'invalid json',
+                   '{}', 'test', 'bar_evaluation.v2', '{}', '', '', '', '', '', '', '', '', now()
+        """)
+    assert query(db, factor_name="selected", limit=1, offset=1, validate_only=True) == empty
+    for params, message in [
+        ({"limit": 0}, "limit must be a positive integer"),
+        ({"limit": True}, "limit must be a positive integer"),
+        ({"limit": 1.5}, "limit must be a positive integer"),
+        ({"offset": -1}, "offset must be a non-negative integer"),
+        ({"offset": False}, "offset must be a non-negative integer"),
+        ({"offset": "1"}, "offset must be a non-negative integer"),
+        ({"factor_name": " \t"}, "factor_name must be nonempty"),
+        ({"factor_name": 3}, "factor_name must be nonempty"),
+    ]:
+        with pytest.raises(BarEvaluationPreconditionError, match=message):
+            query(db, validate_only=True, **params)
+
+
+def test_bar_page_filters_before_reading_child_rows(tmp_path: Path) -> None:
+    db = tmp_path / "pages.duckdb"
+    calibration = json.dumps([{
+        "frequency": "1m", "calibration_status": "uncalibrated",
+        "descriptive_stats_usable": True, "significance_interpretation_usable": False,
+    }])
+    with duckdb.connect(str(db)) as conn:
+        store._create_tables(conn)
+        conn.executemany("""
+            INSERT INTO bar_evaluation_runs (
+                identity_hash, analysis_mode, frequency, calendar_hash, config_hash, input_file_hashes,
+                data_identity, code_version, result_schema_version, exclusion_summary, summary_path,
+                summary_sha256, per_bar_labels_path, per_bar_labels_sha256, ic_by_horizon_path,
+                ic_by_horizon_sha256, quantile_stats_path, quantile_stats_sha256, ingested_at_utc,
+                factor_id, calibration_summary_json
+            )
+            SELECT ?, 'cross_sectional', ?, 'a', 'b', '{}', '{}', 'test', 'bar_evaluation.v2', '{}',
+                   '', '', '', '', '', '', '', '', ?::TIMESTAMPTZ, ?, ?
+        """, [
+            ("wrong-factor", "1min", "2026-01-04T00:00:00Z", "other", calibration),
+            ("wrong-split", "1min", "2026-01-03T00:00:00Z", "selected", calibration),
+            ("wrong-frequency", "5min", "2026-01-02T00:00:00Z", "selected", calibration),
+            ("c", "1min", "2026-01-01T00:00:00Z", "selected", None),
+            ("b", '["1m","5min"]', "2026-01-01T00:00:00Z", "selected", None),
+            ("a", "1min", "2026-01-01T00:00:00Z", "selected", calibration),
+        ])
+        conn.executemany("""
+            INSERT INTO bar_evaluation_split_metrics (
+                identity_hash, row_index, split, frequency, horizon_bars, split_purged_count,
+                n_observations, interval_method, calibration_status, descriptive_stats_usable,
+                significance_interpretation_usable, metrics_json
+            )
+            VALUES (?, ?, 'full', ?, 1, 0, 12, 'hac', 'uncalibrated', ?, FALSE, ?)
+        """, [
+            ("wrong-split", 0, "1min", False, "off-filter"),
+            ("c", 0, "1min", True, "off-page"),
+            ("b", 0, "1m", True, "{}"),
+            ("b", 1, "5min", True, "off-filter"),
+        ])
+        conn.executemany("""
+            INSERT INTO bar_evaluation_ic (
+                identity_hash, row_index, analysis_mode, frequency, horizon_bars, exclusion_counts
+            ) VALUES (?, 0, 'cross_sectional', '1min', 1, ?)
+        """, [("b", "{}"), ("c", "off-page")])
+        conn.execute("""
+            INSERT INTO bar_evaluation_quantiles (
+                identity_hash, row_index, analysis_mode, frequency, horizon_bars, quantile
+            ) VALUES ('b', 0, 'cross_sectional', '1min', 1, 1), ('c', 0, 'cross_sectional', '1min', 1, 1)
+        """)
+        conn.executemany("""
+            INSERT INTO bar_evaluation_cross_sections (
+                identity_hash, row_index, frequency, horizon_bars, signal_timestamp, exclusion_counts
+            ) VALUES (?, 0, '1min', 1, '2026-01-01T00:00:00Z', ?)
+        """, [("b", "{}"), ("c", "off-page")])
+
+    filters = dict(factor_name="selected", frequency="1min", calibration_status="uncalibrated",
+                   descriptive_stats_usable=True, significance_interpretation_usable=False, has_trial_ledger=False)
+    first = query_bar_evaluations(db, limit=1, **filters)
+    assert [run["identity_hash"] for run in first["runs"]] == ["a"]
+    assert not first["split_metrics"]
+    page = query_bar_evaluations(db, limit=1, offset=1, **filters)
+    for key in ("runs", "split_metrics", "ic_by_horizon", "quantile_stats", "cross_sections"):
+        assert [row["identity_hash"] for row in page[key]] == ["b"]
+    assert query_bar_evaluations(db, split="full", limit=1, **filters)["runs"] == page["runs"]
+    with store._open_read_only(db):
+        assert query_bar_evaluation_runs(db, factor_name="selected", frequency="1m", offset=4) == []
+        assert query_bar_evaluation_runs(db, factor_name="selected", frequency="1m", limit=1)
 
 
 def _make_calibrated_hac_config(tmp_path: Path) -> Path:
@@ -444,6 +594,7 @@ def test_python_export_ingests_adaptive_hac_with_periodic_gaps(tmp_path: Path, p
     db = tmp_path / "python_export.duckdb"
     receipt = ingest_evaluation(db, output, expected_hashes={k: store.sha256_file(v) for k, v in paths.items()})
     assert receipt.status == "inserted"
+    assert query_bar_evaluation_runs(db, factor_name="factor_value")[0]["factor_id"] == "factor_value"
     row, = query_bar_evaluations(db, split="train")["split_metrics"]
     assert row["calibration_status"] == "calibrated_pass"
     assert row["significance_interpretation_usable"] is True
@@ -518,6 +669,8 @@ def test_store_uses_verified_bucket_strategy(tmp_path: Path, config_source: str)
         row, = query_bar_evaluation_runs(db)
         expected = config["bucket_strategy"] if config_source.startswith("default_match") else published_strategy
         assert row["bucket_strategy"] == expected
+        if config_source == "legacy_continuous":
+            assert row["factor_id"] == "factor_value"
 
 
 @pytest.mark.parametrize("strategy", ["segment_anchored", "session_clock", None])
@@ -870,6 +1023,7 @@ def test_end_to_end_both_modes_and_csv_parity(tmp_path: Path) -> None:
 
     ts_detail = query_bar_evaluation_detail(results_db, ts_id_hash)
     assert ts_detail["run"]["analysis_mode"] == "time_series"
+    assert ts_detail["run"]["factor_id"] == "factor_value"
     assert ts_detail["run"]["frequency"] == "1min"
     assert ts_detail["run"]["calendar_id"] == "CME Globex Equity"
     assert ts_detail["run"]["per_bar_labels_path"] == ts_artifacts["per_bar_labels"]["path"]

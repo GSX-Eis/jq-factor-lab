@@ -31,8 +31,8 @@ from .schema import (
     _RUN_ARTIFACT_HASH_COLUMNS,
     _RUN_BOOL_COLUMNS,
     _RUN_JSON_COLUMNS,
+    _RUN_OPTIONAL_COLUMN_TYPES,
     _RUN_SEMANTIC_COLUMNS,
-    _RUN_V2_COLUMN_TYPES,
     _SPLIT_BOOL_COLUMNS,
     _SPLIT_FLOAT_COLUMNS,
     _SPLIT_INT_COLUMNS,
@@ -263,13 +263,13 @@ def _write_transaction(
 
 
 def migrate_bar_evaluation_db(db_path: str | Path) -> None:
-    """Explicitly upgrade an existing v1 store while preserving its historical rows."""
+    """Explicitly upgrade an existing store while preserving its historical rows."""
     resolved_db = _validate_db_target_path(db_path)
     if not resolved_db.is_file():
         raise BarEvaluationPreconditionError(f"results_db does not exist: {resolved_db}")
     with _write_transaction(resolved_db) as conn:
         _require_write_schema(conn, _catalog_columns(conn), legacy_only=True)
-        for column, kind in _RUN_V2_COLUMN_TYPES.items():
+        for column, kind in _RUN_OPTIONAL_COLUMN_TYPES.items():
             conn.execute(f"ALTER TABLE bar_evaluation_runs ADD COLUMN IF NOT EXISTS {column} {kind}")
         _create_split_table(conn)
         _require_write_schema(conn, _catalog_columns(conn))

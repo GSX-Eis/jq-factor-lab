@@ -350,8 +350,9 @@ def _handle_read_bar_evaluations(args: argparse.Namespace, *, public_read: bool 
             descriptive_stats_usable=args.descriptive_stats_usable,
             significance_interpretation_usable=args.significance_interpretation_usable,
             has_trial_ledger=args.has_trial_ledger,
-            factor_name=getattr(args, "factor_name", None),
-            limit=getattr(args, "limit", None),
+            factor_name=args.factor_name,
+            limit=args.limit,
+            offset=args.offset,
             validate_only=public_read and args.dry_run,
         )
         if args.dry_run:

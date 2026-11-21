@@ -2,17 +2,20 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Sequence
-from contextlib import contextmanager
+from collections.abc import Mapping, Sequence
+from contextlib import ExitStack, contextmanager
 from hashlib import sha256
 from pathlib import Path
 from typing import Any, Iterator
+from uuid import uuid4
 
 import duckdb
 
 from utils.time_axis import Frequency
 
 from .normalization import (
+    _factor_id_from_config,
+    _factor_id_from_ledger,
     _format_utc_iso,
     _json_safe,
     _parse_filter_timestamp,
@@ -27,7 +30,7 @@ from .schema import (
     _QUANTILE_TABLE_COLUMNS,
     _RUN_ALL_COLUMNS,
     _RUN_JSON_COLUMNS,
-    _RUN_V2_COLUMN_TYPES,
+    _RUN_OPTIONAL_COLUMN_TYPES,
     _SPLIT_JSON_COLUMNS,
     _SPLIT_NAMES,
     _SPLIT_TABLE,
@@ -37,9 +40,7 @@ from .schema import (
     BarEvaluationPreconditionError,
     _catalog_columns,
 )
-from .validation import (
-    _validate_db_target_path,
-)
+from .validation import _validate_db_target_path
 
 
 @contextmanager
@@ -68,19 +69,19 @@ def _require_bar_evaluation_tables(conn: duckdb.DuckDBPyConnection) -> None:
         )
 
 
+def _stored_frequencies(raw: str | None) -> list[str]:
+    if raw is None:
+        return []
+    return json.loads(raw) if raw.startswith("[") else [raw]
+
+
 def _decode_run_row(columns: Sequence[str], row: tuple[Any, ...]) -> dict[str, Any]:
     record = dict(zip(columns, row))
     for json_col in _RUN_JSON_COLUMNS:
         raw = record.get(json_col)
         if isinstance(raw, str):
             record[json_col] = json.loads(raw)
-    freq_raw = record.get("frequency")
-    if isinstance(freq_raw, str) and freq_raw.startswith("["):
-        record["frequencies"] = json.loads(freq_raw)
-    elif isinstance(freq_raw, str):
-        record["frequencies"] = [freq_raw]
-    else:
-        record["frequencies"] = []
+    record["frequencies"] = _stored_frequencies(record.get("frequency"))
     record["ingested_at_utc"] = _format_utc_iso(record.get("ingested_at_utc"))
     safe = _json_safe(record)
     safe["split_config_json"] = record.get("split_config_json")
@@ -123,7 +124,41 @@ def _frequency_matches(run_frequencies: list[str], target: str) -> bool:
     return False
 
 
-def _query_runs_on_conn(
+def _legacy_factor_id(ledger_json: str | None, summary_path: str, summary_sha256: str) -> str | None:
+    factor_id = _factor_id_from_ledger(json.loads(ledger_json)) if ledger_json is not None else None
+    if factor_id is not None:
+        return factor_id
+    path = Path(summary_path)
+    try:
+        if not path.is_file():
+            return None
+        evidence = path.read_bytes()
+        if sha256(evidence).hexdigest() != summary_sha256:
+            return None
+        config = json.loads(evidence)["config"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    return _factor_id_from_config(config) if isinstance(config, dict) else None
+
+
+def _validate_page_filters(factor_name: str | None, limit: int | None, offset: int) -> None:
+    if limit is not None and (type(limit) is not int or limit < 1):
+        raise BarEvaluationPreconditionError("limit must be a positive integer")
+    if type(offset) is not int or offset < 0:
+        raise BarEvaluationPreconditionError("offset must be a non-negative integer")
+    if factor_name is not None and (not isinstance(factor_name, str) or not factor_name.strip()):
+        raise BarEvaluationPreconditionError("factor_name must be nonempty")
+
+
+def _split_filter_sql(filters: Mapping[str, Any], frequency_function: str | None) -> str:
+    clauses = [f"{key} = ?" for key in filters]
+    if clauses and frequency_function is not None:
+        clauses.append(f"{frequency_function}(frequency)")
+    return " AND ".join(clauses)
+
+
+@contextmanager
+def _query_run_page(
     conn: duckdb.DuckDBPyConnection,
     *,
     identity_hash: str | None = None,
@@ -132,8 +167,13 @@ def _query_runs_on_conn(
     calendar_id: str | None = None,
     start_utc: str | None = None,
     end_utc: str | None = None,
+    has_trial_ledger: bool | None = None,
+    factor_name: str | None = None,
+    limit: int | None = None,
+    offset: int = 0,
     validate_only: bool = False,
-) -> list[dict[str, Any]]:
+    split_filters: Mapping[str, Any] | None = None,
+) -> Iterator[tuple[list[dict[str, Any]], str | None]]:
     _require_bar_evaluation_tables(conn)
     if analysis_mode is not None and analysis_mode not in VALID_ANALYSIS_MODES:
         raise BarEvaluationPreconditionError(
@@ -142,7 +182,7 @@ def _query_runs_on_conn(
     clauses: list[str] = []
     params: list[Any] = []
     if identity_hash is not None:
-        clauses.append("identity_hash = ?")
+        clauses.append("r.identity_hash = ?")
         params.append(identity_hash)
     if analysis_mode is not None:
         clauses.append("analysis_mode = ?")
@@ -162,23 +202,85 @@ def _query_runs_on_conn(
         params.append(end_ts.to_pydatetime())
 
     if validate_only:
-        return []
+        yield [], None
+        return
 
-    where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-    run_columns = _catalog_columns(conn).get("bar_evaluation_runs", {})
-    projections = [
-        col if col not in _RUN_V2_COLUMN_TYPES or col in run_columns else f"NULL AS {col}"
-        for col in _RUN_ALL_COLUMNS
-    ]
-    sql = (
-        f"SELECT {', '.join(projections)} FROM bar_evaluation_runs "
-        f"{where_sql} ORDER BY ingested_at_utc DESC, identity_hash ASC"
-    )
-    rows = conn.execute(sql, params).fetchall()
-    decoded = [_decode_run_row(_RUN_ALL_COLUMNS, row) for row in rows]
-    if frequency is not None:
-        decoded = [item for item in decoded if _frequency_matches(item.get("frequencies", []), frequency)]
-    return decoded
+    catalog = _catalog_columns(conn)
+    run_columns = catalog.get("bar_evaluation_runs", {})
+    ledger = "r.trial_ledger_json" if "trial_ledger_json" in run_columns else "NULL"
+    if has_trial_ledger is not None:
+        clauses.append(f"(NULLIF(trim({ledger}), 'null') IS NOT NULL) = ?")
+        params.append(has_trial_ledger)
+    # DuckDB shares registered functions across connections to the same file.
+    with ExitStack() as functions:
+        frequency_function = None
+        if frequency is not None:
+            def frequency_matches(raw: str) -> bool:
+                return _frequency_matches(_stored_frequencies(raw), frequency)
+
+            frequency_function = f"bar_frequency_matches_{uuid4().hex}"
+            conn.create_function(frequency_function, frequency_matches, [str], bool)
+            functions.callback(conn.remove_function, frequency_function)
+            clauses.append(f"{frequency_function}(r.frequency)")
+        if factor_name is not None:
+            factor_function = f"bar_legacy_factor_id_{uuid4().hex}"
+            conn.create_function(factor_function, _legacy_factor_id, [str, str, str], str,
+                                 null_handling="special")
+            functions.callback(conn.remove_function, factor_function)
+            legacy_factor = f"{factor_function}({ledger}, r.summary_path, r.summary_sha256)"
+            if "factor_id" in run_columns:
+                # The legacy reader may touch the filesystem and must run only for NULL factor IDs.
+                clauses.append(f"r.factor_id = ? OR CASE WHEN r.factor_id IS NULL THEN {legacy_factor} = ? END")
+                params.append(factor_name)
+            else:
+                clauses.append(f"{legacy_factor} = ?")
+            params.append(factor_name)
+        if split_filters:
+            split_match: list[str] = []
+            if _SPLIT_TABLE in catalog:
+                same_run = f"SELECT 1 FROM {_SPLIT_TABLE} AS s WHERE s.identity_hash = r.identity_hash"
+                split_match.append(f"EXISTS ({same_run} AND {_split_filter_sql(split_filters, frequency_function)})")
+                params.extend(split_filters.values())
+            if "split" not in split_filters and "calibration_summary_json" in run_columns:
+                legacy_filters = [f"json_extract(entry.value, '$.{key}') = to_json(?)" for key in split_filters]
+                if frequency_function is not None:
+                    legacy_filters.append(
+                        f"{frequency_function}(json_extract_string(entry.value, '$.frequency'))"
+                    )
+                fallback_match = f"""
+                    EXISTS (
+                        SELECT 1 FROM json_each(r.calibration_summary_json) AS entry
+                        WHERE {' AND '.join(legacy_filters)}
+                    )
+                """
+                if _SPLIT_TABLE in catalog:
+                    fallback_match = f"NOT EXISTS ({same_run}) AND {fallback_match}"
+                split_match.append(fallback_match)
+                params.extend(split_filters.values())
+            clauses.append(" OR ".join(split_match) or "FALSE")
+
+        where_sql = "WHERE " + " AND ".join(f"({clause})" for clause in clauses) if clauses else ""
+        projections = [
+            f"r.{col}" if col not in _RUN_OPTIONAL_COLUMN_TYPES or col in run_columns else f"NULL AS {col}"
+            for col in _RUN_ALL_COLUMNS
+        ]
+        sql = (
+            f"SELECT {', '.join(projections)} FROM bar_evaluation_runs AS r "
+            f"{where_sql} ORDER BY r.ingested_at_utc DESC, r.identity_hash ASC"
+        )
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(min(limit, 2**63 - 1))
+        if offset:
+            sql += " OFFSET ?"
+            params.append(min(offset, 2**63 - 1))
+        rows = conn.execute(sql, params).fetchall()
+        yield [_decode_run_row(_RUN_ALL_COLUMNS, row) for row in rows], frequency_function
+
+
+def _query_runs_on_conn(conn: duckdb.DuckDBPyConnection, **filters: Any) -> list[dict[str, Any]]:
+    with _query_run_page(conn, **filters) as (runs, _):
+        return runs
 
 
 def query_bar_evaluation_runs(
@@ -190,8 +292,13 @@ def query_bar_evaluation_runs(
     calendar_id: str | None = None,
     start_utc: str | None = None,
     end_utc: str | None = None,
+    factor_name: str | None = None,
+    limit: int | None = None,
+    offset: int = 0,
+    validate_only: bool = False,
 ) -> list[dict[str, Any]]:
-    """Read-only query of `bar_evaluation_runs` matching the supplied filters."""
+    """Read a page of matching runs, ordered by ingestion time and identity."""
+    _validate_page_filters(factor_name, limit, offset)
     with _open_read_only(db_path) as conn:
         return _query_runs_on_conn(
             conn,
@@ -201,6 +308,10 @@ def query_bar_evaluation_runs(
             calendar_id=calendar_id,
             start_utc=start_utc,
             end_utc=end_utc,
+            factor_name=factor_name,
+            limit=limit,
+            offset=offset,
+            validate_only=validate_only,
         )
 
 
@@ -217,29 +328,6 @@ def query_bar_evaluation_detail(
         raise LookupError(f"No bar evaluation found for identity_hash={identity_hash!r}")
     detail.pop("run_count")
     return {"run": runs[0], **detail}
-
-
-def _run_factor_name(run: dict[str, Any]) -> str | None:
-    # Reuse the ledger when it identifies the evaluated factor. Older runs without
-    # a ledger can still be filtered using their verified published summary.
-    ledger = run["trial_ledger_json"] or {}
-    evaluated = {row["factor_id"] for row in ledger.get("candidates", []) if row["reason"] != "not_evaluated"}
-    if len(evaluated) == 1:
-        return next(iter(evaluated))
-    path = Path(run["summary_path"])
-    try:
-        if not path.is_file():
-            return None
-        evidence = path.read_bytes()
-        if sha256(evidence).hexdigest() != run["summary_sha256"]:
-            return None
-        config = json.loads(evidence)["config"]
-    except (OSError, ValueError, KeyError, TypeError):
-        return None
-    if not isinstance(config, dict):
-        return None
-    default = "factor_value" if "bars_csv" in config or "continuous_futures" in config else None
-    return config.get("factor_id", default)
 
 
 def query_bar_evaluations(
@@ -259,13 +347,11 @@ def query_bar_evaluations(
     has_trial_ledger: bool | None = None,
     factor_name: str | None = None,
     limit: int | None = None,
+    offset: int = 0,
     validate_only: bool = False,
 ) -> dict[str, Any]:
-    """Filter runs and split rows by their inference fields. Legacy tables remain run-scoped."""
-    if limit is not None and (type(limit) is not int or limit < 1):
-        raise BarEvaluationPreconditionError("limit must be a positive integer")
-    if factor_name is not None and not factor_name.strip():
-        raise BarEvaluationPreconditionError("factor_name must be nonempty")
+    """Read a page of matching runs and their child rows."""
+    _validate_page_filters(factor_name, limit, offset)
     if split is not None and split not in _SPLIT_NAMES:
         raise BarEvaluationPreconditionError(f"split must be one of {_SPLIT_NAMES}, got {split!r}")
     if calibration_status is not None and calibration_status not in _CALIBRATION_STATUSES:
@@ -278,13 +364,9 @@ def query_bar_evaluations(
     }
     filters = {key: value for key, value in filters.items() if value is not None}
 
-    def matches(row: dict[str, Any]) -> bool:
-        return all(row.get(key) == value for key, value in filters.items()) and (
-            frequency is None or _frequency_matches([row["frequency"]], frequency)
-        )
-
-    with _open_read_only(db_path) as conn:
-        runs = _query_runs_on_conn(
+    with (
+        _open_read_only(db_path) as conn,
+        _query_run_page(
             conn,
             identity_hash=identity_hash,
             analysis_mode=analysis_mode,
@@ -292,40 +374,26 @@ def query_bar_evaluations(
             calendar_id=calendar_id,
             start_utc=start_utc,
             end_utc=end_utc,
+            has_trial_ledger=has_trial_ledger,
+            factor_name=factor_name,
+            limit=limit,
+            offset=offset,
             validate_only=validate_only,
-        )
+            split_filters=filters,
+        ) as (runs, frequency_function),
+    ):
         if validate_only:
             return {}
-        if factor_name is not None:
-            runs = [run for run in runs if _run_factor_name(run) == factor_name]
-        if has_trial_ledger is not None:
-            runs = [run for run in runs if (run["trial_ledger_json"] is not None) == has_trial_ledger]
         hashes = [run["identity_hash"] for run in runs]
         split_rows: list[dict[str, Any]] = []
         if hashes and _SPLIT_TABLE in _catalog_columns(conn):
+            split_where = f" AND {_split_filter_sql(filters, frequency_function)}" if filters else ""
             rows = conn.execute(
                 f"SELECT {', '.join(_SPLIT_TABLE_COLUMNS)} FROM {_SPLIT_TABLE} "
-                "WHERE identity_hash IN (SELECT unnest(?)) ORDER BY identity_hash, row_index",
-                [hashes],
+                f"WHERE identity_hash IN (SELECT unnest(?)){split_where} ORDER BY identity_hash, row_index",
+                [hashes, *filters.values()],
             ).fetchall()
             split_rows = _decode_table_rows(_SPLIT_TABLE_COLUMNS, rows, json_cols=_SPLIT_JSON_COLUMNS)
-        if filters:
-            with_splits = {row["identity_hash"] for row in split_rows}
-            split_rows = [row for row in split_rows if matches(row)]
-            matching = {row["identity_hash"] for row in split_rows}
-            runs = [
-                run for run in runs if run["identity_hash"] in matching
-                or (
-                    run["identity_hash"] not in with_splits and split is None
-                    and any(matches(row) for row in run["calibration_summary_json"] or [])
-                )
-            ]
-            hashes = [run["identity_hash"] for run in runs]
-        if limit is not None:
-            runs = runs[:limit]
-            hashes = [run["identity_hash"] for run in runs]
-            selected = set(hashes)
-            split_rows = [row for row in split_rows if row["identity_hash"] in selected]
         if not hashes:
             return {
                 "run_count": 0,
@@ -335,22 +403,21 @@ def query_bar_evaluations(
                 "cross_sections": [],
                 "split_metrics": [],
             }
-        placeholders = ", ".join("?" for _ in hashes)
         ic_rows = conn.execute(
             f"SELECT {', '.join(_IC_TABLE_COLUMNS)} FROM bar_evaluation_ic "
-            f"WHERE identity_hash IN ({placeholders}) ORDER BY identity_hash, row_index",
-            hashes,
+            "WHERE identity_hash IN (SELECT unnest(?)) ORDER BY identity_hash, row_index",
+            [hashes],
         ).fetchall()
         q_rows = conn.execute(
             f"SELECT {', '.join(_QUANTILE_TABLE_COLUMNS)} FROM bar_evaluation_quantiles "
-            f"WHERE identity_hash IN ({placeholders}) ORDER BY identity_hash, row_index",
-            hashes,
+            "WHERE identity_hash IN (SELECT unnest(?)) ORDER BY identity_hash, row_index",
+            [hashes],
         ).fetchall()
         cs_rows = (
             conn.execute(
                 f"SELECT {', '.join(_CROSS_SECTION_TABLE_COLUMNS)} FROM bar_evaluation_cross_sections "
-                f"WHERE identity_hash IN ({placeholders}) ORDER BY identity_hash, row_index",
-                hashes,
+                "WHERE identity_hash IN (SELECT unnest(?)) ORDER BY identity_hash, row_index",
+                [hashes],
             ).fetchall()
             if include_cross_sections
             else []

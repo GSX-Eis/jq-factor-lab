@@ -30,6 +30,13 @@ from backtest_and_analysis.time_series.artifacts import _json_value
 from tools.benchmarks import adaptive_inference_calibration as benchmark
 
 
+def test_registered_adaptive_calibration_reports_match_frozen_hashes() -> None:
+    for domain in calibration.REGISTERED_ADAPTIVE_CALIBRATIONS:
+        report = Path(__file__).resolve().parents[1] / domain.report_ref
+        assert report.is_file(), f"{domain.domain_id}: missing calibration report {domain.report_ref}"
+        assert sha256(report.read_bytes()).hexdigest() == domain.report_sha256, domain.domain_id
+
+
 def test_quick_cli_emits_all_preregistered_cells(tmp_path: Path) -> None:
     output = tmp_path / "quick.json"
     subprocess.run(
@@ -432,12 +439,19 @@ def test_s3_production_registry_is_bound_to_formal_bootstrap_evidence() -> None:
     assert generalized.missing_patterns == ("none", "periodic_17_3", "periodic_17_5")
     assert generalized.coverage_cell_ids == tuple(f"3:{index:03d}" for index in range(18))
     assert all(domain.report_ref == "reports/NERE-962/adaptive-calibration-v2.json" for domain in (*core, generalized))
-    report_path = Path(__file__).resolve().parents[1] / generalized.report_ref
-    if not report_path.is_file():
-        pytest.skip('Formal calibration receipt is kept in the private source repository')
-    report_bytes = report_path.read_bytes()
+    report_bytes = (Path(__file__).resolve().parents[1] / generalized.report_ref).read_bytes()
     digest = sha256(report_bytes).hexdigest()
     report = json.loads(report_bytes)
+    assert report["output"] == "reports/NERE-962/adaptive-calibration-v2.json"
+    report_fields = {
+        "synthetic", "nominal_coverage", "coverage_tolerance", "error_rate_upper_bound",
+        "coverage", "multiplicity", "release_passes", "run_fingerprint", "bootstrap_release_passes",
+    }
+    metadata = {key: value for key, value in report.items() if key not in report_fields}
+    fingerprint = sha256(json.dumps(metadata, sort_keys=True).encode()).hexdigest()
+    assert report["run_fingerprint"] == fingerprint
+    assert len(report["coverage"]) == 26
+    assert all(row["run_fingerprint"] == fingerprint for row in report["coverage"])
     assert report["bootstrap_release_passes"] is True and report["repetitions"] == 500
     rows = {row["cell_id"]: row for row in report["coverage"]}
     for index, domain in enumerate(core):
@@ -841,6 +855,52 @@ def test_v2_quick_cli_resume_rejects_impossible_counts(tmp_path, monkeypatch, co
     assert not pending.exists() and not output.exists()
 
 
+def test_v2_cli_writes_report_to_symlink_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = tmp_path.resolve()
+    report_path = Path("reports/quick.json")
+    target = repo / report_path
+    alias = repo / "alias.json"
+    alias.symlink_to(report_path)
+    monkeypatch.chdir(repo)
+    monkeypatch.setattr(benchmark, "REPO_ROOT", repo)
+    monkeypatch.setattr(benchmark, "_matrix", lambda **_: [])
+    monkeypatch.setenv("QUANTATION_CODE_VERSION", "a" * 40)
+    monkeypatch.setattr(sys, "argv", ["benchmark", "--profile", "v2_boot", "--quick", "--output", alias.name])
+
+    benchmark.main()
+
+    assert alias.is_symlink() and alias.resolve() == target
+    assert target.is_file()
+    report = json.loads(target.read_text())
+    checkpoint = json.loads((target.with_suffix(".cells") / "profile.json").read_text())
+    assert report["output"] == checkpoint["output"] == report_path.as_posix()
+
+
+@pytest.mark.parametrize("absolute", [False, True], ids=["relative", "absolute"])
+def test_v2_repo_output_is_normalized_and_resumes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, absolute: bool,
+) -> None:
+    repo = tmp_path.resolve()
+    cwd = repo / "work"
+    cwd.mkdir()
+    monkeypatch.chdir(cwd)
+    monkeypatch.setattr(benchmark, "REPO_ROOT", repo)
+    monkeypatch.setenv("QUANTATION_CODE_VERSION", "a" * 40)
+    monkeypatch.setattr(benchmark, "ProcessPoolExecutor", ThreadPoolExecutor)
+    report_path = Path("reports/quick.json")
+    relative_output = Path("..") / report_path
+    absolute_output = repo / report_path
+    output, resume_output = (absolute_output, relative_output) if absolute else (relative_output, absolute_output)
+    options = dict(quick=True, workers=2, profile_name="v2_boot")
+
+    report = benchmark.run_benchmark(output=output, **options)
+    manifest = absolute_output.with_suffix(".cells") / "profile.json"
+    assert json.loads(manifest.read_text())["output"] == report["output"] == report_path.as_posix()
+    assert benchmark.run_benchmark(output=resume_output, resume=True, **options) == report
+
+
 def test_v2_quick_profile_checkpoint_binds_matrix_and_budget(tmp_path, monkeypatch):
     output = tmp_path / "quick.json"
     monkeypatch.setenv("QUANTATION_CODE_VERSION", "a" * 40)
@@ -867,7 +927,8 @@ def test_v2_quick_profile_checkpoint_binds_matrix_and_budget(tmp_path, monkeypat
     metadata = json.loads(manifest.read_text())
     fingerprint = sha256(json.dumps(metadata, sort_keys=True).encode("utf-8")).hexdigest()
     assert report["run_fingerprint"] == fingerprint
-    assert metadata["output"] == str(output.resolve()) and metadata["source_revision"] == "a" * 40
+    assert metadata["output"] == report["output"] == str(output.resolve())
+    assert metadata["source_revision"] == "a" * 40
     assert (metadata["seed"], metadata["repetitions"], metadata["adaptive_boot"],
             metadata["adaptive_min_valid"], metadata["fixed_boot"], metadata["fixed_min_valid"]) == (
         1538543278954444760, 3, 19, 18, 19, 19,

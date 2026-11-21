@@ -36,6 +36,7 @@ from backtest_and_analysis.evaluation.types import (
 )
 from utils.local_outputs import write_json
 
+REPO_ROOT = Path(__file__).resolve().parents[2]
 ALPHA = .05
 N_CANDIDATES = 6
 GENERALIZED = "generalized_ar_heteroskedastic"
@@ -499,17 +500,17 @@ def run_benchmark(
     *, quick: bool, output: Path, workers: int, resume: bool = False, profile_name: Literal["s4", "s5", "v2_boot"] = "s4",
 ) -> dict:
     s5, v2_boot = profile_name == "s5", profile_name == "v2_boot"
+    resolved_output = output.resolve() if v2_boot else output
     if v2_boot:
         profile = V2_BOOT_QUICK if quick else V2_BOOT_FORMAL
         matrix = [cell for cell in _matrix(s5=True) if cell.section in (1, 3)]
-        output = output.resolve()
     else:
         profile = (S5_QUICK if quick else S5_FORMAL) if s5 else (QUICK if quick else FORMAL)
         matrix = _matrix(s5=s5)
-    checkpoints = output.with_suffix(".cells")
-    output.parent.mkdir(parents=True, exist_ok=True)
-    if output.exists():
-        raise FileExistsError(f"Calibration report already exists at {output}")
+    checkpoints = resolved_output.with_suffix(".cells")
+    resolved_output.parent.mkdir(parents=True, exist_ok=True)
+    if resolved_output.exists():
+        raise FileExistsError(f"Calibration report already exists at {resolved_output}")
     metadata = dict(
         profile="quick" if quick else "registered", **asdict(profile),
         python=platform.python_version(), numpy=np.__version__, scipy=scipy.__version__,
@@ -520,7 +521,10 @@ def run_benchmark(
         source = metadata["source_revision"]
         if source is None or not re.fullmatch(r"[0-9a-f]{40}", source):
             raise ValueError("v2_boot requires a complete Git SHA in QUANTATION_CODE_VERSION")
-        metadata.update(method_version=BOOTSTRAP_V2[0], alpha=ALPHA, output=str(output),
+        metadata_output = str(resolved_output)
+        if resolved_output.is_relative_to(REPO_ROOT):
+            metadata_output = resolved_output.relative_to(REPO_ROOT).as_posix()
+        metadata.update(method_version=BOOTSTRAP_V2[0], alpha=ALPHA, output=metadata_output,
                         fixed_min_valid=profile.fixed_boot)
     if s5 or v2_boot:
         metadata["benchmark_profile"] = profile_name
@@ -553,7 +557,7 @@ def run_benchmark(
         elif fingerprint is not None:
             retained[cell.cell_id] = _read_s5_checkpoint(path, cell, profile, fingerprint)
     if resume and v2_boot:
-        print(f"Resuming {output} with {len(retained)}/{len(matrix)} verified cells", flush=True)
+        print(f"Resuming {resolved_output} with {len(retained)}/{len(matrix)} verified cells", flush=True)
     # Start the costly Bootstrap cells first, longest grids first, to reduce the idle tail.
     pending.sort(key=lambda cell: (cell.section in (1, 3), cell.design.n_times), reverse=True)
     with ProcessPoolExecutor(max_workers=workers) as executor:
@@ -622,9 +626,10 @@ def main() -> None:
     args = parser.parse_args()
     if args.workers < 1:
         parser.error("--workers must be positive")
-    report = run_benchmark(quick=args.quick, output=args.output, workers=args.workers, resume=args.resume,
+    output = args.output.resolve() if args.profile == "v2_boot" else args.output
+    report = run_benchmark(quick=args.quick, output=output, workers=args.workers, resume=args.resume,
                            profile_name=args.profile)
-    write_json(args.output, report)
+    write_json(output, report)
     print(args.output, flush=True)
 
 

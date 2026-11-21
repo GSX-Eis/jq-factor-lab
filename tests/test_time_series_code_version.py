@@ -1,4 +1,5 @@
 """Version lookup must not discover an unrelated enclosing repository."""
+from pathlib import Path
 import subprocess
 
 import pytest
@@ -43,6 +44,44 @@ def test_git_is_bound_to_code_root_and_reports_dirty(tmp_path, monkeypatch):
     assert resolve_code_version(tmp_path) == (expected, 'git')
     file.write_text('changed')
     assert resolve_code_version(tmp_path) == (expected + '-dirty', 'git')
+
+
+@pytest.mark.parametrize(('relative_path', 'dirty'), [
+    ('backtest_and_analysis/new.py', True),
+    ('factor_synthesis/nested/new.py', True),
+    ('factors/nested/新 因子.py', True),
+    ('data_pipeline/new.py', True),
+    ('utils/nested/new.py', True),
+    ('tools/new.py', True),
+    ('utils/new.md', False),
+    ('tools/new.json', False),
+    ('utils/ignored/new.py', False),
+    ('work/new.py', False),
+    ('reports/new.py', False),
+    ('data/new.py', False),
+    ('outputs/new.py', False),
+    ('utils_extra/new.py', False),
+    ('new.py', False),
+])
+def test_git_detects_only_unignored_core_python_files(
+    tmp_path: Path, relative_path: str, dirty: bool,
+) -> None:
+    from utils.code_version import resolve_code_version
+
+    git = ['git', '-C', str(tmp_path)]
+    subprocess.run([*git, 'init'], check=True, capture_output=True)
+    (tmp_path / '.gitignore').write_text('/utils/ignored/\n', encoding='utf-8')
+    subprocess.run([*git, 'add', '.gitignore'], check=True)
+    subprocess.run([*git, '-c', 'user.name=Test', '-c', 'user.email=test@example.org',
+                    'commit', '-m', 'fixture'], check=True, capture_output=True)
+    revision = subprocess.check_output([*git, 'rev-parse', 'HEAD'], text=True).strip()
+
+    file = tmp_path / relative_path
+    file.parent.mkdir(parents=True, exist_ok=True)
+    file.touch()
+
+    expected = revision + ('-dirty' if dirty else '')
+    assert resolve_code_version(tmp_path) == (expected, 'git')
 
 
 def test_worker_records_version_source_in_artifacts(tmp_path, monkeypatch):

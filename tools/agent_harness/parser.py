@@ -198,9 +198,10 @@ def build_parser(*, public_bar_cli: bool = False, parser_class: type[argparse.Ar
     read_bar_eval.add_argument("--descriptive-stats-usable", action=argparse.BooleanOptionalAction)
     read_bar_eval.add_argument("--significance-interpretation-usable", action=argparse.BooleanOptionalAction)
     read_bar_eval.add_argument("--has-trial-ledger", action=argparse.BooleanOptionalAction)
+    read_bar_eval.add_argument("--factor-name", help="Recorded factor ID")
+    read_bar_eval.add_argument("--limit", type=int, help="Maximum latest matching runs")
+    read_bar_eval.add_argument("--offset", type=int, default=0, help="Number of matching runs to skip")
     if public_bar_cli:
-        read_bar_eval.add_argument("--factor-name", help="Recorded factor ID")
-        read_bar_eval.add_argument("--limit", type=int, help="Maximum latest matching runs")
         output_root = str(Path("outputs/agent_harness").resolve())
         for command in (bar_analysis, read_bar_eval):
             command.set_defaults(output_root=output_root)
