@@ -743,7 +743,7 @@ def group_factors_by_config_frequency(prepared: List[Dict[str, Any]], req_map: D
     return {k: v for k, v in groups.items() if v}
 
 
-def render_single_file_strategy(context: Dict[str, Any]) -> str:
+def render_single_file_strategy(context: Dict[str, Any], *, entry_block: Optional[str] = None) -> str:
     parts: List[str] = []
     parts.append(header_banner(context.get("version", "1.0")))
     parts.append("")
@@ -759,7 +759,7 @@ def render_single_file_strategy(context: Dict[str, Any]) -> str:
     parts.append(context["factor_base_code"])
     parts.append("")
     parts.append("# ---- runtime shims ----")
-    parts.append(compose_runtime_shims_block())
+    parts.append(compose_runtime_shims_block(install_modules=entry_block is None))
     parts.append("")
     for blk in context["factor_blocks"]:
         parts.append("# ---- factor implementation ----")
@@ -776,11 +776,31 @@ def render_single_file_strategy(context: Dict[str, Any]) -> str:
     parts.append("")
     parts.append("# ---- strategy entry ----")
     parts.append(
-        compose_strategy_entry_block(
+        entry_block if entry_block is not None else compose_strategy_entry_block(
             context["default_factor"], context["freq"], context["window"], context.get("index", "000300.XSHG")
         )
     )
     return "\n\n".join(parts)
+
+
+def compile_single_file_strategy(
+    context: Dict[str, Any],
+    prepared: List[Dict[str, Any]],
+    requirements: Dict[str, Any],
+    *,
+    entry_block: Optional[str] = None,
+    keep_logs: bool = False,
+) -> str:
+    """Render and finalize a self-contained JoinQuant candidate."""
+    code = render_single_file_strategy(context, entry_block=entry_block)
+    code = inject_factor_required_windows(code, prepared, requirements)
+    code = normalize_indexers_in_fstring_expressions(code)
+    if not keep_logs:
+        code = strip_prints_and_logger_calls(code)
+    code = ensure_nonempty_blocks(code)
+    code = inject_missing_passes(code)
+    validate_no_external_imports(code)
+    return code
 
 
 def inject_factor_required_windows(
@@ -911,6 +931,8 @@ def build_jq_strategy_main(argv: List[str]) -> int:
     if not prepared:
         print('No factors prepared.')
         return 1
+    import os as _os
+    keep_logs = bool(args.keep_logs or _os.getenv('FP_KEEP_LOGS'))
     # If --freq is provided, build single bundle for that frequency (strict)
     if args.freq is not None:
         dep_map = build_dependency_map(prepared, req_map)
@@ -920,7 +942,7 @@ def build_jq_strategy_main(argv: List[str]) -> int:
             print(f"Error computing required window: {e}")
             return 1
         fb_code = lift_minimal_factor_base()
-        code = render_single_file_strategy({
+        code = compile_single_file_strategy({
             'version': '1.0',
             'factor_base_code': fb_code,
             'factor_blocks': [p['code'] for p in prepared],
@@ -930,16 +952,7 @@ def build_jq_strategy_main(argv: List[str]) -> int:
             'window': computed_window,
             'cloud_mapping': cloud_mapping,
             'index': args.index,
-        })
-        code = inject_factor_required_windows(code, prepared, req_map)
-        code = normalize_indexers_in_fstring_expressions(code)
-        import os as _os
-        _keep_logs = bool(getattr(args, 'keep_logs', False) or _os.getenv('FP_KEEP_LOGS'))
-        if not _keep_logs:
-            code = strip_prints_and_logger_calls(code)
-        code = ensure_nonempty_blocks(code)
-        code = inject_missing_passes(code)
-        validate_no_external_imports(code)
+        }, prepared, req_map, keep_logs=keep_logs)
         write_output_file(code, args.out)
         print(f"Generated: {args.out} with {len(prepared)} factors")
         return 0
@@ -972,7 +985,7 @@ def build_jq_strategy_main(argv: List[str]) -> int:
             all_items.extend(items)
         dep_map_all = build_dependency_map(all_items, req_map)
         fb_code = lift_minimal_factor_base()
-        code = render_single_file_strategy({
+        code = compile_single_file_strategy({
             'version': '1.0',
             'factor_base_code': fb_code,
             'factor_blocks': [p['code'] for p in all_items],
@@ -982,16 +995,7 @@ def build_jq_strategy_main(argv: List[str]) -> int:
             'window': max_window,
             'cloud_mapping': cloud_mapping,
             'index': args.index,
-        })
-        code = inject_factor_required_windows(code, all_items, req_map)
-        code = normalize_indexers_in_fstring_expressions(code)
-        import os as _os
-        _keep_logs = bool(getattr(args, 'keep_logs', False) or _os.getenv('FP_KEEP_LOGS'))
-        if not _keep_logs:
-            code = strip_prints_and_logger_calls(code)
-        code = ensure_nonempty_blocks(code)
-        code = inject_missing_passes(code)
-        validate_no_external_imports(code)
+        }, all_items, req_map, keep_logs=keep_logs)
         write_output_file(code, args.out)
         print(f"Generated: {args.out} with {len(all_items)} factors (merged, window={max_window})")
         return 0
@@ -1014,7 +1018,7 @@ def build_jq_strategy_main(argv: List[str]) -> int:
         except Exception as e:
             print(f"Error computing required window for {adapter_freq}: {e}")
             return 1
-        code = render_single_file_strategy({
+        code = compile_single_file_strategy({
             'version': '1.0',
             'factor_base_code': fb_code,
             'factor_blocks': [p['code'] for p in items],
@@ -1024,16 +1028,7 @@ def build_jq_strategy_main(argv: List[str]) -> int:
             'window': computed_window,
             'cloud_mapping': cloud_mapping,
             'index': args.index,
-        })
-        code = inject_factor_required_windows(code, items, req_map)
-        code = normalize_indexers_in_fstring_expressions(code)
-        import os as _os
-        _keep_logs = bool(getattr(args, 'keep_logs', False) or _os.getenv('FP_KEEP_LOGS'))
-        if not _keep_logs:
-            code = strip_prints_and_logger_calls(code)
-        code = ensure_nonempty_blocks(code)
-        code = inject_missing_passes(code)
-        validate_no_external_imports(code)
+        }, items, req_map, keep_logs=keep_logs)
         # Output file name with suffix
         out_file = out_dir / f"{base_name}_{adapter_freq}{ext}"
         write_output_file(code, str(out_file))

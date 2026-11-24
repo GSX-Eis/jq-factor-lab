@@ -1,14 +1,19 @@
 """Session-grid operations shared by minute FactorBase implementations."""
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from numbers import Integral
-from collections.abc import Mapping
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
+from utils.market_db.identity import market_db_identity, slot_market_db_identity
+from utils.slots import MarketSlot
+
 from .contracts import (
-    ContractValidationError, _validate_aligned_factor_frame, validate_bar_frame, validate_factor_frame,
+    ContractValidationError, _mask_unavailable_factor_values, _validate_aligned_factor_frame,
+    validate_bar_frame, validate_factor_frame,
 )
 from utils.time_axis import BarSchedule
 
@@ -41,6 +46,27 @@ def bar_factor_frame(values: pd.DataFrame) -> pd.DataFrame:
     long = values.rename_axis(index='timestamp_utc', columns='instrument_id').reset_index().melt(
         id_vars='timestamp_utc', var_name='instrument_id', value_name='factor_value')
     return validate_factor_frame(long).reset_index(drop=True)
+
+
+def incomplete_bar_keys(grid: pd.DataFrame) -> tuple[tuple[int, str], ...]:
+    """Capture the unavailable keys from the grid that produced a panel."""
+    if 'is_complete' not in grid:
+        return ()
+    incomplete = ~grid.is_complete.eq(True).fillna(False)
+    keys = grid.loc[incomplete, ['timestamp_utc', 'instrument_id']]
+    return tuple((timestamp.value, instrument) for timestamp, instrument in keys.itertuples(index=False, name=None))
+
+
+def mask_incomplete_bars(
+    values: pd.DataFrame, keys: Sequence[tuple[int, str]],
+) -> pd.DataFrame:
+    if not keys:
+        return values
+    times = values.timestamp_utc.dt.as_unit('ns').astype('int64')
+    unavailable = pd.MultiIndex.from_arrays([times, values.instrument_id]).isin(
+        [(timestamp, instrument) for timestamp, instrument in keys],
+    )
+    return values.assign(factor_value=_mask_unavailable_factor_values(values.factor_value, unavailable))
 
 
 def session_grid(bars: pd.DataFrame, calendars: dict, frequency: str, *,
@@ -136,3 +162,35 @@ def session_daily_pricing(grid: pd.DataFrame, calendars: dict) -> pd.Series:
     pricing.attrs['trading_calendar'] = TradingCalendar(days, calendar.start, calendar.end,
                                                        calendar_id=calendar.calendar_id)
     return pricing
+
+
+
+def read_slot_factor_values(
+    store_root: str | Path, slot: MarketSlot, *, factor_id: str, frequency: str, start_date: str, end_date: str,
+    factor_identity_hash: str | None = None, instruments: Sequence[str] | None = None,
+) -> tuple[pd.DataFrame, pd.Series]:
+    """Read one committed identity bound to the requested Slot and its calendar."""
+    from utils.market_factor_store import MarketFactorValueStore
+
+    store = MarketFactorValueStore(store_root)
+    selection = dict(factor_id=factor_id, frequency=frequency, slot_id=slot.slot_id,
+                     factor_identity_hash=factor_identity_hash)
+    identities = store.list_identities(**selection)
+    matches = identities.loc[identities.slot_config_hash.eq(slot.slot_config_hash)]
+    market_db = slot_market_db_identity(slot)
+    if not matches.empty:
+        matches = matches.loc[matches.slot_data_fingerprint.map(lambda value: market_db_identity(value) == market_db)]
+    if len(matches) != 1:
+        raise ValueError('Specify one committed factor identity matching the Slot ID, config, market database and frequency')
+    identity = matches.iloc[0]
+    view = getattr(slot.bar_feed, 'view', 'ETH')
+    if identity.session_view != view:
+        raise ValueError('Factor identity session_view does not match the Slot')
+    selection['factor_identity_hash'] = identity.factor_identity_hash
+    values = store.read_factor_values(**selection, session_view=view, instruments=instruments,
+                                      session_start=start_date, session_end=end_date)
+    if values.empty:
+        raise ValueError('No committed factor values match the evaluation window and instruments')
+    if not values.calendar_hash.eq(slot.calendar.calendar_hash).all():
+        raise ValueError('Factor values calendar_hash does not match the Slot')
+    return values, identity

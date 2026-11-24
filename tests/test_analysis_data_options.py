@@ -2,6 +2,7 @@
 import json
 from pathlib import Path
 import duckdb
+from market_db_samples import declare_market_db
 import pandas as pd
 import pytest
 import run_analysis_main as runner
@@ -24,6 +25,7 @@ def setup(tmp_path, monkeypatch):
     monkeypatch.delenv('QUANT_DATA_BINDINGS',raising=False)
     db=tmp_path/'input.duckdb'
     with duckdb.connect(str(db)) as conn:
+        declare_market_db(conn, 'cn_equity')
         conn.execute("CREATE TABLE price_data_daily AS SELECT DATE '2024-01-31' date, symbol AS stock_code, 1. AS close, 1. AS factor FROM (VALUES ('A'),('B'),('C'),('D'),('E')) t(symbol)")
         conn.execute("CREATE TABLE wanted_prices AS SELECT DATE '2024-01-31' trade_date, symbol, 99. AS close, 1. AS factor FROM (VALUES ('A'),('B'),('C'),('D'),('E')) t(symbol)")
     data=load_data_access_config().as_dict()

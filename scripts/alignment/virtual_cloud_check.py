@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import builtins
 import json
 import math
 import re
@@ -39,12 +40,13 @@ def _parse_py36(source: str, label: str) -> Dict[str, Any]:
     return _check("python36_syntax", True)
 
 
-def _external_imports(source: str, label: str) -> Dict[str, Any]:
+def _external_imports(source: str, label: str, *, strict: bool = False) -> Dict[str, Any]:
     try:
         tree = ast.parse(source, filename=label)
     except SyntaxError as exc:
         return _check("bundle_imports", False, f"{label}: {exc.msg}")
     leaked: List[str] = []
+    local_roots = ("factors", "utils", "config") if strict else ("factors",)
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom):
             module = node.module or ""
@@ -56,7 +58,7 @@ def _external_imports(source: str, label: str) -> Dict[str, Any]:
                 continue
             if (
                 node.level
-                or module == "factors"
+                or module in local_roots
                 or module.startswith(("factors.", "utils.", "config."))
             ):
                 leaked.append(
@@ -64,7 +66,7 @@ def _external_imports(source: str, label: str) -> Dict[str, Any]:
                 )
         elif isinstance(node, ast.Import):
             for alias in node.names:
-                if alias.name == "factors" or alias.name.startswith(
+                if alias.name in local_roots or alias.name.startswith(
                     ("factors.", "utils.", "config.")
                 ):
                     leaked.append(f"line {node.lineno}: import {alias.name}")
@@ -125,7 +127,12 @@ def _load_requirement_payload(path: Path, factor_class: str) -> Dict[str, Any]:
 
 def _requirements_check(path: Path, factor_class: str) -> Dict[str, Any]:
     payload = _load_requirement_payload(path, factor_class)
-    factors = payload.get("factors") if isinstance(payload, dict) else None
+    factors = payload.get("factors")
+    return _check_requirements_payload(payload, factor_class)
+
+
+def _check_requirements_payload(payload: Dict[str, Any], factor_class: str) -> Dict[str, Any]:
+    factors = payload.get("factors")
     if not isinstance(factors, dict) or not isinstance(factors.get(factor_class), dict):
         return _check(
             "requirements", False, f"cloud_requirement_missing:{factor_class}"
@@ -213,7 +220,13 @@ def _legacy_pandas_check(source: str) -> Dict[str, Any]:
 def _jq_runtime_contract(
     path: Path, factor_class: str
 ) -> tuple[Dict[str, Any], List[str]]:
-    payload = _load_requirement_payload(path, factor_class)
+    return _check_runtime_payload(_load_requirement_payload(path, factor_class), factor_class)
+
+
+def _check_runtime_payload(
+    payload: Dict[str, Any], factor_class: str, *, use_runtime_window: bool = False,
+    include_session_prefix: bool = False,
+) -> tuple[Dict[str, Any], List[str]]:
     factor = (payload.get("factors") or {}).get(factor_class) or {}
     requirements = factor.get("requirements") or {}
     # [ALIGNMENT-FIX] The generated JQ adapter derives ``paused`` from
@@ -229,6 +242,8 @@ def _jq_runtime_contract(
             planned_window = math.ceil(
                 float(raw_window) * (1 + float(config.get("slack_ratio", 0)))
             )
+            if use_runtime_window:
+                planned_window = factor.get("runtime", {}).get("window", planned_window)
         except (TypeError, ValueError):
             continue
         invalid = sorted(set(config.get("fields") or ()) & unsupported_history_fields)
@@ -239,11 +254,84 @@ def _jq_runtime_contract(
                 + ":"
                 + ",".join(invalid)
             )
-        if frequency != "daily" and planned_window > 5000:
-            warnings.append(
-                f"cloud_runtime_budget_risk:{frequency}:bars={planned_window}"
-            )
+        if frequency != "daily":
+            requested_window = planned_window
+            if use_runtime_window:
+                # Import only for the bundle preflight. The standalone legacy CLI
+                # also runs directly from scripts/alignment without the repo on sys.path.
+                from utils.factor_runtime import (
+                    JQ_BARS_PER_DAY, MAX_JQ_MINUTE_REQUEST_BARS, jq_minute_request_count,
+                )
+
+                requested_window = jq_minute_request_count(
+                    planned_window, JQ_BARS_PER_DAY[frequency],
+                    include_session_prefix=include_session_prefix,
+                )
+                limit = MAX_JQ_MINUTE_REQUEST_BARS
+            else:
+                limit = 5000
+            if requested_window > limit:
+                warnings.append(f"cloud_runtime_budget_risk:{frequency}:bars={requested_window}")
     return _check("jq_api_contract", not failures, "; ".join(failures)), warnings
+
+
+def inspect_candidate_source(source: str, label: str) -> list[Dict[str, Any]]:
+    return [
+        _parse_py36(source, label),
+        _external_imports(source, label, strict=True),
+    ]
+
+
+def inspect_bundle_candidate(
+    source: str, label: str, factor_classes: list[str], requirements: Dict[str, Any],
+    *, strategy_frequency: str = "1d",
+) -> tuple[list[Dict[str, Any]], list[str]]:
+    """Run the static compatibility gates before executing a multi-factor candidate."""
+    checks = [
+        *inspect_candidate_source(source, label),
+        _legacy_pandas_check(source),
+        _event_loader_check(source),
+    ]
+    warnings = []
+    for name in factor_classes:
+        api_check, risks = _check_runtime_payload(
+            requirements, name, use_runtime_window=True,
+            include_session_prefix=strategy_frequency != "1d",
+        )
+        for check in (
+            _factor_class_check(source, name),
+            _check_requirements_payload(requirements, name),
+            api_check,
+            _check("cloud_runtime_budget", not risks, "; ".join(risks)),
+        ):
+            checks.append(dict(check, name=check["name"] + ":" + name))
+        warnings.extend(f"{name}:{risk}" for risk in risks)
+    return checks, warnings
+
+
+def execute_bundle_candidate(
+    source: str, label: str, api: Dict[str, Any] | None = None
+) -> Dict[str, Any]:
+    """Load a generated candidate with per-execution virtual JoinQuant modules."""
+    api = dict(api or {})
+    modules = {}
+    for name in ("jqdata", "jqfactor"):
+        module = types.ModuleType(name)
+        vars(module).update(api)
+        module.__all__ = list(api)
+        modules[name] = module
+
+    def virtual_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if level == 0 and name.partition(".")[0] in modules:
+            if name in modules:
+                return modules[name]
+            raise ImportError(f"Virtual cloud module unavailable: {name}")
+        return builtins.__import__(name, globals, locals, fromlist, level)
+
+    namespace = dict(api, __name__="__alignment_virtual_cloud__")
+    namespace["__builtins__"] = dict(vars(builtins), __import__=virtual_import)
+    exec(compile(source, label, "exec"), namespace, namespace)
+    return namespace
 
 
 def run_check(

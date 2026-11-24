@@ -82,6 +82,7 @@ def _decode_run_row(columns: Sequence[str], row: tuple[Any, ...]) -> dict[str, A
         if isinstance(raw, str):
             record[json_col] = json.loads(raw)
     record["frequencies"] = _stored_frequencies(record.get("frequency"))
+    record["return_unit"] = (record.get("data_identity") or {}).get("return_unit", "percent")
     record["ingested_at_utc"] = _format_utc_iso(record.get("ingested_at_utc"))
     safe = _json_safe(record)
     safe["split_config_json"] = record.get("split_config_json")
@@ -165,6 +166,7 @@ def _query_run_page(
     analysis_mode: str | None = None,
     frequency: str | None = None,
     calendar_id: str | None = None,
+    slot_id: str | None = None,
     start_utc: str | None = None,
     end_utc: str | None = None,
     has_trial_ledger: bool | None = None,
@@ -207,6 +209,9 @@ def _query_run_page(
 
     catalog = _catalog_columns(conn)
     run_columns = catalog.get("bar_evaluation_runs", {})
+    if slot_id is not None and "slot_id" in run_columns:
+        clauses.append("r.slot_id = ?")
+        params.append(slot_id)
     ledger = "r.trial_ledger_json" if "trial_ledger_json" in run_columns else "NULL"
     if has_trial_ledger is not None:
         clauses.append(f"(NULLIF(trim({ledger}), 'null') IS NOT NULL) = ?")
@@ -290,6 +295,7 @@ def query_bar_evaluation_runs(
     analysis_mode: str | None = None,
     frequency: str | None = None,
     calendar_id: str | None = None,
+    slot_id: str | None = None,
     start_utc: str | None = None,
     end_utc: str | None = None,
     factor_name: str | None = None,
@@ -297,7 +303,7 @@ def query_bar_evaluation_runs(
     offset: int = 0,
     validate_only: bool = False,
 ) -> list[dict[str, Any]]:
-    """Read a page of matching runs, ordered by ingestion time and identity."""
+    """Read matching runs. A legacy store without the slot column skips that filter."""
     _validate_page_filters(factor_name, limit, offset)
     with _open_read_only(db_path) as conn:
         return _query_runs_on_conn(
@@ -306,6 +312,7 @@ def query_bar_evaluation_runs(
             analysis_mode=analysis_mode,
             frequency=frequency,
             calendar_id=calendar_id,
+            slot_id=slot_id,
             start_utc=start_utc,
             end_utc=end_utc,
             factor_name=factor_name,
@@ -337,6 +344,7 @@ def query_bar_evaluations(
     analysis_mode: str | None = None,
     frequency: str | None = None,
     calendar_id: str | None = None,
+    slot_id: str | None = None,
     start_utc: str | None = None,
     end_utc: str | None = None,
     include_cross_sections: bool = True,
@@ -372,6 +380,7 @@ def query_bar_evaluations(
             analysis_mode=analysis_mode,
             frequency=frequency,
             calendar_id=calendar_id,
+            slot_id=slot_id,
             start_utc=start_utc,
             end_utc=end_utc,
             has_trial_ledger=has_trial_ledger,
@@ -447,6 +456,7 @@ def get_bar_evaluation_filter_options(db_path: str | Path) -> dict[str, list[str
         "analysis_modes": modes,
         "frequencies": frequencies,
         "calendar_ids": calendars,
+        "slot_ids": sorted({r["slot_id"] for r in runs if r.get("slot_id")}),
     }
 
 

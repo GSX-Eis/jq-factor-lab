@@ -1,0 +1,28 @@
+schema_version: 1
+allowed_slot_providers:
+- duckdb_table
+exchange_aliases: {}
+session_views:
+- ETH
+- RTH
+market_rules:
+  st_filter: false
+  price_limit: false
+  t_plus: 0
+default_execution_profile: close_to_close
+created_at_utc: '2026-11-24T00:00:00Z'
+db_id: kf_us_portfolios_v1
+market_domain: custom:kf_us_portfolios
+asset_classes:
+- portfolio
+- factor
+timezone: America/New_York
+calendar_id: XNYS
+calendar_source: pmc
+calendar_coverage: 1963-07-01..2026-10-31
+exchanges:
+- KFDL
+instrument_id_pattern: ^[A-Z][A-Z0-9_]*\.KFDL$
+currency: USD
+frequencies:
+- 1d

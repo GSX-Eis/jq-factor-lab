@@ -9,7 +9,9 @@ import pandas_market_calendars as pmc
 import pytest
 
 from data_pipeline.loaders.market_bar_importer import import_market_bars
+from market_db_samples import declare_futures_bars
 from utils import session_calendar
+from utils.bars.catalog import table_exists
 from utils.session_calendar import SessionCalendar
 from utils.time_axis import BarSchedule
 
@@ -61,13 +63,15 @@ def warm_market_calendars() -> Iterator[None]:
 def futures_sample(connection, *, start='2026-01-05', end='2026-01-16', frequency='1d',
                    oi=None, root='CU', calendar_id='SHFE_CU'):
     exchange = calendar_id.split('_')[0]
+    if not table_exists(connection, 'market_db_profile'):
+        declare_futures_bars(connection, exchange)
     cal = SessionCalendar(calendar_id, start, end, rth_reference_calendar=exchange+'_Day')
     schedule = BarSchedule(cal, frequency, bucket_strategy='segment_anchored')
     starts = [schedule.for_session(day.strftime('%Y-%m-%d')).start_utc for day in cal.sessions()]
     frames, metadata = [], []
     months = [(pd.Timestamp(start)+pd.offsets.MonthBegin(i+1)).strftime('%Y-%m') for i in range(3)]
     for index, month in enumerate(months):
-        instrument = root + month[2:].replace('-', '')
+        instrument = f"{root}{month[2:].replace('-', '')}.{exchange}"
         metadata.append(dict(instrument_id=instrument, asset_class='futures', exchange=exchange,
             timezone='Asia/Shanghai', contract_expiry=month, contract_month=month,
             price_adjustment='none', point_value=5., calendar_id=calendar_id,

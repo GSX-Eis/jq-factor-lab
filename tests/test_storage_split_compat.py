@@ -28,12 +28,12 @@ LEGACY_EXPORTS = {
         contextmanager asdict dataclass Path Any Iterator duckdb np pd pa pq is_bool_dtype
         is_complex_dtype is_numeric_dtype DuplicateKeyError BarCatalog table_exists
         resolve_code_version SessionCalendar BarSchedule Frequency
-        MARKET_FACTOR_IDENTITY_SCHEMA_VERSION NAN_CANONICAL_BITS DEFAULT_ROW_GROUP_SIZE
+        MARKET_FACTOR_IDENTITY_SCHEMA_VERSION SUPPORTED_IDENTITY_SCHEMA_VERSIONS NAN_CANONICAL_BITS DEFAULT_ROW_GROUP_SIZE
         VALID_VIEWS VALID_ANALYSIS_MODES VALID_BUCKET_STRATEGIES VALID_ADJUSTMENTS
         TABLE_COLUMNS VIEW_COLUMNS LEAF_COLUMNS IDENTITY_COLUMNS LEAF_ARROW_SCHEMA
         FactorValueConflictError FactorWriteReceipt FactorReadPlan sql_canonical_float
         canonical_float_bits validate_factor_id validate_sha256_hex compute_factor_identity_hash
-        build_identity_record MarketFactorValueStore save_bar_factor_values
+        build_identity_record validate_identity_record MarketFactorValueStore save_bar_factor_values save_factor_values
     """,
     "bar_evaluation": """
         annotations dt json math re struct Mapping Sequence contextmanager dataclass Path

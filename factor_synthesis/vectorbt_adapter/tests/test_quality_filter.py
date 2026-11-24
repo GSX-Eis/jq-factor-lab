@@ -1,11 +1,16 @@
+from pathlib import Path
+
 import duckdb
 import pandas as pd
 
 from factor_synthesis.vectorbt_adapter.quality_filter import apply_pit_quality_filter
+from utils.market_db import init_market_db, load_market_db_profile_yaml
 
 
 def test_pit_quality_filter_requires_only_disclosed_history(tmp_path):
     db = tmp_path / "quality.duckdb"
+    profile_yaml = Path(__file__).resolve().parents[3] / "config/market_databases/cn_equity.yaml"
+    init_market_db(db, load_market_db_profile_yaml(profile_yaml))
     conn = duckdb.connect(str(db))
     conn.execute(
         """

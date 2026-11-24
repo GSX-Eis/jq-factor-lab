@@ -28,6 +28,10 @@ def _handle_factor_synthesis(args: argparse.Namespace) -> HarnessResult:
     )
     effective_run_id = args.run_id or output_dir.name
     result_path = output_dir / "attempts" / execution_id / "result.json"
+    slot_config_arg = str(getattr(args, "slot_config", "") or "").strip()
+    slot_id_arg = str(getattr(args, "slot_id", "") or "").strip()
+    factor_store_arg = str(getattr(args, "factor_values_store", "") or "").strip()
+    frequency_arg = str(getattr(args, "frequency", "") or "").strip()
     command = [
         sys.executable,
         str(cli.REPO_ROOT / "run_factor_synthesis.py"),
@@ -37,9 +41,27 @@ def _handle_factor_synthesis(args: argparse.Namespace) -> HarnessResult:
         str(return_series_output_dir),
         "--run-id",
         effective_run_id,
-        "--result-out", str(result_path),
-        "--execution-id", execution_id,
     ]
+    resolved_slot_cfg = None
+    if slot_config_arg:
+        resolved_slot_cfg = (
+            slot_config_arg
+            if slot_config_arg == "jq_ashare_local"
+            else str(cli._resolve_repo_relative_path(slot_config_arg))
+        )
+        command.extend(["--slot-config", resolved_slot_cfg])
+    market_db_arg = getattr(args, "market_db", None)
+    if market_db_arg is not None:
+        command.extend(["--market-db", market_db_arg])
+    if slot_id_arg:
+        command.extend(["--slot-id", slot_id_arg])
+    if factor_store_arg:
+        command.extend(
+            ["--factor-values-store", str(cli._resolve_repo_relative_path(factor_store_arg))]
+        )
+    if frequency_arg:
+        command.extend(["--frequency", frequency_arg])
+    command.extend(["--result-out", str(result_path), "--execution-id", execution_id])
     artifacts = cli._common_artifacts(output_dir) + [{"artifact_type": "execution_result", "path": str(result_path)}]
     artifacts.append(
         {
@@ -53,6 +75,50 @@ def _handle_factor_synthesis(args: argparse.Namespace) -> HarnessResult:
             "path": str(return_series_output_dir),
         }
     )
+    selection = None
+    try:
+        raw_config = cli._safe_read_json(resolved_config_path) if resolved_config_path.is_file() else {}
+        market_db = market_db_arg if market_db_arg is not None else raw_config.get("market_db")
+        if market_db is not None:
+            from utils.market_db.identity import slot_market_db_identity
+            from utils.market_db.research import (
+                check_synthesis_market_outputs, open_research_slot, resolve_research_market_db,
+                resolve_research_slot, synthesis_market_db_paths,
+            )
+
+            source = resolve_research_market_db(market_db)
+            if market_db_arg is None:
+                command.extend(["--market-db", market_db])
+            check_synthesis_market_outputs(
+                source, raw_config, result_path.parent, return_series_output_dir,
+                files=(*runner._result_output_paths(output_dir, args.json_out), output_dir / "d9_capacity_audit.json"),
+                directories=(result_path.parent,), cwd=cli.REPO_ROOT,
+            )
+            if not args.fake_result:
+                if not resolved_config_path.is_file():
+                    raise FileNotFoundError(resolved_config_path)
+                declared_db, _ = synthesis_market_db_paths(raw_config)
+                if not factor_store_arg and not raw_config.get("factor_values_store") and not (
+                    raw_config.get("database", {}).get("factor_db", {}).get("duckdb_path")
+                ):
+                    raise ValueError("--market-db requires a Scheme B factor store")
+                declaration = resolved_slot_cfg or raw_config.get("slot_config") or raw_config.get("slot")
+                base_dir = Path(raw_config.get("slot_base_dir") or resolved_config_path.parent).expanduser().resolve()
+                if isinstance(declaration, str) and declaration != "jq_ashare_local":
+                    from_repo = cli._resolve_repo_relative_path(declaration)
+                    if from_repo.is_file():
+                        declaration = str(from_repo)
+                frozen, base_dir = resolve_research_slot(declaration, slot_id_arg or raw_config.get("slot_id"), base_dir)
+                with open_research_slot(market_db, frozen, base_dir, declared_db=declared_db) as (slot, _):
+                    selection = slot_market_db_identity(slot)
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        result = cli._failure_result(
+            action=action, mode="preflight", output_dir=output_dir, run_id=args.run_id,
+            command=command, started_at=started_at, reason="market_db_precondition_failed",
+            exit_code=cli.EXIT_PRECONDITION, metrics={"error": str(exc)}, artifacts=[],
+        )
+        result.error["message"] = str(exc)
+        return result
     if args.fake_result:
         return cli._fake_result(
             action=action,
@@ -64,6 +130,17 @@ def _handle_factor_synthesis(args: argparse.Namespace) -> HarnessResult:
             json_out=args.json_out,
         )
     if args.dry_run:
+        dry_metrics = {"planned_config": str(resolved_config_path)}
+        if selection is not None:
+            dry_metrics["market_db"] = selection
+        if slot_config_arg:
+            dry_metrics["planned_slot_config"] = slot_config_arg
+        if slot_id_arg:
+            dry_metrics["planned_slot_id"] = slot_id_arg
+        if factor_store_arg:
+            dry_metrics["planned_factor_values_store"] = factor_store_arg
+        if frequency_arg:
+            dry_metrics["planned_frequency"] = frequency_arg
         return cli._complete_result(
             cli._success_result(
                 action=action,
@@ -72,7 +149,7 @@ def _handle_factor_synthesis(args: argparse.Namespace) -> HarnessResult:
                 run_id=args.run_id,
                 command=command,
                 started_at=started_at,
-                metrics={"planned_config": str(resolved_config_path)},
+                metrics=dry_metrics,
                 artifacts=artifacts,
                 reason="dry_run",
             ),
@@ -136,7 +213,7 @@ def _handle_factor_synthesis(args: argparse.Namespace) -> HarnessResult:
         success_metrics_builder=lambda stdout, stderr: cli._bound_result_metrics(
             result_path, action=action, run_id=effective_run_id, execution_id=execution_id,
             source_sha256=source_sha256, config_payload=config_payload,
-            stdout=stdout, stderr=stderr,
+            config_path=resolved_config_path, stdout=stdout, stderr=stderr,
         ),
     )
     if audit_context is None or not result.ok:

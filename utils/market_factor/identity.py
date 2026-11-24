@@ -7,19 +7,18 @@ import json
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-import numpy as np
 import pandas as pd
-from pandas.api.types import is_bool_dtype, is_complex_dtype, is_numeric_dtype
 
-from backtest_and_analysis.time_series.contracts import DuplicateKeyError
 from utils.code_version import resolve_code_version
-from utils.session_calendar import SessionCalendar
+from utils.data_revision import FactorFrameDigest
+from utils.market_db.identity import MARKET_DB_FIELDS, market_db_identity
 from utils.time_axis import Frequency
 
 from .schema import (
     IDENTITY_COLUMNS,
     MARKET_FACTOR_IDENTITY_SCHEMA_VERSION,
-    TABLE_COLUMNS,
+    SUPPORTED_IDENTITY_SCHEMA_VERSIONS,
+    _V2_IDENTITY_COLUMNS,
     VALID_ADJUSTMENTS,
     VALID_ANALYSIS_MODES,
     VALID_BUCKET_STRATEGIES,
@@ -27,11 +26,41 @@ from .schema import (
     _canonical_json,
     _frame_digest,
     _require_nonempty_str,
-    _validate_session_date_str,
-    canonical_float_bits,
     validate_factor_id,
     validate_sha256_hex,
 )
+
+_LEGACY_SLOT_ID = "legacy_bar"
+_LEGACY_SLOT_CONFIG_HASH = hashlib.sha256(b"market_factor_legacy_bar.v1").hexdigest()
+_ADJUSTMENT_ALIASES = {"ratio_back": "ratio_back_adjust", "panama_canal": "diff_back_adjust"}
+
+
+def _normalize_slot_fields(
+    slot_id: str | None,
+    slot_config_hash: str | None,
+    adjustment_policy: str | None,
+    slot_data_fingerprint: str | Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    if any(value is None for value in (slot_id, slot_config_hash, adjustment_policy, slot_data_fingerprint)):
+        raise ValueError("v2 identity requires slot_id, slot_config_hash, adjustment_policy and slot_data_fingerprint")
+    slot_id = _require_nonempty_str(slot_id, "slot_id")
+    if slot_id != slot_id.strip():
+        raise ValueError("slot_id must have no surrounding whitespace")
+    slot_config_hash = validate_sha256_hex(slot_config_hash, "slot_config_hash")
+    policy = _require_nonempty_str(adjustment_policy, "adjustment_policy")
+    policy = _ADJUSTMENT_ALIASES.get(policy, policy)
+    if policy not in (*VALID_ADJUSTMENTS, "dynamic_pit"):
+        choices = (*VALID_ADJUSTMENTS, "dynamic_pit", *_ADJUSTMENT_ALIASES)
+        raise ValueError(f"adjustment_policy must be one of {choices}, got {adjustment_policy!r}")
+    if isinstance(slot_data_fingerprint, str):
+        fingerprint = _require_nonempty_str(slot_data_fingerprint, "slot_data_fingerprint")
+    elif isinstance(slot_data_fingerprint, Mapping) and slot_data_fingerprint:
+        fingerprint = json.loads(_canonical_json(dict(slot_data_fingerprint)))
+        if fingerprint != slot_data_fingerprint:
+            raise ValueError("slot_data_fingerprint mapping must use strict JSON types and string keys")
+    else:
+        raise ValueError("slot_data_fingerprint must be a non-empty string or JSON mapping")
+    return dict(zip(_V2_IDENTITY_COLUMNS, (slot_id, slot_config_hash, policy, fingerprint))) | market_db_identity(fingerprint)
 
 
 def _normalize_params(params: Mapping[str, Any]) -> dict[str, Any]:
@@ -42,6 +71,8 @@ def _normalize_params(params: Mapping[str, Any]) -> dict[str, Any]:
         value = params[key]
         if isinstance(value, pd.DataFrame):
             normalized[key] = ["dataframe", _frame_digest(value)]
+        elif isinstance(value, FactorFrameDigest):
+            normalized[key] = ["dataframe", validate_sha256_hex(value.sha256, f"params[{key!r}]")]
         else:
             encoded = _canonical_json(value)
             decoded = json.loads(encoded)
@@ -123,8 +154,15 @@ def compute_factor_identity_hash(
     continuous_adjust: str | None = None,
     roll_build_ids: Mapping[str, Any] | None = None,
     code_version: str | None = None,
+    slot_id: str | None = None,
+    slot_config_hash: str | None = None,
+    adjustment_policy: str | None = None,
+    slot_data_fingerprint: str | Mapping[str, Any] | None = None,
+    schema_version: str = MARKET_FACTOR_IDENTITY_SCHEMA_VERSION,
 ) -> tuple[str, dict[str, Any]]:
-    """Compute canonical SHA256 factor_identity_hash and return (hash, canonical_payload)."""
+    """Hash a canonical identity. Source-only callers use a reserved v2 legacy namespace."""
+    if schema_version not in SUPPORTED_IDENTITY_SCHEMA_VERSIONS:
+        raise ValueError(f"Unsupported identity payload schema_version: {schema_version!r}")
     fid = validate_factor_id(factor_id)
     fclass = _require_nonempty_str(factor_class, "factor_class")
     if isinstance(source_sha256, str):
@@ -187,15 +225,27 @@ def compute_factor_identity_hash(
         or src_id.get("source_build_ids")
         or src_id.get("source_dataset_version")
     )
-    if not has_source_build:
+    slot_fields = (slot_id, slot_config_hash, adjustment_policy, slot_data_fingerprint)
+    explicit_slot = any(value is not None for value in slot_fields)
+    is_v2 = schema_version == MARKET_FACTOR_IDENTITY_SCHEMA_VERSION
+    if not is_v2 and explicit_slot:
+        raise ValueError("v1 historical identities do not carry slot metadata")
+    if not has_source_build and (not is_v2 or not explicit_slot):
         raise ValueError(
-            "source_build_id (or source_identity with source_build_id/source_build_ids/source_dataset_version) is required"
+            "Supply v2 slot metadata or a legacy source_build_id "
+            "(or source_identity with source_build_id/source_build_ids/source_dataset_version)"
         )
+    if is_v2 and not explicit_slot:
+        legacy_continuous = src_id.get("continuous")
+        legacy_adjustment = legacy_continuous.get("adjust") if isinstance(legacy_continuous, Mapping) else None
+        slot_fields = (_LEGACY_SLOT_ID, _LEGACY_SLOT_CONFIG_HASH, legacy_adjustment or "none", src_id)
+    if explicit_slot and slot_id == _LEGACY_SLOT_ID:
+        raise ValueError(f"slot_id {_LEGACY_SLOT_ID!r} is reserved for legacy source-only callers")
 
     resolved_cv = _require_nonempty_str(code_version, "code_version") if code_version is not None else resolve_code_version()[0]
 
     payload: dict[str, Any] = {
-        "schema_version": MARKET_FACTOR_IDENTITY_SCHEMA_VERSION,
+        "schema_version": schema_version,
         "factor_id": fid,
         "factor_class": {"name": fclass, "source_sha256": src_hashes},
         "params": norm_params,
@@ -210,6 +260,8 @@ def compute_factor_identity_hash(
     }
     if norm_rth is not None:
         payload["rth_reference_calendar"] = norm_rth
+    if is_v2:
+        payload.update(_normalize_slot_fields(*slot_fields))
 
     canonical_str = _canonical_json(payload)
     digest = hashlib.sha256(canonical_str.encode("utf-8")).hexdigest()
@@ -231,7 +283,7 @@ def build_identity_record(
         factor_class_name = str(factor_class_val["name"])
     else:
         factor_class_name = str(factor_class_val)
-    return {
+    record = {
         "factor_identity_hash": factor_identity_hash,
         "factor_id": str(payload["factor_id"]),
         "factor_class": factor_class_name,
@@ -242,60 +294,13 @@ def build_identity_record(
         "output_frequency": str(payload["output_frequency"]),
         "code_version": str(payload["code_version"]),
         "code_version_source": _require_nonempty_str(code_version_source, "code_version_source"),
-        "source_schema_version": str(payload.get("schema_version", MARKET_FACTOR_IDENTITY_SCHEMA_VERSION)),
+        "source_schema_version": payload["schema_version"],
         "identity_payload_json": _canonical_json(payload),
         "created_at": now_iso,
     }
-
-
-def _validate_utc_series(series: pd.Series, name: str) -> pd.Series:
-    if not isinstance(series.dtype, pd.DatetimeTZDtype):
-        raise ValueError(f"{name} must be timezone-aware UTC datetime64, got {series.dtype}")
-    tz_str = str(series.dt.tz)
-    if tz_str not in ("UTC", "Etc/UTC"):
-        raise ValueError(f"{name} must have UTC timezone, got {tz_str!r}")
-    if series.isna().any():
-        raise ValueError(f"{name} must not contain NaT")
-    return pd.to_datetime(series, utc=True)
-
-
-def _validate_text_series(series: pd.Series, name: str) -> None:
-    if series.isna().any():
-        raise ValueError(f"{name} must not contain null/NA values")
-    for val in series.unique():
-        if not isinstance(val, str) or not val.strip():
-            raise ValueError(f"{name} must contain non-empty strings, got {val!r}")
-
-
-def _validate_calendars_for_batch(
-    df: pd.DataFrame,
-    session_view: str,
-    calendar: SessionCalendar | Mapping[str, SessionCalendar],
-) -> None:
-    """Verify every (instrument_id, timestamp_utc, session_id) aligns with SessionCalendar.session_at."""
-    unique_triples = df[["instrument_id", "timestamp_utc", "session_id"]].drop_duplicates()
-    if isinstance(calendar, SessionCalendar):
-        for ts, sid in unique_triples[["timestamp_utc", "session_id"]].drop_duplicates().itertuples(index=False):
-            owner = calendar.session_at(ts, session_view)
-            if owner is None or owner.session_date != sid:
-                raise ValueError(
-                    f"session_id mismatch at {ts} ({session_view}): "
-                    f"calendar says {None if owner is None else owner.session_date!r}, got {sid!r}"
-                )
-        return
-    if not isinstance(calendar, Mapping):
-        raise TypeError("calendar must be a SessionCalendar or instrument_id -> SessionCalendar mapping")
-    for inst, group in unique_triples.groupby("instrument_id", sort=False):
-        cal = calendar.get(inst)
-        if not isinstance(cal, SessionCalendar):
-            raise ValueError(f"Missing SessionCalendar for instrument_id={inst!r}")
-        for ts, sid in group[["timestamp_utc", "session_id"]].itertuples(index=False):
-            owner = cal.session_at(ts, session_view)
-            if owner is None or owner.session_date != sid:
-                raise ValueError(
-                    f"session_id mismatch for {inst!r} at {ts} ({session_view}): "
-                    f"calendar says {None if owner is None else owner.session_date!r}, got {sid!r}"
-                )
+    record.update({field: payload[field] for field in (*_V2_IDENTITY_COLUMNS, *MARKET_DB_FIELDS)
+                   if field in payload})
+    return _validate_identity_record(record)
 
 
 _REQUIRED_IDENTITY_PAYLOAD_KEYS = (
@@ -325,11 +330,17 @@ def _validate_identity_record(
     expected_factor_id: str | None = None,
     expected_frequency: str | None = None,
     expected_session_view: str | None = None,
+    for_write: bool = False,
 ) -> dict[str, Any]:
     """Validate an identity_record and verify canonical JSON SHA256 against factor_identity_hash."""
     if not isinstance(identity_record, Mapping):
         raise TypeError("identity_record must be a mapping")
-    missing_cols = [col for col in IDENTITY_COLUMNS if col not in identity_record]
+    schema_ver = identity_record.get("source_schema_version")
+    optional = MARKET_DB_FIELDS if schema_ver == MARKET_FACTOR_IDENTITY_SCHEMA_VERSION else (
+        *MARKET_DB_FIELDS, *_V2_IDENTITY_COLUMNS,
+    )
+    columns = (col for col in IDENTITY_COLUMNS if col not in optional)
+    missing_cols = [col for col in columns if col not in identity_record]
     if missing_cols:
         raise ValueError(f"identity_record is missing required fields: {missing_cols}")
 
@@ -362,10 +373,25 @@ def _validate_identity_record(
         )
 
     schema_ver = _require_nonempty_str(payload_obj.get("schema_version"), "payload.schema_version")
-    if schema_ver != MARKET_FACTOR_IDENTITY_SCHEMA_VERSION:
+    if schema_ver not in SUPPORTED_IDENTITY_SCHEMA_VERSIONS:
         raise ValueError(f"Unsupported identity payload schema_version: {schema_ver!r}")
+    if for_write and schema_ver != MARKET_FACTOR_IDENTITY_SCHEMA_VERSION:
+        raise ValueError(f"{schema_ver} identities are read-only; supply a v2 identity")
     if str(identity_record["source_schema_version"]) != schema_ver:
         raise ValueError("identity_record.source_schema_version does not match payload schema_version")
+    if schema_ver == MARKET_FACTOR_IDENTITY_SCHEMA_VERSION:
+        slot_fields = _normalize_slot_fields(*(payload_obj.get(field) for field in _V2_IDENTITY_COLUMNS))
+        for field, value in slot_fields.items():
+            if payload_obj.get(field) != value or identity_record.get(field) != value:
+                raise ValueError(f"identity_record.{field} must match canonical payload {field}")
+        if market_db_identity(payload_obj) != market_db_identity(identity_record) or any(
+            field not in slot_fields and (field in payload_obj or field in identity_record)
+            for field in MARKET_DB_FIELDS
+        ):
+            raise ValueError("Market database identity must match slot_data_fingerprint")
+    elif any(field in identity_record or field in payload_obj for field in (*_V2_IDENTITY_COLUMNS, *MARKET_DB_FIELDS)):
+        raise ValueError("v1 historical identities do not carry slot metadata")
+    _normalize_calendar_mapping(payload_obj["calendar_hash"])
 
     fid = validate_factor_id(str(payload_obj["factor_id"]))
     if str(identity_record["factor_id"]) != fid:
@@ -407,82 +433,3 @@ def _validate_identity_record(
     validated["output_frequency"] = r_out_freq.canonical
     validated["identity_payload_json"] = canonical_payload
     return validated
-
-
-def _validate_and_prepare_batch(
-    df: pd.DataFrame,
-    *,
-    calendar: SessionCalendar | Mapping[str, SessionCalendar] | None = None,
-) -> pd.DataFrame:
-    if not isinstance(df, pd.DataFrame):
-        raise TypeError("batch input must be a pandas DataFrame")
-    if not df.columns.is_unique:
-        raise ValueError("batch columns must be unique")
-    missing = set(TABLE_COLUMNS) - set(df.columns)
-    if missing:
-        raise ValueError(f"Missing required columns: {sorted(missing)}")
-
-    clean = df.loc[:, list(TABLE_COLUMNS)].copy()
-    clean["timestamp_utc"] = _validate_utc_series(clean["timestamp_utc"], "timestamp_utc").dt.as_unit("ns")
-    clean["created_at"] = _validate_utc_series(clean["created_at"], "created_at").dt.as_unit("ns")
-
-    val_series = clean["factor_value"]
-    if is_bool_dtype(val_series.dtype) or is_complex_dtype(val_series.dtype):
-        raise ValueError("factor_value must be real numbers (NaN allowed), not bool or complex")
-    if not is_numeric_dtype(val_series.dtype):
-        # Allow object columns containing floats/ints/None/NaN, reject bools/strings.
-        bits_check = canonical_float_bits(val_series.to_numpy(copy=False))
-        del bits_check
-        clean["factor_value"] = pd.to_numeric(val_series, errors="raise").astype(np.float64)
-    else:
-        clean["factor_value"] = val_series.to_numpy(dtype=np.float64, copy=True)
-
-    vals = clean["factor_value"].to_numpy(dtype=np.float64, copy=False)
-    if np.isinf(vals).any():
-        raise ValueError("factor_value must not contain +-inf (NaN is allowed)")
-    if (vals == 0.0).any():
-        vals = vals.copy()
-        vals[vals == 0.0] = 0.0
-        clean["factor_value"] = vals
-
-    if clean.empty:
-        return clean
-
-    if calendar is None:
-        raise ValueError("calendar (SessionCalendar or instrument->SessionCalendar mapping) is required on every write")
-
-    for col in ("factor_id", "factor_identity_hash", "frequency", "session_view"):
-        _validate_text_series(clean[col], col)
-        if clean[col].nunique(dropna=False) != 1:
-            raise ValueError(f"Single batch must share exactly one {col}, got {clean[col].unique().tolist()}")
-
-    fid = validate_factor_id(str(clean["factor_id"].iloc[0]))
-    fhash = validate_sha256_hex(str(clean["factor_identity_hash"].iloc[0]), "factor_identity_hash")
-    freq_raw = str(clean["frequency"].iloc[0])
-    parsed_freq = Frequency.parse(freq_raw)
-    if not parsed_freq.is_valid:
-        raise ValueError(f"Invalid frequency: {freq_raw!r}")
-    clean["frequency"] = parsed_freq.canonical
-    clean["factor_id"] = fid
-    clean["factor_identity_hash"] = fhash
-
-    view = str(clean["session_view"].iloc[0])
-    if view not in VALID_VIEWS:
-        raise ValueError(f"Invalid session_view: {view!r}; expected one of {VALID_VIEWS}")
-
-    for col in ("instrument_id", "session_id", "source_build_id", "calendar_hash", "code_version", "batch_id"):
-        _validate_text_series(clean[col], col)
-
-    for cal_hex in clean["calendar_hash"].unique():
-        validate_sha256_hex(cal_hex, "calendar_hash")
-    for sid in clean["session_id"].unique():
-        _validate_session_date_str(sid, "session_id")
-
-    dup_mask = clean.duplicated(subset=["factor_identity_hash", "instrument_id", "timestamp_utc"], keep=False)
-    if dup_mask.any():
-        examples = clean.loc[dup_mask, ["instrument_id", "timestamp_utc"]].drop_duplicates().head(5).to_dict("records")
-        raise DuplicateKeyError(f"Duplicate primary keys in batch: {examples}")
-
-    _validate_calendars_for_batch(clean, view, calendar)
-
-    return clean

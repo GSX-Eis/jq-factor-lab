@@ -27,7 +27,7 @@ def build_parser(*, public_bar_cli: bool = False, parser_class: type[argparse.Ar
     gc.add_argument("--cache-days", type=float, default=30)
 
 
-    def add_common(subparser: argparse.ArgumentParser) -> None:
+    def add_common(subparser: argparse.ArgumentParser, *, subprocess_options: bool = True) -> None:
         subparser.add_argument(
             "--run-id", default="", help="Stable run identifier for output colocation"
         )
@@ -44,6 +44,8 @@ def build_parser(*, public_bar_cli: bool = False, parser_class: type[argparse.Ar
             action="store_true",
             help="Plan the command and emit structured JSON only",
         )
+        if not subprocess_options:
+            return
         subparser.add_argument(
             "--fake-result",
             choices=("success", "failure", "degraded", "alignment_failed"),
@@ -57,6 +59,21 @@ def build_parser(*, public_bar_cli: bool = False, parser_class: type[argparse.Ar
             help="Subprocess timeout in seconds",
         )
 
+    market_db = subparsers.add_parser("market-db", help="Manage a local market database profile")
+    market_actions = market_db.add_subparsers(dest="market_db_action", required=True)
+    for name in ("init", "adopt", "show", "migrate-profile"):
+        market_action = market_actions.add_parser(name)
+        add_common(market_action, subprocess_options=False)
+        if name == "show":
+            selection = market_action.add_mutually_exclusive_group(required=True)
+            selection.add_argument("--db", help="Local DuckDB file")
+            selection.add_argument("--market-db", help="db_id from QUANT_DATA_BINDINGS")
+        else:
+            market_action.add_argument("--db", required=True, help="Local DuckDB file")
+            market_action.add_argument("--profile", required=True, help="Market database YAML or JSON declaration")
+        if name == "adopt":
+            market_action.add_argument("--sidecar", action="store_true", required=True)
+
     for name in ('build-bars', 'audit-bars', 'import-bars', 'build-roll-schedule'):
         storage = subparsers.add_parser(name, help='Explicit local Bar storage operation')
         add_common(storage)
@@ -68,8 +85,10 @@ def build_parser(*, public_bar_cli: bool = False, parser_class: type[argparse.Ar
             storage.add_argument('--end', required=name in ('build-bars', 'build-roll-schedule'))
         else:
             storage.set_defaults(instruments=None)
-            storage.add_argument('--bars', required=True, help='Canonical UTC Bar CSV')
-            storage.add_argument('--metadata', required=True, help='Instrument metadata JSON array')
+            source = storage.add_mutually_exclusive_group(required=True)
+            source.add_argument('--bars', help='Canonical UTC Bar CSV (requires --metadata)')
+            source.add_argument('--manifest', help='Declarative slot YAML or JSON')
+            storage.add_argument('--metadata', help='Instrument metadata JSON array for --bars')
             storage.add_argument('--derive', default='', help='Optional comma-separated target frequencies')
         if name == 'build-bars':
             storage.add_argument('--source', required=True)
@@ -77,11 +96,11 @@ def build_parser(*, public_bar_cli: bool = False, parser_class: type[argparse.Ar
             storage.add_argument('--check-only', action='store_true')
         if name == 'build-roll-schedule':
             storage.add_argument('--product-roots', required=True, help='Comma-separated futures product roots')
-            storage.add_argument('--rule', choices=('max_oi',), default='max_oi')
+            storage.add_argument('--rule', choices=('max_oi', 'max_volume', 'days_before_expiry'), default='max_oi')
             storage.add_argument('--confirm-days', type=int, default=1)
             storage.add_argument('--forward-only', action=argparse.BooleanOptionalAction, default=True)
 
-    write_fv = subparsers.add_parser('write-factor-values', help='Append minute/bar factor values to Scheme B store')
+    write_fv = subparsers.add_parser('write-factor-values', help='Append market factor values to Scheme B store')
     add_common(write_fv)
     write_fv.add_argument('--factor-values-store', required=True, help='Explicit Scheme B store directory')
     write_fv.add_argument('--input', required=True, help='Factor values CSV or Parquet file')
@@ -94,18 +113,23 @@ def build_parser(*, public_bar_cli: bool = False, parser_class: type[argparse.Ar
     write_fv.add_argument('--calendar-start', default=None)
     write_fv.add_argument('--calendar-end', default=None)
     write_fv.add_argument('--rth-reference-calendar', default=None)
+    write_fv.add_argument('--slot-config', help='SlotConfig YAML or JSON with its calendar declaration')
+    write_fv.add_argument('--slot-db', help='Read-only DuckDB source for a native futures slot calendar')
+    write_fv.add_argument('--slot-id')
+    write_fv.add_argument('--slot-config-hash')
     write_fv.add_argument('--source-build-id', default=None)
+    write_fv.add_argument('--slot-data-fingerprint', help='Source version string or JSON object')
     write_fv.add_argument('--data-version', default=None)
     write_fv.add_argument('--params-json', default='{}')
     write_fv.add_argument('--factor-class', default='external_cli')
-    write_fv.add_argument('--adjust', choices=('none', 'ratio_back_adjust', 'diff_back_adjust'), default=None)
+    write_fv.add_argument('--factor-source-sha256', help='Stable SHA-256 of the factor definition for slot imports')
+    policy = write_fv.add_mutually_exclusive_group()
+    policy.add_argument('--adjust', choices=('none', 'ratio_back_adjust', 'diff_back_adjust'), default=None)
+    policy.add_argument('--adjustment-policy')
 
     read_fv = subparsers.add_parser('read-factor-values', help='Read-only query over committed Scheme B factor store')
     add_common(read_fv)
     read_fv.add_argument('--factor-values-store', required=True, help='Explicit Scheme B store directory')
-    read_fv.add_argument('--factor-id', default=None)
-    read_fv.add_argument('--factor-identity-hash', default=None)
-    read_fv.add_argument('--frequency', default=None)
     read_fv.add_argument('--session-view', choices=('ETH', 'RTH'), default=None)
     read_fv.add_argument('--instruments', default=None, help='Comma-separated instrument IDs')
     read_fv.add_argument('--start-utc', default=None)
@@ -119,6 +143,29 @@ def build_parser(*, public_bar_cli: bool = False, parser_class: type[argparse.Ar
     verify_fv = subparsers.add_parser('verify-factor-values', help='Read-only integrity check on Scheme B factor store')
     add_common(verify_fv)
     verify_fv.add_argument('--factor-values-store', required=True, help='Explicit Scheme B store directory')
+    for command in (read_fv, verify_fv):
+        command.add_argument('--factor-id')
+        command.add_argument('--factor-identity-hash')
+        command.add_argument('--frequency', help='Stored output frequency')
+        command.add_argument('--slot-id')
+    for command in (write_fv, read_fv, verify_fv):
+        command.add_argument('--json', action='store_true', help='Emit JSON to stdout (default)')
+
+    export = subparsers.add_parser("export-strategy", help="Export an offline deployment candidate")
+    verify = subparsers.add_parser("verify-target-alignment", help="Verify an offline deployment candidate")
+    for deploy in (export, verify):
+        deploy.add_argument("--bundle-dir", required=True)
+        deploy.add_argument("--target", required=True, choices=("jq_cloud", "signal_export"))
+    export.add_argument("--output-dir", required=True)
+    export.add_argument("--factor-file", action="append", help="JoinQuant factor source file, repeatable")
+    export.add_argument("--requirements", help="JoinQuant factor requirements JSON")
+    export.add_argument("--target-positions", help="Signal export target positions in Parquet or JSONL")
+    export.add_argument("--current-positions", help="Signal export current weights as an instrument-to-weight JSON object")
+    verify.add_argument("--artifact-dir", required=True)
+    verify.add_argument("--reference-positions", help="JoinQuant weights JSON or signal export positions in Parquet or JSONL")
+    verify.add_argument("--reference-factors", help="JoinQuant factor values in Parquet, indexed by stock code")
+    verify.add_argument("--trusted-manifest-hash", help="Manifest hash recorded separately from a trusted JoinQuant export")
+    verify.add_argument("--replay-inputs", help="JoinQuant offline replay JSON with stocks, asof and bars_by_frequency")
 
     alignment = subparsers.add_parser(
         "alignment-run",
@@ -164,12 +211,15 @@ def build_parser(*, public_bar_cli: bool = False, parser_class: type[argparse.Ar
         "--pool", action="append", default=[], help="Append a dynamic pool name"
     )
 
-    bar_analysis = subparsers.add_parser("time-series-analysis", help="Evaluate CSV Bar factors in an explicit mode")
+    bar_analysis = subparsers.add_parser("time-series-analysis", help="Evaluate CSV or MarketSlot factors in an explicit mode")
     add_common(bar_analysis)
     bar_analysis.add_argument("--config", default="", help="Bar analysis JSON config")
     bar_analysis.add_argument("--diagnostics-report", action=argparse.BooleanOptionalAction,
                               help="Publish time-series diagnostics in JSON, CSV and Markdown")
     for subparser in (bar_analysis, analyze):
+        subparser.add_argument("--slot", "--slot-config", dest="slot", help="SlotConfig YAML/JSON path or jq_ashare_local")
+        subparser.add_argument("--market-db", help="Database ID in QUANT_DATA_BINDINGS.market_dbs")
+        subparser.add_argument("--slot-id", help="Configured MarketSlot identity")
         subparser.add_argument("--bars-csv")
         subparser.add_argument("--factors-csv")
         subparser.add_argument("--analysis-mode", help="time_series or cross_sectional (required for Bars)")
@@ -191,6 +241,7 @@ def build_parser(*, public_bar_cli: bool = False, parser_class: type[argparse.Ar
     read_bar_eval.add_argument("--analysis-mode", choices=("time_series", "cross_sectional"), default=None)
     read_bar_eval.add_argument("--frequency", default=None)
     read_bar_eval.add_argument("--calendar-id", default=None)
+    read_bar_eval.add_argument("--slot-id", default=None)
     read_bar_eval.add_argument("--start-utc", default=None, help="Inclusive UTC start timestamp or YYYY-MM-DD")
     read_bar_eval.add_argument("--end-utc", default=None, help="Inclusive UTC end timestamp or YYYY-MM-DD")
     read_bar_eval.add_argument("--split", choices=("full", "train", "oos"), help="Filter split metrics and matching runs")
@@ -253,6 +304,7 @@ def build_parser(*, public_bar_cli: bool = False, parser_class: type[argparse.Ar
         "factor-synthesis", help="Wrap run_factor_synthesis.py"
     )
     add_common(synthesis)
+    synthesis.add_argument("--market-db", help="Database ID in QUANT_DATA_BINDINGS.market_dbs")
     synthesis.add_argument(
         "--config", default=str(cli.REPO_ROOT / "config" / "factor_synthesis_config.json")
     )
@@ -260,6 +312,26 @@ def build_parser(*, public_bar_cli: bool = False, parser_class: type[argparse.Ar
         "--return-series-output-dir",
         default="",
         help="Override output directory for per-candidate return CSV artifacts",
+    )
+    synthesis.add_argument(
+        "--slot-config",
+        default="",
+        help="Optional SlotConfig YAML/JSON path or jq_ashare_local",
+    )
+    synthesis.add_argument(
+        "--slot-id",
+        default="",
+        help="Optional MarketSlot identity override",
+    )
+    synthesis.add_argument(
+        "--factor-values-store",
+        default="",
+        help="Optional Scheme B MarketFactorValueStore root directory",
+    )
+    synthesis.add_argument(
+        "--frequency",
+        default="",
+        help="Optional synthesis and backtest frequency (e.g. 1d, 5min, 1h)",
     )
 
     parent_screen = subparsers.add_parser(

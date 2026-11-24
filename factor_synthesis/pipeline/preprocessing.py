@@ -5,11 +5,169 @@ Shared preprocessing utilities for synthesis methods.
 Uses Qlib-style processors internally for consistent preprocessing logic.
 """
 
-from typing import Dict, Optional, Tuple
+from collections.abc import Mapping
+from pathlib import Path
+from typing import Dict, Optional, Tuple, TypedDict
 import logging
 
 import numpy as np
 import pandas as pd
+
+from utils.market_db.guards import require_single_market_db
+from utils.market_db.identity import slot_market_db_identity
+
+from utils.market_factor import MarketFactorValueStore
+from utils.slots import MarketSlot
+
+
+class MarketInputOptions(TypedDict, total=False):
+    slot: MarketSlot
+    slot_id: str
+    frequency: str
+    factor_values_store: MarketFactorValueStore | str | Path
+    factor_identities: Mapping[str, str]
+
+
+def bind_synthesis_panel(synthesizer, panel, config, market_inputs, labels=None):
+    """Consume a loaded panel or load the configured instruments and interval from Scheme B."""
+    from ..core.factor_data_loader import load_factor_data
+    from ..factor_reader import resolve_market_input
+
+    raw_synth_cfg = getattr(synthesizer, "config", None)
+    synth_cfg = raw_synth_cfg if isinstance(raw_synth_cfg, Mapping) else {}
+    config = {} if config is None else config
+    if not isinstance(config, Mapping):
+        raise TypeError("synthesis config must be a mapping or None")
+    source_keys = MarketInputOptions.__annotations__
+    options = {key: synth_cfg[key] for key in source_keys if key in synth_cfg}
+    options.update({key: config[key] for key in source_keys if key in config})
+    if market_inputs:
+        options.update(market_inputs)
+    metadata = panel.attrs.get("market_factor_inputs", {}) if panel is not None else {}
+    sources = metadata.get("factors", [])
+    if sources:
+        options.setdefault("slot_id", sources[0]["slot_id"])
+        options.setdefault("frequency", sources[0]["frequency"])
+    slot_id, frequency = resolve_market_input(
+        options.get("slot"), options.get("slot_id"), options.get("frequency", "1d"),
+    )
+    if panel is None:
+        required = ("factor_names", "start_date", "end_date")
+        missing = [key for key in required if not config.get(key)]
+        if missing:
+            raise ValueError(f"Supply a synthesis panel or configure {', '.join(missing)}")
+        panel = load_factor_data(
+            None, "factor_values", config["factor_names"], config["start_date"], config["end_date"],
+            stock_filter=set(config.get("instruments") or []),
+            config=synth_cfg, neutralization_config=config.get("neutralization"), **options,
+        )
+        metadata = panel.attrs.get("market_factor_inputs", {})
+    elif any((item["slot_id"], item["frequency"]) != (slot_id, frequency) for item in sources):
+        raise ValueError("Scheme B panel sources do not match the requested slot and frequency")
+    require_single_market_db(panel, labels, slot_market_db_identity(options.get("slot")))
+    if metadata:
+        pins = options.get("factor_identities") or {}
+        for name, identity in metadata["identities"].items():
+            if name in pins and pins[name] != identity:
+                raise ValueError(f"Scheme B panel identity does not match factor_identities[{name!r}]")
+
+    label_exits = labels.attrs.get("label_exit_dates") if labels is not None else None
+    if label_exits is not None:
+        def _norm_exit_time(value):
+            ts = pd.Timestamp(value)
+            if pd.isna(ts):
+                raise ValueError("label_exit_dates contains NaT")
+            return ts.normalize() if ts.tz is None else ts.tz_convert("UTC")
+
+        def _normalize_exit_map(raw_map):
+            if not isinstance(raw_map, (Mapping, pd.Series)):
+                raise ValueError("_label_exit_dates must be a mapping or Series matching producer label_exit_dates")
+            normalized = {}
+            for k, v in raw_map.items():
+                day = _norm_exit_time(k)
+                exit_day = _norm_exit_time(v)
+                if day in normalized:
+                    raise ValueError("Duplicate normalized entry date in label_exit_dates")
+                normalized[day] = exit_day
+            return normalized
+
+        producer_map = _normalize_exit_map(label_exits)
+        configured = config.get("_label_exit_dates")
+        if configured is not None:
+            configured_map = _normalize_exit_map(configured)
+            valid_labels = labels.dropna()
+            if valid_labels.empty or panel.empty:
+                active_dates = set()
+            elif (
+                isinstance(valid_labels.index, pd.MultiIndex)
+                and isinstance(panel.index, pd.MultiIndex)
+                and valid_labels.index.nlevels == panel.index.nlevels
+            ):
+                effective_index = valid_labels.index.intersection(panel.index)
+                active_dates = {_norm_exit_time(day) for day in effective_index.get_level_values(0).unique()}
+            else:
+                panel_dates = {_norm_exit_time(day) for day in panel.index.get_level_values(0).unique()}
+                label_dates = {_norm_exit_time(day) for day in valid_labels.index.get_level_values(0).unique()}
+                active_dates = panel_dates & label_dates
+            if any(
+                day not in producer_map or day not in configured_map or configured_map[day] != producer_map[day]
+                for day in active_dates
+            ):
+                raise ValueError("Configured _label_exit_dates conflicts with label producer label_exit_dates")
+        config = dict(config, _label_exit_dates=label_exits)
+    if frequency != "1d" and not panel.empty and not freq_uses_utc(panel):
+        raise ValueError("Non-daily synthesis requires UTC timestamps")
+    if (slot_id != "jq_ashare_local" and labels is not None and not panel.empty
+            and panel.index.get_level_values("stock_code").nunique() == 1
+            and "target_cs_demean" not in config):
+        config = dict(config, target_cs_demean=False)
+    return panel, config
+
+
+def selected_market_inputs(panel: pd.DataFrame, features) -> list[dict]:
+    return [
+        item for item in panel.attrs.get("market_factor_inputs", {}).get("factors", [])
+        if item["factor_id"] in features
+    ]
+
+
+def freq_uses_utc(panel: pd.DataFrame) -> bool:
+    return (isinstance(panel.index, pd.MultiIndex)
+            and isinstance(panel.index.get_level_values("date"), pd.DatetimeIndex)
+            and panel.index.get_level_values("date").tz is not None)
+
+
+def format_panel_time(timestamp: pd.Timestamp) -> str:
+    return timestamp.isoformat() if timestamp.tz is not None else timestamp.strftime("%Y-%m-%d")
+
+
+def training_bounds(panel: pd.DataFrame, start, end) -> tuple[pd.Timestamp, pd.Timestamp]:
+    first, last = pd.Timestamp(start), pd.Timestamp(end)
+    if not freq_uses_utc(panel):
+        return first, last
+    first = first.tz_localize("UTC") if first.tz is None else first.tz_convert("UTC")
+    if last.tz is None:
+        last = last.tz_localize("UTC")
+        if last == last.normalize():
+            last += pd.Timedelta(days=1) - pd.Timedelta(nanoseconds=1)
+    else:
+        last = last.tz_convert("UTC")
+    return first, last
+
+
+def prediction_bounds(panel: pd.DataFrame, train_end, window_days: int) -> tuple[pd.Timestamp, pd.Timestamp]:
+    _, last = training_bounds(panel, train_end, train_end)
+    first = last + (pd.Timedelta(nanoseconds=1) if freq_uses_utc(panel) else pd.Timedelta(days=1))
+    return first, first + pd.Timedelta(days=window_days)
+
+
+def preprocess_synthesis_features(synthesizer, frame: pd.DataFrame, config, *, history: pd.DataFrame) -> pd.DataFrame:
+    from ..core.factor_ops import apply_feature_preprocessing
+    from ..core.feature_preprocessor import TIME_SERIES_METHODS
+
+    if TIME_SERIES_METHODS.intersection(value for value in config.values() if isinstance(value, str)):
+        return apply_feature_preprocessing(frame, config, synthesizer.logger, history=history)
+    return synthesizer._apply_feature_preprocessing(frame, config)
 
 
 def residualize_target_by_factor(

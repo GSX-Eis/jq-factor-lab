@@ -9,9 +9,40 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
+from utils.time_axis import Frequency
+
 from .schema import (
     _canonical_json,
+    _require_nonempty_str,
+    validate_factor_id,
+    validate_sha256_hex,
 )
+
+
+def _identity_filters(
+    factor_id: str | None,
+    frequency: str | None,
+    slot_id: str | None,
+    factor_identity_hash: str | None,
+) -> dict[str, str]:
+    filters = {}
+    if factor_id is not None:
+        filters["factor_id"] = validate_factor_id(factor_id)
+    if frequency is not None:
+        parsed = Frequency.parse(frequency)
+        if parsed.canonical is None:
+            raise ValueError(f"Invalid frequency: {frequency!r}")
+        filters["frequency"] = parsed.canonical
+    if slot_id is not None:
+        filters["slot_id"] = _require_nonempty_str(slot_id, "slot_id")
+    if factor_identity_hash is not None:
+        filters["factor_identity_hash"] = validate_sha256_hex(factor_identity_hash, "factor_identity_hash")
+    return filters
+
+
+def _matches_filters(record: Mapping[str, Any], filters: Mapping[str, str]) -> bool:
+    output_fields = {"frequency": record.get("output_frequency") or record.get("frequency")}
+    return all(output_fields.get(field, record.get(field)) == value for field, value in filters.items())
 
 
 def _trim_unterminated_trailing_line(path: Path) -> None:
@@ -100,8 +131,9 @@ def _write_lock(root: Path, parquet_root: Path, lock_path: Path) -> Iterator[Non
 
 
 def _load_committed_state(identities_path: Path, batches_path: Path) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]:
-    identities_list, id_corrupt, _ = _read_jsonl(identities_path)
+    # Writers register an identity before committing its first batch.
     batches_list, batch_corrupt, _ = _read_jsonl(batches_path)
+    identities_list, id_corrupt, _ = _read_jsonl(identities_path)
     if id_corrupt or batch_corrupt:
         raise ValueError(f"Corrupt ledger entries detected: {id_corrupt + batch_corrupt}")
     identities = {str(rec["factor_identity_hash"]): rec for rec in identities_list}

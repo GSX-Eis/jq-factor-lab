@@ -8,7 +8,7 @@ from typing import Any
 
 import pandas as pd
 
-from backtest_and_analysis.evaluation.types import DirectionalAccuracy, ReturnDistribution
+from backtest_and_analysis.evaluation.types import BOOTSTRAP_V3_P, DirectionalAccuracy, ReturnDistribution
 
 from .evaluator import EXCLUSION_COLUMNS, EvaluationResult, _counts
 
@@ -53,7 +53,7 @@ def evaluate_diagnostics(result: EvaluationResult) -> dict[str, Any]:
             **{key: row[key] for key in (*KEY_COLUMNS, 'grid_start_utc', 'grid_end_utc')},
             counts=dict(total_count=int(tally.total_count), valid_count=int(tally.valid_count),
                         excluded_count=int(tally.excluded_count), exclusion_counts=tally.exclusion_counts),
-            ic=row['ic'], bootstrap={name: row['bootstrap'][name] for name in BOOTSTRAP_FIELDS},
+            ic=row['ic'], bootstrap=_diagnostic_bootstrap(row['bootstrap']),
             interval_usability=usability,
             **{key: row[key] for key in ('direction', 'return_distribution',
                                        'buckets', 'non_overlapping_ic')},
@@ -70,9 +70,10 @@ KEY_COLUMNS = ('instrument_id', 'frequency', 'horizon_bars')
 COUNT_COLUMNS = ('total_count', 'valid_count', 'excluded_count',
                  *(f'excluded_{reason}' for reason in EXCLUSION_COLUMNS))
 IC_COLUMNS = ('ic_sample_count', 'ic_spearman_ic', 'ic_reason')
-# The v1 CSV includes only the original interval fields.
+# Preserve the original interval columns for legacy reports.
 BOOTSTRAP_FIELDS = ('grid_size', 'block_length', 'seed', 'n_boot', 'valid_replicates',
                     'min_valid_replicates', 'alpha', 'lower', 'upper', 'reason')
+P_VALUE_FIELDS = ('method_version', 'p_value', 'p_value_reason')
 BOOTSTRAP_COLUMNS = tuple(f'bootstrap_{name}' for name in BOOTSTRAP_FIELDS)
 DIRECTION_COLUMNS = tuple(f'direction_{field.name}' for field in fields(DirectionalAccuracy))
 RETURN_COLUMNS = tuple(f'return_{field.name}' for field in fields(ReturnDistribution))
@@ -80,6 +81,26 @@ DIAGNOSTICS_CSV_COLUMNS = (
     *KEY_COLUMNS, 'scope', 'index', *COUNT_COLUMNS, *IC_COLUMNS,
     *BOOTSTRAP_COLUMNS, *DIRECTION_COLUMNS, *RETURN_COLUMNS,
 )
+
+
+def _diagnostic_bootstrap(bootstrap: Mapping[str, Any]) -> dict[str, Any]:
+    names = BOOTSTRAP_FIELDS
+    if bootstrap.get('method_version') == BOOTSTRAP_V3_P[0]:
+        names += P_VALUE_FIELDS
+    return {name: bootstrap[name] for name in names}
+
+
+def _pvalue_columns(report: Mapping[str, Any]) -> tuple[str, ...]:
+    if any(row['bootstrap'].get('method_version') == BOOTSTRAP_V3_P[0] for row in report['horizons']):
+        return tuple(f'bootstrap_{name}' for name in P_VALUE_FIELDS)
+    return ()
+
+
+def diagnostics_csv_columns(report: Mapping[str, Any]) -> tuple[str, ...]:
+    columns = (*DIAGNOSTICS_CSV_COLUMNS, *_pvalue_columns(report))
+    if report['schema'] == 'time_series_diagnostics.v2':
+        return ('split', *columns, 'split_purged_count')
+    return columns
 
 
 def diagnostics_rows(report: Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -95,7 +116,7 @@ def diagnostics_rows(report: Mapping[str, Any]) -> list[dict[str, Any]]:
         rows.append(dict(
             **key, scope='overall', **{name: count[name] for name in COUNT_COLUMNS[:3]},
             **_prefixed('excluded', count['exclusion_counts']), **_prefixed('ic', horizon['ic']),
-            **_prefixed('bootstrap', {name: horizon['bootstrap'][name] for name in BOOTSTRAP_FIELDS}),
+            **_prefixed('bootstrap', _diagnostic_bootstrap(horizon['bootstrap'])),
             **purge, **_prefixed('direction', horizon['direction']),
             **_prefixed('return', horizon['return_distribution']),
         ))
@@ -118,6 +139,7 @@ def _markdown_cell(value: Any) -> str:
 def render_diagnostics_markdown(report: Mapping[str, Any], rows: list[dict[str, Any]]) -> str:
     split = report['schema'] == 'time_series_diagnostics.v2'
     purge = ('split_purged_count',) if split else ()
+    bootstrap_columns = (*BOOTSTRAP_COLUMNS, *_pvalue_columns(report))
     lines = [
         '# Time-series diagnostics report', '',
         f"Schema `{report['schema']}`. Returns are in percent.",
@@ -126,7 +148,7 @@ def render_diagnostics_markdown(report: Mapping[str, Any], rows: list[dict[str, 
     ]
     sections = [
         ('Counts and Spearman IC', ('overall',), (*COUNT_COLUMNS, *purge, *IC_COLUMNS)),
-        ('Bootstrap Spearman intervals', ('overall',), BOOTSTRAP_COLUMNS),
+        ('Bootstrap Spearman intervals', ('overall',), bootstrap_columns),
         ('Direction accuracy', ('overall', 'bucket'), ('scope', 'index', *DIRECTION_COLUMNS)),
         ('Conditional return distribution', ('overall', 'bucket'), ('scope', 'index', *RETURN_COLUMNS)),
         ('Non-overlapping offsets', ('offset',), ('index', *IC_COLUMNS)),
@@ -139,7 +161,7 @@ def render_diagnostics_markdown(report: Mapping[str, Any], rows: list[dict[str, 
             if row['scope'] in scopes:
                 lines.append('| ' + ' | '.join(_markdown_cell(row.get(name)) for name in columns) + ' |')
         lines.append('')
-        if values == BOOTSTRAP_COLUMNS:
+        if values == bootstrap_columns:
             for horizon in report['horizons']:
                 if (usability := horizon.get('interval_usability')) is None:
                     continue

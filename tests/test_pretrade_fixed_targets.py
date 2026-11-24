@@ -1,4 +1,6 @@
 import duckdb
+
+from market_db_samples import declare_market_db
 import pandas as pd
 
 from factor_synthesis.vectorbt_adapter.backtest_runner import VectorBTBacktestRunner
@@ -17,6 +19,7 @@ def test_pretrade_fixed_targets_do_not_replace_or_redistribute_blocked_buy():
     )
     prices = pd.DataFrame(10.0, index=dates, columns=scores.columns)
     conn = duckdb.connect(":memory:")
+    declare_market_db(conn, 'cn_equity')
     conn.execute(
         "CREATE TABLE price_data_daily "
         "(stock_code VARCHAR, date DATE, open DOUBLE, close DOUBLE, "

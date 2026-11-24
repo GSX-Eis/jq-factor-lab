@@ -74,7 +74,7 @@ def compose_adapter_block(cloud_mapping=None) -> str:
     )
 
 
-def compose_runtime_shims_block() -> str:
+def compose_runtime_shims_block(*, install_modules: bool = True) -> str:
     import inspect
 
     base_shims = """
@@ -110,7 +110,7 @@ except Exception:
 del __sys, __types
 """
     # Append sources of helper functions
-    src = base_shims
+    src = base_shims if install_modules else ""
     # We need to make sure these functions are defined when this runs
     funcs = [
         __jq_fetch_price_data,
@@ -259,3 +259,171 @@ def handle_data(context, data):
 def after_trading_end(context):
     pass
 """.strip()
+
+
+def compose_bundle_entry_block(metadata: Dict) -> str:
+    """Render the shared scoring and target-weight entry points for a bundle."""
+    return "STRATEGY_BUNDLE_METADATA = " + repr(metadata) + "\n" + '''
+
+import re as _bundle_re
+from functools import partial as _bundle_partial, wraps as _bundle_wraps
+
+_patch_subclasses()
+
+
+def _bundle_local_timestamp(value):
+    timestamp = pd.Timestamp(value)
+    if timestamp.tzinfo is not None:
+        return timestamp.tz_convert("Asia/Shanghai").tz_localize(None)
+    return timestamp
+
+
+def _bundle_cutoff(asof):
+    if not isinstance(asof, str) or not _bundle_re.fullmatch(
+        r"[0-9]{4}-[0-9]{2}-[0-9]{2}"
+        r"([ T][0-9]{2}:[0-9]{2}(:[0-9]{2}([.][0-9]{1,9})?)?(Z|[+-][0-9]{2}:[0-9]{2})?)?", asof
+    ):
+        raise ValueError("Expected an ISO date or timestamp for factor as-of")
+    frequency = STRATEGY_BUNDLE_METADATA["frequency"]
+    timestamp = pd.Timestamp(asof)
+    if frequency != "1d" and timestamp.tzinfo is not None:
+        # An aware as-of is the Slot open key. JoinQuant prices use local bar ends.
+        timestamp += pd.Timedelta(frequency)
+    timestamp = _bundle_local_timestamp(timestamp)
+    if len(asof) == 10:
+        if frequency == "1d":
+            return asof
+        timestamp += pd.Timedelta(hours=15)
+    return str(timestamp)
+
+
+def _bundle_session_grid(timestamp, width):
+    # Generate availability times (bar ends) for the two XSHG trading segments.
+    day = timestamp.normalize()
+    morning = pd.date_range(day + pd.Timedelta(hours=9, minutes=30) + width,
+                            day + pd.Timedelta(hours=11, minutes=30), freq=width)
+    afternoon = pd.date_range(day + pd.Timedelta(hours=13) + width,
+                              day + pd.Timedelta(hours=15), freq=width)
+    return morning.append(afternoon)
+
+
+class _BundleBarAdapter(JQFactorAdapter):
+    def __init__(self, *args, asof, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.asof = asof
+        grid = _bundle_session_grid(asof, pd.Timedelta(minutes=int(self.freq[:-1])))
+        self.expected = grid[grid <= asof]
+        if not len(self.expected) or self.expected[-1] != asof:
+            raise ValueError("Factor as-of must be an A-share bar end")
+        # Request room for the current prefix in addition to the frozen history window.
+        self.window = jq_minute_request_count(
+            self.window, len(grid), include_session_prefix=len(self.expected) < len(grid),
+        )
+        if self.window > MAX_JQ_MINUTE_REQUEST_BARS:
+            raise ValueError("cloud_runtime_budget_risk:{}:bars={}".format(self.freq, self.window))
+
+    def _trim_to_full_days(self, frame, bars_per_day):
+        if frame.empty:
+            return frame
+        today = frame["date"].dt.normalize() == self.asof.normalize()
+        history = super()._trim_to_full_days(frame.loc[~today], bars_per_day)
+        complete = [
+            group for _, group in frame.loc[today].groupby("code")
+            if pd.DatetimeIndex(group["date"]).sort_values().equals(self.expected)
+        ]
+        return pd.concat([history] + complete, ignore_index=True)
+
+    def fetch_price(self, securities, end_date, fields):
+        result = super().fetch_price(securities, end_date, fields)
+        present = set(result.loc[result["date"] == self.asof, "code"])
+        if present != set(securities):
+            raise ValueError("factor_input_incomplete_current_session")
+        return result
+
+
+def _bundle_factor_constructor(cls, input_frequency, output_frequency):
+    if output_frequency == "1d" and input_frequency in ("daily", "5m"):
+        return cls
+
+    @_bundle_wraps(cls)
+    def construct(**kwargs):
+        kwargs.update(analysis_mode="cross_sectional", data_frequency=input_frequency,
+                      output_frequency=output_frequency)
+        return cls(**kwargs)
+
+    return construct
+
+
+def _compute_bundle_factors(stocks, cutoff, pool_history):
+    frequency = STRATEGY_BUNDLE_METADATA["frequency"]
+    classes = {
+        name: _bundle_factor_constructor(
+            globals()[name], next(iter(FACTOR_REQUIREMENTS["factors"][name]["requirements"])), frequency,
+        )
+        for name in STRATEGY_BUNDLE_METADATA["factor_classes"].values()
+    }
+    adapter = JQFactorAdapter if frequency == "1d" else _bundle_partial(
+        _BundleBarAdapter, asof=pd.Timestamp(cutoff),
+    )
+    values = compute_factor_batch(
+        classes, FACTOR_REQUIREMENTS, FACTOR_DEPENDENCIES, stocks, cutoff,
+        adapter, windows=FACTOR_REQUIRED_WINDOWS, pool_history=pool_history,
+    )
+    return pd.DataFrame({
+        factor_id: values[class_name]
+        for factor_id, class_name in STRATEGY_BUNDLE_METADATA["factor_classes"].items()
+    }, index=stocks)
+
+
+def compute_bundle_factors(stocks, asof, pool_history=None):
+    return _compute_bundle_factors(stocks, _bundle_cutoff(asof), pool_history)
+
+
+def compute_bundle_signal(stocks, asof, pool_history=None):
+    cutoff = _bundle_cutoff(asof)
+    factors = _compute_bundle_factors(stocks, cutoff, pool_history)
+    model = model_for_date(STRATEGY_BUNDLE_METADATA["models"], cutoff)
+    if model is None:
+        raise ValueError("No replay model precedes the factor as-of date")
+    scores, _ = linear_signal(factors, model)
+    ranked = rank_scores(scores)
+    selection = STRATEGY_BUNDLE_METADATA["selection"]
+    count = selection_count(len(ranked), selection.get("top_k"), selection.get("top_pct"))
+    return factors, scores, equal_target_weights(ranked[:count])
+
+
+def initialize(context):
+    if callable(globals().get("get_price")):
+        set_external_get_price(get_price)
+    else:
+        try:
+            from jqdata import get_price as cloud_get_price
+            set_external_get_price(cloud_get_price)
+        except ImportError:
+            pass
+    if callable(globals().get("get_valuation")):
+        set_external_get_valuation(get_valuation)
+    try:
+        from jqfactor import get_factor_values
+        set_external_get_factor_values(get_factor_values)
+    except ImportError:
+        pass
+
+
+def handle_data(context, data):
+    # The approved strategy supplies its eligible universe and rebalance dates.
+    if not getattr(context, "strategy_rebalance_due", False):
+        return
+    cutoff = _bundle_local_timestamp(context.previous_date).date().isoformat()
+    frequency = STRATEGY_BUNDLE_METADATA["frequency"]
+    if frequency != "1d":
+        decision = _bundle_local_timestamp(context.current_dt)
+        grid = _bundle_session_grid(decision, pd.Timedelta(frequency))
+        completed = grid[grid <= decision]
+        if len(completed):
+            cutoff = str(completed[-1])
+    _, _, context.strategy_target_weights = compute_bundle_signal(
+        list(context.strategy_universe), cutoff,
+        getattr(context, "monthly_stock_pools", None),
+    )
+'''

@@ -3,6 +3,7 @@ import duckdb
 import pandas as pd
 import pytest
 
+from market_db_samples import declare_market_db
 from utils.duckdb_adapter import DuckDBAdapter
 from utils.factor_base import FactorBase
 
@@ -12,6 +13,7 @@ DEFAULT_FIELDS = ['open', 'close', 'high', 'low', 'volume', 'money']
 
 def write_prices(path):
     with duckdb.connect(str(path)) as conn:
+        declare_market_db(conn, 'cn_equity')
         for table, value in [('price_data_daily', 1.0), ('price_data_5m', 5.0)]:
             conn.execute(f"CREATE TABLE {table} AS SELECT DATE '2026-01-05' AS date, "
                          "'A' AS stock_code, ? AS open, ? AS close, ? AS high, ? AS low, "

@@ -93,6 +93,14 @@ def _make_conn():
 
 def _load(conn, factor_names, *, neutralization_config=None, config=None, logger=None):
     from calendar_test_support import seed_calendar
+    config = dict(config or {"cache_settings": {"use_parquet_cache": False}})
+    config.setdefault("data_bindings", {
+        "output_db": "fixture.duckdb",
+        "outputs": {
+            table: {"role": "output", "table": f"main.{table}", "version": "fixture"}
+            for table in ("factor_values", "neutralized_factor_values")
+        },
+    })
     with duckdb.connect(":memory:") as price_conn:
         seed_calendar(price_conn)
         return load_factor_data(
@@ -102,7 +110,7 @@ def _load(conn, factor_names, *, neutralization_config=None, config=None, logger
             factor_names=factor_names,
             start_date="2024-01-01",
             end_date="2024-01-02",
-            config=config or {"cache_settings": {"use_parquet_cache": False}},
+            config=config,
             neutralization_config=neutralization_config,
             custom_logger=logger or logging.getLogger("test_neutralized_loader"),
         )
@@ -143,21 +151,9 @@ def test_precomputed_neutralized_input_preserves_raw_column_name():
     assert out.loc[(pd.Timestamp("2024-01-02"), "S2"), "FactorA"] == 102.0
 
 
-def test_missing_neutralized_input_warns_and_falls_back_to_raw(caplog):
-    test_logger = logging.getLogger("test_missing_neutralized_loader")
-    caplog.set_level(logging.WARNING, logger=test_logger.name)
-
-    out = _load(
-        _make_conn(),
-        ["FactorB"],
-        neutralization_config={"enabled": True},
-        logger=test_logger,
-    )
-
-    assert out.loc[(pd.Timestamp("2024-01-02"), "S1"), "FactorB"] == 10.0
-    assert (
-        "[中性化输入缺失] raw=FactorB expected=FactorB__neu fallback=raw" in caplog.text
-    )
+def test_missing_frozen_neutralized_input_fails_closed():
+    with _make_conn() as conn, pytest.raises(ValueError, match="unavailable"):
+        _load(conn, ["FactorB"], neutralization_config={"enabled": True})
 
 
 def test_skip_factors_always_load_raw_even_when_neutralized_exists():

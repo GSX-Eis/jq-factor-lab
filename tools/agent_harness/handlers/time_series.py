@@ -28,7 +28,8 @@ def _bar_artifact_paths(evaluation_dir: Path, diagnostics_report: bool) -> set[P
 
 
 def _validate_bar_output_paths(db_path: Path, output_dir: Path, json_out: str,
-                               evaluation_dir: Path | None = None, *, diagnostics_report: bool = False) -> None:
+                               evaluation_dir: Path | None = None, *, diagnostics_report: bool = False,
+                               database_label: str = "results_db") -> None:
     from utils.bar_evaluation_store import BarEvaluationPreconditionError
 
     cli = _cli_bindings(__name__)
@@ -46,17 +47,17 @@ def _validate_bar_output_paths(db_path: Path, output_dir: Path, json_out: str,
         if (db_path == target or db_path in target.parents or target in db_path.parents
                 or (db_path.exists() and target.exists() and db_path.samefile(target))):
             raise BarEvaluationPreconditionError(
-                f"results_db path overlaps an output path: {db_path} / {target}")
+                f"{database_label} path overlaps an output path: {db_path} / {target}")
 
 
 def _handle_time_series_analysis(
     args: argparse.Namespace, *, public_output: ExitStack | None = None,
 ) -> HarnessResult:
     from backtest_and_analysis.time_series.artifacts import validate_evaluation_output_dir
-    from tools.agent_harness.time_series_analysis import load_config
+    from tools.agent_harness.time_series_analysis import (
+        BarEvaluationStoreFailure, load_config, resolve_slot_request, revoke_evaluation_completion,
+    )
     from utils.bar_evaluation_store import (
-        BarEvaluationConflictError,
-        BarEvaluationIntegrityError,
         BarEvaluationPreconditionError,
         _validate_db_target_path,
         ingest_evaluation,
@@ -84,6 +85,17 @@ def _handle_time_series_analysis(
         config = load_config(config_path) if args.config else {}
     except Exception as exc:
         config, config_error = {}, exc
+    for name in ("bars_csv", "factors_csv", "analysis_mode", "view", "calendar",
+                 "entry_offset_bars", "n_quantiles", "slot", "slot_id", "market_db"):
+        value = getattr(args, name, None)
+        if value is not None:
+            config[name] = value
+    cli_slot = getattr(args, "slot", None)
+    if cli_slot is not None:
+        config.pop("slot_config", None)
+        if cli_slot and cli_slot != "jq_ashare_local":
+            config["slot"] = str(Path(cli_slot).expanduser().resolve())
+    selection = None
     guard_config = config
     if config_error is not None:
         try:
@@ -132,6 +144,28 @@ def _handle_time_series_analysis(
         if guarded_db is not None:
             cli._validate_bar_output_paths(guarded_db, output_dir, args.json_out, guarded_destination,
                                        diagnostics_report=diagnostics_requested)
+        if config.get("market_db") is not None and not args.fake_result:
+            from utils.market_db import market_db_sidecar_path
+            from utils.market_db.identity import slot_market_db_identity
+            from utils.market_db.research import open_research_slot, same_database
+
+            guard_reason = "market_db_precondition_failed"
+            if config_error is not None:
+                raise config_error
+            if any(getattr(args, name, None) for name in ("materialize_only", "mining_only", "use_dynamic", "pool", "factor")):
+                raise ValueError("--market-db selects a Slot evaluation over committed Scheme B factors")
+            frozen, base_dir = resolve_slot_request(config)
+            with open_research_slot(
+                config["market_db"], frozen, base_dir,
+                declared_db=config.get("slot_db", config.get("duckdb_path")),
+            ) as (slot, source):
+                selection = slot_market_db_identity(slot)
+            for protected in (source, market_db_sidecar_path(source)):
+                cli._validate_bar_output_paths(protected, output_dir, args.json_out, guarded_destination,
+                                               diagnostics_report=diagnostics_requested, database_label="market_db")
+                if guarded_db is not None and same_database(protected, guarded_db):
+                    raise ValueError("results_db must differ from the market database and its profile")
+            config["market_db_identity"] = selection
         if (public_output is not None and requested_destination is not None and config_error is None
                 and not (args.fake_result or args.dry_run)):
             from utils.local_outputs import reserve_output_directory
@@ -149,6 +183,8 @@ def _handle_time_series_analysis(
         return cli._fake_result(**common, fake_result=args.fake_result, json_out=args.json_out)
     if args.dry_run and public_output is None:
         dry_metrics: Dict[str, Any] = {"planned_config": args.config}
+        if selection is not None:
+            dry_metrics["market_db"] = selection
         if getattr(args, "results_db", None) is not None:
             dry_metrics["planned_results_db"] = str(Path(args.results_db).expanduser().resolve())
         return cli._complete_result(cli._success_result(**common, mode="dry_run", reason="dry_run",
@@ -169,21 +205,24 @@ def _handle_time_series_analysis(
             raise BarEvaluationPreconditionError(f"{option} must be a nonempty path")
         results_db_path = _validate_db_target_path(guarded_db) if guarded_db is not None else None
 
-        for name in ("bars_csv", "factors_csv", "analysis_mode", "view", "calendar",
-                     "entry_offset_bars", "n_quantiles"):
-            value = getattr(args, name)
-            if value is not None:
-                config[name] = value
         if public_output is not None:
-            for name in ("bars_csv", "factors_csv"):
+            for name in ("bars_csv", "factors_csv", "slot_db", "duckdb_path", "factor_store_root", "slot_base_dir",
+                         "slot", "slot_config"):
                 value = config.get(name)
-                if isinstance(value, str) and value.strip():
+                if isinstance(value, str) and value.strip() and (name != "slot" or value != "jq_ashare_local"):
                     config[name] = str(Path(value).expanduser().resolve())
             continuous = config.get("continuous_futures")
             if isinstance(continuous, dict):
                 db = continuous.get("db")
                 if isinstance(db, str) and db.strip():
                     continuous["db"] = str(Path(db).expanduser().resolve())
+        source_db = config.get("slot_db", config.get("duckdb_path"))
+        if (results_db_path is not None and isinstance(source_db, str)
+                and any(config.get(key) is not None for key in ("slot", "slot_id", "slot_config", "factor_store_root"))):
+            source = cli._resolve_repo_relative_path(source_db)
+            if source == results_db_path or (source.is_file() and results_db_path.is_file()
+                                             and source.samefile(results_db_path)):
+                raise BarEvaluationPreconditionError("results_db must differ from the Slot source database")
         if args.horizons is not None:
             config["horizons"] = [int(h.strip()) for h in args.horizons.split(",")]
         if args.calendar is not None:
@@ -238,24 +277,17 @@ def _handle_time_series_analysis(
                 artifacts=cli._common_artifacts(output_dir) + payload["artifacts"])
     except Exception as exc:
         if phase == "results_db":
-            if isinstance(exc, BarEvaluationConflictError):
-                reason = "bar_evaluation_store_conflict"
-                exit_code = cli.EXIT_QUALITY_GATE
-            elif isinstance(exc, (BarEvaluationPreconditionError, BarEvaluationIntegrityError, ValueError, FileNotFoundError)):
-                reason = "bar_evaluation_store_precondition_failed"
-                exit_code = cli.EXIT_PRECONDITION
-            else:
-                reason = "bar_evaluation_store_write_failed"
-                exit_code = cli.EXIT_EXECUTION
+            failure = BarEvaluationStoreFailure(exc, [destination])
             result = cli._failure_result(
                 **common,
                 mode="results_db",
-                reason=reason,
-                exit_code=exit_code,
-                metrics={"exception_type": type(exc).__name__, "error": str(exc)},
+                reason=failure.code,
+                exit_code=failure.exit_code,
+                metrics=failure.details,
                 artifacts=cli._common_artifacts(output_dir),
             )
-            result.error["message"] = str(exc)
+            result.error["message"] = str(failure)
+            result.error["details"].update(failure.cleanup)
         else:
             precondition = phase == "preflight" and isinstance(exc, (OSError, ValueError, TypeError, KeyError))
             reason = (
@@ -271,11 +303,8 @@ def _handle_time_series_analysis(
             result.error["message"] = str(exc)
     if args.dry_run:
         return result
-    if not result.ok:
-        try:
-            (destination / "summary.json").unlink(missing_ok=True)
-        except OSError as exc:
-            result.error["details"]["completion_cleanup_error"] = str(exc)
+    if not result.ok and phase != "results_db":
+        result.error["details"].update(revoke_evaluation_completion([destination]))
     return cli._complete_result(result, args.json_out)
 
 
@@ -293,6 +322,9 @@ def _handle_read_bar_evaluations(args: argparse.Namespace, *, public_read: bool 
     started_at = cli._utc_now()
     db_path = Path(args.results_db).expanduser().resolve()
     command = [action, "--results-db", str(db_path)]
+    slot_id = getattr(args, "slot_id", None)
+    if slot_id is not None:
+        command.extend(["--slot-id", slot_id])
     artifacts = [] if public_read and (args.dry_run or not args.json_out) else cli._common_artifacts(output_dir)
     common = dict(
         action=action,
@@ -343,6 +375,7 @@ def _handle_read_bar_evaluations(args: argparse.Namespace, *, public_read: bool 
             analysis_mode=args.analysis_mode,
             frequency=args.frequency,
             calendar_id=args.calendar_id,
+            slot_id=slot_id,
             start_utc=args.start_utc,
             end_utc=args.end_utc,
             split=args.split,

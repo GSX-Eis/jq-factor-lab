@@ -4,6 +4,15 @@ import math
 import pandas as pd
 
 
+JQ_BARS_PER_DAY = {"1m": 240, "5m": 48, "15m": 16, "30m": 8, "60m": 4, "daily": 1}
+MAX_JQ_MINUTE_REQUEST_BARS = 5000
+
+
+def jq_minute_request_count(window, bars_per_day, *, include_session_prefix=False):
+    days = (window + bars_per_day - 1) // bars_per_day
+    return (days + int(include_session_prefix)) * bars_per_day
+
+
 def factor_plan(name, requirements, dependencies, windows=None):
     entry = requirements.get("factors", requirements).get(name)
     if not isinstance(entry, dict) or not entry.get("requirements"):
@@ -22,9 +31,7 @@ def factor_plan(name, requirements, dependencies, windows=None):
                 req.get(
                     "min_bars",
                     req.get("min_days", 0)
-                    * {"1m": 240, "5m": 48, "15m": 16, "30m": 8, "60m": 4, "daily": 1}[
-                        freq
-                    ],
+                    * JQ_BARS_PER_DAY[freq],
                 )
                 * (1 + req.get("slack_ratio", 0))
             )
@@ -50,7 +57,7 @@ def factor_cross_section(result, asof, output_rule="latest"):
         else timestamp
     )
     if isinstance(result, pd.Series) and not isinstance(result.index, pd.MultiIndex):
-        if isinstance(result.index, pd.DatetimeIndex) or result.index.has_duplicates:
+        if output_rule == "bar" or isinstance(result.index, pd.DatetimeIndex) or result.index.has_duplicates:
             raise ValueError("factor_output_schema_invalid")
         return result
     if isinstance(result, pd.Series):
@@ -60,7 +67,10 @@ def factor_cross_section(result, asof, output_rule="latest"):
             raise ValueError("factor_output_duplicate_key")
         result = result.sort_index(kind="mergesort")
         days = pd.to_datetime(result.index).normalize()
-        eligible = days == cutoff if output_rule == "exact" else days <= cutoff
+        if output_rule == "bar":
+            eligible = result.index == timestamp
+        else:
+            eligible = days == cutoff if output_rule == "exact" else days <= cutoff
         eligible = eligible & (pd.to_datetime(result.index) <= last_allowed)
         selected = result.loc[eligible]
         if selected.empty:
@@ -73,13 +83,13 @@ def factor_cross_section(result, asof, output_rule="latest"):
     )
     if stock is None or "date" not in frame or "value" not in frame:
         raise ValueError("factor_output_schema_invalid")
-    frame = frame[pd.to_datetime(frame["date"]) <= last_allowed].copy()
-    frame["date"] = pd.to_datetime(frame["date"]).dt.normalize()
-    frame = (
-        frame[frame.date == cutoff]
-        if output_rule == "exact"
-        else frame[frame.date <= cutoff]
-    )
+    dates = pd.to_datetime(frame["date"])
+    if output_rule == "bar":
+        frame = frame[dates == timestamp]
+    else:
+        frame = frame[dates <= last_allowed].copy()
+        frame["date"] = pd.to_datetime(frame["date"]).dt.normalize()
+        frame = frame[frame.date == cutoff] if output_rule == "exact" else frame[frame.date <= cutoff]
     if frame.empty:
         raise ValueError("factor_output_date_missing")
     frame = frame[frame.date == frame.date.max()]
@@ -178,10 +188,7 @@ def compute_factor_batch(
         if (pd.to_datetime(data.date) > allowed).any():
             raise ValueError("factor_input_future_data")
         for name, cls, window, required, runtime, pools in plans:
-            bars = {"1m": 240, "5m": 48, "15m": 16, "30m": 8, "60m": 4, "daily": 1}[
-                freq
-            ]
-            count = int(math.ceil(float(window) / bars)) * bars
+            count = jq_minute_request_count(window, JQ_BARS_PER_DAY[freq])
             frame = data.groupby("code", sort=False).tail(count).copy()
             calendar_days = runtime.get("history_calendar_days")
             if calendar_days is not None:

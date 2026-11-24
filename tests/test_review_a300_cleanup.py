@@ -88,11 +88,13 @@ def test_constructor_preserves_primary_and_closes_owned(
 @pytest.mark.parametrize('where', ['interrupt', 'mkdir', 'close_failure'])
 def test_actual_dynamic_pool_reader_closed(tmp_path, monkeypatch, local_env, where):
     from calendar_test_support import seed_calendar
+    from market_db_samples import declare_market_db
     from utils.duckdb_adapter import DuckDBAdapter
     from utils.dynamic_stock_pool import StockFilter
 
     db = tmp_path / 'pool.duckdb'
     with duckdb.connect(str(db)) as con:
+        declare_market_db(con, 'cn_equity')
         seed_calendar(con)
         con.execute("CREATE TABLE factor_data AS SELECT DATE '2024-01-31' AS date, 'A' AS stock_code, 10 AS close")
         con.execute('CREATE TABLE price_data_daily AS SELECT * FROM factor_data')

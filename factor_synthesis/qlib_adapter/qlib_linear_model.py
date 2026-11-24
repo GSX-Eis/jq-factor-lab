@@ -377,7 +377,7 @@ class QlibLinearWrapper:
             split = len(order) // 2
             for block_ids in (order[:split], order[split:]):
                 selected_dates = np.concatenate(
-                    [blocks[int(block_id)].to_numpy() for block_id in block_ids]
+                    [blocks[int(block_id)].to_numpy(dtype=object) for block_id in block_ids]
                 )
                 rows = dates.isin(selected_dates)
                 if not rows.any():
@@ -829,7 +829,7 @@ class QlibLinearWrapper:
         # LassoCV/ElasticNetCV accept cv as list-of-(train, test) index tuples
         # Actual label exits govern isolation equally for every scoring metric.
         cv_purged = PanelPurgedKFold(n_splits=cv_folds)
-        date_groups = X_index.get_level_values(0).values
+        date_groups = X_index.get_level_values(0)
         label_exits = resolve_label_exit_dates(
             X_index, self.config.get("_label_exit_dates"),
             trading_calendar=self.config.get("_label_trading_calendar"),
@@ -1084,7 +1084,7 @@ class QlibLinearWrapper:
             and bool(gamma_grid)
         )
 
-        date_groups = X_index.get_level_values(0).values
+        date_groups = X_index.get_level_values(0)
         instrument_groups = X_index.get_level_values(1).values
 
         # Group alphas by l1_ratio; within each group sort DESCENDING so the
@@ -1449,7 +1449,7 @@ class QlibLinearWrapper:
         cv = PanelPurgedKFold(n_splits=cv_folds)
         
         # Extract date groups from MultiIndex for panel-aware splitting
-        date_groups = X_index.get_level_values(0).values
+        date_groups = X_index.get_level_values(0)
         
         self.logger.info(
             "[PurgedCV] strict actual-label-exit CV: %d folds",

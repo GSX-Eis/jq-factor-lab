@@ -236,7 +236,7 @@ def test_external_transaction_rollback_keeps_tables_consistent(tmp_path: Path) -
     original_results = _analysis_results([0.1, 0.2], ir_value=0.3)
     updated_results = _analysis_results([0.9, 0.8], ir_value=1.3)
 
-    writer.save_factor_values(original_factor_df, factor_name, skip_parquet=True)
+    writer.save_factor_values(original_factor_df, factor_name, allow_legacy_factor_values_write=True, skip_parquet=True)
     writer.write_factor_analysis_results(factor_name, original_results)
     writer.write_monthly_pool_results(factor_name, original_results)
 
@@ -250,7 +250,7 @@ def test_external_transaction_rollback_keeps_tables_consistent(tmp_path: Path) -
         try:
             writer.save_factor_values(
                 updated_factor_df,
-                factor_name,
+                factor_name, allow_legacy_factor_values_write=True,
                 duckdb_conn=failing_conn,
                 allow_fallback=False,
                 skip_parquet=True,
@@ -322,7 +322,7 @@ def test_factor_values_indexes_stay_disabled(tmp_path: Path) -> None:
         duckdb_path=str(tmp_path / "analysis_results.duckdb"),
         parquet_dir=str(tmp_path / "parquet"),
     )
-    writer.save_factor_values(_factor_df([7.0, 8.0]), "factor_delta", skip_parquet=True)
+    writer.save_factor_values(_factor_df([7.0, 8.0]), "factor_delta", allow_legacy_factor_values_write=True, skip_parquet=True)
 
     conn = writer._get_connection(read_only=True)
     try:
@@ -349,7 +349,7 @@ def test_save_factor_values_date_range_replaces_only_range_and_rejects_outliers(
             ["2024-01-01", "2024-01-02", "2024-01-03", "2024-01-04"]
         ),
     )
-    writer.save_factor_values(initial, "factor_range", skip_parquet=True)
+    writer.save_factor_values(initial, "factor_range", allow_legacy_factor_values_write=True, skip_parquet=True)
 
     replacement = pd.DataFrame(
         {"000001.XSHE": [20.0, 30.0]},
@@ -357,7 +357,7 @@ def test_save_factor_values_date_range_replaces_only_range_and_rejects_outliers(
     )
     writer.save_factor_values(
         replacement,
-        "factor_range",
+        "factor_range", allow_legacy_factor_values_write=True,
         skip_parquet=True,
         date_range=("2024-01-02", "2024-01-03"),
     )
@@ -388,7 +388,7 @@ def test_save_factor_values_date_range_replaces_only_range_and_rejects_outliers(
     with pytest.raises(ValueError, match="outside requested date range"):
         writer.save_factor_values(
             out_of_range,
-            "factor_range",
+            "factor_range", allow_legacy_factor_values_write=True,
             skip_parquet=True,
             date_range=("2024-01-02", "2024-01-03"),
         )
@@ -406,7 +406,7 @@ def test_save_factor_values_date_range_replaces_only_range_and_rejects_outliers(
         with pytest.raises(ValueError, match="requires at least one finite factor value"):
             writer.save_factor_values(
                 no_values,
-                "factor_range",
+                "factor_range", allow_legacy_factor_values_write=True,
                 skip_parquet=True,
                 date_range=("2024-01-02", "2024-01-03"),
             )
@@ -425,7 +425,7 @@ def test_save_factor_values_date_range_replaces_only_range_and_rejects_outliers(
             {"000001.XSHE": [60.0]},
             index=pd.to_datetime(["2024-02-01"]),
         ),
-        "factor_range",
+        "factor_range", allow_legacy_factor_values_write=True,
         skip_parquet=True,
     )
     conn = writer._get_connection(read_only=True)
@@ -471,7 +471,7 @@ def test_date_range_mode_rejects_removed_sqlite_backend_and_corruption_repair(
     with pytest.raises(RuntimeError, match="Corrupt database file"):
         duckdb_writer.save_factor_values(
             _factor_df([1.0, 2.0]),
-            "factor_range",
+            "factor_range", allow_legacy_factor_values_write=True,
             skip_parquet=True,
             date_range=date_range,
         )
@@ -525,3 +525,46 @@ def test_symbolic_read_propagates_non_lock_error(monkeypatch):
     monkeypatch.setattr(duckdb_results_writer.time, "sleep", unexpected_sleep)
     with pytest.raises(ValueError, match="Input version missing or ambiguous"):
         loader._connect_data_read_only("synthetic.duckdb")
+
+
+@pytest.mark.parametrize("writer_class", [DuckDBResultsWriter, ResultWriter])
+def test_legacy_factor_values_write_requires_explicit_opt_in(tmp_path, writer_class):
+    import duckdb
+
+    path = tmp_path / "results.duckdb"
+    writer = writer_class(duckdb_path=str(path))
+    frame = _factor_df([1.0, 2.0])
+    with pytest.raises(RuntimeError, match="MarketFactorValueStore.*write-factor-values"):
+        writer.save_factor_values(frame, "example")
+    assert writer.save_factor_values(frame, "example", allow_legacy_factor_values_write=True) == 4
+    with pytest.raises(RuntimeError, match="MarketFactorValueStore"):
+        writer.save_factor_values(frame * 10, "example")
+    with duckdb.connect(str(path), read_only=True) as connection:
+        assert connection.execute("SELECT sum(factor_value) FROM factor_values").fetchone() == (33.0,)
+
+
+def test_acquire_exclusive_write_conn_rechecks_sqlite_header_under_lock(tmp_path: Path, monkeypatch) -> None:
+    import fcntl
+    from utils import duckdb_results_writer as writer_mod
+
+    db_path = tmp_path / "target.duckdb"
+    real_flock = fcntl.flock
+    injected = False
+
+    def inject_sqlite_before_lock(fd, operation):
+        nonlocal injected
+        if not injected and (operation & fcntl.LOCK_EX):
+            injected = True
+            db_path.write_bytes(b"SQLite format 3\x00" + b"\x00" * 64)
+        return real_flock(fd, operation)
+
+    monkeypatch.setattr(writer_mod.fcntl, "flock", inject_sqlite_before_lock)
+    with pytest.raises(ValueError, match="SQLite database files are unsupported"):
+        with acquire_exclusive_write_conn(db_path, retry_interval_sec=0.05):
+            pass
+
+    assert db_path.read_bytes()[:16] == b"SQLite format 3\x00"
+    lock_path = Path(f"{db_path.resolve()}.write.lock")
+    with lock_path.open("a+", encoding="utf-8") as lock_file:
+        real_flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        real_flock(lock_file.fileno(), fcntl.LOCK_UN)

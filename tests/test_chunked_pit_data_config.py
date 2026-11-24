@@ -2,6 +2,7 @@
 import json
 from calendar_test_support import seed_calendar
 import duckdb
+from market_db_samples import declare_market_db
 import pandas as pd
 import pytest
 from utils.factor_base import FactorBase
@@ -29,6 +30,7 @@ def configured_prices(tmp_path, monkeypatch):
     ], columns=['trade date', 'security', 'close', 'factor'])
     db = tmp_path / 'prices.duckdb'
     with duckdb.connect(str(db)) as conn:
+        declare_market_db(conn, 'cn_equity')
         seed_calendar(conn)
         conn.execute('CREATE TABLE custom_prices AS SELECT * FROM frame')
         conn.execute('CREATE TABLE price_data_5m AS SELECT "trade date" AS date, security AS stock_code, close, 10.0::DOUBLE AS factor FROM frame')

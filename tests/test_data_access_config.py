@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 
 import duckdb
+from market_db_samples import declare_market_db
 import pandas as pd
 import pytest
 
@@ -244,6 +245,7 @@ def test_factor_base_uses_same_custom_table_and_keys(tmp_path, mode):
     config = save_config(tmp_path)
     db = tmp_path / 'input.duckdb'
     with duckdb.connect(str(db)) as conn:
+        declare_market_db(conn, 'cn_equity')
         conn.execute("CREATE TABLE custom_prices AS SELECT TIMESTAMP '2026-01-05 15:00:00' AS trade_date, 'A' AS symbol, 7 AS value")
     conn = duckdb.connect(str(db)) if mode == 'borrowed' else None
     factor = FactorBase(conn, 'Configured', '2026-01-05', '2026-01-05', stock_pool=['A'],

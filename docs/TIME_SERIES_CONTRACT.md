@@ -70,9 +70,9 @@
 - **`--results-db` 参数与优先级**：
   - `time-series-analysis` 与分流至 Bar 路径的 `single-factor-analysis` 均支持可选 `--results-db <path>`，也可在配置 JSON（顶层或 `time_series_analysis` 块）中写 `results_db`。
   - 两者同时存在时，**命令行 `--results-db` 优先**（按调用方工作目录解析），配置 `results_db` 按仓库根目录解析。`results_db` 在传给子进程 `tools/agent_harness/time_series_analysis.py` 前从 `resolved.json` 剥离，不进入 `config_hash` 计算；未传 `--results-db` 且配置未声明 `results_db` 时，照常发布 `bar_evaluation.v2` 产物，不创建 DuckDB 文件。
-  - 若 `single-factor-analysis` 未分流到 Bar 路径（即保留日频 `run_analysis_main.py`）却显式传入 `--results-db`，直接以退出码 `2` 拒绝。
+  - 日频 `single-factor-analysis` 保留历史因子计算、股票池和 `execution_result.v1`。显式传入 `--results-db` 时，将同一次运行的因子与价格快照交给默认 A 股 Slot，按因子和股票池发布并写入五表。各次写入结果见 `metrics.results_db.runs`，单组同时提供 `identity_hash` 和 `status`。
   - 子进程评估成功后由父进程入库：成功时 Harness `metrics["results_db"]` 记录 `path`、`identity_hash` 与 `status`（`inserted` 或 `noop`）。
-  - **输出路径隔离**：在任何完成标记清理、子进程发布、Harness/JSON 镜像写入之前，拒绝结果库与四份评估产物、Harness attempt/run summary、`config/resolved.json`、`output_bindings.json`、`--json-out` 重合（包括符号链接、硬链接和文件/目录祖先冲突）。命令行及配置指定的库均受保护；dry-run、fake-result、只读查询以及日频拒绝路径也不能通过镜像覆盖库。路径冲突返回退出码 `2`，仅向 stdout 返回失败 JSON，**不写错误镜像、Harness 文件，也不删除完成标记**。
+  - **输出路径隔离**：在任何完成标记清理、子进程发布、Harness/JSON 镜像写入之前，拒绝结果库与四份评估产物、Harness attempt/run summary、`config/resolved.json`、`output_bindings.json`、`--json-out` 重合（包括符号链接、硬链接和文件/目录祖先冲突）。命令行及配置指定的库均受保护；dry-run、fake-result、只读查询以及日频兼容路径也不能通过镜像覆盖库。路径冲突返回退出码 `2`，仅向 stdout 返回失败 JSON，**不写错误镜像、Harness 文件，也不删除完成标记**。
   - 写库失败时按现有规则撤销 `evaluation/summary.json`，并按 `EVAL_POLICY.md` 返回区分写库原因的失败结果：
     - 退出码 `2`（`bar_evaluation_store_precondition_failed`）：路径非法、旧库 schema、非 DuckDB 文件或发布产物/SHA256 校验失败；
     - 退出码 `4`（`bar_evaluation_store_conflict`）：同 `identity_hash` 内容冲突（`BarEvaluationConflictError`）；
@@ -254,14 +254,46 @@ python3 -m tools.agent_harness.cli build-roll-schedule --db work/NERE-743/input.
 | decision_session_id | VARCHAR，最后决定交易日，数据库约束必须早于生效日 |
 | from_contract / to_contract | VARCHAR，前一状态/当前合约；初始 from 为 NULL |
 | rule / rule_params | VARCHAR / JSON，规则、N、向远月开关、平局规则及逐合约源表 |
-| from_open_interest / to_open_interest | DOUBLE，决定时两个合约持仓量；初始 from 为 NULL |
-| source_hash | VARCHAR，决定窗口持仓量、源版本、日历、月份、参数和先前合约的 SHA256 |
+| from_open_interest / to_open_interest | DOUBLE，`max_oi` 决定时两个合约的持仓量，初始 from 为 NULL。其他规则保留 NULL |
+| source_hash | VARCHAR，决定输入、策略参数和换月状态的 SHA256 |
 | version / build_id | BIGINT / VARCHAR，该品种 × Session 的版本和构建身份 |
 | code_version / code_version_source | VARCHAR，复用 `utils.code_version.resolve_code_version` |
 
 相同输入不重写，输入变化后版本加一并产生新 build_id。重建较早区间时也重算已保存的
 后续决定，避免旧状态残留；源输入或前一合约未变的后续行保留版本与身份。
 补充新的未到期合约后须重建所需区间，不能沿用新 Session 缺失的持仓量。
+
+`--rule max_volume` 比较所有候选合约在整个 ETH Session 的成交量。优先采用完整日线，
+否则汇总覆盖同一 Session 所有应有槽位的完整日内 Bar。普通换月沿用确认窗口、
+方向约束和排序规则。候选合约必须在生效日尚未到期，现合约到期时采用最近已收盘
+Session 的有效候选中成交量最高者。
+
+`--rule days_before_expiry` 默认于前月到期前 5 个交易 Session 的开盘切换到下一
+未到期合约，距离从到期日或此前最后一个交易日倒数。Python 调用可传
+`DaysBeforeExpiry(days=N)`，也可向 `build_roll_schedule(..., rule=...)` 提供自定义
+`RollPolicy`。插槽按解析后的策略校验已存的提前交易日参数，策略字符串对应默认值 5。
+策略只能通过决定窗口内的已收盘 Session 观察价格、成交量和持仓量。
+每个品种只保存一条策略链。更换策略名称须从已保存的首个生效 Session 重建。
+
+### 国内和全球期货插槽
+
+`slots.cn_futures.build_cn_futures_slot` 与 `slots.global_futures.build_global_futures_slot`
+各绑定一个品种根、明确的 Session 日期覆盖和已有的换月计划。两者接受
+`view='ETH'` 或 `'RTH'`，并读取登记过的日频和日内 Bar。RTH 只投影开合边界与
+实体 Bar 一致的 RTH 桶。对同一品种的多个实体合约可在一次请求内读取。
+
+日历网格、信号与执行共用公开时间键。日内键为桶开始时间，日线键为 Session 收盘时间。
+日线存储仍使用 Session 开盘时间，`available_at_utc` 独立记录桶结束时间。
+信号只采用截至 `as_of_utc` 已收盘的 Bar 和已生效的换月。调整模式为 `none`、
+`ratio_back`、`panama_canal`。输出区间结束后、锚点前生效的换月也会回溯调整该区间，
+调整采用决定日的实体合约收盘价。执行读取始终返回未复权实体价格，并标记
+`concrete_instrument_id`。持仓跨换月时可直接传入该实体 ID。
+
+辅助特征的 `open_interest` 采用最近一个已收盘 Session 的持仓量，允许为覆盖首日回看
+区间之前的 Session。
+`days_to_expiry` 按 Session 日期计算自然日距离。可交易掩码默认屏蔽到期日及之后的
+Session，`exclude_delivery_month=True` 可屏蔽 `contract_month` 指定的整个交割月。
+缺少精确到期日的历史合约按到期月最后一日处理。
 
 ### 连续视图、调整与标签
 
@@ -432,7 +464,8 @@ contract_expiry, price_adjustment, point_value, rth_reference_calendar`。
 另有可空列 `calendar_id, product_root, contract_month`（月份为 `YYYY-MM`）。
 导入器在显式连接的事务中用幂等 `ALTER TABLE ADD COLUMN IF NOT EXISTS` 补列；
 旧行保持 null，reader 也兼容尚未迁移的旧表。国内期货按显式 `calendar_id` 或
-`config/futures_calendar_map.json` 的品种根解析，未知品种/日历报错，不能回退交易所日盘。
+`config/futures_calendar_map.json` 的品种根解析。海外期货品种根须同时声明
+`calendar_id` 与 `rth_reference_calendar`。
 股票 `point_value` 缺列时默认为 1；期货须声明到期月份/日期、正乘数，复权只能为
 `none`，Bar 的 `factor` 仅可为 null 或 1。原始导入不接收连续/主力代码；
 连续派生读取见阶段 6.4a。
@@ -456,8 +489,9 @@ source=..., data_version=..., instrument_id=...)` 接受 DataFrame 或 CSV。以
 `MarketBarReader(duckdb_path=...)` 只读打开文件并支持 context manager。
 `read_bars(instrument_ids, frequency, start_utc=None, end_utc=None, view='ETH',
 calendar=None)` 的时间上下界均包含端点，按 UTC Bar 开始时间筛选。
-默认从品种元数据推导日历（CME → CME Globex Equity，XSHE → XSHG，其他 exchange
-使用同名 PMC 日历），参考市场来自 `rth_reference_calendar`；其他产品可显式传日历。
+默认从品种元数据推导日历，参考市场来自 `rth_reference_calendar`。未声明品种根的
+旧 CME 合约继续使用 CME Globex Equity，XSHE 使用 XSHG，其他非期货交易所使用同名
+PMC 日历。调用方也可传入日历。
 推导范围按原始数据的当地日期前补 1 天、后补 7 天，覆盖夜盘归属与标签边界。
 `get_calendars(bars)` 从 raw coverage 复建相同的日历；`get_instrument_metadata(ids)`
 提供原始元数据查询。
@@ -772,6 +806,78 @@ JSON 用 null、CSV 用空字段、Markdown 用破折号表示不可计算的数
 全样本 v1 报告使用描述性分桶。训练/OOS 验收见[统一评测引擎第 16 节](EVALUATION_ENGINE.md#16-s7-时序诊断与-nq-1min-验收)。
 S7 的 NQ 1min 报告标记 `real_market_data_used=false`。真实 NQ 1min 在外置盘挂载后补跑。
 
+### MarketSlot 与因子值仓库
+
+`time-series-analysis` 和 `single-factor-analysis` 可以用同一份 JSON 按 Slot 配置评测。
+`slot` 或 `slot_config` 接受内联 SlotConfig 对象或 YAML/JSON 路径，
+`--slot` 接受配置路径。使用 `slot_id` 或 `--slot-id` 可以核验实例 ID。
+仅指定 `jq_ashare_local` ID 时采用该原生 Slot 的默认配置。
+原生 Slot 通过 `slot_db` 打开只读行情快照。声明式 Slot 的相对源路径基于 SlotConfig 文件
+所在目录，内联配置可用 `slot_base_dir` 指定基准目录。
+
+同时设置 `factor_store_root`、`factor_id`、`frequency`、`start_date`、
+`end_date` 和 `analysis_mode`。日期是含首尾的 Session 标签，`frequency` 缺省为
+`1d`，可评测周期取决于 Slot 提供的数据。`instruments` 可收窄到指定标的。
+存在同一 Slot、周期及因子 ID 的多个已登记身份时，需提供 `factor_identity_hash`。
+因子值的配置哈希、日历和 UTC 键须与 Slot 一致。配置可通过
+`entry_offset_bars`、`execution_profile` 和 `apply_tradability_mask`
+指定执行偏移、覆盖配置及是否启用可交易性屏蔽。评测价格受请求日期边界约束。
+Slot 模式支持 `--results-db` 持久化，`read-bar-evaluations --slot-id <id>` 按已发布的 Slot 过滤。
+`jq_ashare_local` 的日频评测沿用价格表的历史静态复权价，保留成交端点，PIT 信号视图的 `factor` 独立处理。
+缺省 `entry_offset_bars` 为 1，可以显式设置为 0。日频截面摘要在
+`splits.<split>.turnover.1d` 提供交易日收盘 UTC、分位编号及逐日分位换手率。
+
+### 市场库日历和数据可用性
+
+市场库的 `market_db_profile` 声明 `calendar_coverage` 和 `market_rules`。
+`calendar_coverage` 是包含首尾的本地交易日期范围。导入验证 Bar 所属交易时段，
+Slot 声明的日期范围须落在库覆盖内。UTC Bar 键仍由对应 Session 网格定义。
+绑定 Slot 时，`st_filter`、`price_limit` 和 `t_plus` 必须与 provider 的
+内置成交规则一致。任一字段不匹配会报 `MARKET_DB_PROFILE_INVALID`，错误包含字段、
+声明值与实现值。通过 sidecar 接管的旧库执行相同检查。研究产物用 `db_id`
+和 `profile_hash` 绑定该配置版本。
+
+| Slot provider | `st_filter` | `price_limit` | `t_plus` |
+| --- | --- | --- | --- |
+| `jq_ashare_local` | `true` | `true` | `1` |
+| `cn_futures`、`global_futures` | `false` | `false` | `0` |
+| 声明式 provider，如 `duckdb_table` | 辅助源映射后提供 `is_st` 时为 `true`，其余为 `false` | `false` | `0` |
+
+这三个字段描述现有执行能力。A 股成交掩码仍通过 `exclude_st` 参数选择历史 ST 标记，
+按买卖方向比较行情涨跌停价，并在提供 `entry_session_id` 时按入场与当前 Session
+执行 T+1。期货掩码核对交易时段与活跃合约、到期日和交割月。声明式 Slot 按交易时段
+及可选的自定义 `tradable` 掩码核对。对已绑定市场库的声明式 Slot，绑定时读取
+`aux_features` 的列结构并应用 `column_mapping`，以有效的 `is_st` 列核对 ST
+能力。VectorBT 默认买单筛选使用交易时点前可用的 ST 标记，调用方可显式传入
+`require_non_st=False`。
+
+`bars_per_session` 是目前唯一由 `market_rules` 直接驱动执行层的字段。VectorBT
+按匹配的日内频率读取它计算年化，缺省时从日历网格估算。日频和周频分别使用年交易日数
+和每年 52 周。
+
+`CrossMarketAttachSpec.db_ids` 预留多库读取接口。未来实现应逐库验证 profile，
+使用只读 DuckDB `ATTACH`，在各自日历上生成 UTC 的 `available_at_utc`。对每个
+决策时间，as-of 对齐仅匹配可用时间小于等于该时刻的最新观测。当前截面预处理
+拒绝混用不同物理库或市场域。 [市场库操作指南](MARKET_DATABASE_GUIDE.md)
+
+### 从方案 B 到部署输出
+
+因子值的 `timestamp_utc` 和 `session_id` 由 Slot 的 `BarSchedule`
+共同确定。日频键为 Session 收盘，日内键为 Bar 开盘。日内信号最早在
+Bar 可用时刻进入决策，成交端点按 Slot 执行视图和 `ExecutionProfile` 解析。
+原生期货的合约绑定以有效 Session 的换月决定为准。
+
+合成按 Slot、周期和 `factor_identity_hash` 读取方案 B v2 因子值。
+`StrategyBundle` 绑定 Slot 配置、日历、数据指纹、执行参数、因子身份、
+模型、回测收益及执行结果。导出前由 `verify_strategy_bundle` 校验
+所有引用和 SHA-256，再由目标检查兼容性。
+
+`signal_export` 输入调仓决策的 UTC 时间戳、对应 `session_id`、
+`instrument_id` 和 `target_weight`。多空权限来自 bundle，订单差额
+按显式当前持仓或目标定义的回放状态计算。`jq_cloud` 按冻结的聚宽
+适配器和候选运行时重放因子值及目标仓位。两类输出都在
+`deploy_manifest.json` 绑定 bundle 哈希和每个产物的 SHA-256。
+
 ### 统一引擎参数
 
 [`evaluate_bars()`](../backtest_and_analysis/time_series/evaluator.py) 接收原始 Bar、
@@ -819,11 +925,17 @@ S7 的 NQ 1min 报告标记 `real_market_data_used=false`。真实 NQ 1min 在�
 `result_schema_version="bar_evaluation.v2"` 写入评估 `summary.json` 和 `result_identity`。
 Harness 复制摘要字段至 `metrics`（配置见冻结的 `config/resolved.json`）。
 
-- 顶层含 `analysis_mode`、`frequency="bar"`、`return_unit="percent"`、
+- 顶层含 `analysis_mode`、`frequency`、`return_unit`、
   `config`、`data_identity`、`calendar_identity`、`result_identity`、
   `ic_by_horizon`、`quantile_stats`、`cross_sections`、`exclusion_summary`。
   `interval_usability` 是按频率、持有期和标的标注的标准 IC 表可用性。请求诊断时
   摘要还包含 `diagnostics_report`。
+- CSV 评测发布 `frequency="bar"` 与 `return_unit="percent"`。Slot 评测发布实际周期及
+  执行档案的收益单位，`data_identity` 记录 `slot_id`、`slot_config_hash`、
+  `slot_data_fingerprint`、`sources`、`data_versions` 及行情覆盖范围。
+  Slot 的标签 CSV 包含原始成交端点和 `entry_return_price`、`exit_return_price`。
+  `return_pct` 和收益统计列依照 `return_unit` 解释。入库按收益端点校验收益率，
+  原始成交价格继续记录在 `entry_price`、`exit_price`。
 - `evaluate_bars()` 在 `calendar_identity` 中记录分桶策略，以及单个或逐标的日历的
   覆盖日期和 RTH 参考日历。即使 Python 发布时省略 `config`，入库仍可在日历哈希
   匹配后从标签重建应有网格，复算与缺口有关的 HAC 统计和校准观测。

@@ -12,6 +12,7 @@ from typing import List, Optional, Dict, Any
 from datetime import datetime
 import os
 from pathlib import Path
+from collections.abc import Mapping
 
 # Import the base FactorBase class
 import sys
@@ -20,7 +21,9 @@ from utils.factor_base import FactorBase
 from utils.duckdb_results_writer import CommittedParquetExportError
 
 # Import synthesis components
-from .factor_reader import FactorReader
+from .factor_reader import DEFAULT_SLOT_ID, FactorReader, resolve_market_input
+from utils.market_factor import MarketFactorValueStore
+from utils.slots import MarketSlot
 from .factor_composer import FactorComposer, SynthesisConfig
 
 
@@ -51,6 +54,12 @@ class CompositeFactorBase(FactorBase):
         auto_synthesize: bool = True,
         data_bindings: Optional[dict] = None,
         publication_metadata: Optional[dict] = None,
+        *,
+        factor_values_store: MarketFactorValueStore | str | Path | None = None,
+        slot: MarketSlot | None = None,
+        slot_id: str | None = None,
+        frequency: str = "1d",
+        factor_identities: Mapping[str, str] | None = None,
     ):
         """
         Initialize the CompositeFactorBase.
@@ -72,6 +81,10 @@ class CompositeFactorBase(FactorBase):
             results_database_path: Path to results database (for factor values table)
             auto_synthesize: Whether to automatically synthesize on initialization
         """
+        requested_slot_id, frequency = resolve_market_input(slot, slot_id, frequency)
+        self.synthesis_frequency = frequency
+        if slot is None and (requested_slot_id != DEFAULT_SLOT_ID or frequency != "1d"):
+            raise ValueError("Supply a MarketSlot for non-default composite synthesis")
         # Initialize the parent FactorBase
         super().__init__(
             db_connection=db_connection,
@@ -86,6 +99,10 @@ class CompositeFactorBase(FactorBase):
             sort_by=sort_by,
             ascending=ascending,
             data_bindings=data_bindings,
+            slot=slot,
+            data_frequency="daily" if frequency == "1d" else frequency,
+            output_frequency=frequency,
+            analysis_mode="cross_sectional" if frequency != "1d" else None,
         )
         
         # Store synthesis-specific parameters
@@ -94,20 +111,25 @@ class CompositeFactorBase(FactorBase):
         self.results_database_path = results_database_path
         self.auto_synthesize = auto_synthesize
 
-        factor_store = results_database_path or "analysis_results.duckdb"
-        # FactorReader is deliberately read-only at construction.  This
-        # composite is an explicit output-producing API, so initialize its
-        # fresh DuckDB store before attaching the reader.
-        if not data_bindings and not Path(factor_store).exists():
-            from utils.duckdb_results_writer import DuckDBResultsWriter
-            DuckDBResultsWriter(factor_store)
-        
+        from backtest_and_analysis.config import CONFIG
+        from utils.data_store import binding_contract
+
+        factor_store = results_database_path or CONFIG["results_duckdb_path"]
+        bindings = binding_contract(data_bindings)
+        if factor_values_store is None and not bindings:
+            factor_values_store = MarketFactorValueStore.beside_results_database(factor_store).root
+
         # Initialize synthesis components
         self.factor_reader = FactorReader(
             database_path=factor_store,
             logger=self.logger,
-            data_bindings=data_bindings,
+            data_bindings=bindings,
             publication_metadata=publication_metadata,
+            factor_values_store=factor_values_store,
+            factor_identities=factor_identities,
+            slot=slot or self.slot,
+            slot_id=requested_slot_id,
+            frequency=frequency,
         )
         
         self.factor_composer = FactorComposer(
@@ -167,7 +189,8 @@ class CompositeFactorBase(FactorBase):
                 success = self.factor_reader.save_composite_factor(
                     composite_factor_df=synthesized_df,
                     factor_name=self.factor_name,
-                    overwrite=True
+                    overwrite=True,
+                    factor=self,
                 )
             except CommittedParquetExportError:
                 # The database commit succeeded even though its export failed.
@@ -201,9 +224,24 @@ class CompositeFactorBase(FactorBase):
         self._target_available_at = pd.DataFrame()
         self._trading_calendar = pd.DatetimeIndex([])
         try:
-            # Get price data for the extended period to calculate future returns
-            price_df = self.get_price_data(price_type='close')
-            
+            frequency = getattr(self, "synthesis_frequency", "1d")
+            if getattr(self, "_ashare_panel", True) and frequency == "1d":
+                price_df = self.get_price_data(price_type="close")
+            else:
+                from .core.factor_data_loader import get_complete_price_data
+                from .core.pool_manager import market_bar_grid
+
+                slot = self.factor_reader.slot
+                price_df = get_complete_price_data(
+                    None, "", self.all_stocks, self.start_date, self.end_date, slot=slot,
+                    frequency=frequency, pit_enabled=False,
+                )
+                if price_df is None:
+                    return pd.DataFrame()
+                grid = market_bar_grid(slot, frequency, self.start_date, self.end_date)
+                keys = pd.to_datetime(grid.session_id) if frequency == "1d" else grid.timestamp_utc
+                price_df = price_df.reindex(pd.DatetimeIndex(keys, name="date"))
+
             if price_df.empty:
                 return pd.DataFrame()
             
@@ -214,8 +252,16 @@ class CompositeFactorBase(FactorBase):
             # The same positional observation used by the label supplies its
             # availability time; never estimate it with natural-day offsets.
             self._trading_calendar = pd.DatetimeIndex(price_df.index).sort_values().unique()
-            observed_at = pd.DataFrame({stock: price_df.index for stock in price_df.columns},
-                                       index=price_df.index).where(price_df.notna())
+            available_at = price_df.index
+            if available_at.tz is not None:
+                from .core.pool_manager import synthesis_bar_schedule
+
+                schedule = synthesis_bar_schedule(self.factor_reader.slot, frequency)
+                available_at = [schedule.available_at(timestamp) for timestamp in available_at]
+            observed_at = pd.DataFrame(
+                {stock: available_at for stock in price_df.columns},
+                index=price_df.index, columns=price_df.columns,
+            ).where(price_df.notna())
             self._target_available_at = observed_at.shift(-prediction_days).where(future_returns.notna())
 
             # Remove the last few rows that don't have future data
@@ -230,6 +276,14 @@ class CompositeFactorBase(FactorBase):
             self.logger.error(f"Failed to get target returns: {e}")
             return pd.DataFrame()
     
+    def get_factor_values(self, force_recalculate: bool = False) -> pd.DataFrame:
+        if self._ashare_panel and self.synthesis_frequency == "1d":
+            return super().get_factor_values(force_recalculate)
+        # The composer has already fitted and scored the Slot panel on its own clock.
+        if (force_recalculate or not self._synthesis_completed) and not self._perform_synthesis():
+            return pd.DataFrame()
+        return self._synthesized_factor_df.copy()
+
     def _get_raw_data_for_factor(self) -> pd.DataFrame:
         """
         Implementation of FactorBase abstract method.
@@ -325,6 +379,9 @@ class CompositeFactorBase(FactorBase):
                 "update_frequency": self.synthesis_config.update_frequency
             },
             "input_factors": self.input_factor_names,
+            "market_factor_inputs": self.factor_composer.synthesis_results.get(
+                self.factor_name, {}
+            ).get("market_factor_inputs", []),
             "composite_factor_name": self.factor_name,
             "training_history": self.factor_composer.synthesis_results.get(
                 self.factor_name, {}

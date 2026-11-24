@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 import os
 import shutil
 import uuid
@@ -10,15 +11,18 @@ from contextlib import AbstractContextManager
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
+from pandas.api.types import is_bool_dtype, is_complex_dtype, is_numeric_dtype
 
+from backtest_and_analysis.time_series.contracts import DuplicateKeyError
 from utils._storage_compat import _legacy_binding
-from utils.session_calendar import SessionCalendar
+from utils.slots import CalendarSlot
+from utils.time_axis import Frequency
 
 from .identity import (
-    _validate_and_prepare_batch,
     _validate_identity_record,
 )
 from .ledger import (
@@ -28,14 +32,145 @@ from .schema import (
     DEFAULT_ROW_GROUP_SIZE,
     LEAF_ARROW_SCHEMA,
     LEAF_COLUMNS,
+    TABLE_COLUMNS,
+    VALID_VIEWS,
     _EPOCH_NS_COLUMNS,
+    _shard_ownership_fields,
+    _shard_ownership_mismatches,
+    _validate_session_date_str,
     FactorValueConflictError,
     FactorWriteReceipt,
     canonical_float_bits,
+    validate_factor_id,
+    validate_sha256_hex,
 )
 
 
 _LEGACY_MODULE = "utils.market_factor_store"
+
+
+def _validate_utc_series(series: pd.Series, name: str) -> pd.Series:
+    if not isinstance(series.dtype, pd.DatetimeTZDtype):
+        raise ValueError(f"{name} must be timezone-aware UTC datetime64, got {series.dtype}")
+    tz_str = str(series.dt.tz)
+    if tz_str not in ("UTC", "Etc/UTC"):
+        raise ValueError(f"{name} must have UTC timezone, got {tz_str!r}")
+    if series.isna().any():
+        raise ValueError(f"{name} must not contain NaT")
+    return pd.to_datetime(series, utc=True)
+
+
+def _validate_text_series(series: pd.Series, name: str) -> None:
+    if series.isna().any():
+        raise ValueError(f"{name} must not contain null/NA values")
+    for val in series.unique():
+        if not isinstance(val, str) or not val.strip():
+            raise ValueError(f"{name} must contain non-empty strings, got {val!r}")
+
+
+def _validate_calendars_for_batch(
+    df: pd.DataFrame,
+    session_view: str,
+    calendar: CalendarSlot | Mapping[str, CalendarSlot],
+    frequency: Frequency | None = None,
+) -> None:
+    """Verify intraday ownership and exact daily/weekly anchors."""
+    keys = ["timestamp_utc", "session_id", "calendar_hash"]
+    if isinstance(calendar, CalendarSlot):
+        groups = (("all instruments", df),)
+    elif isinstance(calendar, Mapping):
+        groups = df.groupby("instrument_id", sort=False)
+    else:
+        raise TypeError("calendar must be a CalendarSlot or instrument_id -> CalendarSlot mapping")
+    for inst, group in groups:
+        cal = calendar.get(inst) if isinstance(calendar, Mapping) else calendar
+        if not isinstance(cal, CalendarSlot):
+            raise ValueError(f"Missing CalendarSlot for instrument_id={inst!r}")
+        for ts, sid, calendar_hash in group[keys].drop_duplicates().itertuples(index=False):
+            owner = cal.session_at(ts, session_view, frequency=frequency)
+            if owner is None or owner.session_date != sid:
+                raise ValueError(
+                    f"session_id mismatch for {inst!r} at {ts} ({session_view}): "
+                    f"calendar says {None if owner is None else owner.session_date!r}, got {sid!r}"
+                )
+            if calendar_hash != cal.calendar_hash:
+                raise ValueError(f"calendar_hash does not match the supplied calendar for {inst!r}")
+
+
+def _validate_and_prepare_batch(
+    df: pd.DataFrame,
+    *,
+    calendar: CalendarSlot | Mapping[str, CalendarSlot] | None = None,
+) -> pd.DataFrame:
+    if not isinstance(df, pd.DataFrame):
+        raise TypeError("batch input must be a pandas DataFrame")
+    if not df.columns.is_unique:
+        raise ValueError("batch columns must be unique")
+    missing = set(TABLE_COLUMNS) - set(df.columns)
+    if missing:
+        raise ValueError(f"Missing required columns: {sorted(missing)}")
+
+    clean = df.loc[:, list(TABLE_COLUMNS)].copy()
+    clean["timestamp_utc"] = _validate_utc_series(clean["timestamp_utc"], "timestamp_utc").dt.as_unit("ns")
+    clean["created_at"] = _validate_utc_series(clean["created_at"], "created_at").dt.as_unit("ns")
+
+    val_series = clean["factor_value"]
+    if is_bool_dtype(val_series.dtype) or is_complex_dtype(val_series.dtype):
+        raise ValueError("factor_value must be real numbers (NaN allowed), not bool or complex")
+    if not is_numeric_dtype(val_series.dtype):
+        # Allow object columns containing floats/ints/None/NaN, reject bools/strings.
+        bits_check = canonical_float_bits(val_series.to_numpy(copy=False))
+        del bits_check
+        clean["factor_value"] = pd.to_numeric(val_series, errors="raise").astype(np.float64)
+    else:
+        clean["factor_value"] = val_series.to_numpy(dtype=np.float64, copy=True)
+
+    vals = clean["factor_value"].to_numpy(dtype=np.float64, copy=False)
+    if np.isinf(vals).any():
+        raise ValueError("factor_value must not contain +-inf (NaN is allowed)")
+    clean["factor_value"] = canonical_float_bits(vals).view(np.float64)
+
+    if clean.empty:
+        return clean
+
+    if calendar is None:
+        raise ValueError("calendar (CalendarSlot or instrument->CalendarSlot mapping) is required on every write")
+
+    for col in ("factor_id", "factor_identity_hash", "frequency", "session_view"):
+        _validate_text_series(clean[col], col)
+        if clean[col].nunique(dropna=False) != 1:
+            raise ValueError(f"Single batch must share exactly one {col}, got {clean[col].unique().tolist()}")
+
+    fid = validate_factor_id(str(clean["factor_id"].iloc[0]))
+    fhash = validate_sha256_hex(str(clean["factor_identity_hash"].iloc[0]), "factor_identity_hash")
+    freq_raw = str(clean["frequency"].iloc[0])
+    parsed_freq = Frequency.parse(freq_raw)
+    if not parsed_freq.is_valid:
+        raise ValueError(f"Invalid frequency: {freq_raw!r}")
+    clean["frequency"] = parsed_freq.canonical
+    clean["factor_id"] = fid
+    clean["factor_identity_hash"] = fhash
+
+    view = str(clean["session_view"].iloc[0])
+    if view not in VALID_VIEWS:
+        raise ValueError(f"Invalid session_view: {view!r}; expected one of {VALID_VIEWS}")
+
+    for col in ("instrument_id", "session_id", "source_build_id", "calendar_hash", "code_version", "batch_id"):
+        _validate_text_series(clean[col], col)
+
+    for cal_hex in clean["calendar_hash"].unique():
+        validate_sha256_hex(cal_hex, "calendar_hash")
+    for sid in clean["session_id"].unique():
+        _validate_session_date_str(sid, "session_id")
+
+    dup_mask = clean.duplicated(subset=["factor_identity_hash", "instrument_id", "timestamp_utc"], keep=False)
+    if dup_mask.any():
+        examples = clean.loc[dup_mask, ["instrument_id", "timestamp_utc"]].drop_duplicates().head(5).to_dict("records")
+        raise DuplicateKeyError(f"Duplicate primary keys in batch: {examples}")
+
+    _validate_calendars_for_batch(clean, view, calendar, parsed_freq)
+
+    return clean
 
 
 def append_factor_values(
@@ -48,7 +183,7 @@ def append_factor_values(
     write_lock: Callable[[], AbstractContextManager[None]],
     load_committed_state: Callable[[], tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]],
     identity_record: Mapping[str, Any] | None = None,
-    calendar: SessionCalendar | Mapping[str, SessionCalendar] | None = None,
+    calendar: CalendarSlot | Mapping[str, CalendarSlot] | None = None,
     strict_source_build_id: bool = False,
 ) -> FactorWriteReceipt:
     """Validate and idempotently append a single-identity batch; never updates or deletes."""
@@ -56,7 +191,7 @@ def append_factor_values(
     if clean.empty:
         if identity_record is None:
             raise ValueError("Empty batch requires identity_record or at least one row")
-        validated_rec = _validate_identity_record(identity_record)
+        validated_rec = _validate_identity_record(identity_record, for_write=True)
         now_iso = dt.datetime.now(dt.timezone.utc).isoformat()
         return FactorWriteReceipt(
             batch_id=uuid.uuid4().hex,
@@ -86,6 +221,7 @@ def append_factor_values(
             expected_factor_id=fid,
             expected_frequency=freq,
             expected_session_view=view,
+            for_write=True,
         )
 
     inc_ts_ns_series = pd.to_datetime(clean["timestamp_utc"], utc=True).dt.as_unit("ns").astype("int64")
@@ -95,23 +231,28 @@ def append_factor_values(
     with write_lock():
         identities, committed_batches = load_committed_state()
         existing_id_rec = identities.get(fhash)
-        if existing_id_rec is not None:
-            existing_out_freq = existing_id_rec.get("output_frequency") or existing_id_rec["frequency"]
-            if (
-                existing_id_rec["factor_id"] != fid
-                or existing_out_freq != freq
-                or existing_id_rec["session_view"] != view
-            ):
-                raise ValueError(
-                    f"Identity hash {fhash} already registered with different metadata: {existing_id_rec}"
-                )
-        elif validated_id_rec is None:
+        if existing_id_rec is None and validated_id_rec is None:
             raise ValueError(
                 f"factor_identity_hash {fhash} is not registered in {identities_path.name}; "
                 "a verifiable identity_record is required"
             )
+        registered = validated_id_rec
+        if existing_id_rec is not None:
+            registered = _validate_identity_record(
+                existing_id_rec, expected_hash=fhash, expected_factor_id=fid,
+                expected_frequency=freq, expected_session_view=view, for_write=True,
+            )
+        assert registered is not None
+        payload = json.loads(registered["identity_payload_json"])
+        expected_calendars = payload["calendar_hash"]
+        for inst, cal_hash in clean[["instrument_id", "calendar_hash"]].drop_duplicates().itertuples(index=False):
+            expected = expected_calendars.get(inst) if isinstance(expected_calendars, dict) else expected_calendars
+            if cal_hash != expected:
+                raise ValueError(f"calendar_hash for {inst!r} does not match the factor identity")
+        if not clean["code_version"].eq(registered["code_version"]).all():
+            raise ValueError("code_version does not match the factor identity")
 
-        candidate_shards: list[Path] = []
+        candidate_shards: list[tuple[Path, str | None]] = []
         for batch in committed_batches:
             if batch.get("factor_identity_hash") != fhash:
                 continue
@@ -126,13 +267,13 @@ def append_factor_values(
                 )
                 sess_overlaps = bool(set(shard.get("sessions", {}).keys()) & incoming_sessions)
                 if ts_overlaps or (strict_source_build_id and sess_overlaps):
-                    candidate_shards.append(parquet_root / shard["part_path"])
+                    candidate_shards.append((parquet_root / shard["part_path"], batch.get("batch_id")))
 
         to_write = clean
         skipped = 0
         if candidate_shards:
             read_cols = ["instrument_id", "timestamp_utc", "factor_value", "session_id", "source_build_id"]
-            pq_filters: list[tuple[str, str, Any]] = [("factor_identity_hash", "=", fhash)]
+            pq_filters: list[tuple[str, str, Any]] = []
             if not strict_source_build_id:
                 pq_filters.extend(
                     [
@@ -140,15 +281,15 @@ def append_factor_values(
                         ("timestamp_utc", "<=", pa.scalar(inc_max_ns, type=pa.timestamp("ns", tz="UTC"))),
                     ]
                 )
-            tables = [
-                pq.read_table(
-                    str(shard_path),
-                    columns=read_cols,
-                    filters=pq_filters,
-                )
-                for shard_path in candidate_shards
-            ]
-            existing_df = pa.concat_tables(tables).to_pandas() if tables else pd.DataFrame(columns=read_cols)
+            tables = []
+            for shard_path, committed_batch_id in candidate_shards:
+                expected = _shard_ownership_fields(fhash, committed_batch_id, registered["source_schema_version"])
+                with shard_path.open("rb") as source, pq.ParquetFile(source) as file:
+                    mismatches = _shard_ownership_mismatches(file, expected)
+                    if mismatches:
+                        raise ValueError(f"Committed shard {shard_path} ownership mismatch: {', '.join(mismatches)}")
+                    tables.append(pq.read_table(source, columns=read_cols, filters=pq_filters or None))
+            existing_df = pa.concat_tables(tables).to_pandas()
             if not existing_df.empty:
                 existing_df["timestamp_utc"] = pd.to_datetime(existing_df["timestamp_utc"], utc=True).dt.as_unit("ns")
                 if strict_source_build_id:
@@ -218,6 +359,7 @@ def append_factor_values(
         to_write = to_write.sort_values(
             ["factor_identity_hash", "instrument_id", "timestamp_utc"], kind="mergesort"
         ).reset_index(drop=True)
+        to_write["batch_id"] = batch_id
 
         staging_dir = root / f".staging-{batch_id}-{uuid.uuid4().hex[:8]}"
         staging_dir.mkdir(parents=True, exist_ok=True)
@@ -279,6 +421,7 @@ def append_factor_values(
                 "batch_id": batch_id,
                 "factor_id": fid,
                 "factor_identity_hash": fhash,
+                "slot_id": registered["slot_id"],
                 "frequency": freq,
                 "session_view": view,
                 "row_count": int(len(to_write)),

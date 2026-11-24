@@ -105,3 +105,18 @@ def test_future_ties_do_not_change_historical_quantiles():
     pd.testing.assert_series_equal(full.loc[short.index, 'factor_quantile'], short.factor_quantile)
     assert dates[52] not in full.index.get_level_values('date')
     pd.testing.assert_series_equal(full.factor, series.loc[full.index], check_names=False)
+
+
+@pytest.mark.parametrize("mixed_source", ("factor", "pricing", "returns", "across_inputs"))
+def test_daily_run_rejects_inputs_from_multiple_market_databases(mixed_source):
+    prices, factor, pricing = panel()
+    forward_returns = (prices.shift(-2) / prices.shift(-1) - 1).stack().to_frame("1D")
+    if mixed_source == "across_inputs":
+        factor.attrs["db_id"] = "db_a"
+        pricing.attrs["db_id"] = "db_b"
+    else:
+        {"factor": factor, "pricing": pricing, "returns": forward_returns}[mixed_source].attrs["db_ids"] = [
+            "db_a", "db_b",
+        ]
+    with pytest.raises(ValueError, match="multiple market databases"):
+        AlphalensRunner(periods=(1,)).run(factor, pricing, forward_returns=forward_returns)

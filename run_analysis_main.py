@@ -11,6 +11,7 @@ from contextlib import suppress
 from typing import Any, Dict, List, Optional
 import pandas as pd
 import time
+from uuid import uuid4
 from backtest_and_analysis.config import CONFIG
 from backtest_and_analysis.factor_loader import FactorLoader
 from backtest_and_analysis.price_fetcher import PriceFetcher
@@ -94,7 +95,9 @@ def _load_factor_value_cache(factor_class, config):
             raise RuntimeError("source-bound factor cache data hash mismatch")
         cached = pd.read_parquet(data_path)
         cached.index = pd.to_datetime(cached.index, errors="coerce")
-        return cached.loc[cached.index.notna()].sort_index()
+        verified = cached.loc[cached.index.notna()].sort_index()
+        verified.attrs.setdefault("factor_input_fingerprint", {"verified_cache_data_sha256": metadata["data_sha256"]})
+        return verified
     except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
         raise RuntimeError("source-bound factor cache is invalid") from exc
 
@@ -365,11 +368,7 @@ def _persist_analysis_outputs(
     monthly_writer: Optional[Any],
     retry_interval_sec: float = 1,
 ) -> bool:
-    """Commit factor values/analysis/monthly metrics together, then export Parquet.
-
-    A post-commit export failure is reported separately: database rows are durable.
-    """
-    _close_factor_duckdb_handles(factor, factor_name)
+    """Append factor values, then commit analysis and monthly metrics together."""
 
     monthly_using_duckdb = (
         monthly_writer is not None
@@ -382,9 +381,12 @@ def _persist_analysis_outputs(
 
     if not writer.using_duckdb:
         raise RuntimeError("analysis result persistence requires a DuckDB writer")
+    try:
+        receipt = writer.write_market_factor_values(factor, factor_df_unfiltered, factor_name)
+    finally:
+        _close_factor_duckdb_handles(factor, factor_name)
     with writer.duckdb_write_session(retry_interval_sec=retry_interval_sec) as session:
         conn = session.conn
-        factor_rows = 0
         analysis_rows = 0
         monthly_rows = 0
         stage = "begin"
@@ -396,14 +398,6 @@ def _persist_analysis_outputs(
         )
         conn.execute("BEGIN TRANSACTION")
         try:
-            stage = "factor_values"
-            factor_rows = writer.save_factor_values(
-                factor_df_unfiltered,
-                factor_name,
-                duckdb_conn=conn,
-                allow_fallback=False,
-                skip_parquet=True,
-            )
             stage = "factor_analysis_results"
             analysis_rows = writer.write(
                 factor_name,
@@ -434,22 +428,9 @@ def _persist_analysis_outputs(
             )
             raise
 
-        try:
-            parquet_rows = writer.export_factor_values_parquet(
-                factor_df_unfiltered, factor_name, write_session=session,
-            )
-        except Exception as exc:
-            from utils.duckdb_results_writer import CommittedParquetExportError
-            raise CommittedParquetExportError(factor_name) from exc
     logger.info(
-        "Persisted analysis outputs: factor=%s backend=duckdb wait_seconds=%.3f lock_retries=%d factor_rows=%d analysis_rows=%d monthly_rows=%d parquet_rows=%d",
-        factor_name,
-        session.wait_seconds,
-        session.retry_count,
-        factor_rows,
-        analysis_rows,
-        monthly_rows,
-        parquet_rows,
+        "Persisted analysis outputs: factor=%s identity=%s inserted=%d skipped=%d analysis_rows=%d monthly_rows=%d",
+        factor_name, receipt.factor_identity_hash, receipt.inserted, receipt.skipped, analysis_rows, monthly_rows,
     )
     return True
 
@@ -462,37 +443,15 @@ def _persist_materialized_factor_values(
     writer: ResultWriter,
     start_date: str,
     end_date: str,
-    retry_interval_sec: float = 1,
 ) -> bool:
-    """Replace one factor's configured DuckDB date range without analysis side effects."""
-    if not writer.using_duckdb:
-        raise RuntimeError("materialize-only requires an active DuckDB results backend")
-
-    _close_factor_duckdb_handles(factor, factor_name)
-    with writer.duckdb_write_session(retry_interval_sec=retry_interval_sec) as session:
-        conn = session.conn
-        conn.execute("BEGIN TRANSACTION")
-        try:
-            row_count = writer.save_factor_values(
-                factor_df,
-                factor_name,
-                duckdb_conn=conn,
-                allow_fallback=False,
-                skip_parquet=True,
-                date_range=(start_date, end_date),
-            )
-            conn.execute("COMMIT")
-        except Exception:
-            with suppress(Exception):
-                conn.execute("ROLLBACK")
-            raise
-
+    """Append the requested factor snapshot without running analysis."""
+    try:
+        receipt = writer.write_market_factor_values(factor, factor_df, factor_name)
+    finally:
+        _close_factor_duckdb_handles(factor, factor_name)
     logger.info(
-        "Materialized factor values: factor=%s start_date=%s end_date=%s rows=%d",
-        factor_name,
-        start_date,
-        end_date,
-        row_count,
+        "Materialized factor values: factor=%s start_date=%s end_date=%s identity=%s inserted=%d skipped=%d",
+        factor_name, start_date, end_date, receipt.factor_identity_hash, receipt.inserted, receipt.skipped,
     )
     return True
 
@@ -526,6 +485,20 @@ def _compute_mining_only_ic(
         for column in columns
     }, index=panel.datetimes)
 
+
+
+def _publish_daily_bar_evaluation(config: Dict, *, factor_name: str, pool_name: str, factors: pd.DataFrame,
+                                  pricing: pd.Series, price_fetcher: PriceFetcher, runner: AlphalensRunner) -> None:
+    directory = config.get('_bar_evaluation_directory')
+    if directory is None:
+        return
+    from tools.agent_harness.time_series_analysis import publish_legacy_daily_evaluation
+
+    publish_legacy_daily_evaluation(
+        directory / uuid4().hex, pricing=pricing, factors=factors, price_fetcher=price_fetcher,
+        factor_id=factor_name, pool_name=pool_name, horizons=tuple(runner.periods),
+        entry_offset_bars=runner.execution_lag, n_quantiles=runner.n_quantiles,
+    )
 
 def analyze_factor_static(factor, price_fetcher, runner, writer, monthly_writer, config, forward_returns=None):
     """
@@ -617,6 +590,10 @@ def analyze_factor_static(factor, price_fetcher, runner, writer, monthly_writer,
             else:
                 logger.warning(f"Unexpected alphalens_results type: {type(alphalens_results)} for factor {factor_name}")
         
+        _publish_daily_bar_evaluation(
+            config, factor_name=factor_name, pool_name='static', factors=factor_df,
+            pricing=pricing, price_fetcher=price_fetcher, runner=runner,
+        )
         _persist_analysis_outputs(
             factor=factor,
             factor_name=factor_name,
@@ -941,6 +918,10 @@ def analyze_factor_dynamic(
         performance['analysis_before_persist_seconds'] = time.perf_counter() - analysis_started
         combined_results['performance_metrics'] = performance.copy()
         persist_started = time.perf_counter()
+        _publish_daily_bar_evaluation(
+            config, factor_name=factor_name, pool_name=pool_name, factors=factor_df,
+            pricing=pricing, price_fetcher=price_fetcher, runner=runner,
+        )
         _persist_analysis_outputs(
             factor=factor,
             factor_name=factor_name,
@@ -1115,7 +1096,8 @@ def main(config: Dict, *, execution=None):
         db_backend='duckdb',
         duckdb_path=config.get('results_duckdb_path'),
         parquet_dir=config.get('results_parquet_dir'),
-        export_parquet=config.get('results_export_parquet', True)
+        export_parquet=config.get('results_export_parquet', True),
+        factor_values_store=config.get('factor_values_store'),
     )
     monthly_writer = None
     if materialize_only and not writer.using_duckdb:
@@ -1402,7 +1384,7 @@ if __name__ == "__main__":
     parser.add_argument(
         '--materialize-only',
         action='store_true',
-        help='Persist dynamic-pool factor values for the config date range only',
+        help='Append dynamic-pool factor values to Scheme B for the configured date range only',
     )
     parser.add_argument(
         '--mining-only',
@@ -1411,10 +1393,35 @@ if __name__ == "__main__":
     )
     parser.add_argument('--pools', type=str, nargs='+', help='Specific pool names to analyze (for dynamic mode)')
     
+    parser.add_argument("--market-db", help="Database ID in QUANT_DATA_BINDINGS.market_dbs")
+    parser.add_argument("--slot-config", help="SlotConfig YAML/JSON path or jq_ashare_local")
+    parser.add_argument("--dry-run", action="store_true", help="Plan a --market-db Slot evaluation")
+    parser.add_argument("--bar-results-db", type=Path)
     parser.add_argument("--result-out", default="")
     parser.add_argument("--run-id", default="")
     parser.add_argument("--execution-id", default="")
     args = parser.parse_args()
+    if args.market_db is not None:
+        from tools.agent_harness.cli import main as harness_main
+
+        if not args.config:
+            parser.error("--market-db requires a Slot evaluation --config")
+        if args.materialize_only or args.mining_only or args.use_dynamic or args.pools or args.factor:
+            parser.error("--market-db evaluates committed factors from the Slot evaluation config")
+        command = ["single-factor-analysis", "--config", args.config, "--market-db", args.market_db]
+        if args.slot_config is not None:
+            command.extend(["--slot-config", args.slot_config])
+        if args.bar_results_db is not None:
+            command.extend(["--results-db", str(args.bar_results_db)])
+        if args.run_id:
+            command.extend(["--run-id", args.run_id])
+        if args.result_out:
+            command.extend(["--json-out", args.result_out])
+        if args.dry_run:
+            command.append("--dry-run")
+        raise SystemExit(harness_main(command))
+    if args.slot_config is not None or args.dry_run:
+        parser.error("--slot-config and --dry-run require --market-db")
     from utils.output_paths import execution_directory, process_output_environment
     directory = Path(args.result_out).resolve().parent if args.result_out else execution_directory()
     if not args.result_out:
@@ -1433,7 +1440,7 @@ if __name__ == "__main__":
         attempt = execution_directory()
         cache = Path(os.environ.get("QUANT_CACHE_DIR", Path(__file__).resolve().parent / "cache"))
         config.update(cache_dir=str(cache / "factor_values"), forward_returns_cache_dir=str(cache / "forward_returns"),
-                      results_parquet_dir=str(attempt / "analysis_results_parquet"))  # 复制默认配置
+                      results_parquet_dir=str(attempt / "analysis_results_parquet"))
     
         # 如果提供了配置文件，从文件读取配置
         if args.config:
@@ -1509,6 +1516,14 @@ if __name__ == "__main__":
             config['dynamic_pools'] = filtered_pools
             logger.info(f"仅分析指定的股票池: {args.pools}")
     
+        evaluation_db = args.bar_results_db
+        config['_bar_evaluation_directory'] = directory / "bar-evaluations" if evaluation_db is not None else None
+        if evaluation_db is not None:
+            source = Path(config['duckdb_path']).expanduser().resolve()
+            if source == evaluation_db or (source.is_file() and evaluation_db.is_file()
+                                           and source.samefile(evaluation_db)):
+                parser.error('--bar-results-db must differ from the input database')
+
         # 确保必要的目录存在
         if config.get('cache_dir'):
             os.makedirs(config['cache_dir'], exist_ok=True)
@@ -1521,3 +1536,25 @@ if __name__ == "__main__":
                                   os.path.dirname(__file__), "backtest_and_analysis", "config.py"
                               )) as result:
             main(config, execution=result["execution"])
+            if evaluation_db is not None:
+                from tools.agent_harness.time_series_analysis import (
+                    BarEvaluationStoreFailure, ingest_legacy_daily_evaluations,
+                )
+                from tools.agent_harness.run_result import config_sha256
+
+                try:
+                    manifest = ingest_legacy_daily_evaluations(
+                        config['_bar_evaluation_directory'], evaluation_db,
+                        expected_count=result["execution"]["completed"], run_id=args.run_id,
+                    )
+                except BarEvaluationStoreFailure as exc:
+                    result["metrics"]["_bar_store_failure"] = dict(
+                        code=exc.code, exit_code=exc.exit_code, details=exc.details, cleanup=exc.cleanup,
+                    )
+                    raise
+                manifest_path = directory / "bar_evaluations.json"
+                manifest_path.write_text(json.dumps(manifest, allow_nan=False), encoding="utf-8")
+                result["artifacts"].append(dict(
+                    artifact_type="bar_evaluation_manifest", path=str(manifest_path),
+                    sha256=config_sha256(manifest_path),
+                ))

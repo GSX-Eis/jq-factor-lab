@@ -1,5 +1,7 @@
 """Frozen adaptive bootstrap formula, sampling and public entry point checks."""
 
+from dataclasses import asdict
+from itertools import repeat
 from pathlib import Path
 
 import numpy as np
@@ -8,7 +10,8 @@ import pytest
 from scipy.signal import lfilter
 from scipy.stats import rankdata
 
-from backtest_and_analysis.evaluation import EvaluationEngine, kernels, time_series
+from backtest_and_analysis.evaluation import EvaluationEngine, evaluate_interval_usability, kernels, time_series
+from backtest_and_analysis.evaluation.calibration import Trial, TrialLedger
 from backtest_and_analysis.evaluation.panel import EvaluationPanel
 from backtest_and_analysis.time_series import BarReturnLabeler, evaluate_bars, read_bar_csv
 from utils.session_calendar import SessionCalendar
@@ -281,3 +284,108 @@ def test_fixed_blocks_keep_the_original_seed_draws_and_percentiles():
         estimates.append(kernels.spearman(x[rows, None], y[rows, None], axis=0, min_samples=3).values.item())
     np.testing.assert_array_equal([interval.lower, interval.upper], np.quantile(estimates, [.05, .95]))
     assert interval.method_version is None and interval.fisher_z_standard_error is None
+
+
+def test_bootstrap_pvalue_matches_seeded_draws_with_independent_observed_statistic(monkeypatch):
+    x, noise = np.random.default_rng(91).normal(size=(2, 512))
+    y = noise + .13 * x
+    valid = np.ones(512, dtype=bool)
+    generated = time_series._adaptive_pivots
+    pivots = []
+
+    def capture(*args, **kwargs):
+        pivots.extend(generated(*args, **kwargs))
+        return iter(pivots)
+
+    monkeypatch.setattr(time_series, "_adaptive_pivots", capture)
+    actual = _bootstrap(
+        x, y, p_value=True, n_boot=9999, min_valid_replicates=9000,
+        alpha=.05, calibration_scenario="independent_null",
+    )
+    z, se, _ = _reference_fisher(x, y, valid, actual.block_length, historical_v1=False)
+    observed = abs(z / se)
+    exceedances = sum(not -observed < value < observed for value in pivots)
+    assert 0 < exceedances < len(pivots)
+    assert actual.valid_replicates == len(pivots)
+    assert actual.p_value == (1 + exceedances) / (1 + len(pivots))
+
+
+def test_bootstrap_pvalue_matches_independent_tail_count_and_keeps_interval(monkeypatch):
+    x, y = np.random.default_rng(64).normal(size=(2, 512))
+    valid = np.ones(512, dtype=bool)
+    # Exercise the exact tail tie, both signs, a finite-valid denominator and the 90% boundary.
+    pivots = [-4., -2., 0., 2., 3.] + [0.] * 8995
+    legacy = _bootstrap(x, y, alpha=.05, calibration_scenario="independent_null")
+    fisher_z, se, _ = _reference_fisher(
+        x, y, valid, legacy.block_length, historical_v1=False,
+    )
+
+    tied_se = abs(fisher_z) / 2
+
+    def studentization(*args, **kwargs):
+        return fisher_z, tied_se, 0.
+
+    monkeypatch.setattr(time_series, "_fisher_v2_studentization", studentization)
+    monkeypatch.setattr(time_series, "_adaptive_pivots", lambda *args, **kwargs: iter(pivots))
+    options = dict(alpha=.05, n_boot=9999, min_valid_replicates=9000, calibration_scenario="independent_null")
+    before = _bootstrap(x, y, **options)
+    estimate = _bootstrap(x, y, p_value=True, **options)
+    observed = abs(fisher_z / tied_se)
+    exceedances = sum(value <= -observed or value >= observed for value in pivots)
+    assert se > 0 and observed == 2 and exceedances == 4
+    assert estimate.p_value == (1 + exceedances) / (len(pivots) + 1)
+    assert estimate.p_value_reason is None
+    assert estimate.method_version == "ts_boot_adaptive_v3_p"
+    assert asdict(estimate) | {
+        "p_value": None, "p_value_reason": None, "method_version": before.method_version,
+    } == asdict(before)
+
+    use = evaluate_interval_usability(
+        estimate, point_estimate=.1, horizon=1, ic_method="spearman", intervals_verified=True,
+    )
+    assert use.calibration_status == "uncalibrated"
+    assert not use.significance_interpretation_usable
+    ledger = TrialLedger([("ts", 1)])
+    ledger.record(("ts", 1), Trial(.1, estimate.p_value, 512, (estimate.lower, estimate.upper), use))
+    selection = ledger.select_best(method="holm", alpha=.0025)
+    assert selection.best is None
+    assert selection.inference_adjusted_p_values == {}
+    assert selection.trials[0].adjusted_p_value == estimate.p_value
+
+
+@pytest.mark.parametrize(("grid", "requested", "valid_draws", "missing_intervals", "expected"), [
+    (512, 999, 999, False, "insufficient_replicates_for_pvalue"),
+    (512, 9999, 8999, False, "insufficient_replicates_for_pvalue"),
+    (512, 9999, 9000, True, "bootstrap_interval_unestimable"),
+    (256, 9999, 9000, False, "outside_pvalue_calibration_domain"),
+])
+def test_bootstrap_pvalue_unavailable_reasons(monkeypatch, grid, requested, valid_draws, missing_intervals, expected):
+    x, y = np.random.default_rng(64).normal(size=(2, grid))
+    monkeypatch.setattr(time_series, "_adaptive_pivots", lambda *args, **kwargs: repeat(0., valid_draws))
+    interval = _bootstrap(
+        x, y, p_value=True, n_boot=requested, min_valid_replicates=2, alpha=.05,
+        calibration_scenario="independent_null", intervals_verified=not missing_intervals,
+    )
+    assert interval.p_value is None
+    assert interval.p_value_reason == expected
+
+
+def test_pvalue_opt_in_defaults_and_multi_asset_aggregation(monkeypatch):
+    x, y = np.random.default_rng(64).normal(size=(2, 1024))
+    dates = pd.date_range("2026-01-05", periods=512, freq="D")
+    index = pd.MultiIndex.from_product([dates, ["A", "B"]], names=["datetime", "asset"])
+    panel = EvaluationPanel.from_long(pd.DataFrame({"factor": x, "1D": y}, index=index))
+    entries = np.repeat(dates.to_numpy()[:, None], 2, axis=1)
+    monkeypatch.setattr(time_series, "_adaptive_pivots", lambda *args, **kwargs: repeat(0., kwargs["n_boot"]))
+    full = EvaluationEngine("time_series", "daily").evaluate(
+        panel, entry_timestamps={1: entries}, exit_timestamps={1: entries + np.timedelta64(1, "D")},
+        p_value=True, calibration_scenario="independent_null",
+    )
+    horizon = full.splits["full"].statistics.horizons[1]
+    assert horizon.p_value is None
+    assert horizon.p_value_reason == "multi_asset_pvalue_undefined"
+    for asset in panel.assets:
+        interval = horizon.instruments[asset].bootstrap
+        assert interval.n_boot == interval.valid_replicates == 9999
+        assert interval.min_valid_replicates == 9000
+        assert interval.p_value == 1 / 10000

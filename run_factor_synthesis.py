@@ -21,9 +21,10 @@ import shutil
 import subprocess
 import warnings
 from contextlib import contextmanager, suppress
+from dataclasses import asdict, replace
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 # [FIX] 固定 PYTHONHASHSEED 以确保 set/dict 迭代顺序可重复
 # 必须在 import numpy/pandas 之前设置
@@ -42,6 +43,7 @@ np.random.seed(GLOBAL_RANDOM_SEED)
 # DuckDB support (required)
 import duckdb
 
+from utils.market_db.identity import market_db_identity, slot_market_db_identity
 from utils.dynamic_stock_pool import (
     DynamicStockPoolManager,
     StockFilter,
@@ -304,6 +306,116 @@ def _materialize_parent_baseline_contract(
     }
     contract.update({"path": destination.name, "sha256": expected_sha256})
     return contract
+
+
+def _collect_lasso_model_artifacts(
+    synthesis_name: str,
+    *,
+    dest_dir: Path,
+    source_dir: Optional[Path] = None,
+) -> Tuple[List[Tuple[str, str]], List[Dict[str, Any]]]:
+    """Collect and hash-verify LASSO bundle, companion files, and parent_baseline dependencies."""
+    dest_root = Path(dest_dir).expanduser().resolve()
+    src_root = Path(source_dir).expanduser().resolve() if source_dir is not None else dest_root
+    bundle_filename = f"lasso_model_bundle_{synthesis_name}.json"
+    src_bundle = src_root / bundle_filename
+    dest_bundle = dest_root / bundle_filename
+    if source_dir is not None:
+        if not src_bundle.is_file():
+            raise FileNotFoundError(f"LASSO model bundle not found: {src_bundle}")
+        dest_root.mkdir(parents=True, exist_ok=True)
+        if src_bundle.resolve() != dest_bundle.resolve():
+            shutil.copy2(src_bundle, dest_bundle)
+    elif not dest_bundle.is_file():
+        return [], []
+
+    model_artifact_files: List[Tuple[str, str]] = [
+        ("model_bundle", str(dest_bundle.resolve()))
+    ]
+    for role, fname in (
+        ("model_weights", f"lasso_weights_{synthesis_name}.csv"),
+        ("model_selection", f"lasso_model_selection_{synthesis_name}.json"),
+    ):
+        src_companion = src_root / fname
+        dest_companion = dest_root / fname
+        if src_companion.is_file():
+            if src_companion.resolve() != dest_companion.resolve():
+                shutil.copy2(src_companion, dest_companion)
+            model_artifact_files.append((role, str(dest_companion.resolve())))
+
+    bundle_payload = json.loads(dest_bundle.read_text(encoding="utf-8"))
+    if not isinstance(bundle_payload, Mapping):
+        raise ValueError(f"Invalid LASSO model bundle JSON object: {dest_bundle}")
+    index_block = bundle_payload.get("index")
+    if not isinstance(index_block, Mapping):
+        raise ValueError(f"Invalid LASSO model bundle index: {dest_bundle}")
+    bundle_models = index_block.get("models")
+    if not isinstance(bundle_models, list):
+        raise ValueError(f"Invalid LASSO model bundle index.models: {dest_bundle}")
+
+    requires_parent = bool(index_block.get("requires_parent_baseline", False))
+    if requires_parent:
+        expected_count = index_block.get("expected_model_count")
+        if type(expected_count) is not int or expected_count != len(bundle_models):
+            raise ValueError(
+                f"LASSO bundle {dest_bundle} incomplete parent bundle: "
+                f"expected {expected_count!r} models, found {len(bundle_models)}"
+            )
+    seen_pb: set[str] = set()
+    for model_entry in bundle_models:
+        if not isinstance(model_entry, Mapping):
+            continue
+        pb = model_entry.get("parent_baseline")
+        if requires_parent and (not isinstance(pb, Mapping) or not pb):
+            raise ValueError(
+                f"LASSO bundle {dest_bundle} requires parent_baseline for model {model_entry.get('train_end')!r}"
+            )
+        if not isinstance(pb, Mapping) or not pb:
+            continue
+        pb_rel = str(pb.get("path", "")).strip()
+        expected_sha = str(pb.get("sha256", "")).strip()
+        if not pb_rel or not expected_sha:
+            raise ValueError(
+                f"LASSO bundle {dest_bundle} has incomplete parent_baseline contract"
+            )
+        rel_path = Path(pb_rel)
+        if rel_path.is_absolute() or ".." in rel_path.parts:
+            raise ValueError(
+                f"parent_baseline path must be relative without traversal: {pb_rel!r}"
+            )
+        src_pb = (src_root / rel_path).resolve()
+        if not src_pb.is_relative_to(src_root):
+            raise ValueError(
+                f"parent_baseline source path escapes {src_root}: {pb_rel!r}"
+            )
+        if not src_pb.is_file():
+            raise FileNotFoundError(
+                f"parent_baseline file missing for {synthesis_name!r}: {src_pb}"
+            )
+        src_sha = hashlib.sha256(src_pb.read_bytes()).hexdigest()
+        if src_sha != expected_sha:
+            raise ValueError(
+                f"parent_baseline sha256 mismatch for {src_pb}: expected {expected_sha}, got {src_sha}"
+            )
+        dest_pb = (dest_root / rel_path).resolve()
+        if not dest_pb.is_relative_to(dest_root):
+            raise ValueError(
+                f"parent_baseline destination path escapes {dest_root}: {pb_rel!r}"
+            )
+        dest_pb.parent.mkdir(parents=True, exist_ok=True)
+        if src_pb != dest_pb:
+            shutil.copy2(src_pb, dest_pb)
+        dest_sha = hashlib.sha256(dest_pb.read_bytes()).hexdigest()
+        if dest_sha != expected_sha:
+            raise ValueError(
+                f"copied parent_baseline sha256 mismatch for {dest_pb}: expected {expected_sha}, got {dest_sha}"
+            )
+        dest_key = str(dest_pb)
+        if dest_key not in seen_pb:
+            seen_pb.add(dest_key)
+            model_artifact_files.append(("parent_baseline", dest_key))
+
+    return model_artifact_files, [dict(m) for m in bundle_models if isinstance(m, Mapping)]
 
 
 def _merge_replay_scores_into_parent_cache(
@@ -969,6 +1081,11 @@ class FactorSynthesizer:
         *,
         return_series_output_dir: str = "",
         run_id: str = "",
+        slot_config: str = "",
+        slot_id: str = "",
+        factor_values_store: str = "",
+        frequency: str = "",
+        market_db: str | None = None,
     ):
         """初始化因子合成器"""
         self.config_path = config_path
@@ -978,9 +1095,26 @@ class FactorSynthesizer:
             else ""
         )
         self.run_id = run_id
+        self._cli_slot_config = str(slot_config or "").strip()
+        self._cli_slot_id = str(slot_id or "").strip()
+        self._cli_factor_values_store = str(factor_values_store or "").strip()
+        self._cli_frequency = str(frequency or "").strip()
+        self._market_db = market_db
+        self._slot: Any = None
+        self._active_synthesis_name: Optional[str] = None
+        self._bundle_syntheses: Dict[str, Dict[str, Any]] = {}
+        self._bundle_backtests: List[Dict[str, Any]] = []
+        self._last_bundle_synthesis: Optional[Dict[str, Any]] = None
+        self._last_bundle_backtest: Optional[Dict[str, Any]] = None
         from utils.output_paths import bind_output_defaults, execution_directory
         self.execution_dir = execution_directory()
         self.config = bind_output_defaults(self._load_config(), directory=self.execution_dir)
+        if self._market_db is not None:
+            from utils.market_db.research import check_synthesis_market_outputs, resolve_research_market_db
+
+            check_synthesis_market_outputs(
+                resolve_research_market_db(self._market_db), self.config, self.execution_dir, self.return_series_output_dir,
+            )
         from utils.local_outputs import write_json
         self.execution_dir.mkdir(parents=True, exist_ok=True)
         write_json(self.execution_dir / "resolved_output_paths.json", {
@@ -991,77 +1125,112 @@ class FactorSynthesizer:
             "cache_settings": self.config["cache_settings"],
         })
         self.logger = self._setup_logger()
+        self._init_slot_and_store()
 
-        # 读取后端配置 (仅支持 DuckDB)
+        # 读取后端配置 (DuckDB 与/或 MarketSlot)
         db_config = self.config.get("database", {})
         self.db_backend = "duckdb"
 
-        # 设置 DuckDB 连接
-        self.logger.info("使用 DuckDB 后端")
         factor_duckdb_path = db_config.get("factor_db", {}).get("duckdb_path")
-        price_duckdb_path = db_config.get("price_db", {}).get("duckdb_path")
+        price_duckdb_path = db_config.get("price_db", {}).get("duckdb_path") or self.config.get("slot_db")
         local_duckdb_path = db_config.get("local_db", {}).get("duckdb_path")
 
-        # Fail-fast if DuckDB paths are incomplete
+        native_providers = ("jq_ashare_local", "cn_futures", "global_futures")
+        if self._market_db is not None:
+            from utils.market_db.research import (
+                open_research_slot, synthesis_market_db_paths,
+            )
+
+            self._declared_market_db, _ = synthesis_market_db_paths(self.config)
+            with open_research_slot(
+                self._market_db, self._slot_config_obj, self._slot_base_dir, declared_db=self._declared_market_db,
+            ) as (market_slot, source):
+                self._market_db_identity = slot_market_db_identity(market_slot)
+                if self._slot_provider_name in native_providers:
+                    price_duckdb_path = str(source)
+                else:
+                    self._slot = market_slot
+                    price_duckdb_path = None
+
         missing_paths = []
-        if not factor_duckdb_path:
+        if not factor_duckdb_path and self.factor_values_store is None and not self.config.get("data_bindings"):
             missing_paths.append("factor_db.duckdb_path")
-        if not price_duckdb_path:
+        if not price_duckdb_path and self._slot_provider_name in native_providers:
             missing_paths.append("price_db.duckdb_path")
-        if not local_duckdb_path:
+        if not local_duckdb_path and not self._slot_is_explicit:
             missing_paths.append("local_db.duckdb_path")
         if missing_paths:
             raise ValueError(f"DuckDB 路径配置不完整，缺少: {', '.join(missing_paths)}")
 
-        self.factor_duckdb_path = str(Path(factor_duckdb_path).expanduser().resolve())
-        self.price_duckdb_path = str(Path(price_duckdb_path).expanduser().resolve())
-        self.local_duckdb_path = str(Path(local_duckdb_path).expanduser().resolve())
-
-        # 初始化结果写入器（支持 DuckDB）
-        self.result_writer = ResultWriter(
-            db_conn_str=self.local_duckdb_path,
-            output_table=self.config["database"]["local_db"]["results_table"],
-            db_backend=self.db_backend,
-            duckdb_path=self.local_duckdb_path,
-            parquet_dir=self.config.get("cache_settings", {}).get("parquet_dir"),
+        self.factor_duckdb_path = (
+            str(Path(factor_duckdb_path).expanduser().resolve())
+            if factor_duckdb_path
+            else None
         )
-        self.logger.info(
-            "[REPAIR_DEBUG] ResultWriter initialized for local DuckDB path: %s",
-            self.local_duckdb_path,
+        self.price_duckdb_path = (
+            str(Path(price_duckdb_path).expanduser().resolve())
+            if price_duckdb_path
+            else None
+        )
+        self.local_duckdb_path = (
+            str(Path(local_duckdb_path).expanduser().resolve())
+            if local_duckdb_path
+            else None
         )
 
-        # 使用结果写入器的排他写会话初始化本地表，避免在同一进程中持有两个写连接
-        with self.result_writer.duckdb_write_session() as write_session:
-            initialize_local_tables(write_session.conn, self.db_backend, self.logger)
+        # 初始化结果写入器（可选，仅在配置 local_db 时写入 DuckDB）
+        if self.local_duckdb_path is not None:
+            self.result_writer = ResultWriter(
+                db_conn_str=self.local_duckdb_path,
+                output_table=db_config["local_db"].get("results_table", "factor_analysis_results"),
+                db_backend=self.db_backend,
+                duckdb_path=self.local_duckdb_path,
+                parquet_dir=self.config.get("cache_settings", {}).get("parquet_dir"),
+            )
+            self.logger.info(
+                "[REPAIR_DEBUG] ResultWriter initialized for local DuckDB path: %s",
+                self.local_duckdb_path,
+            )
+
+            # 使用结果写入器的排他写会话初始化本地表，避免在同一进程中持有两个写连接
+            with self.result_writer.duckdb_write_session() as write_session:
+                initialize_local_tables(write_session.conn, self.db_backend, self.logger)
+        else:
+            self.result_writer = None
 
         # 同库(reader=read_only)在写入前必须全部释放，否则 DuckDB 会拒绝打开写连接。
         # factor/local 改为短生命周期 reader；price 保持 lazy reader，如与 local 同库则写前统一关闭。
         self._conn_paths = {
-            "local_conn": self.local_duckdb_path,
-            "factor_conn": self.factor_duckdb_path,
-            "price_conn": self.price_duckdb_path,
+            name: path
+            for name, path in (
+                ("local_conn", self.local_duckdb_path),
+                ("factor_conn", self.factor_duckdb_path),
+                ("price_conn", self.price_duckdb_path),
+            )
+            if path is not None
         }
         self.local_conn = None
         self.factor_conn = None
         self.price_conn = None
-        self.logger.info("DuckDB reader lifecycle:")
         self.logger.info(
-            f"  local_db: {self.local_duckdb_path} (write-only via ResultWriter)"
+            "MarketSlot & storage: slot_id=%s frequency=%s factor_store=%s price_db=%s",
+            self._slot_id,
+            self.frequency,
+            self.factor_values_store or self.factor_duckdb_path,
+            self.price_duckdb_path,
         )
-        self.logger.info(f"  factor_db: {self.factor_duckdb_path} (short-lived reader)")
-        self.logger.info(f"  price_db: {self.price_duckdb_path} (lazy reader)")
         self._vectorbt_result_summaries: List[dict] = []
 
         # 获取表名配置
-        db_config = self.config.get("database", {})
         self.factor_table = db_config.get("factor_table", "factor_values")
         self.price_table = db_config.get("price_table", "price_data")
         self.fundamental_table = db_config.get(
             "fundamental_table", "factor_data"
         )  # Used as fallback for price
 
-        # 自动解析正确的价格表
-        self.price_table = self._resolve_price_table()
+        # 自动解析正确的价格表 (仅 legacy/jq_ashare_local 且存在 price_db 时)
+        if self.price_duckdb_path is not None and self._slot_provider_name == "jq_ashare_local":
+            self.price_table = self._resolve_price_table()
 
         self.logger.info(
             f"使用表名配置: Factor={self.factor_table}, Price={self.price_table}, Fundamental={self.fundamental_table}"
@@ -1108,23 +1277,18 @@ class FactorSynthesizer:
         selection_mode: str,
         top_pct: Any,
         top_k: Any,
+        synthesis_name: Optional[str] = None,
     ) -> str:
-        payload = {
-            "config_path": str(Path(self.config_path).expanduser().resolve()),
-            "factor_name": factor_name,
-            "selection_mode": selection_mode,
-            "top_pct": top_pct,
-            "top_k": top_k,
-        }
-        digest = hashlib.sha256(
-            json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
-        ).hexdigest()[:12]
-        selector = top_pct if selection_mode == "top_pct" else top_k
-        raw = f"{factor_name}_{selection_mode}_{selector}_{digest}"
-        safe = "".join(
-            ch if ch.isalnum() or ch in {"-", "_", "."} else "_" for ch in raw
+        from tools.agent_harness.run_result import build_backtest_trial_id
+
+        return build_backtest_trial_id(
+            config_path=getattr(self, "config_path", None),
+            factor_name=factor_name,
+            selection_mode=selection_mode,
+            top_pct=top_pct,
+            top_k=top_k,
+            synthesis_name=synthesis_name,
         )
-        return safe.strip("._") or f"trial_{digest}"
 
     def _open_read_conn(self, duckdb_path: str, label: str):
         """Open a read-only DuckDB connection."""
@@ -1143,8 +1307,167 @@ class FactorSynthesizer:
                 conn.close()
             self.logger.debug(f"关闭 {label}: {duckdb_path}")
 
+    def _init_slot_and_store(self) -> None:
+        from slots.jq_ashare_local import daily_slot_config
+        from utils.slots import SlotConfig, load_slot_config
+        from utils.time_axis import Frequency
+
+        config_dir = Path(self.config_path).expanduser().resolve().parent
+        raw_slot = (
+            getattr(self, "_cli_slot_config", None)
+            or self.config.get("slot_config")
+            or self.config.get("slot")
+        )
+        requested_slot_id = getattr(self, "_cli_slot_id", None) or self.config.get("slot_id")
+        store_raw = getattr(self, "_cli_factor_values_store", None) or self.config.get("factor_values_store")
+        self.factor_values_store = (
+            str(Path(store_raw).expanduser().resolve())
+            if store_raw
+            else None
+        )
+        self.factor_identities = dict(self.config.get("factor_identities") or {})
+        self._slot_base_dir = Path(
+            self.config.get("slot_base_dir") or config_dir
+        ).expanduser().resolve()
+        self._slot_spec_raw = raw_slot
+
+        if isinstance(raw_slot, str) and raw_slot != "jq_ashare_local":
+            slot_path = Path(raw_slot).expanduser()
+            if not slot_path.is_absolute():
+                repo_candidate = Path(__file__).resolve().parent / slot_path
+                slot_path = repo_candidate if repo_candidate.exists() else config_dir / slot_path
+            slot_path = slot_path.resolve()
+            self._slot_config_obj = load_slot_config(slot_path)
+            self._slot_base_dir = slot_path.parent
+            self._slot_is_explicit = True
+        elif isinstance(raw_slot, Mapping):
+            self._slot_config_obj = SlotConfig.from_mapping(dict(raw_slot))
+            self._slot_is_explicit = True
+        elif raw_slot == "jq_ashare_local":
+            self._slot_config_obj = daily_slot_config()
+            self._slot_is_explicit = True
+        elif requested_slot_id in (None, "", "jq_ashare_local"):
+            self._slot_config_obj = daily_slot_config()
+            self._slot_is_explicit = False
+        else:
+            raise ValueError(
+                f"Supply slot_config for non-default slot_id {requested_slot_id!r}"
+            )
+
+        if requested_slot_id and requested_slot_id != self._slot_config_obj.slot_id:
+            raise ValueError(
+                f"slot_id {requested_slot_id!r} disagrees with SlotConfig "
+                f"{self._slot_config_obj.slot_id!r}"
+            )
+        self._slot_id = self._slot_config_obj.slot_id
+        self._slot_provider_name = self._slot_config_obj.bar_feed.provider
+        if getattr(self, "_market_db", None) is not None:
+            self._slot_is_explicit = True
+
+        raw_freq = (
+            getattr(self, "_cli_frequency", None)
+            or self.config.get("frequency")
+            or self._slot_config_obj.bar_feed.options.get("frequency")
+            or "1d"
+        )
+        parsed_freq = Frequency.parse(str(raw_freq))
+        if not parsed_freq.is_valid or parsed_freq.canonical is None:
+            raise ValueError(f"Invalid frequency: {raw_freq!r}")
+        self.frequency = parsed_freq.canonical
+
+    def _get_slot(self):
+        if getattr(self, "_slot", None) is not None:
+            return self._slot
+        if getattr(self, "_market_db", None) is not None:
+            from utils.market_db.research import open_research_slot
+
+            with open_research_slot(
+                self._market_db, self._slot_config_obj, self._slot_base_dir,
+                declared_db=self._declared_market_db, connection=self._get_price_conn(),
+            ) as (slot, _):
+                if slot_market_db_identity(slot) != self._market_db_identity:
+                    raise ValueError("Market database identity changed since synthesis initialization")
+                self._slot = slot
+                return slot
+        if not getattr(self, "_slot_is_explicit", False):
+            conn = self._get_price_conn()
+            if conn is None:
+                return None
+            from slots.jq_ashare_local import build_jq_ashare_local
+            from utils.market_db.validation import (
+                calendar_key, market_db_calendar_bounds, require_market_db_profile,
+                validate_market_db_provider,
+            )
+            from utils.session_calendar import SessionCalendar, load_trading_calendar
+
+            profile = require_market_db_profile(conn)
+            validate_market_db_provider(profile, "jq_ashare_local", domain="cn_equity")
+            verified = load_trading_calendar(conn)
+            market_db_calendar_bounds(profile, verified.start, verified.end)
+            verified_cal = SessionCalendar.from_verified_sessions(
+                verified.sessions(),
+                verified.start,
+                verified.end,
+                calendar_id=verified.calendar_id,
+                template_calendar=calendar_key(profile.calendar_id, market_domain=profile.market_domain),
+            )
+            built = build_jq_ashare_local(
+                conn,
+                start=verified.start.strftime("%Y-%m-%d"),
+                end=verified.end.strftime("%Y-%m-%d"),
+                calendar=verified_cal,
+            )
+            self._slot = replace(
+                built, slot_config_hash=self._slot_config_obj.slot_config_hash
+            )
+            return self._slot
+        if (
+            self._slot_provider_name == "jq_ashare_local"
+            and self._slot_spec_raw in (None, "", "jq_ashare_local")
+        ):
+            conn = self._get_price_conn()
+            if conn is None:
+                return None
+            from slots.jq_ashare_local import build_jq_ashare_local
+
+            # Preserve legacy has_explicit_fees=False default 30bps fee behavior.
+            built = build_jq_ashare_local(conn)
+            self._slot = replace(
+                built, slot_config_hash=self._slot_config_obj.slot_config_hash
+            )
+            return self._slot
+
+        from slots import build_slot_from_config
+
+        native = self._slot_provider_name in ("jq_ashare_local", "cn_futures", "global_futures")
+        conn = self._get_price_conn() if native else None
+        self._slot = build_slot_from_config(
+            self._slot_config_obj,
+            connection=conn,
+            base_dir=self._slot_base_dir,
+        )
+        return self._slot
+
+    def _use_slot_feeds(self) -> bool:
+        if getattr(self, "_slot_is_explicit", False):
+            return True
+        return bool(
+            getattr(self, "_slot_id", None) == "jq_ashare_local"
+            and getattr(self, "price_table", "price_data_daily") == "price_data_daily"
+            and getattr(self, "fundamental_table", "factor_data") == "factor_data"
+        )
+
+    def _effective_pit_enabled(self) -> Optional[bool]:
+        if "pit_adjustment" in self.config:
+            return bool(self.pit_config.get("enabled", True))
+        if self._use_slot_feeds():
+            return None
+        return self.pit_config.get("enabled", True)
+
     def _get_price_conn(self):
         """Get or lazily create the price reader connection."""
+        if getattr(self, "price_duckdb_path", None) is None:
+            return None
         if self.price_conn is None:
             self.price_conn = self._open_read_conn(self.price_duckdb_path, "price_conn")
         return self.price_conn
@@ -1152,6 +1475,8 @@ class FactorSynthesizer:
     def _close_conn_attr(self, attr_name: str) -> bool:
         """Close a managed connection attribute if it is currently open."""
         conn = getattr(self, attr_name, None)
+        if attr_name == "price_conn":
+            self._slot = None
         if conn is None:
             return False
         try:
@@ -1206,16 +1531,40 @@ class FactorSynthesizer:
         with open(self.config_path, "r", encoding="utf-8") as f:
             config = json.load(f)
         from utils.data_store import resolve_database_config
+        if getattr(self, "_market_db", None) is None:
+            self._market_db = config.get("market_db")
         config = resolve_database_config(config)
         validate_regime_placeholders(config)
 
+        has_market_slot = bool(
+            self._market_db is not None
+            or getattr(self, "_cli_slot_config", None)
+            or getattr(self, "_cli_factor_values_store", None)
+            or config.get("slot_config")
+            or config.get("slot")
+            or config.get("factor_values_store")
+        )
+        if has_market_slot:
+            config.setdefault("database", {})
+            config.setdefault("logging", {"level": "INFO"})
+            config.setdefault(
+                "rolling_window",
+                {
+                    "train_window_days": 30,
+                    "predict_window_days": 5,
+                    "step_size_days": 5,
+                    "min_train_samples": 10,
+                },
+            )
+
         # 基本配置验证
         required_keys = [
-            "database",
             "factor_groups",
             "synthesis_methods",
             "analysis_period",
         ]
+        if not has_market_slot:
+            required_keys.insert(0, "database")
         for key in required_keys:
             if key not in config:
                 raise ValueError(f"配置文件缺少必需的键: {key}")
@@ -1308,10 +1657,35 @@ class FactorSynthesizer:
         stock_filter: Optional[set] = None,
         neutralization_config: Optional[Dict[str, Any]] = None,
     ) -> pd.DataFrame:
-        """从数据库加载因子数据 - 代理到核心模块"""
-        with self._temporary_read_conn(
-            self.factor_duckdb_path, "factor_conn"
-        ) as factor_conn:
+        """从数据库或 Scheme B 存储加载因子数据 - 代理到核心模块"""
+        slot_arg = self._get_slot() if self._use_slot_feeds() else None
+        extra_kwargs: Dict[str, Any] = {}
+        if slot_arg is not None or getattr(self, "factor_values_store", None) is not None:
+            extra_kwargs = {
+                "slot": slot_arg,
+                "slot_id": getattr(self, "_slot_id", None),
+                "frequency": getattr(self, "frequency", "1d"),
+                "factor_values_store": getattr(self, "factor_values_store", None),
+                "factor_identities": getattr(self, "factor_identities", None),
+            }
+        factor_db = getattr(self, "factor_duckdb_path", None)
+        if factor_db is None:
+            return core_load_factor_data(
+                factor_conn=None,
+                factor_table=self.factor_table,
+                factor_names=factor_names,
+                start_date=start_date,
+                end_date=end_date,
+                stock_filter=stock_filter,
+                config=self.config,
+                price_conn=self._get_price_conn(),
+                price_table=self.price_table,
+                neutralization_config=neutralization_config,
+                custom_logger=self.logger,
+                factor_database_path=None,
+                **extra_kwargs,
+            )
+        with self._temporary_read_conn(factor_db, "factor_conn") as factor_conn:
             return core_load_factor_data(
                 factor_conn=factor_conn,
                 factor_table=self.factor_table,
@@ -1324,6 +1698,8 @@ class FactorSynthesizer:
                 price_table=self.price_table,
                 neutralization_config=neutralization_config,
                 custom_logger=self.logger,
+                factor_database_path=factor_db,
+                **extra_kwargs,
             )
 
     def _process_raw_factor_df(
@@ -1452,7 +1828,9 @@ class FactorSynthesizer:
             fundamental_table=self.fundamental_table,
             period=period,
             custom_logger=self.logger,
-            pit_enabled=self.pit_config.get("enabled", True),
+            pit_enabled=self._effective_pit_enabled(),
+            slot=self._get_slot() if self._use_slot_feeds() else None,
+            frequency=getattr(self, "frequency", "1d"),
         )
 
 
@@ -1473,6 +1851,8 @@ class FactorSynthesizer:
             stock_filter=stock_filter,
             custom_logger=self.logger,
             trading_calendar=trading_calendar,
+            slot=self._get_slot() if self._use_slot_feeds() else None,
+            frequency=getattr(self, "frequency", "1d"),
         )
 
 
@@ -1487,7 +1867,12 @@ class FactorSynthesizer:
         )
 
     def direct_analyze_composite_factor(
-        self, composite_series: pd.Series, factor_name: str, run_alphalens: bool = True
+        self,
+        composite_series: pd.Series,
+        factor_name: str,
+        run_alphalens: bool = True,
+        *,
+        synthesis_name: Optional[str] = None,
     ):
         """直接分析合成因子而不保存到数据库 - 内存模式
 
@@ -1513,7 +1898,7 @@ class FactorSynthesizer:
         try:
             # 获取因子数据的股票池和时间范围
             dates = composite_series.index.get_level_values("date").unique()
-            stocks = composite_series.index.get_level_values("stock_code").unique()
+            stocks = list(composite_series.index.get_level_values("stock_code").unique())
 
             self.logger.info(
                 f"因子时间范围: {dates.min()} 到 {dates.max()} ({len(dates)}天)"
@@ -1649,8 +2034,24 @@ class FactorSynthesizer:
                 nan_after_fill = factor_df_filled.isna().sum().sum()
                 self.logger.info(f"前向填充后NaN数量: {nan_after_fill}")
 
+            effective_run_alphalens = (
+                bool(run_alphalens)
+                and not bool(pe_cfg.get("skip_alphalens_analysis", False))
+                and getattr(self, "frequency", "1d") == "1d"
+                and len(stocks) >= 2
+                and getattr(self, "result_writer", None) is not None
+            )
+
             # 获取价格数据
-            pricing = self._get_pricing_data(stocks, dates)
+            pricing = self._get_pricing_data(
+                stocks,
+                dates,
+                future_periods=(
+                    None
+                    if effective_run_alphalens
+                    else 0
+                ),
+            )
 
             if pricing.empty:
                 raise RuntimeError(f"missing pricing: {factor_name}")
@@ -1699,12 +2100,17 @@ class FactorSynthesizer:
             pe_config = self.config.get("performance_evaluation", {})
             top_k_cfg = pe_config.get("top_k_strategy", {})
             if top_k_cfg.get("enabled", False):
-                self._run_vectorbt_backtest(factor_df_filled, factor_name, pricing)
+                self._run_vectorbt_backtest(
+                    factor_df_filled,
+                    factor_name,
+                    pricing,
+                    synthesis_name=synthesis_name or getattr(self, "_active_synthesis_name", None),
+                )
             # ==========================================
 
-            if not run_alphalens:
+            if not effective_run_alphalens:
                 self.logger.info(
-                    f"[REUSE] 跳过 alphalens/IC 分析 (复用回放模式): {factor_name}"
+                    f"[REUSE] 跳过 alphalens/IC 分析 (复用回放或非日频/单标的模式): {factor_name}"
                 )
                 return
 
@@ -1739,8 +2145,45 @@ class FactorSynthesizer:
             traceback.print_exc()
             raise
 
+    def _resolve_active_synthesis_name(
+        self, factor_name: str, synthesis_name: Optional[str] = None
+    ) -> Optional[str]:
+        synthesis_methods = self.config.get("synthesis_methods", {})
+        if not synthesis_methods:
+            return None
+        if synthesis_name:
+            if synthesis_name not in synthesis_methods:
+                raise ValueError(
+                    f"Unknown synthesis_name {synthesis_name!r}; expected one of {list(synthesis_methods)}"
+                )
+            return synthesis_name
+        active = getattr(self, "_active_synthesis_name", None)
+        if active and active in synthesis_methods:
+            return active
+        prefix = str(
+            self.config.get("output_settings", {}).get("composite_factor_prefix") or ""
+        )
+        matched = [
+            name
+            for name in synthesis_methods
+            if factor_name == name
+            or (prefix and factor_name == f"{prefix}_{name}")
+        ]
+        if len(matched) == 1:
+            return matched[0]
+        if len(synthesis_methods) == 1:
+            return next(iter(synthesis_methods))
+        raise ValueError(
+            f"Cannot resolve synthesis_name for {factor_name!r} among {list(synthesis_methods)}"
+        )
+
     def _run_vectorbt_backtest(
-        self, factor_df: pd.DataFrame, factor_name: str, pricing: pd.Series
+        self,
+        factor_df: pd.DataFrame,
+        factor_name: str,
+        pricing: pd.Series,
+        *,
+        synthesis_name: Optional[str] = None,
     ) -> None:
         """
         使用VectorBT运行Top-K策略回测
@@ -1767,9 +2210,11 @@ class FactorSynthesizer:
             factor_db_path = None
 
             synthesis_methods = self.config.get("synthesis_methods", {})
-            if synthesis_methods:
-                # 使用第一个合成方法的配置
-                method_name = list(synthesis_methods.keys())[0]
+            method_name = self._resolve_active_synthesis_name(
+                factor_name, synthesis_name=synthesis_name
+            )
+            synthesis_method = None
+            if method_name is not None:
                 method_cfg = synthesis_methods[method_name]
                 synthesis_method = method_cfg.get("method", "lasso")
 
@@ -1866,12 +2311,11 @@ class FactorSynthesizer:
             )
 
             # Derive experiment name from synthesis method or config
-            experiment_name = output_cfg.get(
-                "composite_factor_prefix", "unnamed_experiment"
+            experiment_name = (
+                method_name
+                if method_name is not None
+                else output_cfg.get("composite_factor_prefix", "unnamed_experiment")
             )
-            if synthesis_methods:
-                method_name = list(synthesis_methods.keys())[0]
-                experiment_name = method_name
 
             # [JQ-ALIGNED V5] 获取完整价格数据（包括 skip months），不使用已过滤的 pricing 参数
             # VectorBT 需要 skip month 日期来正确追踪资产价值和执行清仓
@@ -1910,17 +2354,30 @@ class FactorSynthesizer:
 
             # self.logger.info(f"[VectorBT] 收盘价数据: {price_wide.shape[0]} 日期, {price_wide.shape[1]} 股票")
 
-            # [JoinQuant 对齐] 获取开盘价数据用于订单执行（同样不过滤 skip months）
-            open_wide = self._get_open_price_data(
-                list(price_wide.columns),
-                start_date,  # 使用完整日期范围
-                end_date,
+            slot_arg = self._get_slot() if self._use_slot_feeds() else None
+
+            # [JoinQuant 对齐] 历史 A 股默认保留开盘价执行；显式非 jq_ashare_local 插槽按约定 entry_price_field 执行
+            explicit_close_slot = (
+                slot_arg is not None
+                and slot_arg.slot_id != "jq_ashare_local"
+                and slot_arg.microstructure.execution_profile.entry_price_field == "close"
             )
-            if open_wide is not None:
-                # self.logger.info(f"[VectorBT] 开盘价数据: {open_wide.shape[0]} 日期, {open_wide.shape[1]} 股票")
-                pass
+            if explicit_close_slot:
+                open_wide = None
+                self.logger.info(
+                    "[VectorBT] 显式插槽 %s 配置 entry_price_field='close'，跳过开盘价读取",
+                    slot_arg.slot_id,
+                )
             else:
-                self.logger.warning("[VectorBT] 无法获取开盘价，将使用收盘价执行订单")
+                open_wide = self._get_open_price_data(
+                    list(price_wide.columns),
+                    start_date,  # 使用完整日期范围
+                    end_date,
+                )
+                if open_wide is not None:
+                    pass
+                else:
+                    self.logger.warning("[VectorBT] 无法获取开盘价，将使用收盘价执行订单")
 
             # 确保因子数据格式正确 (Wide: Index=date, Columns=stocks)
             if isinstance(factor_df.index, pd.MultiIndex):
@@ -1934,6 +2391,7 @@ class FactorSynthesizer:
             factor_wide.index = pd.to_datetime(factor_wide.index)
             factor_wide = factor_wide.sort_index()
             pure_blend_parent_panel = None
+            extra_market_factor_inputs: Optional[Dict[str, Any]] = None
             pure_blend_factor = _pure_blend_fallback_factor(bundle_path)
             if pure_blend_factor:
                 raw_parent = self.load_factor_data(
@@ -1942,6 +2400,9 @@ class FactorSynthesizer:
                     end_date,
                     stock_filter=set(price_wide.columns),
                 )
+                raw_parent_inputs = raw_parent.attrs.get("market_factor_inputs")
+                if isinstance(raw_parent_inputs, Mapping):
+                    extra_market_factor_inputs = dict(raw_parent_inputs)
                 pure_blend_parent_panel = winsorized_zscore_panel(
                     self._wide_factor_panel(raw_parent, pure_blend_factor)
                 )
@@ -1964,97 +2425,152 @@ class FactorSynthesizer:
 
             # self.logger.info(f"[VectorBT] 动态池: {len(dynamic_pools)} 个调仓日")
 
-            # [MULTI-TOP-PCT] 支持多个 top_pct 值，逐一运行回测
-            top_pct_raw = top_k_cfg.get("top_pct", None)
-            if top_pct_raw is None:
-                top_pct_list: list[float | None] = [None]  # will use top_k or default
-            elif isinstance(top_pct_raw, list):
-                top_pct_list = top_pct_raw
-            else:
-                top_pct_list = [top_pct_raw]
+            from tools.agent_harness.run_result import resolve_backtest_candidates
+
+            # [MULTI-TOP-PCT] 支持多个 top_pct 值，逐一运行回测（遵循 top_k > top_pct > 默认值）
+            selection_candidates = resolve_backtest_candidates(top_k_cfg)
 
             benchmark_cfg = pe_config.get("benchmark_suite", {})
-            reuse_scores = len(top_pct_list) > 1 or benchmark_cfg.get(
+            reuse_scores = len(selection_candidates) > 1 or benchmark_cfg.get(
                 "enabled", False
             )
             factor_load_cache: dict | None = {} if reuse_scores else None
             synthesis_score_cache: dict | None = {} if reuse_scores else None
 
-            for pct in top_pct_list:
-                # 为每个 top_pct 值创建独立的 runner_config
+            rebalance_freq = str(top_k_cfg.get("rebalance_freq") or "weekly")
+            freq_arg = getattr(self, "frequency", "1d")
+            store_arg = getattr(self, "factor_values_store", None)
+            identities_arg = getattr(self, "factor_identities", None)
+            fp_instruments = sorted(
+                set(map(str, price_wide.columns))
+                | {
+                    str(s)
+                    for pool_vals in (dynamic_pools or {}).values()
+                    for s in (pool_vals or ())
+                }
+            )
+            execution_bars_fp = self._compute_execution_bars_fingerprint(
+                price_wide=price_wide,
+                open_wide=open_wide,
+                factor_ratio_df=factor_ratio_df,
+                slot=slot_arg,
+                price_conn=price_conn,
+                frequency=freq_arg,
+                instruments=fp_instruments,
+                start_date=start_date,
+                end_date=end_date,
+                top_k_cfg=top_k_cfg,
+                price_table=getattr(self, "price_table", "price_data_daily"),
+            )
+
+            for selection_mode, resolved_pct, top_k_value in selection_candidates:
+                # 为每个候选选股参数创建独立的 runner_config
                 iter_top_k_cfg = dict(top_k_cfg)
                 if (
                     synthesis_method == "size_conditional_elasticnet"
                     or pure_blend_parent_panel is not None
                 ):
                     iter_top_k_cfg["score_source"] = "input_factor"
-                iter_top_k_cfg["top_pct"] = pct  # override to single float (or None)
+                iter_top_k_cfg["top_pct"] = resolved_pct  # override to single float (or None)
+                iter_top_k_cfg["top_k"] = top_k_value
                 iter_runner_config = {
                     "top_k_strategy": iter_top_k_cfg,
                     "calendar_filters": cal_cfg_for_backtest,
                 }
-
-                selection_mode = "top_pct" if pct is not None else "top_k"
-                top_k_value = (
-                    None if pct is not None else iter_top_k_cfg.get("top_k", 5)
-                )
                 trial_id = self._build_backtest_trial_id(
                     factor_name=factor_name,
                     selection_mode=selection_mode,
-                    top_pct=pct,
+                    top_pct=resolved_pct,
                     top_k=top_k_value,
+                    synthesis_name=method_name,
                 )
                 pct_label = (
-                    f"top_pct={pct}" if pct is not None else f"top_k={top_k_value}"
+                    f"top_pct={resolved_pct}"
+                    if resolved_pct is not None
+                    else f"top_k={top_k_value}"
                 )
                 self.logger.info(f"[VectorBT] 运行回测: {pct_label}")
 
                 runner = None
+                effective_allow_short = False
+                effective_benchmark = None
+                effective_exec_profile = None
+                effective_universe_filter = None
                 try:
-                    runner = VectorBTBacktestRunner(
-                        iter_runner_config,
-                        logger=self.logger,
-                        bundle_path=bundle_path,
-                        factor_db_path=factor_db_path,
-                        factor_db_conn=None,
-                        price_db_path=price_db_path,
-                        price_db_conn=price_conn,
-                        save_alignment_data=save_alignment_data,
-                        alignment_output_dir=output_cfg.get(
-                            "alignment_output_dir", "outputs/synthesis/alignment"
-                        ),
-                        experiment_name=experiment_name,
-                        alignment_output_format=alignment_output_format,
-                        return_series_output_dir=self.return_series_output_dir,
-                        return_series_trial_id=trial_id
-                        if self.return_series_output_dir
-                        else None,
-                        return_series_metadata={
-                            "run_id": self.run_id,
-                            "selected_config_path": str(
-                                Path(self.config_path).expanduser().resolve()
+                    try:
+                        runner = VectorBTBacktestRunner(
+                            iter_runner_config,
+                            logger=self.logger,
+                            bundle_path=bundle_path,
+                            factor_db_path=factor_db_path,
+                            factor_db_conn=None,
+                            price_db_path=price_db_path,
+                            price_db_conn=price_conn,
+                            save_alignment_data=save_alignment_data,
+                            alignment_output_dir=output_cfg.get(
+                                "alignment_output_dir", "outputs/synthesis/alignment"
                             ),
-                        },
-                        diagnostics_output_dir=self.config.get(
-                            "output_settings", {}
-                        ).get("diagnostics_output_dir"),
-                        factor_load_cache=factor_load_cache,
-                        synthesis_score_cache=synthesis_score_cache,
-                    )
+                            experiment_name=experiment_name,
+                            alignment_output_format=alignment_output_format,
+                            return_series_output_dir=self.return_series_output_dir,
+                            return_series_trial_id=trial_id
+                            if self.return_series_output_dir
+                            else None,
+                            return_series_metadata={
+                                "run_id": self.run_id,
+                                "selected_config_path": str(
+                                    Path(self.config_path).expanduser().resolve()
+                                ),
+                            },
+                            diagnostics_output_dir=self.config.get(
+                                "output_settings", {}
+                            ).get("diagnostics_output_dir"),
+                            factor_load_cache=factor_load_cache,
+                            synthesis_score_cache=synthesis_score_cache,
+                            slot=slot_arg,
+                            frequency=freq_arg,
+                            factor_values_store=store_arg,
+                            factor_identities=identities_arg,
+                        )
 
-                    # 运行回测 - 传入开盘价以对齐JoinQuant执行方式
-                    results = runner.run_backtest(
-                        factor_df=factor_wide,
-                        price_df=price_wide,
-                        open_df=open_wide,  # JoinQuant对齐: 开盘价执行
-                        factor_ratio_df=factor_ratio_df,  # Evidence only; prices already include PIT adjustment.
-                        dynamic_pools=dynamic_pools,
-                        rebalance_freq="weekly",
+                        # 运行回测 - 按插槽配置或历史 A 股开盘价执行
+                        results = runner.run_backtest(
+                            factor_df=factor_wide,
+                            price_df=price_wide,
+                            open_df=open_wide,
+                            factor_ratio_df=factor_ratio_df,  # Evidence only; prices already include PIT adjustment.
+                            dynamic_pools=dynamic_pools,
+                            rebalance_freq=rebalance_freq,
+                        )
+                        effective_allow_short = bool(runner.allow_short)
+                        effective_benchmark = runner.benchmark_instrument
+                        effective_exec_profile = self._resolve_effective_execution_profile(
+                            runner=runner,
+                            slot=slot_arg,
+                        )
+                        effective_universe_filter = self._resolve_universe_filter_snapshot(
+                            iter_top_k_cfg, runner=runner, slot=slot_arg
+                        )
+                    finally:
+                        if runner is not None:
+                            with suppress(Exception):
+                                runner.close()
+                except PITValidationError:
+                    raise
+                except Exception as cand_exc:
+                    self._vectorbt_result_summaries.append(
+                        {
+                            "synthesis_name": method_name,
+                            "factor_name": factor_name,
+                            "trial_id": trial_id,
+                            "selection_mode": selection_mode,
+                            "top_k": top_k_value,
+                            "top_pct": resolved_pct,
+                            "error": str(cand_exc),
+                        }
                     )
-                finally:
-                    if runner is not None:
-                        with suppress(Exception):
-                            runner.close()
+                    self.logger.error(f"[VectorBT] 回测异常 ({pct_label}, trial_id={trial_id}): {cand_exc}")
+                    continue
 
                 if (
                     "error" not in results
@@ -2104,6 +2620,10 @@ class FactorSynthesizer:
                         },
                         factor_load_cache=factor_load_cache,
                         synthesis_score_cache=synthesis_score_cache,
+                        slot=slot_arg,
+                        frequency=freq_arg,
+                        factor_values_store=store_arg,
+                        factor_identities=identities_arg,
                     )
                     try:
                         candidate_gross_result = gross_runner.run_backtest(
@@ -2112,7 +2632,7 @@ class FactorSynthesizer:
                             open_df=open_wide,
                             factor_ratio_df=factor_ratio_df,
                             dynamic_pools=dynamic_pools,
-                            rebalance_freq="weekly",
+                            rebalance_freq=rebalance_freq,
                         )
                     finally:
                         gross_runner.close()
@@ -2120,11 +2640,12 @@ class FactorSynthesizer:
                 # 输出结果
                 if "error" not in results:
                     summary = {
+                        "synthesis_name": method_name,
                         "factor_name": factor_name,
                         "trial_id": trial_id,
                         "selection_mode": selection_mode,
                         "top_k": top_k_value,
-                        "top_pct": pct,
+                        "top_pct": resolved_pct,
                         "annual_return": results.get("annual_return"),
                         "sharpe_ratio": results.get("sharpe_ratio"),
                         "calmar_ratio": results.get("calmar_ratio"),
@@ -2152,7 +2673,41 @@ class FactorSynthesizer:
                         "avg_exposure": results.get("avg_exposure"),
                         "overlay": results.get("overlay"),
                     }
+                    summary.update(market_db_identity(results))
                     self._vectorbt_result_summaries.append(summary)
+                    returns_series = self._extract_portfolio_returns(results.get("portfolio"))
+                    candidate_entry = {
+                        "synthesis_name": method_name,
+                        "trial_id": trial_id,
+                        "summary": dict(summary),
+                        "returns_series": returns_series,
+                        "return_series_artifact": results.get("return_series_artifact"),
+                        "rebalance_config": {
+                            "rebalance_freq": rebalance_freq,
+                            "rebalance_schedule": self.config.get("stock_pool", {}).get(
+                                "rebalance_schedule", "weekly"
+                            ),
+                            "holding_period": int(iter_top_k_cfg.get("holding_period", 5)),
+                            "nth_trading_day": int(iter_top_k_cfg.get("nth_trading_day", 3)),
+                            "selection_mode": selection_mode,
+                            "top_k": top_k_value,
+                            "top_pct": resolved_pct,
+                            "skip_months": list(
+                                self.config.get("calendar_filters", {}).get("skip_months", [])
+                            ),
+                        },
+                        "allow_short": effective_allow_short,
+                        "benchmark_instrument": effective_benchmark,
+                        "execution_profile": effective_exec_profile,
+                        "universe_filter": effective_universe_filter,
+                        "execution_bars_fingerprint": execution_bars_fp,
+                        "pure_blend_factor": pure_blend_factor,
+                        "extra_market_factor_inputs": extra_market_factor_inputs,
+                    }
+                    self._last_bundle_backtest = candidate_entry
+                    if not hasattr(self, "_bundle_backtests") or self._bundle_backtests is None:
+                        self._bundle_backtests = []
+                    self._bundle_backtests.append(candidate_entry)
                     if benchmark_cfg.get("enabled", False) and not getattr(
                         self, "_p2_benchmark_done", False
                     ):
@@ -2193,16 +2748,17 @@ class FactorSynthesizer:
                 else:
                     self._vectorbt_result_summaries.append(
                         {
+                            "synthesis_name": method_name,
                             "factor_name": factor_name,
                             "trial_id": trial_id,
                             "selection_mode": selection_mode,
                             "top_k": top_k_value,
-                            "top_pct": pct,
+                            "top_pct": resolved_pct,
                             "error": results.get("error"),
                         }
                     )
                     self.logger.warning(
-                        f"[VectorBT] 回测失败 ({pct_label}): {results.get('error')}"
+                        f"[VectorBT] 回测失败 ({pct_label}, trial_id={trial_id}): {results.get('error')}"
                     )
 
         except PITValidationError:
@@ -2406,8 +2962,15 @@ class FactorSynthesizer:
             custom_logger=self.logger,
         )
 
-    def _get_pricing_data(self, stocks: list, dates: pd.Index) -> pd.Series:
+    def _get_pricing_data(
+        self, stocks: list, dates: pd.Index, *, future_periods: Optional[int] = None
+    ) -> pd.Series:
         """获取价格数据用于alphalens分析 - 代理到核心模块"""
+        resolved_future = (
+            future_periods
+            if future_periods is not None
+            else max(self.config.get('performance_evaluation', {}).get('ic_periods') or (1, 5, 10)) + 1
+        )
         return core_get_pricing_data(
             price_conn=self._get_price_conn(),
             price_table=self.price_table,
@@ -2416,10 +2979,10 @@ class FactorSynthesizer:
             skip_months=getattr(self, "skip_months", None),
             skip_months_evaluation=getattr(self, "skip_months_evaluation", False),
             custom_logger=self.logger,
-            pit_enabled=self.pit_config.get("enabled", True)
-            if hasattr(self, "pit_config")
-            else True,
-            future_periods=max(self.config['performance_evaluation'].get('ic_periods') or (1, 5, 10)) + 1,
+            pit_enabled=self._effective_pit_enabled(),
+            future_periods=resolved_future,
+            slot=self._get_slot() if self._use_slot_feeds() else None,
+            frequency=getattr(self, "frequency", "1d"),
         )
 
     def _get_open_price_data(
@@ -2433,10 +2996,10 @@ class FactorSynthesizer:
             start_date=start_date,
             end_date=end_date,
             custom_logger=self.logger,
-            pit_enabled=self.pit_config.get("enabled", True)
-            if hasattr(self, "pit_config")
-            else True,
+            pit_enabled=self._effective_pit_enabled(),
             for_label=for_label,
+            slot=self._get_slot() if self._use_slot_feeds() else None,
+            frequency=getattr(self, "frequency", "1d"),
         )
 
     def _get_complete_price_data_for_vectorbt(
@@ -2449,6 +3012,8 @@ class FactorSynthesizer:
                 - price_df: Wide DataFrame (Index=date, Columns=stocks) with close prices
                 - factor_ratio_df: Wide DataFrame with factor ratios for corporate action adjustment
         """
+        slot_arg = self._get_slot() if self._use_slot_feeds() else None
+        freq_arg = getattr(self, "frequency", "1d")
         price_df = core_get_complete_price_data(
             price_conn=self._get_price_conn(),
             price_table=self.price_table,
@@ -2456,9 +3021,9 @@ class FactorSynthesizer:
             start_date=start_date,
             end_date=end_date,
             custom_logger=self.logger,
-            pit_enabled=self.pit_config.get("enabled", True)
-            if hasattr(self, "pit_config")
-            else True,
+            pit_enabled=self._effective_pit_enabled(),
+            slot=slot_arg,
+            frequency=freq_arg,
         )
 
         # 获取除权因子比率数据
@@ -2469,6 +3034,8 @@ class FactorSynthesizer:
             start_date=start_date,
             end_date=end_date,
             custom_logger=self.logger,
+            slot=slot_arg,
+            frequency=freq_arg,
         )
 
         return price_df, factor_ratio_df
@@ -2941,10 +3508,13 @@ class FactorSynthesizer:
             # The backtest path loads the bundle from this run's weights_output_dir, so make
             # sure it is present there (no-op when source_dir == weights_output_dir).
             dest_dir = Path(output_dir)
-            dest_dir.mkdir(parents=True, exist_ok=True)
-            dest_bundle = dest_dir / bundle_path.name
-            if bundle_path.resolve() != dest_bundle.resolve():
-                shutil.copy2(bundle_path, dest_bundle)
+            model_artifact_files, bundle_models = _collect_lasso_model_artifacts(
+                synthesis_name,
+                dest_dir=dest_dir,
+                source_dir=source_dir,
+            )
+            dest_bundle = dest_dir / f"lasso_model_bundle_{synthesis_name}.json"
+
             frame = pd.read_parquet(cache_path)
             composite = frame.iloc[:, 0]
             composite.name = None
@@ -2975,15 +3545,47 @@ class FactorSynthesizer:
                 self.logger.warning(
                     f"[REUSE] 扩展动态池universe失败，继续使用原cache: {e}"
                 )
+
+            factor_group = synthesis_config.get("factor_group")
+            training_factor_names = list(
+                self.config.get("factor_groups", {})
+                .get(factor_group, {})
+                .get("factors", [])
+            )
+            reused_df = composite.to_frame("composite_value")
+            reused_inputs = self._resolve_reuse_market_factor_inputs(
+                training_factor_names=training_factor_names,
+                synthesis_config=synthesis_config,
+                bundle_models=bundle_models,
+                composite=composite,
+                cache_path=cache_path,
+            )
+            if reused_inputs:
+                reused_df.attrs["market_factor_inputs"] = reused_inputs
+            self._record_bundle_synthesis(
+                synthesis_name=synthesis_name,
+                method=method,
+                synthesis_config=synthesis_config,
+                training_factor_names=training_factor_names,
+                factor_df=reused_df,
+                model_artifact_files=model_artifact_files,
+                model_infos=list(bundle_models),
+            )
+
             composite_name = f"{self.config['output_settings']['composite_factor_prefix']}_{synthesis_name}"
             self.logger.info(
                 f"[REUSE] 复用已有合成 (跳过 Lasso 训练): bundle={dest_bundle}, "
                 f"cache={cache_path}, rows={len(composite)}"
             )
             self.direct_analyze_composite_factor(
-                composite, composite_name, run_alphalens=False
+                composite,
+                composite_name,
+                run_alphalens=False,
+                synthesis_name=synthesis_name,
             )
             return True
+        except (FileNotFoundError, ValueError):
+            raise
         except Exception as e:
             self.logger.error(f"[REUSE] 复用合成失败，回退到完整合成: {e}")
             import traceback
@@ -2999,6 +3601,18 @@ class FactorSynthesizer:
             synthesis_name: 合成方法名称
             synthesis_config: 合成配置
         """
+        prev_active = getattr(self, "_active_synthesis_name", None)
+        self._active_synthesis_name = synthesis_name
+        try:
+            return self._rolling_window_synthesis_impl(
+                synthesis_name, synthesis_config
+            )
+        finally:
+            self._active_synthesis_name = prev_active
+
+    def _rolling_window_synthesis_impl(
+        self, synthesis_name: str, synthesis_config: dict
+    ):
         self.logger.info(f"开始滚动窗口合成: {synthesis_name}")
 
         # 获取因子组
@@ -3105,12 +3719,19 @@ class FactorSynthesizer:
 
         # [自动扩展] 向前扩展 train_window_days + buffer 以满足第一个训练窗口的数据需求
         # start_date 是合成输出的起始日期，第一个训练窗口为 [start_date - train_window_days, start_date]
-        train_window_days = self.config["rolling_window"]["train_window_days"]
-        _buffer_days = 30  # buffer 用于 shift(1) 和交易日历对齐
-        data_start_date = (
-            pd.to_datetime(start_date)
-            - timedelta(days=train_window_days + _buffer_days)
-        ).strftime("%Y-%m-%d")
+        train_window_days = (
+            0
+            if method == "weighted_sum" and "rolling_window" not in self.config
+            else self.config["rolling_window"]["train_window_days"]
+        )
+        _buffer_days = 0 if method == "weighted_sum" and train_window_days == 0 else 30  # buffer 用于 shift(1) 和交易日历对齐
+        data_start_dt = pd.to_datetime(start_date) - timedelta(days=train_window_days + _buffer_days)
+        active_slot = self._get_slot() if self._use_slot_feeds() else None
+        if active_slot is not None:
+            cal_start = pd.Timestamp(active_slot.calendar.start)
+            if data_start_dt < cal_start <= pd.to_datetime(start_date):
+                data_start_dt = cal_start
+        data_start_date = data_start_dt.strftime("%Y-%m-%d")
         self.logger.info(
             f"[日期范围] 合成结果范围: {start_date} ~ {end_date}, "
             f"数据读取范围自动扩展为: {data_start_date} ~ {end_date} "
@@ -3132,6 +3753,7 @@ class FactorSynthesizer:
                 stock_filter=all_pool_stocks,
                 neutralization_config=synthesis_config.get("neutralization"),
             )
+            market_factor_inputs = frame.attrs.get("market_factor_inputs")
             frame = self._apply_dynamic_stock_pool_filter(
                 frame, start_date=data_start_date, end_date=end_date
             ).sort_index()
@@ -3139,6 +3761,8 @@ class FactorSynthesizer:
                 self, "skip_months", None
             ):
                 frame = self._apply_skip_months(frame)
+            if market_factor_inputs is not None:
+                frame.attrs["market_factor_inputs"] = market_factor_inputs
             return frame
 
         prepared_panel = None
@@ -3148,28 +3772,20 @@ class FactorSynthesizer:
         if method == "size_conditional_elasticnet":
             size_cfg = synthesis_config.get("size_conditioning", {})
             prepared_cache_cfg = size_cfg.get("prepared_cache", {})
-            if self.config.get("stock_pool", {}).get("use_dynamic_pools", False):
-                all_pool_stocks = self._get_all_pool_stocks(data_start_date, end_date)
-            factor_hash = hashlib.md5(
-                "_".join(sorted(all_factor_names)).encode()
-            ).hexdigest()[:8]
-            stock_hash = hashlib.md5(
-                str(sorted(all_pool_stocks) if all_pool_stocks else "ALL").encode()
-            ).hexdigest()[:8]
-            raw_cache_root = Path(
-                self.config.get("cache_settings", {}).get(
-                    "cache_dir", "./cache/factor_data"
-                )
-            )
-            raw_factor_cache = raw_cache_root / (
-                f"factors_{factor_hash}_{data_start_date}_{end_date}_{stock_hash}.parquet"
-            )
+            frame = _load_filtered_factor_panel()
+            if frame.empty:
+                raise ValueError(f"无因子数据可用于 {synthesis_name}")
+            market_factor_inputs = frame.attrs.pop("market_factor_inputs", None)
+            aligned_factor_panel = {
+                "columns": list(frame.columns),
+                "dtypes": [str(dtype) for dtype in frame.dtypes],
+                "sha256": hashlib.sha256(
+                    pd.util.hash_pandas_object(frame, index=True).to_numpy(dtype="<u8").tobytes()
+                ).hexdigest(),
+            }
             price_source = (
                 self.config.get("database", {}).get("price_db", {}).get("duckdb_path")
             )
-            source_paths = [str(raw_factor_cache)]
-            if price_source:
-                source_paths.append(price_source)
             from utils.trading_calendar import load_trading_calendar
             market_cap_calendar = load_trading_calendar(self._get_price_conn())
             market_cap_sessions = market_cap_calendar.sessions(data_start_date, end_date)
@@ -3194,14 +3810,15 @@ class FactorSynthesizer:
                 all_factor_names,
                 data_start_date,
                 end_date,
-                source_paths,
-                source_markers={"market_cap_alignment": market_cap_alignment},
+                [price_source] if price_source else [],
+                source_markers={
+                    "market_cap_alignment": market_cap_alignment,
+                    "market_factor_inputs": market_factor_inputs,
+                    "aligned_factor_panel": aligned_factor_panel,
+                },
             )
 
             def _build_prepared_panel():
-                frame = _load_filtered_factor_panel()
-                if frame.empty:
-                    raise ValueError(f"无因子数据可用于 {synthesis_name}")
                 returns = self.calculate_forward_returns(
                     frame, synthesis_config.get("target_period", 5)
                 )
@@ -3221,18 +3838,11 @@ class FactorSynthesizer:
                     "cache_dir", "./cache/factor_data"
                 )
             )
-            cache_enabled = bool(prepared_cache_cfg.get("enabled", True))
-            if not raw_factor_cache.exists():
-                self.logger.info(
-                    "[SIZE_PREPARED_CACHE] raw factor cache absent; prepared cache starts next run: %s",
-                    raw_factor_cache,
-                )
-                cache_enabled = False
             prepared_panel, snapshot_info = load_or_build_size_conditional_snapshot(
                 cache_root,
                 snapshot_identity,
                 _build_prepared_panel,
-                enabled=cache_enabled,
+                enabled=bool(prepared_cache_cfg.get("enabled", True)),
                 logger=self.logger,
             )
             factor_df = prepared_panel["predict_factors"]
@@ -3247,12 +3857,42 @@ class FactorSynthesizer:
         else:
             factor_df = _load_filtered_factor_panel()
 
+        market_inputs_kwargs: Dict[str, Any] = {}
+        if self._use_slot_feeds() or getattr(self, "factor_values_store", None) is not None:
+            market_inputs_kwargs = {
+                "slot": active_slot,
+                "slot_id": self._slot_id,
+                "frequency": self.frequency,
+                "factor_values_store": self.factor_values_store,
+                "factor_identities": self.factor_identities,
+            }
+
         # weighted_sum 不需要滚动窗口与训练，直接在全样本上做线性合成
         if method == "weighted_sum":
             self.logger.info(f"使用 weighted_sum 固定权重合成: {synthesis_name}")
-            run_weighted_sum_synthesis(
-                self, synthesis_name, synthesis_config, factor_df
+            self._record_bundle_synthesis(
+                synthesis_name=synthesis_name,
+                method=method,
+                synthesis_config=synthesis_config,
+                training_factor_names=training_factor_names,
+                factor_df=factor_df,
+                model_artifact_files=[],
             )
+            run_weighted_sum_synthesis(
+                self, synthesis_name, synthesis_config, factor_df, **market_inputs_kwargs
+            )
+            weights_dir = self.config.get("output_settings", {}).get("weights_output_dir", "./results")
+            ws_bundle = Path(weights_dir) / f"weighted_sum_bundle_{synthesis_name}.json"
+            syntheses_map = getattr(self, "_bundle_syntheses", {})
+            ws_entry = syntheses_map.get(synthesis_name)
+            if ws_entry is not None and ws_bundle.is_file():
+                ws_entry["model_artifact_files"] = [
+                    ("model_bundle", str(ws_bundle.resolve()))
+                ]
+            if self._last_bundle_synthesis is not None and ws_bundle.is_file():
+                self._last_bundle_synthesis["model_artifact_files"] = [
+                    ("model_bundle", str(ws_bundle.resolve()))
+                ]
             return
 
         # 若为LASSO，则收集每个窗口的系数以便最终导出CSV
@@ -3369,6 +4009,7 @@ class FactorSynthesizer:
                         train_end_str,
                         synthesis_config,
                         daily_pools=daily_pools_for_predict,
+                        **market_inputs_kwargs,
                     )
                 except InsufficientSurvivingFactorsError as exc:
                     training_window_audits.append(
@@ -3437,6 +4078,7 @@ class FactorSynthesizer:
                     train_start_str,
                     train_end_str,
                     synthesis_config,
+                    **market_inputs_kwargs,
                 )
 
                 if composite_results:
@@ -3460,6 +4102,7 @@ class FactorSynthesizer:
                         synthesis_config,
                         output_dir=model_output_dir,
                         daily_pools=daily_pools_for_predict,
+                        **market_inputs_kwargs,
                     )
                 except InsufficientSurvivingFactorsError as exc:
                     training_window_audits.append(
@@ -3515,6 +4158,7 @@ class FactorSynthesizer:
                         synthesis_config,
                         daily_pools=daily_pools_for_predict,
                         prepared_panel=prepared_panel,
+                        **market_inputs_kwargs,
                     )
                 except InsufficientSurvivingFactorsError as exc:
                     training_window_audits.append(
@@ -3819,8 +4463,56 @@ class FactorSynthesizer:
                         f"多重共线性诊断异常（不影响后续流程）: {e}", exc_info=True
                     )
 
+            # [REPAIR] 记录合成元数据以供 StrategyBundle 固化
+            model_artifact_files: List[Tuple[str, str]] = []
+            if method == "lasso":
+                weights_dir = Path(
+                    self.config.get("output_settings", {}).get("weights_output_dir", "./results")
+                )
+                model_artifact_files, _ = _collect_lasso_model_artifacts(
+                    synthesis_name,
+                    dest_dir=weights_dir,
+                    source_dir=None,
+                )
+            elif method == "lightgbm" and model_output_dir:
+                lgb_dir = Path(model_output_dir)
+                lgb_bundle = lgb_dir / f"lgb_model_bundle_{synthesis_name}.json"
+                if lgb_bundle.is_file():
+                    model_artifact_files.append(("model_bundle", str(lgb_bundle.resolve())))
+                for info in model_infos:
+                    if isinstance(info, dict) and info.get("model_path"):
+                        mp = Path(str(info["model_path"]))
+                        if mp.is_file():
+                            model_artifact_files.append(("lgb_model", str(mp.resolve())))
+            elif method == "size_conditional_elasticnet":
+                weights_dir = Path(
+                    self.config.get("output_settings", {}).get("weights_output_dir", "./results")
+                )
+                sc_bundle_path = self._write_size_conditional_model_bundle(
+                    output_dir=weights_dir,
+                    synthesis_name=synthesis_name,
+                    factor_group=factor_group,
+                    model_infos=model_infos,
+                    synthesis_config=synthesis_config,
+                )
+                if sc_bundle_path is not None and sc_bundle_path.is_file():
+                    model_artifact_files.append(("model_bundle", str(sc_bundle_path.resolve())))
+            self._record_bundle_synthesis(
+                synthesis_name=synthesis_name,
+                method=method,
+                synthesis_config=synthesis_config,
+                training_factor_names=training_factor_names,
+                factor_df=factor_df,
+                model_artifact_files=model_artifact_files,
+                model_infos=model_infos,
+            )
+
             # 直接分析而不保存到数据库
-            self.direct_analyze_composite_factor(final_composite, composite_name)
+            self.direct_analyze_composite_factor(
+                final_composite,
+                composite_name,
+                synthesis_name=synthesis_name,
+            )
             self.logger.info(f"完成{method.upper()}合成因子分析: {composite_name}")
             model_evidence_diagnostics: Dict[str, Any] = {}
             if method == "lasso":
@@ -4005,6 +4697,28 @@ class FactorSynthesizer:
                         except Exception as e:
                             self.logger.error(f"生成 LightGBM 模型打包文件失败: {e}")
 
+                        updated_files: List[Tuple[str, str]] = []
+                        for role, fname in (
+                            ("model_bundle", f"lgb_model_bundle_{synthesis_name}.json"),
+                            ("model_index", f"model_index_{synthesis_name}.json"),
+                        ):
+                            p = Path(model_output_dir) / fname
+                            if p.is_file():
+                                updated_files.append((role, str(p.resolve())))
+                        for info in model_infos:
+                            if isinstance(info, dict) and info.get("model_path"):
+                                mp = Path(str(info["model_path"]))
+                                if mp.is_file():
+                                    updated_files.append(("lgb_model", str(mp.resolve())))
+                        syntheses_map = getattr(self, "_bundle_syntheses", {})
+                        if synthesis_name in syntheses_map:
+                            syntheses_map[synthesis_name]["model_artifact_files"] = list(updated_files)
+                        if (
+                            getattr(self, "_last_bundle_synthesis", None) is not None
+                            and self._last_bundle_synthesis.get("synthesis_name") == synthesis_name
+                        ):
+                            self._last_bundle_synthesis["model_artifact_files"] = list(updated_files)
+
                     else:
                         self.logger.warning(
                             "LightGBM 没有可用于索引的模型信息，跳过索引文件生成"
@@ -4038,6 +4752,15 @@ class FactorSynthesizer:
 
                     composite_name = f"{self.config['output_settings']['composite_factor_prefix']}_{synthesis_name}_PC{i + 1}"
 
+                    self._record_bundle_synthesis(
+                        synthesis_name=synthesis_name,
+                        method=method,
+                        synthesis_config=synthesis_config,
+                        training_factor_names=training_factor_names,
+                        factor_df=factor_df,
+                        model_artifact_files=[],
+                        model_infos=model_infos,
+                    )
                     # 直接分析而不保存到数据库
                     self.direct_analyze_composite_factor(
                         final_component, composite_name
@@ -4045,6 +4768,114 @@ class FactorSynthesizer:
                     self.logger.info(f"完成PCA合成因子分析: {composite_name}")
 
         self.logger.info(f"滚动窗口合成和分析完成: {synthesis_name}")
+
+    def _expected_backtest_trials(
+        self, synthesis_name: str, synthesis_config: Mapping[str, Any]
+    ) -> List[Dict[str, Any]]:
+        from tools.agent_harness.run_result import expected_backtest_trials
+
+        cfg = (
+            dict(self.config)
+            if isinstance(getattr(self, "config", None), Mapping)
+            else {}
+        )
+        cfg["synthesis_methods"] = {synthesis_name: dict(synthesis_config or {})}
+        return expected_backtest_trials(
+            cfg, config_path=getattr(self, "config_path", None)
+        )
+
+    def _validate_synthesis_backtest_outcomes(
+        self,
+        synthesis_name: str,
+        synthesis_config: Mapping[str, Any],
+        summaries: Sequence[Mapping[str, Any]],
+        *,
+        bundle_backtests: Optional[Sequence[Mapping[str, Any]]] = None,
+    ) -> None:
+        top_k_enabled = (
+            self.config.get("performance_evaluation", {})
+            .get("top_k_strategy", {})
+            .get("enabled", False)
+        )
+        if not top_k_enabled:
+            return
+        expected_trials = self._expected_backtest_trials(synthesis_name, synthesis_config)
+        if not expected_trials:
+            raise RuntimeError(
+                f"backtest_metrics_missing: no backtest candidates configured for {synthesis_name!r}"
+            )
+
+        valid_by_trial: Dict[str, Mapping[str, Any]] = {}
+        failed_by_trial: Dict[str, str] = {}
+        extra_failures: List[str] = []
+        for item in summaries:
+            if not isinstance(item, Mapping):
+                extra_failures.append("invalid_summary_entry")
+                continue
+            tid = str(item.get("trial_id") or "").strip()
+            has_error = "error" in item and item.get("error") is not None
+            missing_metrics = [
+                key
+                for key in ("annual_return", "sharpe_ratio", "max_drawdown")
+                if item.get(key) is None
+                or not isinstance(item.get(key), (int, float))
+                or not np.isfinite(float(item.get(key)))
+            ]
+            if has_error or missing_metrics or "error" in item:
+                reason = (
+                    str(item.get("error"))
+                    if item.get("error") is not None
+                    else f"missing/non-finite metrics {missing_metrics}"
+                )
+                if tid:
+                    failed_by_trial[tid] = reason
+                else:
+                    extra_failures.append(f"unknown_trial ({reason})")
+            elif tid:
+                if tid in valid_by_trial:
+                    extra_failures.append(f"{tid} (duplicate)")
+                else:
+                    valid_by_trial[tid] = item
+            else:
+                extra_failures.append("missing_trial_id")
+
+        problems: List[str] = []
+        expected_ids = {exp["trial_id"] for exp in expected_trials}
+        for exp in expected_trials:
+            tid = exp["trial_id"]
+            if tid in failed_by_trial:
+                problems.append(f"{tid} (failed: {failed_by_trial[tid]})")
+            elif tid not in valid_by_trial:
+                problems.append(f"{tid} (missing)")
+
+        for tid, reason in failed_by_trial.items():
+            if tid not in expected_ids:
+                problems.append(f"{tid} (failed: {reason})")
+        problems.extend(extra_failures)
+
+        if bundle_backtests is not None:
+            bundle_ids = {
+                str(b.get("trial_id") or "").strip()
+                for b in bundle_backtests
+                if isinstance(b, Mapping) and b.get("synthesis_name") == synthesis_name
+            }
+            for exp in expected_trials:
+                tid = exp["trial_id"]
+                if tid in valid_by_trial and tid not in bundle_ids:
+                    problems.append(f"{tid} (missing bundle candidate)")
+
+        if problems:
+            if not valid_by_trial and not any(
+                isinstance(item, Mapping)
+                and "error" not in item
+                and all(
+                    item.get(key) is not None
+                    for key in ("annual_return", "sharpe_ratio", "max_drawdown")
+                )
+                for item in summaries
+            ):
+                raise RuntimeError(f"backtest_metrics_missing: {'; '.join(problems)}")
+            raise RuntimeError(f"backtest_candidate_failed: {'; '.join(problems)}")
 
     def run_synthesis(self, *, execution=None, metrics=None):
         """运行所有配置的因子合成"""
@@ -4054,7 +4885,13 @@ class FactorSynthesizer:
         execution = execution if execution is not None else {}
         execution.update(expected=len(synthesis_methods), completed=0, failed=0, errors=[])
         self._execution_metrics = metrics if metrics is not None else {}
+        if getattr(self, "_market_db_identity", None):
+            self._execution_metrics["market_db"] = self._market_db_identity
         self._vectorbt_result_summaries = []
+        self._bundle_syntheses = {}
+        self._bundle_backtests = []
+        self._last_bundle_synthesis = None
+        self._last_bundle_backtest = None
         self._p2_benchmark_done = False
         self._model_evidence = {}
         self._execution_metrics.update(
@@ -4070,20 +4907,13 @@ class FactorSynthesizer:
                 self.logger.info(f"执行合成方法: {synthesis_name}")
                 summary_start = len(getattr(self, "_vectorbt_result_summaries", []))
                 self.rolling_window_synthesis(synthesis_name, synthesis_config)
-                top_k_enabled = self.config.get("performance_evaluation", {}).get(
-                    "top_k_strategy", {}
-                ).get("enabled", False)
                 new_summaries = getattr(self, "_vectorbt_result_summaries", [])[summary_start:]
-                if top_k_enabled and not any(
-                    isinstance(item, dict)
-                    and "error" not in item
-                    and all(
-                        item.get(key) is not None
-                        for key in ("annual_return", "sharpe_ratio", "max_drawdown")
-                    )
-                    for item in new_summaries
-                ):
-                    raise RuntimeError("backtest_metrics_missing")
+                self._validate_synthesis_backtest_outcomes(
+                    synthesis_name,
+                    synthesis_config,
+                    new_summaries,
+                    bundle_backtests=getattr(self, "_bundle_backtests", None),
+                )
                 execution["completed"] += 1
 
             except Exception as e:
@@ -4109,6 +4939,1027 @@ class FactorSynthesizer:
                 ),
             )
             self.logger.info("所有因子合成任务完成")
+        self._emit_strategy_bundle(execution=execution, metrics=self._execution_metrics)
+
+    @staticmethod
+    def _extract_portfolio_returns(portfolio: Any) -> Optional[pd.Series]:
+        if portfolio is None:
+            return None
+        try:
+            returns = portfolio.returns()
+            if isinstance(returns, pd.DataFrame):
+                if returns.empty:
+                    return None
+                series = returns.iloc[:, 0] if returns.shape[1] == 1 else returns.mean(axis=1)
+            else:
+                series = pd.Series(returns)
+            series.index = pd.to_datetime(series.index)
+            series = pd.to_numeric(series, errors="coerce").dropna()
+            return series if not series.empty else None
+        except Exception:
+            return None
+
+    @staticmethod
+    def _compute_execution_bars_fingerprint(
+        *,
+        price_wide: Optional[pd.DataFrame],
+        open_wide: Optional[pd.DataFrame],
+        factor_ratio_df: Optional[pd.DataFrame],
+        slot: Any,
+        price_conn: Any,
+        frequency: str = "1d",
+        instruments: Optional[Sequence[str]] = None,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        top_k_cfg: Optional[Mapping[str, Any]] = None,
+        price_table: str = "price_data_daily",
+    ) -> Dict[str, Any]:
+        from utils.data_revision import connection_revision, frame_digest
+        from utils.time_axis import Frequency
+
+        payload: Dict[str, Any] = {
+            "close_frame_sha256": frame_digest(price_wide)
+            if price_wide is not None and not price_wide.empty
+            else None,
+            "open_frame_sha256": frame_digest(open_wide)
+            if open_wide is not None and not open_wide.empty
+            else None,
+            "factor_ratio_sha256": frame_digest(factor_ratio_df)
+            if factor_ratio_df is not None and not factor_ratio_df.empty
+            else None,
+        }
+        bar_instruments = sorted(
+            {str(s) for s in (instruments or ()) if str(s).strip()}
+            | (set(map(str, price_wide.columns)) if price_wide is not None and not price_wide.empty else set())
+        )
+        if slot is not None:
+            payload.update(slot_market_db_identity(slot))
+            if getattr(slot, "slot_data_fingerprint", None) is not None:
+                payload["slot_registered"] = slot.slot_data_fingerprint
+            bar_feed = getattr(slot, "bar_feed", None)
+            if getattr(bar_feed, "data_version", None):
+                payload["bar_data_version"] = str(bar_feed.data_version)
+            if getattr(bar_feed, "source_name", None):
+                payload["bar_source_name"] = str(bar_feed.source_name)
+            cal = getattr(slot, "calendar", None)
+            if bar_feed is not None and hasattr(bar_feed, "read_execution_bars") and bar_instruments and cal is not None:
+                try:
+                    from factor_synthesis.vectorbt_adapter.backtest_runner import (
+                        VectorBTBacktestRunner,
+                    )
+
+                    freq_obj = Frequency.parse(frequency)
+                    parsed_overlay = VectorBTBacktestRunner._parse_overlay_config(
+                        dict(top_k_cfg or {})
+                    )
+                    cg_cfg = parsed_overlay["risk_overlay"]["crisis_guard"]
+                    tc_cfg = cg_cfg["signals"]["turnover_collapse"]
+                    long_win = int(tc_cfg["long_window"]) if cg_cfg["enabled"] else 0
+                    liq_cfg = parsed_overlay["liquidity_cap"]
+                    adv_win = int(liq_cfg["adv_lookback_days"]) if liq_cfg["enabled"] else 0
+                    vt_cfg = parsed_overlay["risk_overlay"]["vol_targeting"]
+                    vol_win = int(vt_cfg["lookback_days"]) if vt_cfg["enabled"] else 0
+                    w_cfg = parsed_overlay["weighting"]
+                    w_vol_win = int(w_cfg["vol_lookback_days"]) if w_cfg["scheme"] != "equal" else 0
+                    mvo_win = (
+                        int(w_cfg["mvo"]["cov_lookback_days"])
+                        if w_cfg["scheme"] == "mvo"
+                        else 0
+                    )
+                    buf_days = max(
+                        90, long_win * 2, adv_win * 4, vol_win * 2, w_vol_win * 2, mvo_win * 2
+                    )
+
+                    if start_date and end_date:
+                        min_day = pd.Timestamp(start_date).normalize()
+                        max_day = pd.Timestamp(end_date).normalize()
+                    elif price_wide is not None and not price_wide.empty:
+                        ts_min = pd.Timestamp(price_wide.index.min())
+                        ts_max = pd.Timestamp(price_wide.index.max())
+                        if ts_min.tzinfo is not None:
+                            ts_min = ts_min.tz_convert("UTC").tz_localize(None)
+                            ts_max = ts_max.tz_convert("UTC").tz_localize(None)
+                        min_day = ts_min.normalize()
+                        max_day = ts_max.normalize()
+                    else:
+                        min_day = cal.start
+                        max_day = cal.end
+
+                    cal_start = max(cal.start, min_day - pd.Timedelta(days=buf_days))
+                    cal_end = min(cal.end, max_day)
+                    bars = None
+                    for candidate_start in (cal_start, max(cal.start, min_day)):
+                        if candidate_start > cal_end:
+                            continue
+                        grid = cal.bar_grid(freq_obj, candidate_start, cal_end)
+                        if grid.empty:
+                            continue
+                        start_utc = pd.Timestamp(grid["timestamp_utc"].min()).to_pydatetime()
+                        end_utc = pd.Timestamp(grid["timestamp_utc"].max()).to_pydatetime()
+                        try:
+                            bars = bar_feed.read_execution_bars(
+                                bar_instruments, freq_obj, start_utc=start_utc, end_utc=end_utc
+                            )
+                            break
+                        except Exception:
+                            bars = None
+                            continue
+                    if bars is not None:
+                        bars_clean = bars.copy()
+                        bars_clean.attrs = {}
+                        sort_cols = [
+                            c
+                            for c in ("timestamp_utc", "session_id", "instrument_id")
+                            if c in bars_clean.columns
+                        ]
+                        if sort_cols and not bars_clean.empty:
+                            bars_clean = bars_clean.sort_values(sort_cols)
+                        bars_clean = bars_clean.reindex(sorted(bars_clean.columns), axis=1).reset_index(drop=True)
+                        payload["execution_bars_content_sha256"] = frame_digest(bars_clean)
+                except Exception:
+                    pass
+        if "execution_bars_content_sha256" not in payload and price_conn is not None and bar_instruments and start_date and end_date:
+            with suppress(Exception):
+                from factor_synthesis.vectorbt_adapter.backtest_runner import (
+                    VectorBTBacktestRunner,
+                )
+                from utils.data_store import identifier
+
+                parsed_overlay = VectorBTBacktestRunner._parse_overlay_config(
+                    dict(top_k_cfg or {})
+                )
+                cg_cfg = parsed_overlay["risk_overlay"]["crisis_guard"]
+                tc_cfg = cg_cfg["signals"]["turnover_collapse"]
+                long_win = int(tc_cfg["long_window"]) if cg_cfg["enabled"] else 0
+                liq_cfg = parsed_overlay["liquidity_cap"]
+                adv_win = int(liq_cfg["adv_lookback_days"]) if liq_cfg["enabled"] else 0
+                sql_buf_days = max(90, long_win * 2, adv_win * 4)
+                sql_start = (
+                    pd.Timestamp(start_date).normalize() - pd.Timedelta(days=sql_buf_days)
+                ).strftime("%Y-%m-%d")
+                sql_df = price_conn.execute(
+                    f"SELECT * FROM {identifier(price_table)} "
+                    f"WHERE stock_code IN (SELECT unnest(?)) AND date BETWEEN ? AND ? "
+                    f"ORDER BY stock_code, date",
+                    [bar_instruments, sql_start, end_date],
+                ).fetchdf()
+                sql_df = sql_df.reindex(sorted(sql_df.columns), axis=1).reset_index(drop=True)
+                payload["execution_bars_content_sha256"] = frame_digest(sql_df)
+        if price_conn is not None:
+            with suppress(Exception):
+                payload["price_db_revision"] = connection_revision(price_conn)
+        canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+        payload["execution_bars_sha256"] = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        return payload
+
+    def _resolve_reuse_market_factor_inputs(
+        self,
+        *,
+        training_factor_names: Sequence[str],
+        synthesis_config: Mapping[str, Any],
+        bundle_models: Sequence[Mapping[str, Any]],
+        composite: pd.Series,
+        cache_path: Path,
+    ) -> Dict[str, Any]:
+        from factor_synthesis.factor_reader import market_factor_inputs, plan_market_factor_values
+        from utils.market_factor import MarketFactorValueStore
+
+        factor_names: List[str] = list(training_factor_names)
+        for name in (synthesis_config.get("blend_weights") or {}):
+            if name not in factor_names:
+                factor_names.append(str(name))
+        for m in bundle_models:
+            if not isinstance(m, Mapping):
+                continue
+            for name in m.get("feature_names") or ():
+                if name not in factor_names:
+                    factor_names.append(str(name))
+            for name in (m.get("blend_weights") or {}):
+                if name not in factor_names:
+                    factor_names.append(str(name))
+
+        slot = self._get_slot() if self._use_slot_feeds() else None
+        slot_id = slot.slot_id if slot is not None else getattr(self, "_slot_id", "jq_ashare_local")
+        freq = getattr(self, "frequency", "1d")
+        store = None
+        store_root = getattr(self, "factor_values_store", None)
+        if store_root:
+            store = MarketFactorValueStore(store_root)
+        elif getattr(self, "factor_duckdb_path", None):
+            candidate = MarketFactorValueStore.beside_results_database(self.factor_duckdb_path)
+            if candidate.identities_path.is_file():
+                store = candidate
+        if store is not None and factor_names:
+            period = self.config.get("analysis_period", {})
+            start_date = str(period.get("start_date") or "")
+            end_date = str(period.get("end_date") or "")
+            if start_date and end_date:
+                selected, plan = plan_market_factor_values(
+                    store,
+                    factor_names,
+                    getattr(self, "factor_identities", None) or {},
+                    start_date,
+                    end_date,
+                    None,
+                    slot_id=slot_id,
+                    frequency=freq,
+                    slot=self._get_slot() if getattr(self, "_market_db", None) is not None else None,
+                )
+                if plan is not None:
+                    return market_factor_inputs(selected, plan, slot_id, freq)
+        return {
+            "identities": {},
+            "shard_paths": [str(cache_path.resolve())] if cache_path.is_file() else [],
+            "factors": [],
+        }
+
+    def _write_size_conditional_model_bundle(
+        self,
+        *,
+        output_dir: Path,
+        synthesis_name: str,
+        factor_group: str,
+        model_infos: Sequence[Mapping[str, Any]],
+        synthesis_config: Mapping[str, Any],
+    ) -> Optional[Path]:
+        if not model_infos:
+            return None
+        from tools.agent_harness.run_result import _json_values
+
+        output_dir.mkdir(parents=True, exist_ok=True)
+        models_payload: List[Dict[str, Any]] = []
+        for info in model_infos:
+            if not isinstance(info, Mapping):
+                continue
+            coeffs = info.get("coefficients")
+            policy = info.get("selected_policy")
+            intercept = info.get("intercept")
+            if (
+                not isinstance(coeffs, Mapping)
+                or not coeffs.get("global_coefficients")
+                or not isinstance(policy, Mapping)
+                or intercept is None
+            ):
+                raise RuntimeError(
+                    f"size_conditional_elasticnet model_info incomplete for {synthesis_name}"
+                )
+            feature_names = list(coeffs["global_coefficients"].keys())
+            models_payload.append(
+                {
+                    "train_start": info.get("train_start"),
+                    "train_end": info.get("train_end"),
+                    "embargo_train_end": info.get("embargo_train_end"),
+                    "validation_start": info.get("validation_start"),
+                    "validation_end": info.get("validation_end"),
+                    "feature_names": feature_names,
+                    "selected_policy": dict(policy),
+                    "stable_support": list(info.get("stable_support") or ()),
+                    "stability_fallback": info.get("stability_fallback"),
+                    "coefficients": dict(coeffs),
+                    "intercept": float(intercept),
+                    "bucket_edges": list(
+                        (info.get("protocol") or {}).get("bucket_edges") or ()
+                    ),
+                    "preprocess_config": dict(synthesis_config.get("preprocess") or {}),
+                    "standardize": bool(synthesis_config.get("standardize", True)),
+                }
+            )
+        if not models_payload:
+            raise RuntimeError(
+                f"size_conditional_elasticnet produced no replayable models for {synthesis_name}"
+            )
+        models_payload.sort(key=lambda item: str(item.get("validation_start") or ""))
+        bundle_payload = {
+            "version": "1.0",
+            "model_type": "size_conditional_elasticnet",
+            "synthesis_name": synthesis_name,
+            "factor_group": factor_group,
+            "protocol": dict(model_infos[0].get("protocol") or {}),
+            "index": {
+                "synthesis_name": synthesis_name,
+                "factor_group": factor_group,
+                "model_count": len(models_payload),
+                "models": models_payload,
+            },
+        }
+        bundle_path = output_dir / f"size_conditional_model_bundle_{synthesis_name}.json"
+        tmp_path = bundle_path.with_suffix(".tmp")
+        tmp_path.write_text(
+            json.dumps(
+                _json_values(bundle_payload),
+                ensure_ascii=False,
+                indent=2,
+                allow_nan=False,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        os.replace(tmp_path, bundle_path)
+        return bundle_path
+
+    def _resolve_effective_execution_profile(
+        self, *, runner: Any, slot: Any
+    ) -> Dict[str, Any]:
+        from utils.slots.contracts import ExecutionProfile
+
+        base = (
+            slot.microstructure.execution_profile
+            if slot is not None
+            else ExecutionProfile(
+                "close", "close", 0, 0, "decimal", "endpoints_only", "cross_session"
+            )
+        )
+        effective_entry = (
+            getattr(runner, "effective_entry_price_field", None)
+            or base.entry_price_field
+        )
+        commission_bps = round(float(runner.buy_cost_rate) * 10_000.0, 12)
+        sell_tax_bps = round(
+            max(0.0, float(runner.sell_cost_rate) - float(runner.buy_cost_rate)) * 10_000.0,
+            12,
+        )
+        slippage_bps = round(float(runner.slippage) * 10_000.0, 12)
+        effective = replace(
+            base,
+            entry_price_field=effective_entry,
+            allow_short=bool(runner.allow_short),
+            benchmark_instrument=runner.benchmark_instrument,
+            commission_bps=commission_bps,
+            sell_tax_bps=sell_tax_bps,
+            slippage_bps=slippage_bps,
+        )
+        return asdict(effective)
+
+    def _resolve_universe_filter_snapshot(
+        self,
+        top_k_cfg: Mapping[str, Any],
+        *,
+        runner: Any = None,
+        slot: Any = None,
+    ) -> Dict[str, Any]:
+        stock_pool_cfg = self.config.get("stock_pool", {})
+        slot_obj = slot if slot is not None else (self._get_slot() if hasattr(self, "_get_slot") else None)
+        has_plugin = bool(
+            (runner is not None and getattr(runner, "universe_filter_plugin", None) is not None)
+            or (
+                slot_obj is not None
+                and getattr(slot_obj.aux_features, "universe_filter_plugin", None) is not None
+            )
+        )
+        effective_qf = (
+            dict(getattr(runner, "quality_filter", None) or {})
+            if runner is not None
+            else (dict(top_k_cfg.get("quality_filter") or {}) if isinstance(top_k_cfg.get("quality_filter"), Mapping) else {})
+        )
+        effective_sq = (
+            dict(getattr(runner, "selection_quality", None) or {})
+            if runner is not None
+            else (dict(top_k_cfg.get("selection_quality") or {}) if isinstance(top_k_cfg.get("selection_quality"), Mapping) else {})
+        )
+        enable_tday = (
+            bool(runner.enable_tday_filter)
+            if runner is not None and hasattr(runner, "enable_tday_filter")
+            else bool(top_k_cfg.get("enable_tday_filter", True))
+        )
+        strict_max = (
+            bool(runner.strict_max_actual_holdings)
+            if runner is not None and hasattr(runner, "strict_max_actual_holdings")
+            else bool(top_k_cfg.get("strict_max_actual_holdings", False))
+        )
+        return {
+            "use_dynamic_pools": bool(stock_pool_cfg.get("use_dynamic_pools", False)),
+            "filters": list(stock_pool_cfg.get("filters") or []),
+            "max_stocks": stock_pool_cfg.get("max_stocks"),
+            "enable_tday_filter": enable_tday,
+            "has_slot_universe_filter_plugin": has_plugin,
+            "quality_filter_enabled": bool(effective_qf.get("enabled", False)),
+            "quality_filter": effective_qf,
+            "selection_quality": effective_sq,
+            "strict_max_actual_holdings": strict_max,
+        }
+
+    def _record_bundle_synthesis(
+        self,
+        *,
+        synthesis_name: str,
+        method: str,
+        synthesis_config: Mapping[str, Any],
+        training_factor_names: List[str],
+        factor_df: pd.DataFrame,
+        model_artifact_files: List[Tuple[str, str]],
+        model_infos: Optional[List[dict]] = None,
+    ) -> None:
+        from utils.data_revision import frame_digest
+
+        market_inputs = (
+            dict(factor_df.attrs.get("market_factor_inputs") or {})
+            if hasattr(factor_df, "attrs")
+            else {}
+        )
+        factor_panel_sha256 = (
+            frame_digest(factor_df)
+            if factor_df is not None and not factor_df.empty
+            else None
+        )
+        preprocess_cfg = dict(synthesis_config.get("preprocess") or {})
+        neutral_cfg = dict(synthesis_config.get("neutralization") or {})
+        aux_features: List[str] = []
+        slot_id = getattr(self, "_slot_id", "jq_ashare_local")
+        if neutral_cfg.get("enabled") and (
+            slot_id == "jq_ashare_local"
+            or neutral_cfg.get("on_missing_aux", "skip") == "error"
+        ):
+            if neutral_cfg.get("market_cap", True):
+                aux_features.append("factor_data.natural_log_of_market_cap")
+            if neutral_cfg.get("industry", True):
+                aux_features.append("industry_membership.sw_l1_code")
+        if method == "size_conditional_elasticnet" and (
+            "factor_data.natural_log_of_market_cap" not in aux_features
+        ):
+            aux_features.append("factor_data.natural_log_of_market_cap")
+
+        blend_weights = synthesis_config.get("blend_weights")
+        blend_factor_names = (
+            [str(k) for k in blend_weights.keys()]
+            if isinstance(blend_weights, Mapping)
+            else []
+        )
+        target_res = synthesis_config.get("target_residualization")
+        baseline_factor_names: List[str] = []
+        if isinstance(target_res, Mapping) and target_res.get("enabled"):
+            raw_bf = target_res.get("baseline_factors")
+            if isinstance(raw_bf, list):
+                baseline_factor_names.extend(str(item) for item in raw_bf if item)
+            elif target_res.get("baseline_factor"):
+                baseline_factor_names.append(str(target_res["baseline_factor"]))
+
+        raw_seed = synthesis_config.get(
+            "lgb_random_state" if method == "lightgbm" else "random_state",
+            GLOBAL_RANDOM_SEED,
+        )
+        random_seed = int(raw_seed) if raw_seed is not None else GLOBAL_RANDOM_SEED
+        record = {
+            "synthesis_name": synthesis_name,
+            "method": method,
+            "training_factor_names": list(training_factor_names),
+            "blend_factor_names": blend_factor_names,
+            "baseline_factor_names": baseline_factor_names,
+            "blend_with_original_ratio": float(
+                synthesis_config.get("blend_with_original_ratio", 0.0) or 0.0
+            ),
+            "dynamic_blend_enabled": bool(
+                (synthesis_config.get("dynamic_blend") or {}).get("enabled", False)
+            ),
+            "market_factor_inputs": market_inputs,
+            "factor_panel_sha256": factor_panel_sha256,
+            "preprocess_cfg": preprocess_cfg,
+            "preprocessing_params": {
+                "preprocess": preprocess_cfg,
+                "neutralization": neutral_cfg,
+                "missing_data_strategy": self.config.get("missing_data_strategy", "drop"),
+                "ffill_limit": self.config.get("ffill_limit", 30),
+                "distribution_prefilter": dict(
+                    synthesis_config.get("distribution_prefilter") or {}
+                ),
+                "postprocess_cs_standardize": bool(
+                    synthesis_config.get("postprocess_cs_standardize", True)
+                ),
+            },
+            "aux_features_required": sorted(aux_features),
+            "random_seed": random_seed,
+            "model_artifact_files": list(model_artifact_files),
+            "model_infos": list(model_infos or []),
+        }
+        self._last_bundle_synthesis = record
+        if not hasattr(self, "_bundle_syntheses") or self._bundle_syntheses is None:
+            self._bundle_syntheses = {}
+        self._bundle_syntheses[synthesis_name] = record
+
+    @staticmethod
+    def _collect_effective_factor_names(
+        synthesis_info: Mapping[str, Any],
+        backtest_info: Mapping[str, Any],
+        model_artifact_files: Sequence[Tuple[str, str]],
+    ) -> List[str]:
+        ordered: List[str] = []
+
+        def _add(name: Any) -> None:
+            if name is None:
+                return
+            text = str(name).strip()
+            if text and text not in ordered:
+                ordered.append(text)
+
+        for fid in synthesis_info.get("training_factor_names") or ():
+            _add(fid)
+
+        include_blend = bool(
+            float(synthesis_info.get("blend_with_original_ratio", 0.0) or 0.0) > 0.0
+            or synthesis_info.get("dynamic_blend_enabled")
+            or backtest_info.get("pure_blend_factor")
+        )
+        if include_blend:
+            for fid in synthesis_info.get("blend_factor_names") or ():
+                _add(fid)
+        for fid in synthesis_info.get("baseline_factor_names") or ():
+            _add(fid)
+        if backtest_info.get("pure_blend_factor"):
+            _add(backtest_info["pure_blend_factor"])
+
+        for info in synthesis_info.get("model_infos") or ():
+            if not isinstance(info, Mapping):
+                continue
+            for fid in info.get("feature_names") or ():
+                _add(fid)
+            coeffs = info.get("coefficients")
+            if isinstance(coeffs, Mapping):
+                if isinstance(coeffs.get("global_coefficients"), Mapping):
+                    for fid in coeffs["global_coefficients"].keys():
+                        _add(fid)
+                else:
+                    for fid in coeffs.keys():
+                        _add(fid)
+            blend_map = info.get("blend_weights")
+            if isinstance(blend_map, Mapping) and (
+                include_blend or float(info.get("blend_with_original_ratio", 0.0) or 0.0) > 0.0
+            ):
+                for fid in blend_map.keys():
+                    _add(fid)
+            for item in info.get("market_factor_inputs") or ():
+                if isinstance(item, Mapping) and item.get("factor_id"):
+                    _add(item["factor_id"])
+
+        for role, raw_src in model_artifact_files:
+            if role != "model_bundle":
+                continue
+            src = Path(raw_src)
+            if not src.is_file():
+                continue
+            try:
+                payload = json.loads(src.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            models = (
+                payload.get("index", {}).get("models", [])
+                if isinstance(payload, Mapping)
+                else []
+            )
+            for m in models:
+                if not isinstance(m, Mapping):
+                    continue
+                for fid in m.get("feature_names") or ():
+                    _add(fid)
+                if isinstance(m.get("weights"), Mapping):
+                    for fid in m["weights"].keys():
+                        _add(fid)
+                if isinstance(m.get("blend_weights"), Mapping) and (
+                    include_blend
+                    or m.get("blend_only")
+                    or float(m.get("blend_with_original_ratio", 0.0) or 0.0) > 0.0
+                ):
+                    for fid in m["blend_weights"].keys():
+                        _add(fid)
+
+        return ordered
+
+    def _emit_strategy_bundle(
+        self, *, execution: Mapping[str, Any], metrics: Dict[str, Any]
+    ) -> None:
+        from factor_synthesis.strategy_bundle import (
+            BundleArtifactRef,
+            StrategyBundle,
+            StrategyBundleError,
+            StrategyFactorSpec,
+            sha256_file,
+            write_strategy_bundle,
+        )
+        from tools.agent_harness.run_result import (
+            SCHEMA_VERSION as EXEC_SCHEMA_VERSION,
+            _json_values,
+            config_sha256,
+        )
+        from utils.market_factor import MarketFactorValueStore
+
+        execution_dir = getattr(self, "execution_dir", None)
+        if execution_dir is None:
+            return
+        if not execution or int(execution.get("completed", 0)) < 1:
+            return
+
+        syntheses_map: Dict[str, Dict[str, Any]] = dict(
+            getattr(self, "_bundle_syntheses", None) or {}
+        )
+        if not syntheses_map and getattr(self, "_last_bundle_synthesis", None):
+            last_s = self._last_bundle_synthesis
+            syntheses_map[str(last_s["synthesis_name"])] = last_s
+
+        candidates: List[Dict[str, Any]] = list(
+            getattr(self, "_bundle_backtests", None) or []
+        )
+        if not candidates and getattr(self, "_last_bundle_backtest", None):
+            last_b = dict(self._last_bundle_backtest)
+            if "synthesis_name" not in last_b and syntheses_map:
+                last_b["synthesis_name"] = next(iter(syntheses_map))
+            if "trial_id" not in last_b:
+                last_b["trial_id"] = str(
+                    (last_b.get("summary") or {}).get("trial_id") or "default"
+                )
+            candidates = [last_b]
+
+        top_k_enabled = (
+            self.config.get("performance_evaluation", {})
+            .get("top_k_strategy", {})
+            .get("enabled", False)
+        )
+        if not candidates:
+            if top_k_enabled:
+                raise RuntimeError("backtest_metrics_missing")
+            return
+
+        slot = self._get_slot() if hasattr(self, "_get_slot") else None
+        if slot is None:
+            return
+
+        store = None
+        store_root = getattr(self, "factor_values_store", None)
+        if store_root:
+            store = MarketFactorValueStore(store_root)
+        elif getattr(self, "factor_duckdb_path", None):
+            candidate_store = MarketFactorValueStore.beside_results_database(
+                self.factor_duckdb_path
+            )
+            if candidate_store.identities_path.is_file():
+                store = candidate_store
+
+        identity_meta: Dict[str, Dict[str, Any]] = {}
+        identities_by_factor: Dict[str, List[str]] = {}
+        if store is not None:
+            try:
+                id_df = store.list_identities(
+                    slot_id=slot.slot_id, frequency=self.frequency
+                )
+                for row in id_df.to_dict("records"):
+                    fhash = str(row["factor_identity_hash"])
+                    identity_meta[fhash] = row
+                    identities_by_factor.setdefault(str(row["factor_id"]), []).append(fhash)
+            except Exception:
+                identity_meta = {}
+                identities_by_factor = {}
+
+        method_candidate_counts: Dict[str, int] = {}
+        for cand in candidates:
+            sname = str(cand.get("synthesis_name") or "")
+            method_candidate_counts[sname] = method_candidate_counts.get(sname, 0) + 1
+
+        multi_candidate = len(candidates) > 1
+        emitted_bundles: List[Dict[str, Any]] = []
+        used_bundle_dirs: set[Path] = set()
+
+        for cand_idx, backtest_info in enumerate(candidates):
+            synthesis_name = str(backtest_info.get("synthesis_name") or "")
+            synthesis_info = syntheses_map.get(synthesis_name)
+            if not synthesis_info:
+                raise StrategyBundleError(
+                    f"Missing synthesis metadata for backtest candidate {synthesis_name!r}"
+                )
+
+            raw_model_files = list(synthesis_info.get("model_artifact_files") or [])
+            staging_dir = Path(execution_dir) / f".strategy_bundle_staging_{cand_idx}"
+            if staging_dir.exists():
+                shutil.rmtree(staging_dir)
+            staging_dir.mkdir(parents=True, exist_ok=True)
+
+            try:
+                # 1. Stage replayable model artifacts (fail-closed if missing).
+                source_files: Dict[str, Path] = {}
+                model_refs: List[BundleArtifactRef] = []
+                used_rel_paths: set[str] = set()
+                for role, raw_src in raw_model_files:
+                    src = Path(raw_src)
+                    if not src.is_file():
+                        continue
+                    rel = f"models/{src.name}"
+                    if rel in used_rel_paths:
+                        rel = f"models/{len(used_rel_paths)}_{src.name}"
+                    used_rel_paths.add(rel)
+                    source_files[rel] = src
+                    model_refs.append(
+                        BundleArtifactRef(
+                            path=rel,
+                            sha256=sha256_file(src),
+                            artifact_type=role,
+                            size_bytes=src.stat().st_size,
+                        )
+                    )
+                if not model_refs or not any(
+                    ref.artifact_type in {"model_bundle", "model_weights", "lgb_model", "model_index"}
+                    for ref in model_refs
+                ):
+                    raise StrategyBundleError(
+                        f"Cannot emit StrategyBundle for {synthesis_name!r}: missing required replayable model/weights artifacts"
+                    )
+
+                # 2. Resolve effective factor dependencies (training, blend, fallback).
+                market_inputs = dict(synthesis_info.get("market_factor_inputs") or {})
+                identities_map = dict(market_inputs.get("identities") or {})
+                extra_inputs = backtest_info.get("extra_market_factor_inputs")
+                if isinstance(extra_inputs, Mapping):
+                    for k, v in (extra_inputs.get("identities") or {}).items():
+                        identities_map.setdefault(str(k), str(v))
+                for info in synthesis_info.get("model_infos") or ():
+                    if isinstance(info, Mapping):
+                        for item in info.get("market_factor_inputs") or ():
+                            if isinstance(item, Mapping) and item.get("factor_id") and item.get("factor_identity_hash"):
+                                identities_map.setdefault(
+                                    str(item["factor_id"]),
+                                    str(item["factor_identity_hash"]),
+                                )
+
+                effective_factors = self._collect_effective_factor_names(
+                    synthesis_info, backtest_info, raw_model_files
+                )
+                pinned_identities = getattr(self, "factor_identities", None) or {}
+                preprocess_cfg = synthesis_info["preprocess_cfg"]
+                default_prep = preprocess_cfg.get("ALL", "none")
+                blend_names_set = set(synthesis_info.get("blend_factor_names") or ())
+                factor_specs: List[StrategyFactorSpec] = []
+                for fid in effective_factors:
+                    fhash = identities_map.get(fid)
+                    if not fhash and fid in pinned_identities:
+                        fhash = str(pinned_identities[fid])
+                    if not fhash and len(identities_by_factor.get(fid, ())) == 1:
+                        fhash = identities_by_factor[fid][0]
+                    if fhash:
+                        identities_map[fid] = fhash
+                    if not fhash:
+                        fallback_payload = {
+                            "slot_id": slot.slot_id,
+                            "frequency": self.frequency,
+                            "factor_id": fid,
+                            "factor_panel_sha256": synthesis_info.get("factor_panel_sha256"),
+                            "factor_duckdb_path": getattr(self, "factor_duckdb_path", None),
+                            "data_bindings": self.config.get("data_bindings") or {},
+                        }
+                        fhash = hashlib.sha256(
+                            json.dumps(fallback_payload, sort_keys=True, default=str).encode("utf-8")
+                        ).hexdigest()
+                    meta = identity_meta.get(fhash, {})
+                    source_module = meta.get("source_module") or meta.get("factor_class")
+                    if source_module is not None:
+                        source_module = str(source_module).strip() or None
+                    prep_value = preprocess_cfg.get(
+                        fid, "zscore" if fid in blend_names_set and fid not in preprocess_cfg else default_prep
+                    )
+                    factor_specs.append(
+                        StrategyFactorSpec(
+                            factor_id=fid,
+                            factor_identity_hash=fhash,
+                            frequency=self.frequency,
+                            preprocessing=prep_value,
+                            aux_features_required=tuple(
+                                synthesis_info["aux_features_required"]
+                            ),
+                            source_module=source_module,
+                        )
+                    )
+
+                # 3. Stage backtest returns & NAV CSVs.
+                returns_series = backtest_info.get("returns_series")
+                if returns_series is None or returns_series.empty:
+                    ret_art = backtest_info.get("return_series_artifact") or {}
+                    ret_csv = ret_art.get("path")
+                    if ret_csv and Path(ret_csv).is_file():
+                        df_ret = pd.read_csv(ret_csv)
+                        returns_series = pd.Series(
+                            pd.to_numeric(df_ret["net_return"], errors="coerce").values,
+                            index=pd.to_datetime(df_ret["date"]),
+                        ).dropna()
+                if returns_series is None or returns_series.empty:
+                    raise StrategyBundleError(
+                        f"Missing backtest returns series for {synthesis_name!r} ({backtest_info.get('trial_id')})"
+                    )
+
+                is_daily = bool(
+                    self.frequency == "1d"
+                    and returns_series.index.tz is None
+                    and returns_series.index.equals(returns_series.index.normalize())
+                )
+                date_strs = (
+                    returns_series.index.strftime("%Y-%m-%d")
+                    if is_daily
+                    else [pd.Timestamp(ts).isoformat() for ts in returns_series.index]
+                )
+                ret_df = pd.DataFrame(
+                    {"date": date_strs, "net_return": returns_series.astype(float).values}
+                )
+                nav_values = (1.0 + returns_series.astype(float)).cumprod()
+                nav_df = pd.DataFrame({"date": date_strs, "nav": nav_values.values})
+
+                ret_stage = staging_dir / "returns.csv"
+                nav_stage = staging_dir / "nav.csv"
+                ret_df.to_csv(ret_stage, index=False)
+                nav_df.to_csv(nav_stage, index=False)
+                source_files["backtest/returns.csv"] = ret_stage
+                source_files["backtest/nav.csv"] = nav_stage
+
+                backtest_returns_ref = BundleArtifactRef(
+                    path="backtest/returns.csv",
+                    sha256=sha256_file(ret_stage),
+                    artifact_type="backtest_returns",
+                    size_bytes=ret_stage.stat().st_size,
+                )
+                backtest_nav_ref = BundleArtifactRef(
+                    path="backtest/nav.csv",
+                    sha256=sha256_file(nav_stage),
+                    artifact_type="backtest_nav",
+                    size_bytes=nav_stage.stat().st_size,
+                )
+
+                # 4. Stage execution_result.v1 provenance snapshot.
+                exec_snapshot = {
+                    "schema_version": EXEC_SCHEMA_VERSION,
+                    "command": "factor-synthesis",
+                    "run_id": self.run_id or Path(execution_dir).name,
+                    "execution_id": Path(execution_dir).name,
+                    "config_sha256": config_sha256(self.config_path),
+                    "execution": {**dict(execution), "status": "succeeded"},
+                    "metrics": _json_values(
+                        {
+                            k: v
+                            for k, v in metrics.items()
+                            if k not in ("strategy_bundle", "strategy_bundles")
+                        }
+                    ),
+                    "artifacts": [],
+                }
+                exec_stage = staging_dir / "execution_result.json"
+                exec_stage.write_text(
+                    json.dumps(
+                        _json_values(exec_snapshot),
+                        ensure_ascii=False,
+                        indent=2,
+                        allow_nan=False,
+                        default=str,
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                exec_rel = "provenance/execution_result.json"
+                source_files[exec_rel] = exec_stage
+                exec_sha256 = sha256_file(exec_stage)
+
+                summary = backtest_info["summary"]
+                perf_summary = {
+                    "annual_return": _finite_float(summary.get("annual_return")),
+                    "sharpe_ratio": _finite_float(summary.get("sharpe_ratio")),
+                    "max_drawdown": _finite_float(summary.get("max_drawdown")),
+                    "annual_turnover": _finite_float(summary.get("annual_turnover")),
+                    "total_return": _finite_float(summary.get("total_return")),
+                    "calmar_ratio": _finite_float(summary.get("calmar_ratio")),
+                    "sortino_ratio": _finite_float(summary.get("sortino_ratio")),
+                    "trade_count": int(summary.get("trade_count") or 0),
+                }
+
+                # 5. Bind real data digests for bars and factor shards read.
+                shard_paths: List[str] = []
+                for raw_p in (market_inputs.get("shard_paths") or ()):
+                    if str(raw_p) not in shard_paths:
+                        shard_paths.append(str(raw_p))
+                if isinstance(extra_inputs, Mapping):
+                    for raw_p in (extra_inputs.get("shard_paths") or ()):
+                        if str(raw_p) not in shard_paths:
+                            shard_paths.append(str(raw_p))
+                factor_shards = [
+                    {
+                        "path": str(Path(p).name),
+                        "sha256": sha256_file(p),
+                    }
+                    for p in sorted(shard_paths)
+                    if Path(p).is_file()
+                ]
+                slot_fingerprint: Dict[str, Any] = {
+                    **slot_market_db_identity(slot),
+                    "slot_id": slot.slot_id,
+                    "frequency": self.frequency,
+                    "analysis_period": dict(self.config.get("analysis_period") or {}),
+                    "factor_identities": identities_map,
+                    "factor_shards": factor_shards,
+                    "factor_panel_sha256": synthesis_info.get("factor_panel_sha256"),
+                }
+                exec_fp = backtest_info.get("execution_bars_fingerprint")
+                if isinstance(exec_fp, Mapping):
+                    slot_fingerprint.update(exec_fp)
+                if slot.slot_data_fingerprint is not None:
+                    slot_fingerprint["registered"] = slot.slot_data_fingerprint
+
+                slot_config_hash = (
+                    slot.slot_config_hash
+                    or getattr(self._slot_config_obj, "slot_config_hash", None)
+                )
+
+                trial_id = str(backtest_info.get("trial_id") or f"trial_{cand_idx}")
+                if not multi_candidate:
+                    bundle_dir = Path(execution_dir) / "strategy_bundle"
+                    strategy_id = synthesis_name
+                else:
+                    safe_trial = "".join(
+                        ch if ch.isalnum() or ch in {"-", "_", "."} else "_"
+                        for ch in trial_id
+                    ).strip("._") or f"candidate_{cand_idx}"
+                    bundle_dir = Path(execution_dir) / "strategy_bundles" / safe_trial
+                    if bundle_dir in used_bundle_dirs:
+                        bundle_dir = Path(execution_dir) / "strategy_bundles" / f"{cand_idx}_{safe_trial}"
+                    strategy_id = (
+                        synthesis_name
+                        if method_candidate_counts.get(synthesis_name, 0) == 1
+                        else f"{synthesis_name}__{trial_id}"
+                    )
+                used_bundle_dirs.add(bundle_dir)
+
+                rebalance_cfg = dict(backtest_info["rebalance_config"])
+                rebalance_cfg["synthesis_name"] = synthesis_name
+                rebalance_cfg["trial_id"] = trial_id
+
+                bundle = StrategyBundle(
+                    strategy_id=strategy_id,
+                    slot_id=slot.slot_id,
+                    slot_config_hash=slot_config_hash,
+                    calendar_hash=slot.calendar.calendar_hash,
+                    slot_data_fingerprint=slot_fingerprint,
+                    frequency=self.frequency,
+                    factors=tuple(factor_specs),
+                    synthesis_method=str(synthesis_info["method"]),
+                    model_artifacts=tuple(model_refs),
+                    preprocessing_params=synthesis_info["preprocessing_params"],
+                    random_seed=int(synthesis_info["random_seed"]),
+                    rebalance_config=rebalance_cfg,
+                    execution_profile=backtest_info["execution_profile"],
+                    universe_filter=backtest_info["universe_filter"],
+                    allow_short=bool(backtest_info["allow_short"]),
+                    benchmark_instrument=backtest_info["benchmark_instrument"],
+                    performance_summary=perf_summary,
+                    backtest_returns=backtest_returns_ref,
+                    backtest_nav=backtest_nav_ref,
+                    execution_result_ref=exec_rel,
+                    execution_result_sha256=exec_sha256,
+                )
+
+                written_dir = write_strategy_bundle(
+                    bundle, bundle_dir, source_files=source_files
+                )
+                if not multi_candidate:
+                    manifest_copy = Path(execution_dir) / "strategy_bundle_manifest.json"
+                    shutil.copy2(written_dir / "manifest.json", manifest_copy)
+                    manifest_path_str = str(manifest_copy.resolve())
+                else:
+                    manifest_path_str = str((written_dir / "manifest.json").resolve())
+
+                emitted_bundles.append(
+                    {
+                        "schema_version": bundle.schema_version,
+                        "strategy_id": bundle.strategy_id,
+                        "synthesis_name": synthesis_name,
+                        "trial_id": trial_id,
+                        "selection_mode": rebalance_cfg.get("selection_mode"),
+                        "top_k": rebalance_cfg.get("top_k"),
+                        "top_pct": rebalance_cfg.get("top_pct"),
+                        "bundle_dir": str(written_dir.resolve()),
+                        "manifest_path": manifest_path_str,
+                        "bundle_hash": bundle.bundle_hash,
+                        "slot_id": bundle.slot_id,
+                        "frequency": bundle.frequency,
+                        "synthesis_method": bundle.synthesis_method,
+                        "factor_count": len(bundle.factors),
+                    }
+                )
+            finally:
+                shutil.rmtree(staging_dir, ignore_errors=True)
+
+        if emitted_bundles:
+            if top_k_enabled and isinstance(self.config.get("synthesis_methods"), Mapping):
+                emitted_trial_ids_list = [
+                    str(item.get("trial_id") or "").strip()
+                    for item in emitted_bundles
+                ]
+                if len(emitted_trial_ids_list) != len(set(emitted_trial_ids_list)):
+                    raise StrategyBundleError(
+                        f"Duplicate emitted StrategyBundle trial_id(s): {emitted_trial_ids_list}"
+                    )
+                emitted_trial_ids = set(emitted_trial_ids_list)
+                expected_trial_ids: List[str] = []
+                for sname, scfg in self.config["synthesis_methods"].items():
+                    for exp in self._expected_backtest_trials(sname, scfg):
+                        if exp.get("method") != "pca":
+                            expected_trial_ids.append(exp["trial_id"])
+                missing_bundle_trials = [
+                    tid for tid in expected_trial_ids if tid not in emitted_trial_ids
+                ]
+                if missing_bundle_trials:
+                    raise StrategyBundleError(
+                        f"Missing emitted StrategyBundle for expected trial_id(s): {missing_bundle_trials}"
+                    )
+            metrics["strategy_bundles"] = emitted_bundles
+            metrics["strategy_bundle"] = emitted_bundles[-1]
 
     def _run_local_reranker_profile(self) -> None:
         top_k = self.config.get("performance_evaluation", {}).get(
@@ -4236,6 +6087,31 @@ def main():
         default="",
         help="可选：写入收益序列 metadata 的 harness run id",
     )
+    parser.add_argument(
+        "--slot-config",
+        type=str,
+        default="",
+        help="可选：MarketSlot SlotConfig YAML/JSON 路径或 jq_ashare_local",
+    )
+    parser.add_argument(
+        "--slot-id",
+        type=str,
+        default="",
+        help="可选：显式校验的 MarketSlot slot_id",
+    )
+    parser.add_argument(
+        "--factor-values-store",
+        type=str,
+        default="",
+        help="可选：方案 B MarketFactorValueStore 根目录",
+    )
+    parser.add_argument(
+        "--frequency",
+        type=str,
+        default="",
+        help="可选：合成与回测频率 (如 1d, 5min, 1h)",
+    )
+    parser.add_argument("--market-db", help="Database ID in QUANT_DATA_BINDINGS.market_dbs")
     parser.add_argument("--result-out", default="")
     parser.add_argument("--execution-id", default="")
     args = parser.parse_args()
@@ -4247,6 +6123,20 @@ def main():
         args.execution_id = directory.name
     if not args.run_id:
         args.run_id = args.execution_id
+    return_series_dir = args.return_series_output_dir or str(directory / "returns")
+    from tools.agent_harness._json_io import _safe_read_json
+    raw_config = _safe_read_json(Path(args.config))
+    market_db = args.market_db if args.market_db is not None else raw_config.get("market_db")
+    if market_db is not None:
+        from utils.market_db.research import check_synthesis_market_outputs, resolve_research_market_db
+
+        try:
+            check_synthesis_market_outputs(
+                resolve_research_market_db(market_db), raw_config, directory, return_series_dir,
+                files=(args.result_out,),
+            )
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            parser.error(str(exc))
     with process_output_environment(directory):
 
         config_path = args.config
@@ -4264,9 +6154,21 @@ def main():
 
         with execution_result(args.result_out, command="factor-synthesis", run_id=args.run_id,
                               execution_id=args.execution_id, config_path=config_path) as result:
-            synthesizer = FactorSynthesizer(
-                config_path, return_series_output_dir=args.return_series_output_dir, run_id=args.run_id,
-            )
+            synth_kwargs: Dict[str, Any] = {
+                "return_series_output_dir": return_series_dir,
+                "run_id": args.run_id,
+            }
+            if market_db is not None:
+                synth_kwargs["market_db"] = market_db
+            if args.slot_config:
+                synth_kwargs["slot_config"] = args.slot_config
+            if args.slot_id:
+                synth_kwargs["slot_id"] = args.slot_id
+            if args.factor_values_store:
+                synth_kwargs["factor_values_store"] = args.factor_values_store
+            if args.frequency:
+                synth_kwargs["frequency"] = args.frequency
+            synthesizer = FactorSynthesizer(config_path, **synth_kwargs)
             synthesizer.run_synthesis(execution=result["execution"], metrics=result["metrics"])
 
         print("\n" + "=" * 60)

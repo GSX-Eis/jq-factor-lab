@@ -19,7 +19,7 @@ from .csv_reader import BarAvailability, filter_bars_by_view, read_bar_csv, read
 from .labels import BarReturnLabeler
 from .inference import BarTrialFamily
 from .evaluator import (
-    RESULT_SCHEMA_VERSION, BarCrossSectionalEvaluator, EvaluationResult, TimeSeriesEvaluator, evaluate_bars,
+    RESULT_SCHEMA_VERSION, BarCrossSectionalEvaluator, EvaluationResult, TimeSeriesEvaluator, evaluate_bars, evaluate_slot,
 )
 from .artifacts import write_evaluation_artifacts
 
@@ -30,7 +30,7 @@ __all__ = [
     'sha256_file', 'validate_bar_frame', 'validate_factor_frame',
     'BarAvailability', 'filter_bars_by_view', 'read_bar_csv', 'read_factor_csv',
     'BarReturnLabeler',
-    'BarCrossSectionalEvaluator', 'EvaluationResult', 'TimeSeriesEvaluator', 'evaluate_bars',
+    'BarCrossSectionalEvaluator', 'EvaluationResult', 'TimeSeriesEvaluator', 'evaluate_bars', 'evaluate_slot',
     'BarTrialFamily', 'RESULT_SCHEMA_VERSION',
     'write_evaluation_artifacts',
 ]

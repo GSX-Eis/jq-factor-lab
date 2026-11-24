@@ -1,0 +1,22 @@
+schema_version: 1
+db_id: cn_equity_jq_v1
+market_domain: cn_equity
+allowed_slot_providers: [jq_ashare_local]
+asset_classes: [equity, index]
+timezone: Asia/Shanghai
+calendar_id: XSHG
+calendar_source: local_crosschecked
+calendar_coverage: 2016-01-04..2026-12-31
+exchanges: [XSHG, XSHE]
+exchange_aliases: {SSE: XSHG, SZSE: XSHE}
+instrument_id_pattern: '^\d{6}\.(XSHG|XSHE)$'
+currency: CNY
+frequencies: [1d, 5m]
+session_views: [ETH]
+market_rules:
+  st_filter: true
+  price_limit: true
+  t_plus: 1
+  bars_per_session: {5m: 48}
+default_execution_profile: close_to_close
+created_at_utc: '2026-11-23T00:00:00Z'

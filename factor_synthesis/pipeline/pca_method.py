@@ -1,31 +1,38 @@
 import numpy as np
 import pandas as pd
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Unpack
 
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
 
 # Core utilities
 from factor_synthesis.core.feature_preprocessor import cross_sectional_standardize
+from .preprocessing import (
+    MarketInputOptions, bind_synthesis_panel,
+    preprocess_synthesis_features, selected_market_inputs, training_bounds,
+)
 from .lasso_method import _outer_prediction_index, _strict_label_exit_index
 
 
 def run_pca_synthesis(
     synthesizer,
-    factor_df: pd.DataFrame,
+    factor_df: pd.DataFrame | None,
     forward_returns: pd.Series,
     train_start: str,
     train_end: str,
     config: dict,
+    **market_inputs: Unpack[MarketInputOptions],
 ) -> Tuple[List[pd.Series], Dict]:
     """
     PCA-based factor synthesis, extracted from the original
     `FactorSynthesizer.pca_synthesis` method.
     """
+    factor_df, config = bind_synthesis_panel(
+        synthesizer, factor_df, config, market_inputs, forward_returns,
+    )
     logger = synthesizer.logger
 
-    train_start_dt = pd.to_datetime(train_start)
-    train_end_dt = pd.to_datetime(train_end)
+    train_start_dt, train_end_dt = training_bounds(factor_df, train_start, train_end)
 
     train_mask = (factor_df.index.get_level_values("date") >= train_start_dt) & (
         factor_df.index.get_level_values("date") <= train_end_dt
@@ -77,7 +84,7 @@ def run_pca_synthesis(
     # Support both "preprocessing" (new) and "preprocess" (legacy) config keys
     preprocess_cfg = config.get("preprocessing", config.get("preprocess", {}))
     if isinstance(preprocess_cfg, dict) and preprocess_cfg:
-        train_factors = synthesizer._apply_feature_preprocessing(train_factors, preprocess_cfg)
+        train_factors = preprocess_synthesis_features(synthesizer, train_factors, preprocess_cfg, history=factor_df)
 
     train_factors = train_factors.fillna(0.0)
 
@@ -107,8 +114,8 @@ def run_pca_synthesis(
             predict_factors = predict_factors[selected_features]
 
         if isinstance(preprocess_cfg, dict) and preprocess_cfg:
-            predict_factors = synthesizer._apply_feature_preprocessing(
-                predict_factors, preprocess_cfg
+            predict_factors = preprocess_synthesis_features(
+                synthesizer, predict_factors, preprocess_cfg, history=factor_df,
             )
 
         predict_factors = predict_factors.fillna(0.0)
@@ -157,6 +164,9 @@ def run_pca_synthesis(
             n_components,
             total_variance,
         )
+        sources = selected_market_inputs(factor_df, model_info["feature_names"])
+        if sources:
+            model_info["market_factor_inputs"] = sources
         return component_series_list, model_info
 
     except Exception as e:

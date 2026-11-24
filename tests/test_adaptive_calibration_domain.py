@@ -369,6 +369,7 @@ def test_s5_production_registry_is_bound_to_formal_hac_evidence() -> None:
     *core, generalized = (
         domain for domain in calibration.REGISTERED_ADAPTIVE_CALIBRATIONS
         if domain.method_version == "cs_hac_adaptive_v1"
+        and domain.report_ref == "reports/NERE-936/adaptive-calibration-s5.json"
     )
     assert [domain.scenario for domain in core] == [design.scenario for design in benchmark.CORE]
     assert generalized.scenario == "generalized_ar_heteroskedastic"

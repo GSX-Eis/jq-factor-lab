@@ -1,0 +1,67 @@
+schema_version: 1
+slot_id: crypto_binance_spot_v1_1d
+market_domain: custom:crypto_binance_spot
+calendar:
+  provider: custom_sessions
+  options:
+    calendar_id: BINANCE_UTC
+    start: '2024-11-01'
+    end: '2026-10-31'
+    custom_sessions:
+      timezone: UTC
+      weekdays:
+      - 0
+      - 1
+      - 2
+      - 3
+      - 4
+      - 5
+      - 6
+      segments:
+      - open: 00:00
+        close: 00:00
+        open_day_offset: 0
+        close_day_offset: 1
+bar_feed:
+  provider: duckdb_table
+  options:
+    table: public_bars_1d
+    frequency: 1d
+    timestamp_anchor: bar_start
+    source_timezone: UTC
+    volume_mode: interval
+    data_version: crypto_binance_spot_v1
+    column_mapping:
+      timestamp_utc: timestamp
+      instrument_id: instrument_id
+      open: open
+      high: high
+      low: low
+      close: close
+      volume: volume
+universe:
+  provider: static
+  options:
+    instruments:
+      BTCUSDT.BINANCE: {asset_class: crypto, currency: USDT}
+      ETHUSDT.BINANCE: {asset_class: crypto, currency: USDT}
+      BNBUSDT.BINANCE: {asset_class: crypto, currency: USDT}
+      XRPUSDT.BINANCE: {asset_class: crypto, currency: USDT}
+      SOLUSDT.BINANCE: {asset_class: crypto, currency: USDT}
+      ADAUSDT.BINANCE: {asset_class: crypto, currency: USDT}
+      DOGEUSDT.BINANCE: {asset_class: crypto, currency: USDT}
+      LINKUSDT.BINANCE: {asset_class: crypto, currency: USDT}
+      LTCUSDT.BINANCE: {asset_class: crypto, currency: USDT}
+      AVAXUSDT.BINANCE: {asset_class: crypto, currency: USDT}
+aux_features:
+  provider: none
+microstructure:
+  provider: open
+execution_profile:
+  entry_price_field: close
+  exit_price_field: close
+  min_entry_offset_bars: 0
+  exit_adjustment: 0
+  return_unit: decimal
+  gap_rule: endpoints_only
+  boundary_policy: cross_session

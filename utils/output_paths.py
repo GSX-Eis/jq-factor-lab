@@ -37,6 +37,20 @@ def execution_directory() -> Path:
     return root / "agent_harness/standalone" / uuid.uuid4().hex
 
 
+def bind_output_defaults(config: dict, *, directory: Path | None = None) -> dict:
+    resolved = copy.deepcopy(config)
+    directory = directory or execution_directory()
+    settings = resolved.setdefault("output_settings", {})
+    for key, child in (
+        ("weights_output_dir", "weights"),
+        ("model_output_dir", "models"),
+    ):
+        settings.setdefault(key, str(directory / child))
+    cache = Path(os.environ.get("QUANT_CACHE_DIR", output_root() / "cache"))
+    resolved.setdefault("cache_settings", {}).setdefault(
+        "cache_dir", str(cache / "factor_data")
+    )
+    return resolved
 
 
 def diagnostic_file(name: str, *, directory=None) -> Path | None:

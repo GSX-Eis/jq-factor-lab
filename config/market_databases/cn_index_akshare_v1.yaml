@@ -1,0 +1,29 @@
+schema_version: 1
+allowed_slot_providers:
+- duckdb_table
+exchange_aliases: {}
+session_views:
+- ETH
+- RTH
+market_rules:
+  st_filter: false
+  price_limit: false
+  t_plus: 0
+default_execution_profile: close_to_close
+created_at_utc: '2026-11-24T00:00:00Z'
+db_id: cn_index_akshare_v1
+market_domain: cn_equity
+asset_classes:
+- index
+timezone: Asia/Shanghai
+calendar_id: XSHG
+calendar_source: pmc
+calendar_coverage: 1990-12-19..2026-10-31
+exchanges:
+- XSHG
+- XSHE
+- SW
+instrument_id_pattern: ^\d{6}\.(XSHG|XSHE|SW)$
+currency: CNY
+frequencies:
+- 1d

@@ -1,9 +1,12 @@
 import json
 import os
-from typing import Dict
+from collections.abc import Mapping
+from typing import Dict, Unpack
 
 import numpy as np
 import pandas as pd
+from .preprocessing import MarketInputOptions, bind_synthesis_panel, selected_market_inputs
+from ..core.feature_preprocessor import TIME_SERIES_METHODS, time_series_standardize
 
 
 def _save_weighted_sum_bundle(
@@ -67,7 +70,8 @@ def run_weighted_sum_synthesis(
     synthesizer,
     synthesis_name: str,
     synthesis_config: dict,
-    factor_df: pd.DataFrame,
+    factor_df: pd.DataFrame | None,
+    **market_inputs: Unpack[MarketInputOptions],
 ) -> None:
     """
     Fixed-weight linear composite factor (no training).
@@ -75,14 +79,19 @@ def run_weighted_sum_synthesis(
     Extracted from `FactorSynthesizer.weighted_sum_synthesis` so that the
     main orchestrator stays slim and only delegates to this function.
     """
+    factor_df, synthesis_config = bind_synthesis_panel(
+        synthesizer, factor_df, synthesis_config, market_inputs,
+    )
     logger = synthesizer.logger
 
     try:
         if factor_df.empty:
             raise RuntimeError(f"weighted_sum: no factor data for {synthesis_name}")
 
+        raw_synth_cfg = getattr(synthesizer, "config", None)
+        synth_cfg = raw_synth_cfg if isinstance(raw_synth_cfg, Mapping) else {}
         factor_group = synthesis_config.get("factor_group")
-        group_cfg: Dict = synthesizer.config.get("factor_groups", {}).get(factor_group, {})
+        group_cfg: Dict = synth_cfg.get("factor_groups", {}).get(factor_group, {})
         factor_names = group_cfg.get("factors", [])
 
         if not factor_names:
@@ -114,26 +123,19 @@ def run_weighted_sum_synthesis(
 
         df = factor_df[used_factors].copy()
 
-        # [FIX] T-1 Factor Shift
-        # Real-world trading uses T-1 factor data for T-day execution.
-        # Shift data by 1 period (trading day) to prevent look-ahead bias.
-        logger.info("weighted_sum: Shifting factor data by 1 day to simulate T-1 signal availability")
-        
-        # 1. Unstack to (date, stock) table
-        # 2. Shift(1) to move T-1 data to T row
-        # 3. Stack back to long format
-        df_unstacked = df.unstack(level='stock_code')
-        df_shifted_unstacked = df_unstacked.shift(1)
-        
-        # Stack back and clean up
-        # dropna=False ensures we keep the dates even if some stocks are NaN, 
-        # but we generally want to drop NaNs for synthesis
-        df_shifted = df_shifted_unstacked.stack(level='stock_code', dropna=True)
-        
-        # Re-sort to ensure index order (date, stock) matches expected format
-        df_shifted = df_shifted.reindex(df.index).dropna()
-        
-        df = df_shifted
+        # Preserve the historical A-share weighting input lag.
+        inputs = factor_df.attrs.get("market_factor_inputs", {}).get("factors", [])
+        source_slot = market_inputs.get("slot") or synthesis_config.get("slot")
+        fallback_slot = source_slot.slot_id if source_slot is not None else "jq_ashare_local"
+        slot_id = inputs[0]["slot_id"] if inputs else market_inputs.get(
+            "slot_id", synthesis_config.get("slot_id", fallback_slot),
+        )
+        freq = inputs[0]["frequency"] if inputs else market_inputs.get(
+            "frequency", synthesis_config.get("frequency", "1d"),
+        )
+        if slot_id == "jq_ashare_local" and freq in {"1d", "daily"}:
+            shifted = df.unstack(level="stock_code").shift(1).stack(level="stock_code", dropna=True)
+            df = shifted.reindex(df.index).dropna()
 
         def _zscore(series: pd.Series) -> pd.Series:
             m = series.mean()
@@ -151,8 +153,14 @@ def run_weighted_sum_synthesis(
             return pd.Series(0.0, index=series.index)
 
         for f in used_factors:
-            mode = preprocess_cfg.get(f, "none")
-            if mode == "zscore":
+            default_mode = preprocess_cfg.get("ALL")
+            mode = preprocess_cfg.get(f, default_mode if default_mode in TIME_SERIES_METHODS else "none")
+            if mode in TIME_SERIES_METHODS:
+                df[f] = time_series_standardize(
+                    df[f], mode, window=preprocess_cfg.get("_ts_window", 20),
+                    min_periods=preprocess_cfg.get("_ts_min_periods"),
+                )
+            elif mode == "zscore":
                 logger.info(
                     "weighted_sum[%s]: 对因子 %s 使用按日截面 z-score 预处理",
                     synthesis_name,
@@ -198,12 +206,14 @@ def run_weighted_sum_synthesis(
         composite.index = composite.index.set_names(["date", "stock_code"])
 
         composite_name = (
-            f"{synthesizer.config['output_settings']['composite_factor_prefix']}_"
+            f"{synth_cfg['output_settings']['composite_factor_prefix']}_"
             f"{synthesis_name}"
         )
         composite_series = composite.copy()
 
         composite_series.name = composite_name
+        if inputs:
+            composite_series.attrs["market_factor_inputs"] = selected_market_inputs(factor_df, used_factors)
         logger.info(
             "weighted_sum[%s]: 合成因子 %s 计算完成, 数据点=%d",
             synthesis_name,
@@ -212,7 +222,7 @@ def run_weighted_sum_synthesis(
         )
 
         # [FIX] Save bundle file for VectorBT backtest (same format as Lasso)
-        output_settings = synthesizer.config.get("output_settings", {})
+        output_settings = synth_cfg.get("output_settings", {})
         weights_output_dir = output_settings.get("weights_output_dir", "./results")
         
         # Build weights dict with only used factors
@@ -231,7 +241,7 @@ def run_weighted_sum_synthesis(
             composite_series,
             composite_name,
             run_alphalens=not bool(
-                synthesizer.config.get("performance_evaluation", {}).get(
+                synth_cfg.get("performance_evaluation", {}).get(
                     "skip_alphalens_analysis", False
                 )
             ),

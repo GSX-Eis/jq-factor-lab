@@ -6,7 +6,7 @@ import os
 import pickle
 import re
 import tempfile
-from typing import List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -14,10 +14,14 @@ from scipy import stats as scipy_stats
 
 from backtest_and_analysis.evaluation.labels import (
     ForwardReturnsValidationError as ForwardReturnsValidationError,
+    UnifiedReturnLabeler,
     label_daily_returns,
     resolve_daily_calendar,
     validate_daily_horizons,
 )
+
+if TYPE_CHECKING:
+    from utils.slots.contracts import MarketSlot
 
 
 def newey_west_mean_test(values, max_lag: int) -> tuple[float | None, float | None]:
@@ -59,7 +63,7 @@ class ForwardReturnsCalculator:
     预先计算所有股票在所有时间周期的前瞻收益率，避免每个因子分析时重复计算
     """
     
-    def __init__(self, cache_dir: Optional[str] = None, *, trading_calendar=None):
+    def __init__(self, cache_dir: Optional[str] = None, *, trading_calendar=None, slot: 'MarketSlot | None' = None):
         """
         初始化前瞻收益率计算器
         
@@ -68,6 +72,7 @@ class ForwardReturnsCalculator:
         """
         self.cache_dir = cache_dir
         self.trading_calendar = trading_calendar
+        self.slot = slot
         if cache_dir:
             os.makedirs(cache_dir, exist_ok=True)
         self.logger = logging.getLogger(self.__class__.__name__)
@@ -97,7 +102,47 @@ class ForwardReturnsCalculator:
         Raises:
             ForwardReturnsValidationError: 非法价格，或所有请求期间均无有效收益
         """
+        if self.slot is not None:
+            if (not isinstance(pricing, pd.Series) or not isinstance(pricing.index, pd.MultiIndex)
+                    or pricing.index.nlevels != 2):
+                raise ValueError("Slot pricing must supply MultiIndex date/asset keys")
+            names = pricing.index.names
+            if names == [None, None]:
+                assets = pricing.index.get_level_values(0).unique()
+                dates = pricing.index.get_level_values(1)
+            elif names in (["asset", "date"], ["date", "asset"]):
+                assets = pricing.index.get_level_values("asset").unique()
+                dates = pricing.index.get_level_values("date")
+            else:
+                raise ValueError("Slot pricing must supply MultiIndex date/asset keys")
+            dates = pd.DatetimeIndex(dates)
+            if dates.empty or dates.hasnans or dates.tz is not None or not dates.equals(dates.normalize()):
+                raise ValueError("Slot pricing requires nonempty timezone-naive session dates")
+            return self._calculate_slot_returns(list(assets), dates.min(), dates.max(), periods, execution_lag)
+        profile = pricing.attrs.get('execution_profile') if isinstance(pricing, pd.Series) else None
+        if profile is not None:
+            return UnifiedReturnLabeler(profile)._label_daily(
+                pricing, self.trading_calendar, execution_lag, periods,
+            ).returns
         return label_daily_returns(pricing, self.trading_calendar, execution_lag, periods).returns
+
+    def _calculate_slot_returns(
+        self, instruments: list[str], start_date: str | pd.Timestamp, end_date: str | pd.Timestamp,
+        periods: tuple[int, ...], execution_lag: int,
+    ) -> pd.DataFrame:
+        periods = self._validate_horizons(periods, execution_lag)
+        labels = UnifiedReturnLabeler.from_slot(self.slot).label(
+            instruments, "1d", start_date=start_date, end_date=end_date,
+            horizons=tuple(dict.fromkeys(periods)), entry_offset_bars=execution_lag,
+        )
+        valid = labels.loc[labels.status.eq("valid")]
+        if valid.empty:
+            raise ForwardReturnsValidationError("未能计算出任何前瞻收益率：检查价格覆盖与请求的持有期/执行滞后")
+        wide = valid.assign(date=pd.to_datetime(valid.signal_session_id), asset=valid.instrument_id).pivot(
+            index=["date", "asset"], columns="horizon_bars", values="forward_return",
+        )
+        wide = wide.reindex(columns=list(dict.fromkeys(periods))).rename(columns=lambda period: f"{period}D")
+        return wide.rename_axis(columns=None)
 
     def get_cache_key(
         self,
@@ -229,7 +274,7 @@ class ForwardReturnsCalculator:
     
     def calculate_or_load_forward_returns(
         self,
-        pricing: pd.Series,
+        pricing: pd.Series | None,
         code_list: List[str],
         start_date: str,
         end_date: str,
@@ -251,6 +296,9 @@ class ForwardReturnsCalculator:
         Returns:
             前瞻收益率DataFrame
         """
+        if self.slot is not None:
+            # Execution feeds and eligibility inputs may change independently of the legacy price series.
+            return self._calculate_slot_returns(code_list, start_date, end_date, periods, execution_lag)
         periods = self._validate_horizons(periods, execution_lag)
         if not self.cache_dir:
             return self.calculate_forward_returns(pricing, periods, execution_lag)

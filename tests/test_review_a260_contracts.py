@@ -74,11 +74,11 @@ def create_values(path, table='factor_values'):
         conn.execute(f"INSERT INTO {table} VALUES ('2020-01-02','A','f',42)")
 
 
-def test_reader_case_equivalent_table(tmp_path):
+def test_unbound_reader_ignores_case_equivalent_legacy_table(tmp_path):
     path = tmp_path / 'upper.duckdb'
     create_values(path, 'FACTOR_VALUES')
     reader = FactorReader(str(path), data_bindings={})
-    assert reader.get_available_factors() == ['f']
+    assert reader.get_available_factors() == []
 
 
 def test_reader_frozen_empty_bindings(tmp_path, monkeypatch):
@@ -87,8 +87,8 @@ def test_reader_frozen_empty_bindings(tmp_path, monkeypatch):
     monkeypatch.setenv('QUANT_DATA_BINDINGS', '{}')
     reader = FactorReader(str(path), data_bindings={})
     monkeypatch.setenv('QUANT_DATA_BINDINGS', 'invalid-json')
-    assert reader.get_available_factors() == ['f']
-    assert FactorReader(str(path), data_bindings={}).get_available_factors() == ['f']
+    assert reader.get_available_factors() == []
+    assert FactorReader(str(path), data_bindings={}).get_available_factors() == []
 
 
 def test_retry_forwards_empty_bindings_and_preserves_wait(monkeypatch):
@@ -153,7 +153,7 @@ def test_normal_save_result_keeps_success_contract(success):
     assert state._perform_synthesis() is True
     assert state._synthesized_factor_df is candidate and state._synthesis_completed
     state.factor_reader.save_composite_factor.assert_called_once_with(
-        composite_factor_df=candidate, factor_name='blend', overwrite=True)
+        composite_factor_df=candidate, factor_name='blend', overwrite=True, factor=state)
 
 
 def test_interrupt_propagates_without_retry():

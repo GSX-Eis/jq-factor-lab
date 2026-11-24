@@ -41,17 +41,18 @@ def test_result_writer_explicit_date_range_preserves_other_dates_and_removes_sta
     assert by_date == [("2024-01-02", 4, 2), ("2024-01-03", 2, 0)]
 
 
-def test_factor_reader_construction_is_read_only_and_missing_store_fails(tmp_path: Path) -> None:
+def test_factor_reader_construction_is_read_only_and_uses_scheme_b(tmp_path: Path) -> None:
     path = tmp_path / "factors.duckdb"
     with duckdb.connect(str(path)) as conn:
         conn.execute("CREATE TABLE factor_values(date DATE, stock_code VARCHAR, factor_name VARCHAR, factor_value DOUBLE)")
         conn.execute("INSERT INTO factor_values VALUES ('2024-01-02', '000001.XSHE', 'alpha', 1.0)")
     reader = FactorReader(str(path))
-    assert reader.get_factor_values("alpha", "2024-01-02", "2024-01-02").iloc[0, 0] == 1.0
+    assert reader.get_factor_values("alpha", "2024-01-02", "2024-01-02").empty
     with duckdb.connect(str(path), read_only=True) as conn:
         assert {row[0] for row in conn.execute("SHOW TABLES").fetchall()} == {"factor_values"}
-    with pytest.raises(Exception):
-        FactorReader(str(tmp_path / "missing.duckdb"))
+    missing = tmp_path / "missing.duckdb"
+    assert FactorReader(str(missing)).get_available_factors() == []
+    assert not missing.exists()
 
 
 def test_price_fetcher_keeps_timestamped_explicit_end_date(tmp_path: Path) -> None:

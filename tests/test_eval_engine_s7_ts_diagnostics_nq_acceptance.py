@@ -12,8 +12,13 @@ import pytest
 
 from backtest_and_analysis.evaluation import EvaluationEngine
 from backtest_and_analysis.evaluation.panel import EvaluationPanel
+from backtest_and_analysis.time_series import BarReturnLabeler, evaluate_bars
 from backtest_and_analysis.time_series.artifacts import _json_value
+from backtest_and_analysis.time_series.diagnostics_report import evaluate_diagnostics
 from test_time_series_cli_end_to_end import run_cli
+from tools.agent_harness.time_series_analysis import publish_evaluation
+from utils.bar_evaluation_store import ingest_evaluation, query_bar_evaluation_detail
+from utils.session_calendar import SessionCalendar
 
 
 FIXTURES = Path(__file__).parent / 'fixtures' / 'eval_engine' / 'ts_diagnostics_contract'
@@ -421,3 +426,60 @@ def test_nq_acceptance_report_contract_on_year_boundary():
     assert markdown.count('**SYNTHETIC**') == 1
     assert identity['sha256'] in markdown
     assert all(result['train']['fit_identity']['sha256'] in markdown for result in views.values())
+
+
+@pytest.mark.parametrize('split', [False, True], ids=['full_value', 'split_null_reason'])
+def test_v3_pvalue_is_published_in_all_diagnostics_formats(tmp_path, split):
+    size = 513
+    rng = np.random.default_rng(791)
+    price = 100. + rng.uniform(-1, 1, size)
+    bars = pd.DataFrame(dict(
+        timestamp_utc=pd.date_range('2026-12-01T00:00Z', periods=size, freq='1min'),
+        instrument_id='NQZ26', frequency='1min', open=price, high=price + 1, low=price - 1,
+        close=price + rng.uniform(-.5, .5, size), volume=1., source='SYNTHETIC',
+        data_version='NERE1269',
+    ))
+    factors = bars.iloc[:-1][['timestamp_utc', 'instrument_id']].assign(factor_value=rng.normal(size=size - 1))
+    labeler = BarReturnLabeler(SessionCalendar('NQ', '2026-12-01', '2026-12-01'),
+                              horizons=[1], factor_keys_only=True)
+    config = dict(
+        analysis_mode='time_series', calibration_scenario='independent_null',
+        bootstrap={'p_value': True} if not split else {'p_value': True, 'n_boot': 19},
+    )
+    if split:
+        config['split'] = {'train_end': '2026-12-01T04:00Z', 'oos_start': '2026-12-01T04:01Z'}
+    result = evaluate_bars(bars, factors, labeler, diagnostics=True, **config)
+    payload = publish_evaluation(result, config, {}, tmp_path / 'evaluation',
+                                 diagnostics_report=evaluate_diagnostics(result))
+    db = tmp_path / 'diagnostics.duckdb'
+    receipt = ingest_evaluation(db, artifacts=payload['artifacts'])
+    stored_splits = query_bar_evaluation_detail(db, receipt.identity_hash)['run']['split_config_json']
+    paths = {item['artifact_type']: Path(item['path']) for item in payload['artifacts']}
+    summary = json.loads(paths['evaluation_summary'].read_text(encoding='utf-8'))
+    report = summary['diagnostics_report']
+    assert report == payload['metrics']['diagnostics_report']
+    with paths['diagnostics_report_csv'].open(newline='', encoding='utf-8') as stream:
+        csv_rows = [row for row in csv.DictReader(stream) if row['scope'] == 'overall']
+    markdown = paths['diagnostics_report_markdown'].read_text(encoding='utf-8')
+    assert '| bootstrap_method_version | bootstrap_p_value | bootstrap_p_value_reason |' in markdown
+    for row, csv_row in zip(report['horizons'], csv_rows, strict=True):
+        name = row.get('split', 'full')
+        source, = summary['splits'][name]['horizons']
+        interval = source['bootstrap']
+        assert interval['method_version'] == 'ts_boot_adaptive_v3_p'
+        p, reason = interval['p_value'], interval['p_value_reason']
+        stored, = stored_splits[name]['instrument_ic_summaries']
+        assert (stored['p_value'], stored['p_value_reason']) == (p, reason)
+        if split:
+            assert p is None and reason == 'insufficient_replicates_for_pvalue'
+            assert '| ts_boot_adaptive_v3_p | — | insufficient_replicates_for_pvalue |' in markdown
+        else:
+            assert source['ic']['sample_count'] == interval['grid_size'] == 512
+            assert 0 < p < 1 and reason is None
+            assert f'| ts_boot_adaptive_v3_p | {p:.8g} | — |' in markdown
+        assert {field: row['bootstrap'][field] for field in ('method_version', 'p_value', 'p_value_reason')} == {
+            'method_version': interval['method_version'], 'p_value': p, 'p_value_reason': reason,
+        }
+        assert csv_row['bootstrap_method_version'] == interval['method_version']
+        assert csv_row['bootstrap_p_value'] == ('' if p is None else str(p))
+        assert csv_row['bootstrap_p_value_reason'] == (reason or '')

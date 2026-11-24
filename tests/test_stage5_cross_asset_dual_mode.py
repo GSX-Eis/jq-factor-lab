@@ -1,5 +1,7 @@
 """Stage 5: importer -> temporary DuckDB -> FactorBase -> frozen evaluators."""
 import duckdb
+
+from market_db_samples import declare_equity_bars, declare_futures_bars
 import numpy as np
 import pandas as pd
 import pytest
@@ -39,16 +41,20 @@ def conn(tmp_path):
 
 def populate(conn, *, future=False, frequency='1min', instruments=1, days=2, missing=()):
     start, end = ('2026-12-01', '2026-12-02') if future else ('2026-09-01', '2026-09-15')
+    if future:
+        declare_futures_bars(conn, 'CME')
+    else:
+        declare_equity_bars(conn)
     calendar = SessionCalendar('NQ' if future else 'XSHG', start, end)
     sessions = calendar.sessions()[:days]
     frames, metadata, ids = [], [], []
     for i in range(instruments):
-        instrument = 'NQZ26' if future else f'60000{i}.XSHG'
+        instrument = 'NQZ26.CME' if future else f'60000{i}.XSHG'
         ids.append(instrument)
         metadata.append(dict(instrument_id=instrument, asset_class='futures' if future else 'equity',
             exchange='CME' if future else 'XSHG', timezone='America/Chicago' if future else 'Asia/Shanghai',
             contract_expiry='2026-12' if future else None, price_adjustment='none',
-            point_value=20. if future else 1., rth_reference_calendar='NYSE' if future else 'XSHG'))
+            point_value=20. if future else 1., calendar_id=calendar.calendar_id, rth_reference_calendar='NYSE' if future else 'XSHG'))
         for day_index, day in enumerate(sessions):
             times = calendar.expected_bar_opens(day.strftime('%Y-%m-%d'), frequency)
             j = np.arange(len(times))
@@ -313,6 +319,7 @@ def test_1d_alias_preserves_legacy_daily_reads_and_pit(conn, tmp_path, backed_by
     kwargs = dict(stock_pool=['A'])
     connection = conn
     if backed_by_path:
+        declare_equity_bars(conn)
         connection = None
         kwargs['duckdb_path'] = str(tmp_path / 'synthetic.duckdb')
         conn.close()
@@ -336,15 +343,22 @@ def test_mixed_asset_calendars_isolate_read_bounds(conn):
                  "FROM market_bars WHERE timestamp_utc = (SELECT min(timestamp_utc) FROM market_bars)")
     calendar = SessionCalendar('NQ', stock_spec[2], stock_spec[3])
     times = calendar.expected_bar_opens(stock_spec[2], '1min')
-    bars = pd.DataFrame(dict(timestamp_utc=times, instrument_id='NQZ26', frequency='1min',
+    bars = pd.DataFrame(dict(timestamp_utc=times, instrument_id='NQZ26.CME', frequency='1min',
                             open=100., high=102., low=99., close=101., volume=1.,
                             source='SYNTHETIC', data_version='v1'))
-    meta = pd.DataFrame([dict(instrument_id='NQZ26', asset_class='futures', exchange='CME',
+    meta = pd.DataFrame([dict(instrument_id='NQZ26.CME', asset_class='futures', exchange='CME',
         timezone='America/Chicago', contract_expiry='2026-12', price_adjustment='none',
-        point_value=20., rth_reference_calendar='NYSE')])
-    import_market_bars(conn, bars, meta)
-    ids = [*stock_spec[1], 'NQZ26']
-    calendars = {stock_spec[1][0]: stock_spec[0], 'NQZ26': calendar}
+        point_value=20., calendar_id=calendar.calendar_id, rth_reference_calendar='NYSE')])
+    # Simulate a pre-S7 mixed database for the legacy reader's per-instrument bounds test.
+    with duckdb.connect() as futures:
+        declare_futures_bars(futures, 'CME')
+        import_market_bars(futures, bars, meta)
+        for table in ('instrument_metadata', 'market_bars'):
+            frame = futures.table(table).fetchdf()
+            conn.from_df(frame).insert_into(table)
+    conn.execute('DROP TABLE market_db_profile')
+    ids = [*stock_spec[1], 'NQZ26.CME']
+    calendars = {stock_spec[1][0]: stock_spec[0], 'NQZ26.CME': calendar}
     item = factor(conn, stock_spec, stock_pool=ids, session_calendar=calendars)
     frame = item.get_bar_factor_frame()
     assert set(frame.instrument_id) == set(ids)

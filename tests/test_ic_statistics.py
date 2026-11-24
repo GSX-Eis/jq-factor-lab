@@ -1,3 +1,5 @@
+from functools import partial
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -308,8 +310,8 @@ def test_write_probe_failure_preserves_all_rows(tmp_path, monkeypatch, kind, bor
     dates = pd.to_datetime(['2024-01-02', '2024-02-01'])
     values = pd.DataFrame({'S':[1.,2.]},index=dates)
     results = {'ic':pd.DataFrame({'1D':[.1,.2]},index=dates)}
-    writer.save_factor_values(values, 'factor')
-    writer.save_factor_values(values*3, 'other')
+    writer.save_factor_values(values, 'factor', allow_legacy_factor_values_write=True)
+    writer.save_factor_values(values*3, 'other', allow_legacy_factor_values_write=True)
     writer.write_factor_analysis_results('factor', results)
     writer.write_monthly_pool_results('factor', results)
     tables = ['factor_values','factor_analysis_results','factor_monthly_results','monthly_pool_results']
@@ -326,7 +328,7 @@ def test_write_probe_failure_preserves_all_rows(tmp_path, monkeypatch, kind, bor
         if kind.endswith('_range'):
             options['date_range'] = ('2024-01-02','2024-01-02')
         if kind.startswith('factor'):
-            writer.save_factor_values(values.iloc[:1]*10, 'factor', skip_parquet=True, **options)
+            writer.save_factor_values(values.iloc[:1]*10, 'factor', allow_legacy_factor_values_write=True, skip_parquet=True, **options)
         else:
             method = {'analysis':'write_factor_analysis_results', 'analysis_range':'write_factor_analysis_results',
                       'pool':'write_monthly_pool_results'}[kind]
@@ -353,10 +355,10 @@ def test_failed_probe_does_not_restore_stale_or_partial_parquet(tmp_path, monkey
     pytest.importorskip('pyarrow')
     writer = DuckDBResultsWriter(str(tmp_path/'results.duckdb'),parquet_dir=str(tmp_path/'parquet'))
     values = pd.DataFrame({'S':[1.,2.]},index=pd.to_datetime(['2024-01-02','2024-01-03']))
-    writer.save_factor_values(values, 'target')
-    writer.save_factor_values(values*2, 'backed')
-    writer.save_factor_values(values*3, 'unbacked', skip_parquet=True)
-    writer.save_factor_values(values*4, 'backed', skip_parquet=True)
+    writer.save_factor_values(values, 'target', allow_legacy_factor_values_write=True)
+    writer.save_factor_values(values*2, 'backed', allow_legacy_factor_values_write=True)
+    writer.save_factor_values(values*3, 'unbacked', allow_legacy_factor_values_write=True, skip_parquet=True)
+    writer.save_factor_values(values*4, 'backed', allow_legacy_factor_values_write=True, skip_parquet=True)
     def snapshot():
         with writer._get_connection(read_only=True) as conn:
             return conn.execute('SELECT * FROM factor_values ORDER BY ALL').fetchall()
@@ -366,7 +368,7 @@ def test_failed_probe_does_not_restore_stale_or_partial_parquet(tmp_path, monkey
         raise RuntimeError('Corrupt database file')
     monkeypatch.setattr(writer, '_count_factor_rows', fail_probe)
     with pytest.raises(RuntimeError, match='Corrupt database file'):
-        writer.save_factor_values(values*5, 'target', skip_parquet=True)
+        writer.save_factor_values(values*5, 'target', allow_legacy_factor_values_write=True, skip_parquet=True)
     assert snapshot() == before
     assert {str(p):hashlib.sha256(p.read_bytes()).hexdigest() for p in (tmp_path/'parquet').rglob('*') if p.is_file()} == files
 
@@ -436,7 +438,7 @@ def test_factor_snapshot_invalid_input_preserves_storage(tmp_path, entry, case):
     pytest.importorskip('pyarrow')
     writer = DuckDBResultsWriter(str(tmp_path/'results.duckdb'), parquet_dir=str(tmp_path/'parquet'))
     values = pd.DataFrame({'A': [1., 2.]}, index=pd.to_datetime(['2024-01-02', '2024-01-03']))
-    writer.save_factor_values(values, 'factor')
+    writer.save_factor_values(values, 'factor', allow_legacy_factor_values_write=True)
     def snapshot():
         with writer._get_connection(read_only=True) as conn:
             rows = conn.execute('SELECT * FROM factor_values ORDER BY ALL').fetchall()
@@ -459,7 +461,10 @@ def test_factor_snapshot_invalid_input_preserves_storage(tmp_path, entry, case):
     else:
         frame = frame.astype(object)
         frame.iloc[0, 0] = {'infinite': np.inf, 'string': '1.5', 'bool': True, 'complex': 1+2j}[case]
-    method = writer.save_factor_values if entry == 'save' else writer.export_factor_values_to_parquet
+    method = (
+        partial(writer.save_factor_values, allow_legacy_factor_values_write=True)
+        if entry == 'save' else writer.export_factor_values_to_parquet
+    )
     with pytest.raises(ValueError):
         method(frame, name)
     assert snapshot() == before
@@ -474,7 +479,7 @@ def test_factor_snapshot_normalizes_double_without_mutating_input(tmp_path, dtyp
                          index=['2024-01-03', '2024-01-02'], dtype='Float64').astype(dtype)
     frame.index.name = 'date'
     original = frame.copy(deep=True)
-    assert writer.save_factor_values(frame, 'factor') == 3
+    assert writer.save_factor_values(frame, 'factor', allow_legacy_factor_values_write=True) == 3
     pd.testing.assert_frame_equal(frame, original)
     with writer._get_connection(read_only=True) as conn:
         db = conn.execute('SELECT date,stock_code,factor_value FROM factor_values ORDER BY date,stock_code').fetchdf()
@@ -491,7 +496,7 @@ def test_postcommit_export_failure_can_retry_without_rewriting_database(tmp_path
     import utils.duckdb_results_writer as module
     writer = DuckDBResultsWriter(str(tmp_path/'results.duckdb'), parquet_dir=str(tmp_path/'parquet'))
     frame = pd.DataFrame({'A': [1., 2.]}, index=pd.to_datetime(['2024-01-02','2024-01-03']))
-    writer.save_factor_values(frame, 'factor')
+    writer.save_factor_values(frame, 'factor', allow_legacy_factor_values_write=True)
     def hashes():
         return {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in (tmp_path/'parquet').rglob('*.parquet')}
     old_files = hashes()
@@ -501,7 +506,7 @@ def test_postcommit_export_failure_can_retry_without_rewriting_database(tmp_path
             raise failure
         patch.setattr(module.pq, 'write_to_dataset', fail)
         with pytest.raises(module.CommittedParquetExportError) as caught:
-            writer.save_factor_values(frame*10, 'factor')
+            writer.save_factor_values(frame*10, 'factor', allow_legacy_factor_values_write=True)
     assert caught.value.database_committed is True
     assert caught.value.factor_name == 'factor'
     assert caught.value.__cause__ is failure
@@ -519,13 +524,13 @@ def test_postcommit_export_failure_can_retry_without_rewriting_database(tmp_path
 def test_invalid_factor_snapshot_rejected_before_borrowed_transaction_changes(tmp_path):
     writer = DuckDBResultsWriter(str(tmp_path/'results.duckdb'), export_parquet=False)
     frame = pd.DataFrame({'A':[1.]}, index=pd.to_datetime(['2024-01-02']))
-    writer.save_factor_values(frame, 'factor')
+    writer.save_factor_values(frame, 'factor', allow_legacy_factor_values_write=True)
     with writer.acquire_write_session() as session:
         conn = session.conn
         before = conn.execute('SELECT * FROM factor_values').fetchall()
         conn.execute('BEGIN TRANSACTION')
         with pytest.raises(ValueError):
-            writer.save_factor_values(frame*np.inf, 'factor', duckdb_conn=conn)
+            writer.save_factor_values(frame*np.inf, 'factor', allow_legacy_factor_values_write=True, duckdb_conn=conn)
         conn.execute('COMMIT')
         assert conn.execute('SELECT * FROM factor_values').fetchall() == before
 
@@ -535,7 +540,7 @@ def test_factor_invalid_date_range_rejected(tmp_path, date_range):
     writer = DuckDBResultsWriter(str(tmp_path/'results.duckdb'), export_parquet=False)
     frame = pd.DataFrame({'A':[1.]}, index=pd.to_datetime(['2024-01-02']))
     with pytest.raises(ValueError):
-        writer.save_factor_values(frame, 'factor', skip_parquet=True, date_range=date_range)
+        writer.save_factor_values(frame, 'factor', allow_legacy_factor_values_write=True, skip_parquet=True, date_range=date_range)
 
 
 @pytest.mark.parametrize('second_operation', ['save', 'export'])
@@ -551,7 +556,7 @@ def test_factor_export_serializes_competing_writers(tmp_path, monkeypatch, secon
     first._write_lock = threading.Lock()
     second._write_lock = threading.Lock()
     frame = pd.DataFrame({'A':[1.,2.]}, index=pd.to_datetime(['2024-01-02','2024-01-03']))
-    first.save_factor_values(frame, 'factor')
+    first.save_factor_values(frame, 'factor', allow_legacy_factor_values_write=True)
     entered, release, attempted = threading.Event(), threading.Event(), threading.Event()
     original_export = first._export_factor_values_to_parquet
     def paused_export(*args):
@@ -562,10 +567,10 @@ def test_factor_export_serializes_competing_writers(tmp_path, monkeypatch, secon
     def competing():
         attempted.set()
         if second_operation == 'save':
-            return second.save_factor_values(frame*20, 'factor')
+            return second.save_factor_values(frame*20, 'factor', allow_legacy_factor_values_write=True)
         return second.export_factor_values_to_parquet(frame, 'factor')
     with ThreadPoolExecutor(max_workers=2) as pool:
-        a = pool.submit(first.save_factor_values, frame*10, 'factor')
+        a = pool.submit(first.save_factor_values, frame*10, 'factor', allow_legacy_factor_values_write=True)
         try:
             assert entered.wait(10)
             b = pool.submit(competing)
@@ -604,14 +609,14 @@ def test_factor_export_holds_database_lock_until_file_replacement(tmp_path, monk
     if entry == 'borrowed':
         with writer.acquire_write_session() as session:
             session.conn.execute('BEGIN')
-            writer.save_factor_values(frame, 'factor', duckdb_conn=session.conn, skip_parquet=True)
+            writer.save_factor_values(frame, 'factor', allow_legacy_factor_values_write=True, duckdb_conn=session.conn, skip_parquet=True)
             with pytest.raises(ValueError, match='Commit the DuckDB'):
                 writer.export_factor_values_to_parquet(frame, 'factor', write_session=session)
             assert not (tmp_path/'parquet'/'factor_values'/'factor').exists()
             session.conn.execute('COMMIT')
             assert writer.export_factor_values_to_parquet(frame, 'factor', write_session=session) == 1
     elif entry == 'save':
-        writer.save_factor_values(frame, 'factor')
+        writer.save_factor_values(frame, 'factor', allow_legacy_factor_values_write=True)
     else:
         writer.export_factor_values_to_parquet(frame, 'factor')
     with (tmp_path/'results.duckdb.write.lock').open('a+') as lock:
@@ -631,7 +636,7 @@ def test_export_refuses_session_for_another_database(tmp_path):
 def test_export_rejects_stale_subset_and_accepts_reordered_current_values(tmp_path):
     writer = DuckDBResultsWriter(str(tmp_path/'results.duckdb'), parquet_dir=str(tmp_path/'parquet'))
     frame = pd.DataFrame({'A':[1.,2.], 'B':[3.,4.]}, index=pd.to_datetime(['2024-01-02','2024-01-03']))
-    writer.save_factor_values(frame, 'factor')
+    writer.save_factor_values(frame, 'factor', allow_legacy_factor_values_write=True)
     for stale in (frame.iloc[:1], frame[['A']], frame*2):
         with pytest.raises(ValueError, match='differs from current'):
             writer.export_factor_values_to_parquet(stale, 'factor')
@@ -651,9 +656,9 @@ def test_parquet_replacement_uses_stable_directory_lock(tmp_path, monkeypatch):
                 fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         return real_write(*args, **kwargs)
     monkeypatch.setattr(module.pq, 'write_to_dataset', checked)
-    writer.save_factor_values(frame, 'factor')
+    writer.save_factor_values(frame, 'factor', allow_legacy_factor_values_write=True)
     inode = lock_path.stat().st_ino
-    writer.save_factor_values(frame*2, 'factor')
+    writer.save_factor_values(frame*2, 'factor', allow_legacy_factor_values_write=True)
     assert lock_path.stat().st_ino == inode
     with lock_path.open('a+') as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -711,8 +716,8 @@ def test_versioned_explicit_export_selects_snapshot_without_implicit_latest(tmp_
     writer = DuckDBResultsWriter(str(tmp_path/'results.duckdb'), parquet_dir=str(tmp_path/'parquet'),
                                 publication_metadata=context, data_bindings={})
     frame = pd.DataFrame({'A':[1.]}, index=pd.to_datetime(['2024-01-02']))
-    writer.save_factor_values(frame, 'factor')
-    writer.save_factor_values(frame*2, 'factor')
+    writer.save_factor_values(frame, 'factor', allow_legacy_factor_values_write=True)
+    writer.save_factor_values(frame*2, 'factor', allow_legacy_factor_values_write=True)
     assert writer.export_factor_values_to_parquet(frame, 'factor') == 1
     files = writer._list_visible_parquet_files(tmp_path/'parquet'/'factor_values'/'factor')
     assert pd.concat([pq.ParquetFile(p).read().to_pandas() for p in files]).factor_value.sum() == 1.
@@ -725,7 +730,7 @@ def test_publication_failure_preserves_committed_catalog_and_can_retry(tmp_path,
         publication_metadata=dict(run_id='r',pool_id='p',source_hash='s',config_hash='c',
                                   input_versions={},created_at='2024-01-01'), data_bindings={})
     frame = pd.DataFrame({'A':[1.,2.]},index=pd.to_datetime(['2024-01-02','2024-01-03']))
-    writer.save_factor_values(frame, 'factor')
+    writer.save_factor_values(frame, 'factor', allow_legacy_factor_values_write=True)
     def catalog():
         with writer._get_connection(read_only=True) as conn:
             return conn.execute('SELECT * FROM meta.artifacts ORDER BY artifact_id').fetchall()
@@ -733,7 +738,7 @@ def test_publication_failure_preserves_committed_catalog_and_can_retry(tmp_path,
     if failure_mode == 'borrowed_rollback':
         with writer.acquire_write_session() as session:
             session.conn.execute('BEGIN')
-            assert writer.save_factor_values(frame*2, 'factor', duckdb_conn=session.conn) == 2
+            assert writer.save_factor_values(frame*2, 'factor', allow_legacy_factor_values_write=True, duckdb_conn=session.conn) == 2
             session.conn.execute('ROLLBACK')
     else:
         failure = RuntimeError('injected precommit failure')
@@ -742,14 +747,14 @@ def test_publication_failure_preserves_committed_catalog_and_can_retry(tmp_path,
         with monkeypatch.context() as patch:
             patch.setattr(revision, 'advance_revision', fail)
             with pytest.raises(RuntimeError) as caught:
-                writer.save_factor_values(frame*2, 'factor')
+                writer.save_factor_values(frame*2, 'factor', allow_legacy_factor_values_write=True)
             assert caught.value is failure
     assert catalog() == before
     assert not hasattr(writer, 'published_refs')
-    assert writer.save_factor_values(frame*2, 'factor') == 2
+    assert writer.save_factor_values(frame*2, 'factor', allow_legacy_factor_values_write=True) == 2
     after = catalog()
     assert len(after) == 2
-    assert writer.save_factor_values(frame*2, 'factor') == 2
+    assert writer.save_factor_values(frame*2, 'factor', allow_legacy_factor_values_write=True) == 2
     assert catalog() == after
     with writer._get_connection(read_only=True) as conn:
         assert conn.execute('SELECT SUM(factor_value) FROM factor_values').fetchone()[0] == 9.

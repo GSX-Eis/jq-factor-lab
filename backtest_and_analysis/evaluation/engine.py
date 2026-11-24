@@ -8,6 +8,8 @@ import numpy as np
 import numpy.typing as npt
 import pandas as pd
 
+from utils.market_db.guards import require_single_market_db
+
 from . import kernels
 from .cross_section import _daily_horizon_steps, evaluate_cross_section
 from .kernels import CorrelationResult, _positive_int
@@ -16,8 +18,7 @@ from .quantiles import QuantileFit, QuantileScheme, Standardization
 from .split import SplitConfig, SplitEvaluation, evaluate_splits
 from .time_series import evaluate_time_series
 from .types import (
-    DEFAULT_BOOTSTRAP_REPLICATES, DEFAULT_MIN_VALID_REPLICATES, CrossSectionResult, HACInterval,
-    ReturnMode, TimeSeriesInstrument, TimeSeriesResult,
+    CrossSectionResult, HACInterval, ReturnMode, TimeSeriesInstrument, TimeSeriesResult,
 )
 
 AnalysisMode = Literal["cross_sectional", "time_series"]
@@ -207,6 +208,8 @@ class EvaluationEngine:
         sample alongside inference on the scheduled signal grid.
         """
         cross_sectional = self.analysis_mode == "cross_sectional"
+        if cross_sectional:
+            require_single_market_db(panel.market_db_sources)
         for name, value in (
             ("all_non_overlapping_phases", all_non_overlapping_phases),
             ("signal_diagnostics", signal_diagnostics),
@@ -278,8 +281,6 @@ class EvaluationEngine:
                     exit_timestamps = _normalize_daily_horizons(exit_timestamps)
             statistics_options.setdefault("block_length", "auto")
             statistics_options.setdefault("seed", 0)
-            statistics_options.setdefault("n_boot", DEFAULT_BOOTSTRAP_REPLICATES)
-            statistics_options.setdefault("min_valid_replicates", DEFAULT_MIN_VALID_REPLICATES)
 
         if calibration_scenario is not None:
             statistics_options["calibration_scenario"] = calibration_scenario

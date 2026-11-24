@@ -443,8 +443,10 @@ class QlibLGBWrapper:
             label_period=self.config.get("_label_effective_period"),
             calendar_source=self.config.get("_label_calendar_source"),
         )
-        valid_dates = pd.DatetimeIndex(df_valid.index.get_level_values(0)).normalize()
-        if not len(valid_dates) or valid_dates.hasnans or valid_dates.tz is not None:
+        valid_dates = pd.DatetimeIndex(df_valid.index.get_level_values(0))
+        if valid_dates.tz is None:
+            valid_dates = valid_dates.normalize()
+        if not len(valid_dates) or valid_dates.hasnans or str(valid_dates.tz) not in ("None", "UTC"):
             raise LabelIsolationError("LightGBM validation requires valid nonempty dates")
         eligible = exits < valid_dates.min()
         if not eligible.any():

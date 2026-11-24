@@ -1,0 +1,29 @@
+schema_version: 1
+allowed_slot_providers:
+- duckdb_table
+exchange_aliases: {}
+session_views:
+- ETH
+- RTH
+market_rules:
+  st_filter: false
+  price_limit: false
+  t_plus: 0
+default_execution_profile: close_to_close
+created_at_utc: '2026-11-24T00:00:00Z'
+db_id: crypto_binance_spot_v1
+market_domain: custom:crypto_binance_spot
+asset_classes:
+- crypto
+timezone: UTC
+calendar_id: BINANCE_UTC
+calendar_source: custom_sessions
+calendar_coverage: 2024-11-01..2026-10-31
+exchanges:
+- BINANCE
+instrument_id_pattern: ^[A-Z0-9]+USDT\.BINANCE$
+# S7 profile currencies are three-letter codes. XUT denotes the USDT quote unit.
+currency: XUT
+frequencies:
+- 1min
+- 1d

@@ -252,7 +252,7 @@ def test_pool_filter_failure_propagates_without_saving_result(mode, cache_dir):
         stock_pools_by_period={'2024-01': ['A']}, dynamic_pool_mode=mode,
         logger=logging.getLogger('pool-failure'),
         _get_raw_data_for_factor=lambda: raw,
-        _get_cache_key=lambda data: 'key', _load_from_cache=lambda key: None,
+        _get_cache_key=lambda data, **kwargs: 'key', _load_from_cache=lambda key: None,
         calculate_factor=lambda data: wide,
         _apply_dynamic_pool_to_factor_df=fail_filter,
         _save_to_cache=lambda values, key: saved.append((values, key)),

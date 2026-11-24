@@ -1,38 +1,35 @@
-"""Bridge factor output and Bar catalog identity into the append-only store."""
+"""Persist FactorBase output against its MarketSlot and trading clock."""
 from __future__ import annotations
 
 import datetime as dt
 import hashlib
 import inspect
+import re
 import uuid
 from collections.abc import Mapping
+from dataclasses import asdict
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-import duckdb
 import pandas as pd
 
-from utils.bars.catalog import BarCatalog, table_exists
+from utils.market_db.identity import bind_market_db_fingerprint, slot_market_db_identity
 from utils.code_version import resolve_code_version
-from utils.session_calendar import SessionCalendar
+from utils.data_revision import FactorFrameDigest
+from utils.slots import CalendarSlot
 from utils.time_axis import BarSchedule, Frequency
 
-from .identity import (
-    build_identity_record,
-    compute_factor_identity_hash,
-)
+from .identity import build_identity_record, compute_factor_identity_hash
 from .schema import (
-    TABLE_COLUMNS,
-    FactorWriteReceipt,
-    _require_nonempty_str,
-    validate_factor_id,
+    TABLE_COLUMNS, FactorWriteReceipt, _canonical_json, _frame_digest, canonical_float_bits, validate_factor_id,
 )
-from .store import (
-    MarketFactorValueStore,
-)
+from .store import MarketFactorValueStore
+
+if TYPE_CHECKING:
+    from utils.factor_base import FactorBase
 
 
-def _factor_source_hashes(factor: Any) -> list[str]:
+def _factor_source_hashes(factor: FactorBase) -> list[str]:
     from backtest_and_analysis.time_series.factor_bridge import session_grid
     from utils.factor_base import FactorBase
     from utils.factor_core.cache import factor_core_source_hashes
@@ -56,305 +53,276 @@ def _factor_source_hashes(factor: Any) -> list[str]:
     return hashes
 
 
-def _open_factor_db_readonly(factor: Any) -> tuple[duckdb.DuckDBPyConnection | None, bool]:
-    conn = getattr(factor, "db_connection", None)
-    if isinstance(conn, duckdb.DuckDBPyConnection):
-        return conn, False
-    duckdb_path = getattr(factor, "duckdb_path", None)
-    if duckdb_path is not None and Path(str(duckdb_path)).is_file():
-        return duckdb.connect(str(duckdb_path), read_only=True), True
-    return None, False
+def _digest(value: object) -> str:
+    return hashlib.sha256(_canonical_json(value).encode()).hexdigest()
 
 
-def _resolve_bucket_strategy(
-    factor: Any,
-    frequency: str,
-    view: str,
-    calendars: Mapping[str, SessionCalendar],
-    explicit_strategy: str | None,
-    conn: duckdb.DuckDBPyConnection | None,
-) -> str:
-    if explicit_strategy is not None:
-        strategies = {
-            BarSchedule(cal, frequency, view=view, bucket_strategy=explicit_strategy).bucket_strategy
-            for cal in calendars.values()
-        }
-        if len(strategies) != 1:
-            raise ValueError(f"Multiple bucket strategies resolved: {sorted(strategies)}")
-        return next(iter(strategies))
+def factor_rows_on_grid(on_grid: pd.Series, populated: pd.Series) -> pd.Series:
+    """Keep scheduled rows and reject any observation without a grid key."""
+    if (~on_grid & populated).any():
+        raise ValueError("Factor output contains values outside the Slot output grid")
+    return on_grid
 
-    cont = factor.market_bars.attrs.get("continuous") if hasattr(factor, "market_bars") else None
-    if isinstance(cont, Mapping) and cont.get("bucket_strategy"):
-        return str(cont["bucket_strategy"])
 
-    if conn is not None:
-        config_obj = factor._get_local_data_config().as_dict() if hasattr(factor, "_get_local_data_config") else None
-        catalog = BarCatalog(conn, config=config_obj)
-        found: set[str] = set()
-        for inst in calendars:
-            try:
-                entry = catalog.resolve(frequency, inst)
-            except LookupError:
-                continue
-            if entry.bucket_strategy:
-                found.add(entry.bucket_strategy)
-        if len(found) == 1:
-            strat = next(iter(found))
-            for cal in calendars.values():
-                BarSchedule(cal, frequency, view=view, bucket_strategy=strat)
-            return strat
+def _wide_values(
+    factor: FactorBase, panel: pd.DataFrame, frequency: Frequency, strategy: str | None,
+    bar_grid: pd.DataFrame | None = None,
+) -> tuple[pd.DataFrame, dict[str, CalendarSlot]]:
+    """Map date labels or UTC bar openings onto authoritative Slot anchors."""
+    if not panel.columns.is_unique or not all(isinstance(key, str) and key for key in panel.columns):
+        raise ValueError("Factor values require unique, nonempty instrument columns")
+    dates = pd.DatetimeIndex(panel.index)
+    if dates.hasnans or not dates.is_unique:
+        raise ValueError("Factor values require unique, non-null dates")
 
-    strategies = {
-        BarSchedule(cal, frequency, view=view, bucket_strategy=None).bucket_strategy
-        for cal in calendars.values()
+    if dates.tz is not None:
+        dates = dates.tz_convert("UTC")
+    values = panel.set_axis(dates.as_unit("ns"), axis=0).rename_axis(index="date", columns=None).reset_index().melt(
+        id_vars="date", var_name="instrument_id", value_name="factor_value",
+    )
+    calendars = {
+        inst: getattr(factor, "market_calendars", {}).get(inst, factor.slot.calendar) for inst in panel.columns
     }
-    if len(strategies) != 1:
-        raise ValueError(f"Multiple bucket strategies resolved: {sorted(strategies)}")
-    return next(iter(strategies))
-
-
-def _resolve_build_ids(
-    factor: Any,
-    frequency: str,
-    required_pairs: set[tuple[str, str]],
-    explicit_build_ids: str | Mapping[str, Any] | None,
-    conn: duckdb.DuckDBPyConnection | None,
-) -> dict[tuple[str, str], str]:
-    resolved: dict[tuple[str, str], str] = {}
-
-    def _ingest_mapping(mapping: Mapping[str, Any]) -> None:
-        for k, v in mapping.items():
-            if isinstance(k, tuple) and len(k) == 2 and isinstance(v, str) and v.strip():
-                resolved[(str(k[0]), str(k[1]))] = v
-            elif isinstance(k, str) and isinstance(v, Mapping):
-                for sid, bid in v.items():
-                    if isinstance(bid, str) and bid.strip():
-                        resolved[(k, str(sid))] = bid
-            elif isinstance(k, str) and isinstance(v, str) and v.strip():
-                for inst, sid in required_pairs:
-                    if inst == k:
-                        resolved.setdefault((inst, sid), v)
-
-    # 1. Explicit caller override
-    if isinstance(explicit_build_ids, str):
-        bid = _require_nonempty_str(explicit_build_ids, "source_build_ids")
-        for pair in required_pairs:
-            resolved[pair] = bid
-    elif isinstance(explicit_build_ids, Mapping):
-        _ingest_mapping(explicit_build_ids)
-
-    # 2. Check market_bars.attrs['build_ids'] if present
-    missing = required_pairs - set(resolved)
-    if missing and hasattr(factor, "market_bars"):
-        attrs_bids = factor.market_bars.attrs.get("build_ids")
-        if isinstance(attrs_bids, Mapping):
-            _ingest_mapping(attrs_bids)
-
-    # 3. Actively query bar_build_log / bar_catalog from factor's DB (never assume attrs has it)
-    missing = required_pairs - set(resolved)
-    if missing and conn is not None:
-        instruments = sorted({inst for inst, _ in missing})
-        if table_exists(conn, "bar_build_log"):
-            placeholders = ", ".join("?" for _ in instruments)
-            rows = conn.execute(
-                f"SELECT instrument_id, session_id, build_id FROM bar_build_log "
-                f"WHERE frequency = ? AND instrument_id IN ({placeholders})",
-                [frequency, *instruments],
-            ).fetchall()
-            for inst, sid, bid in rows:
-                if isinstance(bid, str) and bid.strip():
-                    resolved.setdefault((str(inst), str(sid)), bid)
-
-        missing = required_pairs - set(resolved)
-        if missing and table_exists(conn, "bar_catalog"):
-            placeholders = ", ".join("?" for _ in instruments)
-            rows = conn.execute(
-                f"SELECT instrument_id, build_id FROM bar_catalog "
-                f"WHERE frequency = ? AND (instrument_id IN ({placeholders}) OR instrument_id = '*') "
-                f"AND build_id IS NOT NULL",
-                [frequency, *instruments],
-            ).fetchall()
-            by_inst = {str(inst): str(bid) for inst, bid in rows if isinstance(bid, str) and bid.strip()}
-            for inst, sid in list(missing):
-                bid = by_inst.get(inst) or by_inst.get("*")
-                if bid:
-                    resolved[(inst, sid)] = bid
-
-    missing = sorted(required_pairs - set(resolved))
-    if missing:
-        raise ValueError(
-            "Cannot resolve non-empty source_build_id for (instrument_id, session_id) pairs "
-            f"{missing[:5]} (total missing={len(missing)}): neither attrs['build_ids'], "
-            "bar_build_log/bar_catalog, nor explicit source_build_ids provided a build_id"
+    if bar_grid is not None and dates.tz is not None:
+        grid = bar_grid[["timestamp_utc", "instrument_id", "session_id"]].assign(
+            date=lambda frame: frame.timestamp_utc.dt.as_unit("ns"),
         )
-    return resolved
+    else:
+        grids = []
+        for inst, calendar in calendars.items():
+            if dates.tz is not None or frequency.kind == "intraday":
+                grid = calendar.bar_grid(frequency, factor.start_date, factor.end_date,
+                                         view=factor.session_view, bucket_strategy=strategy)
+                labels = grid.timestamp_utc
+                if dates.tz is None:
+                    clock = getattr(calendar, "default", calendar)
+                    schedule = BarSchedule(clock, frequency, view=factor.session_view, bucket_strategy=strategy)
+                    # Historical minute panels label the end of each intraday bar.
+                    ends = pd.DatetimeIndex([schedule.end_at(ts) for ts in labels], tz="UTC")
+                    labels = ends.tz_convert(clock.timezone).tz_localize(None)
+            else:
+                grid = calendar.bar_grid(frequency, dates.min().date(), dates.max().date(),
+                                         view=factor.session_view, bucket_strategy=strategy)
+                labels = pd.to_datetime(grid.session_id)
+            grids.append(grid.assign(date=pd.DatetimeIndex(labels).as_unit("ns"), instrument_id=inst))
+        grid = pd.concat(grids, ignore_index=True)
+    keyed = values.merge(grid, on=["date", "instrument_id"], how="left", validate="one_to_one")
+    on_grid = factor_rows_on_grid(keyed.session_id.notna(), keyed.factor_value.notna())
+    return keyed.loc[on_grid].drop(columns="date"), calendars
 
 
-def save_bar_factor_values(
-    factor: Any,
+def _build_ids(
+    required: set[tuple[str, str]],
+    catalog_entries: dict,
+    catalog_builds: dict,
+    supplied: str | Mapping | None,
+) -> dict[tuple[str, str], str]:
+    builds = {}
+    for inst, session in sorted(required):
+        source = supplied if isinstance(supplied, str) else None
+        if isinstance(supplied, Mapping):
+            source = supplied.get((inst, session), supplied.get(inst))
+            if isinstance(source, Mapping):
+                source = source.get(session)
+        if source is None:
+            source = catalog_builds.get((inst, session)) or getattr(catalog_entries.get(inst), "build_id", None)
+        if source is not None:
+            if not isinstance(source, str) or not source.strip():
+                raise ValueError("source_build_ids must contain nonempty strings")
+            builds[inst, session] = source
+    return builds
+
+
+def save_factor_values(
+    factor: FactorBase,
     store: MarketFactorValueStore,
     *,
+    factor_values: pd.DataFrame | None = None,
     factor_id: str | None = None,
+    factor_params: Mapping[str, Any] | None = None,
     bucket_strategy: str | None = None,
-    source_build_ids: str | Mapping[str, Any] | None = None,
+    source_build_ids: str | Mapping | None = None,
     identity_scope: str = "exact",
     batch_id: str | None = None,
 ) -> FactorWriteReceipt:
-    """Persist a minute FactorBase output to MarketFactorValueStore without mutating FactorBase."""
+    """Append calculated or precomputed values, with per-Slot identity and provenance."""
+    from backtest_and_analysis.time_series.factor_bridge import incomplete_bar_keys, mask_incomplete_bars
+    from utils.factor_core.bar_bridge import _bucket_strategy, _session_rollup
+
+    if not isinstance(store, MarketFactorValueStore):
+        raise TypeError("store must be a MarketFactorValueStore")
     if identity_scope not in ("exact", "incremental"):
         raise ValueError("identity_scope must be 'exact' or 'incremental'")
-    if not isinstance(store, MarketFactorValueStore):
-        raise TypeError("store must be a MarketFactorValueStore instance")
 
-    values = factor.get_bar_factor_frame()
-    if not hasattr(factor, "market_bars") or not hasattr(factor, "market_calendars") or not hasattr(factor, "market_bar_grid"):
-        raise ValueError("factor must populate market_bars, market_bar_grid, and market_calendars")
+    slot = factor.slot
+    feed = slot.bar_feed
+    view = factor.session_view
+    input_frequency = Frequency.parse(factor.data_frequency)
+    output_frequency = Frequency.parse(factor.output_frequency)
+    if not input_frequency.is_valid or not output_frequency.is_valid:
+        raise ValueError("Factor persistence requires valid input and output frequencies")
+    bar_output = factor._frequency_route.bar_grid and not _session_rollup(factor)
+    panel = factor.get_factor_values() if factor_values is None else factor_values
+    if panel.empty:
+        raise ValueError("No factor values to persist")
+    instruments = panel.columns.tolist()
+    # Older 5m factors can emit one value per session through the wide API.
+    if (not bar_output and output_frequency.kind == "intraday"
+            and isinstance(panel.index, pd.DatetimeIndex) and panel.index.tz is None
+            and panel.index.equals(panel.index.normalize())):
+        output_frequency = Frequency.parse("1d")
 
-    if "_get_cache_inputs" not in vars(type(factor)):
-        raise ValueError(f"{type(factor).__name__} must declare _get_cache_inputs() for factor_identity_hash")
-    params = factor._get_cache_inputs()
-    if params is None:
-        raise ValueError(f"{type(factor).__name__}._get_cache_inputs() returned None; cannot build factor_identity_hash")
+    bar_grid = None
+    if bar_output:
+        bar_grid = getattr(factor, "market_bar_grid", None)
+        if bar_grid is None:
+            bar_grid = factor._fetch_market_bars()
 
-    fid = validate_factor_id(factor_id or getattr(factor, "factor_name", ""))
-    raw_out_freq = getattr(factor, "output_frequency", None) or factor.data_frequency
-    freq = Frequency.parse(raw_out_freq).canonical
-    in_freq = Frequency.parse(factor.data_frequency).canonical
-    if not freq or not in_freq:
-        raise ValueError(f"Invalid factor frequency: {factor.data_frequency!r}")
-    view = str(factor.session_view)
-    analysis_mode = str(factor.analysis_mode)
-    calendars: dict[str, SessionCalendar] = dict(factor.market_calendars)
+    provenance = (getattr(feed, "factor_write_provenance", None)
+                  if factor._frequency_route.bar_grid or identity_scope == "incremental" else None)
+    entries, builds = provenance(input_frequency, instruments) if provenance is not None else ({}, {})
+    strategies = {
+        bucket_strategy or getattr(entries.get(inst), "bucket_strategy", None)
+        or _bucket_strategy(feed, input_frequency, inst) or "segment_anchored"
+        for inst in instruments
+    }
+    if len(strategies) > 1:
+        raise ValueError(f"Factor output spans multiple bucket strategies: {sorted(strategies)}")
+    strategy = next(iter(strategies), "segment_anchored")
+    if input_frequency.kind == "session":
+        strategy = "session"
+    values, calendars = _wide_values(
+        factor, panel, output_frequency, "session" if output_frequency.kind == "session" else strategy,
+        bar_grid=bar_grid,
+    )
+    if bar_grid is not None:
+        incomplete = panel.attrs.get("incomplete_bar_keys")
+        values = mask_incomplete_bars(values, incomplete if incomplete is not None else incomplete_bar_keys(bar_grid))
 
-    grid_keys = factor.market_bar_grid[["timestamp_utc", "instrument_id", "session_id"]].drop_duplicates()
-    merged = values.merge(grid_keys, on=["timestamp_utc", "instrument_id"], how="left", validate="one_to_one")
-    if merged["session_id"].isna().any():
-        raise ValueError("Unable to resolve session_id for all rows in factor output")
-
-    required_pairs = {(str(r.instrument_id), str(r.session_id)) for r in merged[["instrument_id", "session_id"]].drop_duplicates().itertuples(index=False)}
-
-    conn, should_close = _open_factor_db_readonly(factor)
-    try:
-        resolved_strategy = _resolve_bucket_strategy(factor, in_freq, view, calendars, bucket_strategy, conn)
-        build_map = _resolve_build_ids(factor, in_freq, required_pairs, source_build_ids, conn)
-
-        catalog_meta: dict[str, Any] = {}
-        if conn is not None:
-            config_obj = factor._get_local_data_config().as_dict() if hasattr(factor, "_get_local_data_config") else None
-            catalog = BarCatalog(conn, config=config_obj)
-            for inst in sorted(calendars):
-                try:
-                    entry = catalog.resolve(in_freq, inst)
-                except LookupError:
-                    continue
-                catalog_meta[inst] = {
-                    "dataset": entry.dataset,
-                    "table_name": entry.table_name,
-                    "kind": entry.kind,
-                    "source_frequency": entry.source_frequency,
-                    "source_version": entry.source_version,
-                }
-    finally:
-        if should_close and conn is not None:
-            conn.close()
-
-    cal_hashes = {inst: cal.calendar_hash for inst, cal in sorted(calendars.items())}
-    rth_refs = {inst: cal.rth_reference_calendar for inst, cal in sorted(calendars.items())}
-
-    cont_attrs = factor.market_bars.attrs.get("continuous")
-    roll_bids = factor.market_bars.attrs.get("roll_build_ids")
-    continuous_adjust = str(cont_attrs["adjust"]) if isinstance(cont_attrs, Mapping) and cont_attrs.get("adjust") else None
-
-    source_identity: dict[str, Any] = {}
-    if catalog_meta:
-        source_identity["catalog"] = catalog_meta
-    if isinstance(cont_attrs, Mapping):
-        source_identity["continuous"] = {
-            "product_root": cont_attrs.get("product_root"),
-            "adjust": continuous_adjust,
-            "frequency": cont_attrs.get("frequency"),
+    slots_hash = slot.slot_config_hash or factor.slot_config_hash
+    if slots_hash is None:
+        components = (slot.calendar, feed, slot.universe, slot.aux_features, slot.microstructure)
+        slots_hash = _digest({
+            "components": [f"{type(part).__module__}.{type(part).__qualname__}" for part in components],
+            "execution_profile": asdict(slot.microstructure.execution_profile),
+        })
+    elif not re.fullmatch(r"[0-9a-f]{64}", slots_hash):
+        slots_hash = _digest(slots_hash)
+    adjustment = slot.adjustment_policy
+    if adjustment is None:
+        adjustment = "dynamic_pit" if factor._ashare_panel and factor.pit_enabled and not bar_output else "none"
+    inputs = dict(panel.attrs.get("factor_input_fingerprint", {}))
+    captured_params = inputs.pop("declared_params", None)
+    declared_params = factor_params
+    if declared_params is None and captured_params is not None:
+        declared_params = {
+            key: FactorFrameDigest(value) if kind == "dataframe" else value
+            for key, (kind, value) in captured_params.items()
         }
-        if roll_bids:
-            source_identity["continuous"]["roll_build_ids"] = dict(sorted(roll_bids.items()))
+    params = {
+        "dynamic_pool_mode": factor.dynamic_pool_mode if factor.use_dynamic_pool else None,
+        "universe_id": factor.universe_id,
+        "pit_factor_column": factor.pit_factor_column if factor.pit_enabled else None,
+        "pit_window": factor.pit_window if factor.pit_enabled else None,
+    }
+    # The identity API already supports top-level DataFrame-valued dependencies.
+    if declared_params is not None:
+        if not isinstance(declared_params, Mapping) or any(not isinstance(key, str) for key in declared_params):
+            raise TypeError("factor_params must be a mapping with string keys")
+        params.update({f"factor.{key}": value for key, value in declared_params.items()})
 
-    explicit_data_version = getattr(factor, "data_version", None)
-    row_data_version = explicit_data_version
-    if row_data_version is None and "data_version" in factor.market_bars.columns and not factor.market_bars.empty:
-        versions = sorted(set(factor.market_bars["data_version"].dropna().astype(str)))
-        if versions:
-            row_data_version = ",".join(versions)
-
-    if identity_scope == "exact":
-        nested_bids: dict[str, dict[str, str]] = {}
-        for (inst, sid), bid in sorted(build_map.items()):
-            nested_bids.setdefault(inst, {})[sid] = bid
-        id_source_build: str | Mapping[str, Any] | None = nested_bids
-        id_data_version = row_data_version
+    values = values.sort_values(["instrument_id", "timestamp_utc"], ignore_index=True)
+    required = set(values[["instrument_id", "session_id"]].itertuples(index=False, name=None))
+    build_map = _build_ids(required, entries, builds, source_build_ids)
+    market_db = slot_market_db_identity(slot)
+    registered = slot.slot_data_fingerprint
+    if registered == market_db:
+        registered = None  # Profile-only bindings still need an input or output revision.
+    revision = registered
+    if revision is None:
+        revision = factor.source_revision or factor.data_version
+    source_identity: dict[str, Any] = {"identity_scope": identity_scope}
+    if entries:
+        source_identity["catalog"] = {
+            instrument: {name: getattr(entry, name) for name in ("dataset", "table_name", "kind", "source_frequency")}
+            for instrument, entry in entries.items()
+        }
+    inferred_fingerprint: dict[str, Any] = {}
+    if revision is not None:
+        inferred_fingerprint["revision"] = revision
+    if identity_scope == "incremental":
+        if declared_params is None:
+            raise ValueError("Incremental writes require factor_params or _get_cache_inputs()")
+        if revision is None and required - build_map.keys():
+            raise ValueError("Incremental writes require a slot_data_fingerprint or source_build_ids")
     else:
-        id_source_build = None
-        id_data_version = explicit_data_version
-        stable_catalog = {
-            inst: {
-                "dataset": meta["dataset"],
-                "table_name": meta["table_name"],
-                "kind": meta["kind"],
-                "source_frequency": meta["source_frequency"],
-            }
-            for inst, meta in catalog_meta.items()
-        }
-        source_identity.pop("catalog", None)
-        source_identity["source_dataset_version"] = {
-            "data_version": explicit_data_version,
-            "catalog": stable_catalog,
-        }
+        if inputs:
+            if registered is None:
+                inferred_fingerprint.update(inputs)
+            else:
+                source_identity["factor_input_fingerprint"] = inputs
+        if registered is None or declared_params is None:
+            keys = _frame_digest(values[["instrument_id", "timestamp_utc", "session_id"]])
+            bits = canonical_float_bits(values.factor_value).astype("<u8", copy=False).tobytes()
+            digest = hashlib.sha256(keys.encode() + bits).hexdigest()
+            if registered is None:
+                inferred_fingerprint["realized_panel_sha256"] = digest
+            elif declared_params is None:
+                source_identity["realized_panel_sha256"] = digest
 
-    code_ver, code_ver_src = resolve_code_version()
+    fingerprint = registered
+    if fingerprint is None:
+        fingerprint = inferred_fingerprint or {"kind": "per_session_build_ids"}
+    fingerprint = bind_market_db_fingerprint(fingerprint, market_db)
+    fallback_build = _digest(fingerprint)
+    nested_builds: dict[str, dict[str, str]] = {}
+    for inst, session in sorted(required):
+        nested_builds.setdefault(inst, {})[session] = build_map.get((inst, session), fallback_build)
+    cal_hashes = {inst: calendar.calendar_hash for inst, calendar in calendars.items()}
+    rth_refs = {
+        inst: ref for inst, calendar in calendars.items()
+        if (ref := getattr(getattr(calendar, "default", calendar), "rth_reference_calendar", None))
+    }
+    fid = validate_factor_id(factor_id or factor.factor_name)
+    code_version, code_source = resolve_code_version()
     fhash, payload = compute_factor_identity_hash(
         factor_id=fid,
         factor_class=f"{type(factor).__module__}.{type(factor).__qualname__}",
         source_sha256=_factor_source_hashes(factor),
         params=params,
-        frequency=in_freq,
-        output_frequency=freq,
+        frequency=input_frequency.canonical,
+        output_frequency=output_frequency.canonical,
         session_view=view,
-        analysis_mode=analysis_mode,
-        bucket_strategy=resolved_strategy,
-        calendar_hash=cal_hashes,
+        analysis_mode=factor.analysis_mode or "cross_sectional",
+        bucket_strategy=strategy,
+        calendar_hash=cal_hashes or slot.calendar.calendar_hash,
         source_identity=source_identity,
-        source_build_id=id_source_build,
-        data_version=id_data_version,
-        rth_reference_calendar=rth_refs,
-        continuous_adjust=continuous_adjust,
-        roll_build_ids=roll_bids if isinstance(roll_bids, Mapping) else None,
-        code_version=code_ver,
+        source_build_id=nested_builds if identity_scope == "exact" and nested_builds else None,
+        data_version=factor.data_version,
+        rth_reference_calendar=rth_refs or None,
+        code_version=code_version,
+        slot_id=slot.slot_id,
+        slot_config_hash=slots_hash,
+        adjustment_policy=adjustment,
+        slot_data_fingerprint=fingerprint,
     )
 
-    now_dt = dt.datetime.now(dt.timezone.utc)
-    now_iso = now_dt.isoformat()
-    bid_str = batch_id or uuid.uuid4().hex
-    identity_rec = build_identity_record(
-        factor_identity_hash=fhash,
-        payload=payload,
-        code_version_source=code_ver_src,
-        created_at=now_iso,
+    now = dt.datetime.now(dt.timezone.utc)
+    values = values.assign(
+        factor_id=fid, factor_identity_hash=fhash, frequency=output_frequency.canonical, session_view=view,
+        source_build_id=[nested_builds[inst][session] for inst, session in
+                         values[["instrument_id", "session_id"]].itertuples(index=False, name=None)],
+        calendar_hash=values.instrument_id.map(cal_hashes), code_version=code_version,
+        created_at=pd.Timestamp(now), batch_id=batch_id or uuid.uuid4().hex,
     )
-
-    merged["factor_id"] = fid
-    merged["factor_identity_hash"] = fhash
-    merged["frequency"] = freq
-    merged["session_view"] = view
-    merged["source_build_id"] = [
-        build_map[(str(r.instrument_id), str(r.session_id))]
-        for r in merged[["instrument_id", "session_id"]].itertuples(index=False)
-    ]
-    merged["calendar_hash"] = [cal_hashes[str(inst)] for inst in merged["instrument_id"]]
-    merged["code_version"] = code_ver
-    merged["created_at"] = pd.Timestamp(now_dt)
-    merged["batch_id"] = bid_str
-
     return store.append_factor_values(
-        merged.loc[:, list(TABLE_COLUMNS)],
-        identity_record=identity_rec,
+        values.loc[:, list(TABLE_COLUMNS)],
+        identity_record=build_identity_record(factor_identity_hash=fhash, payload=payload,
+                                              code_version_source=code_source, created_at=now.isoformat()),
         calendar=calendars,
         strict_source_build_id=True,
     )
+
+
+# Existing callers use this name for the same Slot-aware persistence API.
+save_bar_factor_values = save_factor_values

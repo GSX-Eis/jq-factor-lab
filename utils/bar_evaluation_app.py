@@ -63,13 +63,15 @@ def _format_run_label(run: Mapping[str, Any]) -> str:
     mode = run.get("analysis_mode", "")
     freq = run.get("frequency", "")
     cal = run.get("calendar_id") or "-"
+    slot = run.get("slot_id") or "-"
     ingested = run.get("ingested_at_utc") or ""
-    return f"{short_hash} | {mode} | {freq} | {cal} | {ingested}"
+    return f"{short_hash} | {mode} | {freq} | {cal} | {slot} | {ingested}"
 
 
 def _extract_build_id_summary(data_identity: Mapping[str, Any]) -> Any:
     found: dict[str, Any] = {}
-    for key in ("build_id", "build_ids", "roll_build_ids", "sources", "data_versions", "continuous_futures"):
+    for key in ("db_id", "profile_hash", "market_domain", "slot_data_fingerprint", "build_id", "build_ids", "roll_build_ids", "sources", "data_versions",
+                "continuous_futures"):
         if key in data_identity and data_identity[key] is not None:
             found[key] = data_identity[key]
     return found
@@ -97,12 +99,14 @@ def render_bar_evaluation_page(db_path: Path) -> None:
         "Calendar ID",
         ["All", *options["calendar_ids"]],
     )
+    slot_choice = st.sidebar.selectbox("Slot ID", [None, *options["slot_ids"]], format_func=lambda slot: slot or "All")
 
     runs = query_bar_evaluation_runs(
         db_path,
         analysis_mode=None if mode_choice == "All" else mode_choice,
         frequency=None if freq_choice == "All" else freq_choice,
         calendar_id=None if cal_choice == "All" else cal_choice,
+        slot_id=slot_choice,
     )
 
     st.subheader(f"Evaluation Runs ({len(runs)})")
@@ -119,6 +123,7 @@ def render_bar_evaluation_page(db_path: Path) -> None:
             "boundary_policy": r.get("boundary_policy"),
             "bucket_strategy": r.get("bucket_strategy"),
             "calendar_id": r.get("calendar_id"),
+            "slot_id": r.get("slot_id"),
             "code_version": r.get("code_version"),
             "result_schema_version": r["result_schema_version"],
             "has_split": r.get("has_split"),
@@ -146,11 +151,14 @@ def render_bar_evaluation_page(db_path: Path) -> None:
                 "identity_hash": run["identity_hash"],
                 "analysis_mode": run["analysis_mode"],
                 "frequency": run["frequency"],
+                "return_unit": run["return_unit"],
                 "view": run.get("view"),
                 "boundary_policy": run.get("boundary_policy"),
                 "bucket_strategy": run.get("bucket_strategy"),
                 "calendar_id": run.get("calendar_id"),
                 "calendar_hash": run["calendar_hash"],
+                "slot_id": run.get("slot_id"),
+                "slot_config_hash": run.get("slot_config_hash"),
                 "config_hash": run["config_hash"],
                 "code_version": run["code_version"],
                 "code_version_source": run.get("code_version_source"),

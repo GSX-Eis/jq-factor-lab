@@ -1,0 +1,145 @@
+# OHLC are four copies of a synthetic close index. Use close-to-close returns only.
+schema_version: 1
+slot_id: kf_us_portfolios_v1_1d
+market_domain: custom:kf_us_portfolios
+calendar:
+  provider: pmc
+  options:
+    calendar_id: XNYS
+    start: '1963-07-01'
+    end: '2026-10-31'
+bar_feed:
+  provider: duckdb_table
+  options:
+    table: public_bars_1d
+    frequency: 1d
+    timestamp_anchor: bar_start
+    source_timezone: America/New_York
+    volume_mode: interval
+    data_version: kf_us_portfolios_v1
+    column_mapping:
+      timestamp_utc: timestamp
+      instrument_id: instrument_id
+      open: open
+      high: high
+      low: low
+      close: close
+      volume: volume
+universe:
+  provider: static
+  options:
+    instruments:
+      AGRIC_VW.KFDL: {asset_class: portfolio, currency: USD}
+      FOOD_VW.KFDL: {asset_class: portfolio, currency: USD}
+      SODA_VW.KFDL: {asset_class: portfolio, currency: USD}
+      BEER_VW.KFDL: {asset_class: portfolio, currency: USD}
+      SMOKE_VW.KFDL: {asset_class: portfolio, currency: USD}
+      TOYS_VW.KFDL: {asset_class: portfolio, currency: USD}
+      FUN_VW.KFDL: {asset_class: portfolio, currency: USD}
+      BOOKS_VW.KFDL: {asset_class: portfolio, currency: USD}
+      HSHLD_VW.KFDL: {asset_class: portfolio, currency: USD}
+      CLTHS_VW.KFDL: {asset_class: portfolio, currency: USD}
+      HLTH_VW.KFDL: {asset_class: portfolio, currency: USD}
+      MEDEQ_VW.KFDL: {asset_class: portfolio, currency: USD}
+      DRUGS_VW.KFDL: {asset_class: portfolio, currency: USD}
+      CHEMS_VW.KFDL: {asset_class: portfolio, currency: USD}
+      RUBBR_VW.KFDL: {asset_class: portfolio, currency: USD}
+      TXTLS_VW.KFDL: {asset_class: portfolio, currency: USD}
+      BLDMT_VW.KFDL: {asset_class: portfolio, currency: USD}
+      CNSTR_VW.KFDL: {asset_class: portfolio, currency: USD}
+      STEEL_VW.KFDL: {asset_class: portfolio, currency: USD}
+      FABPR_VW.KFDL: {asset_class: portfolio, currency: USD}
+      MACH_VW.KFDL: {asset_class: portfolio, currency: USD}
+      ELCEQ_VW.KFDL: {asset_class: portfolio, currency: USD}
+      AUTOS_VW.KFDL: {asset_class: portfolio, currency: USD}
+      AERO_VW.KFDL: {asset_class: portfolio, currency: USD}
+      SHIPS_VW.KFDL: {asset_class: portfolio, currency: USD}
+      GUNS_VW.KFDL: {asset_class: portfolio, currency: USD}
+      GOLD_VW.KFDL: {asset_class: portfolio, currency: USD}
+      MINES_VW.KFDL: {asset_class: portfolio, currency: USD}
+      COAL_VW.KFDL: {asset_class: portfolio, currency: USD}
+      OIL_VW.KFDL: {asset_class: portfolio, currency: USD}
+      UTIL_VW.KFDL: {asset_class: portfolio, currency: USD}
+      TELCM_VW.KFDL: {asset_class: portfolio, currency: USD}
+      PERSV_VW.KFDL: {asset_class: portfolio, currency: USD}
+      BUSSV_VW.KFDL: {asset_class: portfolio, currency: USD}
+      HARDW_VW.KFDL: {asset_class: portfolio, currency: USD}
+      SOFTW_VW.KFDL: {asset_class: portfolio, currency: USD}
+      CHIPS_VW.KFDL: {asset_class: portfolio, currency: USD}
+      LABEQ_VW.KFDL: {asset_class: portfolio, currency: USD}
+      PAPER_VW.KFDL: {asset_class: portfolio, currency: USD}
+      BOXES_VW.KFDL: {asset_class: portfolio, currency: USD}
+      TRANS_VW.KFDL: {asset_class: portfolio, currency: USD}
+      WHLSL_VW.KFDL: {asset_class: portfolio, currency: USD}
+      RTAIL_VW.KFDL: {asset_class: portfolio, currency: USD}
+      MEALS_VW.KFDL: {asset_class: portfolio, currency: USD}
+      BANKS_VW.KFDL: {asset_class: portfolio, currency: USD}
+      INSUR_VW.KFDL: {asset_class: portfolio, currency: USD}
+      RLEST_VW.KFDL: {asset_class: portfolio, currency: USD}
+      FIN_VW.KFDL: {asset_class: portfolio, currency: USD}
+      OTHER_VW.KFDL: {asset_class: portfolio, currency: USD}
+      AGRIC_EW.KFDL: {asset_class: portfolio, currency: USD}
+      FOOD_EW.KFDL: {asset_class: portfolio, currency: USD}
+      SODA_EW.KFDL: {asset_class: portfolio, currency: USD}
+      BEER_EW.KFDL: {asset_class: portfolio, currency: USD}
+      SMOKE_EW.KFDL: {asset_class: portfolio, currency: USD}
+      TOYS_EW.KFDL: {asset_class: portfolio, currency: USD}
+      FUN_EW.KFDL: {asset_class: portfolio, currency: USD}
+      BOOKS_EW.KFDL: {asset_class: portfolio, currency: USD}
+      HSHLD_EW.KFDL: {asset_class: portfolio, currency: USD}
+      CLTHS_EW.KFDL: {asset_class: portfolio, currency: USD}
+      HLTH_EW.KFDL: {asset_class: portfolio, currency: USD}
+      MEDEQ_EW.KFDL: {asset_class: portfolio, currency: USD}
+      DRUGS_EW.KFDL: {asset_class: portfolio, currency: USD}
+      CHEMS_EW.KFDL: {asset_class: portfolio, currency: USD}
+      RUBBR_EW.KFDL: {asset_class: portfolio, currency: USD}
+      TXTLS_EW.KFDL: {asset_class: portfolio, currency: USD}
+      BLDMT_EW.KFDL: {asset_class: portfolio, currency: USD}
+      CNSTR_EW.KFDL: {asset_class: portfolio, currency: USD}
+      STEEL_EW.KFDL: {asset_class: portfolio, currency: USD}
+      FABPR_EW.KFDL: {asset_class: portfolio, currency: USD}
+      MACH_EW.KFDL: {asset_class: portfolio, currency: USD}
+      ELCEQ_EW.KFDL: {asset_class: portfolio, currency: USD}
+      AUTOS_EW.KFDL: {asset_class: portfolio, currency: USD}
+      AERO_EW.KFDL: {asset_class: portfolio, currency: USD}
+      SHIPS_EW.KFDL: {asset_class: portfolio, currency: USD}
+      GUNS_EW.KFDL: {asset_class: portfolio, currency: USD}
+      GOLD_EW.KFDL: {asset_class: portfolio, currency: USD}
+      MINES_EW.KFDL: {asset_class: portfolio, currency: USD}
+      COAL_EW.KFDL: {asset_class: portfolio, currency: USD}
+      OIL_EW.KFDL: {asset_class: portfolio, currency: USD}
+      UTIL_EW.KFDL: {asset_class: portfolio, currency: USD}
+      TELCM_EW.KFDL: {asset_class: portfolio, currency: USD}
+      PERSV_EW.KFDL: {asset_class: portfolio, currency: USD}
+      BUSSV_EW.KFDL: {asset_class: portfolio, currency: USD}
+      HARDW_EW.KFDL: {asset_class: portfolio, currency: USD}
+      SOFTW_EW.KFDL: {asset_class: portfolio, currency: USD}
+      CHIPS_EW.KFDL: {asset_class: portfolio, currency: USD}
+      LABEQ_EW.KFDL: {asset_class: portfolio, currency: USD}
+      PAPER_EW.KFDL: {asset_class: portfolio, currency: USD}
+      BOXES_EW.KFDL: {asset_class: portfolio, currency: USD}
+      TRANS_EW.KFDL: {asset_class: portfolio, currency: USD}
+      WHLSL_EW.KFDL: {asset_class: portfolio, currency: USD}
+      RTAIL_EW.KFDL: {asset_class: portfolio, currency: USD}
+      MEALS_EW.KFDL: {asset_class: portfolio, currency: USD}
+      BANKS_EW.KFDL: {asset_class: portfolio, currency: USD}
+      INSUR_EW.KFDL: {asset_class: portfolio, currency: USD}
+      RLEST_EW.KFDL: {asset_class: portfolio, currency: USD}
+      FIN_EW.KFDL: {asset_class: portfolio, currency: USD}
+      OTHER_EW.KFDL: {asset_class: portfolio, currency: USD}
+      MKT_RF.KFDL: {asset_class: factor, currency: USD}
+      SMB.KFDL: {asset_class: factor, currency: USD}
+      HML.KFDL: {asset_class: factor, currency: USD}
+      RF.KFDL: {asset_class: factor, currency: USD}
+aux_features:
+  provider: none
+microstructure:
+  provider: open
+execution_profile:
+  entry_price_field: close
+  exit_price_field: close
+  min_entry_offset_bars: 0
+  exit_adjustment: 0
+  return_unit: decimal
+  gap_rule: require_complete_bars
+  boundary_policy: cross_session

@@ -1,0 +1,16 @@
+This file was created using an example CRSP database.
+Missing data are indicated by -99.99 or -999.
+
+  Average Value Weighted Returns -- Daily
+,Agric,Food
+19630701,10.00,-999
+19630702,-99.99,1.50
+19630703,2.00,-99.99
+
+  Average Equal Weighted Returns -- Daily
+,Agric,Food
+19630701,5.00,7.00
+19630702,-999,3.00
+19630703,0.00,0.00
+
+Copyright synthetic fixture

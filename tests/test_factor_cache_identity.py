@@ -4,6 +4,7 @@ import logging
 import pickle
 
 import duckdb
+from market_db_samples import declare_market_db
 import numpy as np
 import pytest
 import pandas as pd
@@ -176,6 +177,7 @@ class CachedClose(FactorBase):
 
 def make_store(path, scale):
     with duckdb.connect(str(path)) as conn:
+        declare_market_db(conn, 'cn_equity')
         conn.execute('CREATE TABLE price_data_daily(date DATE, stock_code VARCHAR, close DOUBLE, factor DOUBLE)')
         conn.execute("INSERT INTO price_data_daily VALUES ('2024-01-02','A',?,1), ('2024-01-03','A',?,2)", [10*scale,12*scale])
 

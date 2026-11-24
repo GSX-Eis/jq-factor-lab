@@ -12,7 +12,7 @@ import subprocess
 import sys as sys
 import traceback as traceback
 import uuid as uuid
-from contextlib import ExitStack
+from contextlib import ExitStack, redirect_stdout
 from dataclasses import dataclass as dataclass
 from datetime import datetime as datetime, timezone as timezone
 from pathlib import Path
@@ -123,6 +123,15 @@ from tools.agent_harness.runner import (
 def main(argv: Sequence[str] | None = None, *, public_bar_cli: bool = False) -> int:
     parser = build_parser(public_bar_cli=True) if public_bar_cli else build_parser()
     args = parser.parse_args(argv)
+    if args.command in ("export-strategy", "verify-target-alignment"):
+        from tools.agent_harness.handlers.deploy import handle_deploy
+
+        with redirect_stdout(sys.stderr):
+            payload, exit_code = handle_deploy(args)
+        print(json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False))
+        return exit_code
+    if args.command == 'import-bars' and bool(args.bars) != bool(args.metadata):
+        parser.error('import-bars requires --bars with --metadata, or --manifest alone')
 
     if args.command == "outputs-gc":
         command = [args.task_manager, "--task-root", str(Path(args.task_root).resolve()), "--json",
@@ -134,7 +143,11 @@ def main(argv: Sequence[str] | None = None, *, public_bar_cli: bool = False) -> 
             return subprocess.run(command, check=False).returncode
         except OSError as exc:
             parser.error(str(exc))
-    if args.command in ('build-bars', 'audit-bars', 'import-bars', 'build-roll-schedule'):
+    if args.command == "market-db":
+        from tools.agent_harness.handlers.market_db import handle_market_db
+
+        result = handle_market_db(args)
+    elif args.command in ('build-bars', 'audit-bars', 'import-bars', 'build-roll-schedule'):
         result = _handle_bar_storage(args)
     elif args.command in ('write-factor-values', 'read-factor-values', 'verify-factor-values'):
         result = _handle_factor_values_store(args)

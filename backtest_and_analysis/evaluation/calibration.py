@@ -23,6 +23,7 @@ from .types import (
     CalibrationStatus,
     DEFAULT_BOOTSTRAP_REPLICATES,
     DEFAULT_MIN_VALID_REPLICATES,
+    P_VALUE_BOOTSTRAP_REPLICATES,
     FloatArray,
     HACInterval,
     ICMethod,
@@ -51,6 +52,26 @@ _SCENARIOS = {
     "positive_effect": _Scenario(pearson_rho=0.35),
     "negative_effect": _Scenario(pearson_rho=-0.35),
 }
+
+
+def bootstrap_pvalue_reason(interval: BootstrapInterval) -> str | None:
+    """Check the preregistered diagnostic design and finite-replicate budget."""
+    if interval.reason == "insufficient_bootstrap_replicates":
+        return "insufficient_replicates_for_pvalue"
+    if interval.reason is not None:
+        return "bootstrap_interval_unestimable"
+    if (interval.n_boot < P_VALUE_BOOTSTRAP_REPLICATES
+            or 10 * interval.valid_replicates < 9 * interval.n_boot):
+        return "insufficient_replicates_for_pvalue"
+    if (
+        not isinstance(interval.calibration_scenario, str) or interval.calibration_scenario not in _SCENARIOS
+        or interval.grid_size not in (512, 1024)
+        or interval.min_block_length not in (1, 5, 20) or interval.missing_pattern != "none"
+        or interval.min_pairs_per_replicate != 4 or interval.alpha != _ALPHA
+        or not _finite_real(interval.effective_blocks) or interval.effective_blocks < 4
+    ):
+        return "outside_pvalue_calibration_domain"
+    return None
 
 
 def _gaussian_series(
@@ -171,6 +192,7 @@ class AdaptiveCalibrationDomain:
     covered: int
     repetitions: int
     grid_sizes: tuple[int, ...] | None = None
+    alpha: float = _ALPHA
 
 
 _PATTERN_GAPS = {"none": 0, "periodic_17_3": 3, "periodic_17_5": 5}
@@ -295,7 +317,7 @@ def _adaptive_domain_mismatches(
         "missing_fraction": 1 - n / size <= domain.max_missing_fraction,
         "missing_pattern": o.missing_pattern in domain.missing_patterns,
         "horizon": o.horizon in domain.horizons,
-        "nominal_coverage": o.alpha == _ALPHA and 1 - o.alpha == domain.nominal_coverage,
+        "nominal_coverage": o.alpha == domain.alpha and 1 - o.alpha == domain.nominal_coverage,
     }
     if domain.min_effective_df is not None:
         checks.update(
@@ -366,6 +388,27 @@ def _candidate_adaptive_domain(
     )
 
 
+_CS_HAC_SIZE_REPORT = "reports/NERE-1280/cs_hac_calibration.json"
+_CS_HAC_SIZE_ALPHAS = (.01, .05)
+
+# Retained NERE-1280 null cells at T=1024. Counts are ordered by _CS_HAC_SIZE_ALPHAS.
+_CS_HAC_SIZE_COUNTS = (
+    ("independent_null", 256, 1, (217, 1042)),
+    ("independent_null", 256, 20, (225, 1036)),
+    ("independent_null", 1024, 1, (180, 842)),
+    ("independent_null", 1024, 20, (178, 864)),
+    ("ar1_null", 256, 1, (223, 1083)),
+    ("ar1_null", 256, 20, (208, 1005)),
+    ("ar1_null", 1024, 1, (180, 856)),
+    ("ar1_null", 1024, 20, (161, 803)),
+    ("overlap_null", 256, 1, (202, 972)),
+    ("overlap_null", 256, 20, (224, 1029)),
+    ("overlap_null", 1024, 1, (182, 829)),
+    ("overlap_null", 1024, 20, (148, 826)),
+)
+_CS_HAC_SIZE_REPETITIONS = {256: 20000, 1024: 16000}
+
+
 # NERE-936 S5 released HAC. NERE-962 S3 separately released Bootstrap v2.
 REGISTERED_ADAPTIVE_CALIBRATIONS: tuple[AdaptiveCalibrationDomain, ...] = tuple(
     replace(
@@ -407,6 +450,26 @@ REGISTERED_ADAPTIVE_CALIBRATIONS: tuple[AdaptiveCalibrationDomain, ...] = tuple(
         ("negative_effect", 1, 0, ("1:007",), 471),
         ("generalized_ar_heteroskedastic", 1, 0, tuple(f"3:{index:03d}" for index in range(18)), 462),
     )
+) + tuple(
+    replace(
+        _candidate_adaptive_domain(cross_section=True, scenario=scenario, horizon=horizon, gap=0),
+        domain_id=f"cs_hac_adaptive_v1:{scenario}:nere1280:{width}:1024:{horizon}:{alpha}",
+        grid_size_min=1024,
+        grid_size_max=1024,
+        min_n_valid=1024,
+        cross_section_width_min=width,
+        cross_section_width_max=width,
+        min_effective_df=1,
+        nominal_coverage=1 - alpha,
+        report_ref=_CS_HAC_SIZE_REPORT,
+        report_sha256="c16f6c989a5f3d5faa951c410dc94fa50b9629790b5565cea81da6fe3d857994",
+        coverage_cell_ids=(f"{scenario}:{width}:1024:{horizon}:{alpha}",),
+        covered=_CS_HAC_SIZE_REPETITIONS[width] - rejected,
+        repetitions=_CS_HAC_SIZE_REPETITIONS[width],
+        alpha=alpha,
+    )
+    for scenario, width, horizon, counts in _CS_HAC_SIZE_COUNTS
+    for alpha, rejected in zip(_CS_HAC_SIZE_ALPHAS, counts, strict=True)
 )
 
 
@@ -424,7 +487,8 @@ def _registered_adaptive_evidence(
             scenario=observation.scenario, method=method, window=observation.window,
             sample_size=observation.grid_size, bootstrap_replicates=observation.n_boot,
             nominal_coverage=domain.nominal_coverage, observed_coverage=domain.covered / domain.repetitions,
-            tolerance=_TOLERANCE_MCSE * _coverage_mcse(domain.repetitions),
+            tolerance=(.5 * domain.alpha if domain.report_ref == _CS_HAC_SIZE_REPORT
+                       else _TOLERANCE_MCSE * _coverage_mcse(domain.repetitions)),
             passes=True, report_ref=domain.report_ref, method_version=domain.method_version,
             domain_id=domain.domain_id, report_sha256=domain.report_sha256,
         )
@@ -647,6 +711,18 @@ def adjust_pvalues(p_values: npt.ArrayLike, *, method: Correction) -> FloatArray
     return result
 
 
+def _hac_test_at_alpha(
+    statistic: float, observation: AdaptiveCalibrationObservation, alpha: float,
+) -> tuple[float, float, float]:
+    from .cross_section import student_t_hac_p_value
+
+    df, variance = observation.effective_df, observation.hac_variance
+    assert df is not None and variance is not None
+    half_width = float(student_t.isf(alpha / 2, df)) * sqrt(variance)
+    lower, upper = statistic - half_width, statistic + half_width
+    return lower, upper, student_t_hac_p_value(statistic, variance, df, alpha, lower, upper)
+
+
 @dataclass(frozen=True)
 class Trial:
     """One attempt; the legacy n_effective field counts observed pairs or sections."""
@@ -674,26 +750,24 @@ class Trial:
         evidence = use.calibration_evidence
         observation = use.adaptive_observation
         if observation is not None or self.p_value_method == "two_sided_student_t_hac":
+            levels = _CS_HAC_SIZE_ALPHAS if evidence.report_ref == _CS_HAC_SIZE_REPORT else (_ALPHA,)
             if (
                 not isinstance(observation, AdaptiveCalibrationObservation)
                 or observation.horizon != horizon or observation.n_valid != self.n_observations
-                or alpha != _ALPHA or self.p_value_method != "two_sided_student_t_hac"
+                or alpha not in levels or self.p_value_method != "two_sided_student_t_hac"
                 or evidence.method != "cross_section_hac_adaptive"
                 or evidence != _registered_adaptive_evidence(observation)
                 or self.statistic is None
             ):
                 return False
-            from .cross_section import student_t_hac_p_value
-
-            half_width = float(student_t.isf(alpha / 2, observation.effective_df)) * sqrt(observation.hac_variance)
-            lower, upper = self.statistic - half_width, self.statistic + half_width
-            expected = student_t_hac_p_value(
-                self.statistic, observation.hac_variance, observation.effective_df, alpha, lower, upper,
-            )
+            interval_alpha = observation.alpha
+            lower, upper, expected = _hac_test_at_alpha(self.statistic, observation, interval_alpha)
             actual = self.p_value
             return (
                 isclose(actual, expected, rel_tol=1e-12, abs_tol=0.0)
-                and (actual < alpha) == (expected < alpha) and (actual > alpha) == (expected > alpha)
+                and (actual < interval_alpha) == (expected < interval_alpha)
+                and (actual > interval_alpha) == (expected > interval_alpha)
+                and all((actual <= level) == (expected <= level) for level in levels)
                 and isclose(self.interval[0], lower, rel_tol=1e-12, abs_tol=0.0)
                 and isclose(self.interval[1], upper, rel_tol=1e-12, abs_tol=0.0)
             )
@@ -702,6 +776,18 @@ class Trial:
             and 1 - alpha >= evidence.nominal_coverage and evidence in REGISTERED_CALIBRATIONS
             and horizon == _SCENARIOS[evidence.scenario].horizon
         )
+
+    def _p_value_for_adjustment(self) -> float:
+        assert self.p_value is not None and self.interval_usability is not None
+        evidence = self.interval_usability.calibration_evidence
+        assert evidence is not None
+        if evidence.report_ref == _CS_HAC_SIZE_REPORT:
+            observation = self.interval_usability.adaptive_observation
+            assert observation is not None and self.statistic is not None
+            # The registered size study used the 95% interval to evaluate all thresholds.
+            _, _, reference_p = _hac_test_at_alpha(self.statistic, observation, _ALPHA)
+            return next((level for level in _CS_HAC_SIZE_ALPHAS if reference_p <= level), 1.)
+        return self.p_value
 
     def __post_init__(self) -> None:
         _positive_int(self.n_effective, "n_effective", minimum=0)
@@ -793,7 +879,10 @@ class TrialLedger:
         ]
         # Keep every registered hypothesis in the denominator, without borrowing evidence
         # from the raw p-values of ineligible candidates.
-        inference = adjust_pvalues(np.where(eligible, p_values, 1.), method=method)
+        inference = adjust_pvalues([
+            self._trials[key]._p_value_for_adjustment() if usable else 1.
+            for key, usable in zip(self._candidates, eligible, strict=True)
+        ], method=method)
         trials = tuple(
             AdjustedTrial(key, self._trials[key], float(p), bool(usable and q <= alpha))
             for key, p, q, usable in zip(self._candidates, adjusted, inference, eligible, strict=True)

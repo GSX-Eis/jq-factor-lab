@@ -4,11 +4,89 @@ Writers advance the generation in the data transaction. Readers never create
 metadata, commit a borrowed connection, or move a frozen input binding.
 """
 from contextlib import contextmanager
+from dataclasses import dataclass
 from functools import wraps
 from pathlib import Path
+from typing import TYPE_CHECKING, Any
+import hashlib
 import json
 import os
+import pickle
 import uuid
+
+
+if TYPE_CHECKING:
+    import pandas as pd
+
+
+def frame_digest(frame: "pd.DataFrame") -> str:
+    """Hash the snapshot bytes without building a second copy of the frame."""
+    digest = hashlib.sha256()
+
+    class _HashWriter:
+        def write(self, data: bytes) -> int:
+            digest.update(data)
+            return len(data)
+
+    pickle.dump(frame, _HashWriter(), protocol=4)
+    return digest.hexdigest()
+
+
+@dataclass(frozen=True)
+class FactorFrameDigest:
+    """A DataFrame dependency captured before the factor can mutate its inputs."""
+
+    sha256: str
+
+
+def normalize_factor_inputs(inputs: dict[str, Any]) -> dict[str, list[Any]]:
+    """Serialize declared parameters and DataFrame dependencies into panel metadata."""
+    import pandas as pd
+
+    if not isinstance(inputs, dict) or any(not isinstance(key, str) for key in inputs):
+        raise TypeError("_get_cache_inputs must return a dictionary with string keys")
+    declared = {}
+    for key, value in inputs.items():
+        if isinstance(value, pd.DataFrame):
+            declared[key] = ["dataframe", frame_digest(value)]
+        else:
+            normalized = json.loads(json.dumps(value, sort_keys=True, allow_nan=False))
+            if normalized != value:
+                raise TypeError(f"Cache input {key} must use JSON values without coercion")
+            declared[key] = ["json", normalized]
+    return declared
+
+
+def capture_factor_inputs(factor) -> dict[str, list[Any]] | None:
+    # An inherited hook might omit parameters added by the concrete factor.
+    if "_get_cache_inputs" not in vars(type(factor)):
+        return None
+    inputs = factor._get_cache_inputs()
+    if inputs is None:
+        return None
+    try:
+        return normalize_factor_inputs(inputs)
+    except (TypeError, ValueError, OSError, pickle.PicklingError) as exc:
+        factor.logger.warning("Cannot capture factor inputs: %s", exc)
+        return None
+
+
+def factor_input_fingerprint(factor, frame: "pd.DataFrame") -> dict[str, Any]:
+    return {"factor_input_sha256": frame_digest(frame), "declared_params": capture_factor_inputs(factor)}
+
+
+def carry_factor_inputs(values: "pd.DataFrame", declared: dict | None) -> "pd.DataFrame":
+    values.attrs["factor_input_fingerprint"] = {"declared_params": declared}
+    return values
+
+
+def window_factor_input_fingerprint(windows: list["pd.DataFrame"]) -> dict:
+    declared = [window.attrs.get("factor_input_fingerprint", {}).get("declared_params") for window in windows]
+    if not declared:
+        return {}
+    if all(snapshot == declared[0] for snapshot in declared):
+        return {"declared_params": declared[0]}
+    return {"declared_params_by_window": declared}
 
 
 def advance_revision(conn):

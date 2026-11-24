@@ -16,7 +16,7 @@ import tempfile
 import time
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Any, Callable, Mapping, Optional, Sequence
+from typing import Any, Callable, Mapping, Optional, Sequence, Unpack
 
 import numpy as np
 import pandas as pd
@@ -34,7 +34,11 @@ from .lasso_method import (
     _outer_prediction_index,
     _strict_label_exit_index,
 )
-from .preprocessing import apply_target_cs_preprocessing, compute_sample_weights
+from .preprocessing import (
+    apply_target_cs_preprocessing, compute_sample_weights,
+    MarketInputOptions, bind_synthesis_panel, format_panel_time,
+    preprocess_synthesis_features, selected_market_inputs, training_bounds,
+)
 
 
 FIXED_BUCKET_EDGES = (0.0, 20.0, 40.0, 60.0, 80.0, 100.0)
@@ -222,9 +226,14 @@ def size_conditional_snapshot_identity(
     mapping = method_config.get("_label_exit_dates")
     calendar = method_config.get("_label_trading_calendar")
     if mapping is not None or calendar is not None:
-        days = list(mapping) if mapping is not None else pd.DatetimeIndex(calendar)
+        if mapping is not None:
+            days = list(mapping.index) if isinstance(mapping, pd.Series) else list(mapping)
+        else:
+            days = pd.DatetimeIndex(calendar)
         if mapping is None:
-            days = days[(days >= pd.Timestamp(start_date)) & (days <= pd.Timestamp(end_date))]
+            dated = pd.DataFrame(index=pd.MultiIndex.from_product([days, ["snapshot"]], names=["date", "stock_code"]))
+            first, last = training_bounds(dated, start_date, end_date)
+            days = days[(days >= first) & (days <= last)]
         keys = pd.MultiIndex.from_product([days, ["snapshot"]], names=["date", "stock_code"])
         context = _snapshot_label_context(keys, method_config)
         label_producer["exit_dates"] = context["_label_exit_dates"]
@@ -263,7 +272,7 @@ def _snapshot_label_context(index: pd.MultiIndex, context: Mapping[str, Any]) ->
     )
     return {
         "_label_exit_dates": {
-            str(pd.Timestamp(day).normalize().date()): str(exit_day.date())
+            format_panel_time(pd.Timestamp(day)): format_panel_time(exit_day)
             for day, exit_day in zip(index.get_level_values(0), exits)
         },
         "_label_trading_calendar": None,
@@ -293,12 +302,12 @@ def prepare_size_conditional_panel(
         context["_effective_label_definition"] = forward_returns.attrs["label_definition"]
     label_context = _snapshot_label_context(train_raw.index, context)
     train_factors = (
-        synthesizer._apply_feature_preprocessing(train_raw, preprocess)
+        preprocess_synthesis_features(synthesizer, train_raw, preprocess, history=factor_df)
         if preprocess
         else train_raw.copy()
     )
     predict_factors = (
-        synthesizer._apply_feature_preprocessing(predict_raw, preprocess)
+        preprocess_synthesis_features(synthesizer, predict_raw, preprocess, history=factor_df)
         if preprocess
         else predict_raw.copy()
     )
@@ -320,6 +329,22 @@ def prepare_size_conditional_panel(
             log_market_cap, predict_factors.index
         ),
     }
+
+
+def _snapshot_attrs(attrs: Mapping[str, Any]) -> dict[str, Any]:
+    """Convert snapshot attrs into JSON-serializable metadata without mutating inputs."""
+    serialized = dict(attrs)
+    exits = serialized.get("label_exit_dates")
+    if isinstance(exits, (Mapping, pd.Series)):
+        normalized: dict[str, str] = {}
+        for day, exit_day in exits.items():
+            entry_ts = pd.Timestamp(day)
+            exit_ts = pd.Timestamp(exit_day)
+            if pd.isna(entry_ts) or pd.isna(exit_ts):
+                raise ValueError("label_exit_dates contains NaT")
+            normalized[format_panel_time(entry_ts)] = format_panel_time(exit_ts)
+        serialized["label_exit_dates"] = normalized
+    return serialized
 
 
 def _snapshot_frame(panel: Mapping[str, Any]) -> pd.DataFrame:
@@ -451,7 +476,7 @@ def load_or_build_size_conditional_snapshot(
         "label_context_sha256": hashlib.sha256(json.dumps(
             panel["label_context"], sort_keys=True, separators=(",", ":")
         ).encode("utf-8")).hexdigest(),
-        "panel_metadata": {name: {"name": getattr(value, "name", None), "attrs": value.attrs}
+        "panel_metadata": {name: {"name": getattr(value, "name", None), "attrs": _snapshot_attrs(value.attrs)}
                            for name, value in panel.items() if name != "label_context"},
     }
     parquet_handle = tempfile.NamedTemporaryFile(
@@ -841,9 +866,9 @@ def select_inner_policy(
             )
         ),
     )
-    groups = pd.DatetimeIndex(common.get_level_values(0)).to_numpy()
+    groups = pd.DatetimeIndex(common.get_level_values(0))
     splits = list(splitter.split(
-        np.empty((len(common), 0)), groups=groups, label_exit_dates=exits.to_numpy()
+        np.empty((len(common), 0)), groups=groups, label_exit_dates=exits
     ))
     if len(splits) < 2:
         raise ValueError("fewer than two valid purged inner folds")
@@ -1168,7 +1193,7 @@ def _coefficient_payload(
 
 def run_size_conditional_synthesis(
     synthesizer: Any,
-    factor_df: pd.DataFrame,
+    factor_df: pd.DataFrame | None,
     forward_returns: pd.Series,
     log_market_cap: pd.Series,
     train_start: str,
@@ -1176,20 +1201,35 @@ def run_size_conditional_synthesis(
     config: dict[str, Any],
     daily_pools: Optional[Mapping[str, set[str]]] = None,
     prepared_panel: Optional[Mapping[str, Any]] = None,
+    **market_inputs: Unpack[MarketInputOptions],
 ) -> tuple[pd.Series, dict[str, Any]]:
     """Fit one nested-selected policy and score the next outer window."""
+    snapshot_context = None
+    if prepared_panel is not None:
+        factor_df = prepared_panel["predict_factors"]
+        forward_returns = prepared_panel["raw_returns"]
+        snapshot_context = _snapshot_label_context(
+            prepared_panel["train_factors"].index, prepared_panel.get("label_context")
+        )
+        if "_label_exit_dates" not in config and "_label_exit_dates" in snapshot_context:
+            config = dict(config, _label_exit_dates=snapshot_context["_label_exit_dates"])
+    factor_df, config = bind_synthesis_panel(
+        synthesizer, factor_df, config, market_inputs, forward_returns,
+    )
     logger = synthesizer.logger
-    top_k_config = synthesizer.config.get("performance_evaluation", {}).get(
+    raw_synth_cfg = getattr(synthesizer, "config", None)
+    synth_cfg = raw_synth_cfg if isinstance(raw_synth_cfg, Mapping) else {}
+    top_k_config = (synth_cfg.get("performance_evaluation") or {}).get(
         "top_k_strategy", {}
     )
     normalized = validate_size_conditional_config(config, top_k_config)
-    if prepared_panel is not None:
+    if prepared_panel is not None and snapshot_context is not None:
+        producer_exits = config.get("_label_exit_dates")
         config = dict(config)
-        config.update(_snapshot_label_context(prepared_panel["train_factors"].index, prepared_panel.get("label_context")))
-        factor_df = prepared_panel["predict_factors"]
-        forward_returns = prepared_panel["raw_returns"]
-    train_start_dt = pd.Timestamp(train_start)
-    train_end_dt = pd.Timestamp(train_end)
+        config.update(snapshot_context)
+        if forward_returns.attrs.get("label_exit_dates") is not None and producer_exits is not None:
+            config["_label_exit_dates"] = producer_exits
+    train_start_dt, train_end_dt = training_bounds(factor_df, train_start, train_end)
     predict_index = _outer_prediction_index(
         synthesizer, factor_df, train_end_dt, daily_pools, logger
     )
@@ -1252,7 +1292,7 @@ def run_size_conditional_synthesis(
         combined = pd.concat((X_train_raw, X_predict_raw)).sort_index()
         preprocess = config.get("preprocess", config.get("preprocessing", {}))
         processed = (
-            synthesizer._apply_feature_preprocessing(combined, preprocess)
+            preprocess_synthesis_features(synthesizer, combined, preprocess, history=factor_df)
             if preprocess
             else combined
         )
@@ -1409,6 +1449,7 @@ def run_size_conditional_synthesis(
         "dsr": selection["dsr"],
         "performance": selection["performance"],
         "coefficients": coefficient_payload,
+        "market_factor_inputs": selected_market_inputs(factor_df, columns),
         "intercept": float(model.intercept_),
         "training_window_audit": audit,
         "protocol": protocol,

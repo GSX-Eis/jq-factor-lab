@@ -16,10 +16,13 @@ ICMethod = Literal["spearman", "pearson"]
 
 DEFAULT_BOOTSTRAP_REPLICATES = 999
 DEFAULT_MIN_VALID_REPLICATES = 900
+P_VALUE_BOOTSTRAP_REPLICATES = 9999
 
 BOOTSTRAP_FIXED = (None, "fixed", "moving_block", "percentile")
 BOOTSTRAP_V1 = ("ts_boot_adaptive_v1", "ppw2009", "circular_block", "fisher_z_bootstrap_t")
 BOOTSTRAP_V2 = ("ts_boot_adaptive_v2", "ppw2009", "circular_block", "fisher_z_bootstrap_t_flat_top_block")
+
+BOOTSTRAP_V3_P = ("ts_boot_adaptive_v3_p", *BOOTSTRAP_V2[1:])
 
 CalibrationStatus = Literal["uncalibrated", "calibrated_pass", "calibrated_fail"]
 CalibrationMethod = Literal[
@@ -198,9 +201,20 @@ class BootstrapInterval:
     effective_blocks: float | None = None
     fisher_z_standard_error: float | None = None
 
+    p_value: float | None = None
+    p_value_reason: str | None = None
+
     @property
     def confidence_level(self) -> float:
         return 1 - self.alpha
+
+
+def bootstrap_interval_payload(interval: BootstrapInterval) -> dict:
+    payload = asdict(interval)
+    if interval.method_version != BOOTSTRAP_V3_P[0]:
+        del payload["p_value"]
+        del payload["p_value_reason"]
+    return payload
 
 
 @dataclass(frozen=True)
@@ -246,6 +260,8 @@ class TimeSeriesHorizon:
     instruments: dict[Hashable, TimeSeriesInstrument]
     ic_summary: InstrumentICSummary
     non_overlapping_ic_summary: dict[int, InstrumentICSummary]
+    p_value: float | None = None
+    p_value_reason: str | None = None
 
 
 @dataclass(frozen=True)

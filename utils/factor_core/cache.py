@@ -10,6 +10,8 @@ from typing import Callable, Optional
 import numpy as np
 import pandas as pd
 
+from utils.data_revision import capture_factor_inputs, frame_digest
+
 
 def factor_core_source_hashes(facade: Path) -> list[str]:
     """Hash extracted FactorBase sources in deterministic filename order."""
@@ -17,6 +19,14 @@ def factor_core_source_hashes(facade: Path) -> list[str]:
         hashlib.sha256(dependency.read_bytes()).hexdigest()
         for dependency in sorted(facade.with_name("factor_core").glob("*.py"))
     ]
+
+
+def _legacy_reader_source_hashes(facade: Path) -> list[str]:
+    """Track the historical reader dependencies under the new slot cache identity."""
+    mapping = Path(__file__).resolve().parents[1] / 'legacy_cache_identity.json'
+    names = json.loads(mapping.read_text())['dependencies']
+    return [hashlib.sha256((facade.parent / name).read_bytes()).hexdigest()
+            for name in sorted(names) if not name.startswith('factor_core/')]
 
 
 def _get_cache_inputs(self) -> Optional[dict]:
@@ -36,6 +46,8 @@ def _get_cache_key(
     stock_filter_cls: type,
     apply_pit_adjustment: Callable,
     raw_data: Optional[pd.DataFrame] = None,
+    *,
+    captured_inputs: dict | None = None,
 ) -> Optional[str]:
     """Hash declared inputs; never infer configuration from runtime state."""
     import inspect
@@ -47,46 +59,23 @@ def _get_cache_key(
         self.logger.warning("Cache disabled: %s must declare _get_cache_inputs", type(self).__name__)
         return None
     # Dependency read failures must propagate, even if an old cache exists.
-    inputs = self._get_cache_inputs()
-    if inputs is None:
+    declared = capture_factor_inputs(self) if captured_inputs is None else captured_inputs["declared_params"]
+    if declared is None:
         self.logger.warning("Cache disabled: _get_cache_inputs did not identify all inputs")
         return None
 
+    slot = getattr(self, 'slot', None)
+    adapter = self._duckdb_adapter or getattr(getattr(slot, 'bar_feed', None), 'adapter', None)
     source_revision = None
-    if self._duckdb_adapter is not None:
-        source_revision = self._duckdb_adapter.cache_revision()
+    if adapter is not None:
+        source_revision = adapter.cache_revision()
         if source_revision is None:
             return None  # Unmanaged Parquet must not reuse derived disk caches.
     elif self.db_connection is not None:
         from utils.data_revision import connection_revision
         source_revision = connection_revision(self.db_connection)
 
-    def frame_digest(frame):
-        # Include values, ordering, dtypes, categorical metadata, axes and attrs.
-        digest = hashlib.sha256()
-
-        class HashWriter:
-            def write(self, data):
-                digest.update(data)
-                return len(data)
-
-        # Stream into the digest instead of retaining the entire pickle too.
-        pickle.dump(frame, HashWriter(), protocol=4)
-        return digest.hexdigest()
-
     try:
-        if not isinstance(inputs, dict) or any(not isinstance(key, str) for key in inputs):
-            raise TypeError("_get_cache_inputs must return a dictionary with string keys")
-        declared = {}
-        for key, value in inputs.items():
-            if isinstance(value, pd.DataFrame):
-                declared[key] = ["dataframe", frame_digest(value)]
-            else:
-                encoded = json.dumps(value, sort_keys=True, allow_nan=False)
-                normalized = json.loads(encoded)
-                if normalized != value:
-                    raise TypeError("Cache input " + key + " must use JSON values without coercion")
-                declared[key] = ["json", normalized]
         fields = (
             "factor_name", "start_date", "end_date", "stock_pool", "all_stocks",
             "use_dynamic_pool", "stock_pools_by_period", "dynamic_pool_mode",
@@ -97,17 +86,31 @@ def _get_cache_key(
         )
         parameters = {name: getattr(self, name) for name in fields}
         parameters["pool_schedule"] = getattr(self, "pool_schedule", None)
+        if slot is not None:
+            if self.slot_config_hash is None:
+                return None  # A custom slot needs a stable declaration to share a disk cache.
+            from utils.market_db.identity import slot_market_db_identity
+
+            parameters.update(slot_market_db_identity(slot))
+            parameters.update(slot_id=self.slot_id, slot_config_hash=self.slot_config_hash,
+                              universe_id=self.universe_id, slot_calendar_hash=slot.calendar.calendar_hash)
         for name in ('analysis_mode', 'output_frequency', 'session_view', 'label_config',
-                     'data_version', 'source_revision', 'calendar_hash', 'rth_reference_calendar'):
+                     'data_version', 'source_revision'):
             parameters[name] = getattr(self, name, None)
-        metadata = getattr(self, 'instrument_metadata', None)
+        # A retained diagnostic grid can come from a previous run. A causal cache
+        # key binds the clocks and metadata of the current window.
+        context = raw_data.attrs if getattr(self, '_slot_input_window', None) is not None else vars(self)
+        for name in ('calendar_hash', 'rth_reference_calendar'):
+            parameters[name] = context.get(name)
+        metadata = context.get('instrument_metadata')
         parameters['instrument_metadata'] = frame_digest(metadata) if isinstance(metadata, pd.DataFrame) else metadata
         calendars = getattr(self, 'session_calendar', None)
         if calendars is not None:
             parameters['session_calendar'] = (calendars.calendar_hash if hasattr(calendars, 'calendar_hash')
                 else {instrument: calendar.calendar_hash for instrument, calendar in calendars.items()})
-        if self._duckdb_adapter is not None or self.db_connection is not None:
-            parameters["data_access"] = self._get_local_data_config().as_dict()
+        if adapter is not None or self.db_connection is not None:
+            config = adapter.data_config if adapter is not None else self._get_local_data_config()
+            parameters["data_access"] = config.as_dict()
             parameters["source_policy"] = self.source_policy
         for name in ("duckdb_path", "parquet_dir"):
             value = getattr(self, name)
@@ -146,6 +149,8 @@ def _get_cache_key(
             if implementation is factor_base_cls:
                 # Bar and edited facades use source hashes outside the frozen mapping.
                 sources.extend(factor_core_source_hashes(path))
+                if slot is not None and self._ashare_panel:
+                    sources.extend(_legacy_reader_source_hashes(path))
         identity = json.dumps({"schema": 3, "class": type(self).__qualname__,
                                "source": sources, "parameters": parameters,
                                "runtime": [pd.__version__, np.__version__],

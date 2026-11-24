@@ -15,38 +15,17 @@ from tools.agent_harness.runner import HarnessResult
 
 def _handle_single_factor_analysis(args: argparse.Namespace) -> HarnessResult:
     cli = _cli_bindings(__name__, _json_io, time_series, run_result, runner)
-    if args.bars_csv is not None or args.analysis_mode == "time_series":
+    if (getattr(args, "market_db", None) is not None or args.bars_csv is not None
+            or args.analysis_mode == "time_series"
+            or getattr(args, "slot", None) is not None or getattr(args, "slot_id", None) is not None):
         return cli._handle_time_series_analysis(args)
+    config = {}
     if args.config:
         config = cli._safe_read_json(cli._resolve_repo_relative_path(args.config))
-        if ("bars_csv" in config or "time_series_analysis" in config or "continuous_futures" in config
+        if (config.keys() & {"bars_csv", "time_series_analysis", "continuous_futures", "slot", "slot_id",
+                             "slot_config", "factor_store_root", "market_db"}
                 or config.get("analysis_mode") == "time_series"):
             return cli._handle_time_series_analysis(args)
-    if getattr(args, "results_db", None) is not None:
-        action = "single-factor-analysis"
-        output_dir = cli._output_dir(
-            action, cli._resolve_args_output_root(args.output_root), args.run_id
-        )
-        started_at = cli._utc_now()
-        result = cli._failure_result(
-            action=action,
-            mode="preflight",
-            output_dir=output_dir,
-            run_id=args.run_id,
-            command=[sys.executable, str(cli.REPO_ROOT / "run_analysis_main.py")],
-            started_at=started_at,
-            reason="results_db_unsupported_for_daily",
-            exit_code=cli.EXIT_PRECONDITION,
-            metrics={"results_db": str(args.results_db)},
-            artifacts=cli._common_artifacts(output_dir),
-        )
-        try:
-            cli._validate_bar_output_paths(Path(args.results_db).expanduser(), output_dir, args.json_out)
-        except (OSError, ValueError, TypeError) as exc:
-            result.artifacts = []
-            result.error["message"] = str(exc)
-            return result
-        return cli._complete_result(result, json_out=args.json_out)
     action = "single-factor-analysis"
     output_dir = cli._output_dir(
         action, cli._resolve_args_output_root(args.output_root), args.run_id
@@ -58,6 +37,36 @@ def _handle_single_factor_analysis(args: argparse.Namespace) -> HarnessResult:
     command = [sys.executable, str(cli.REPO_ROOT / "run_analysis_main.py"),
                "--result-out", str(result_path), "--run-id", effective_run_id,
                "--execution-id", execution_id]
+    evaluation_db = None
+    if getattr(args, "results_db", None) is not None:
+        from utils.bar_evaluation_store import _validate_db_target_path
+
+        try:
+            requested_db = Path(args.results_db).expanduser().resolve()
+            cli._validate_bar_output_paths(requested_db, output_dir, args.json_out)
+            cli._validate_bar_output_paths(requested_db, result_path.parent, args.json_out,
+                                           result_path.parent / "bar-evaluations")
+            if requested_db.is_relative_to(result_path.parent):
+                raise ValueError("results_db must differ from bound analysis output paths")
+            if args.materialize_only or args.mining_only or config.get("materialize_only") or config.get("mining_only"):
+                raise ValueError("--results-db requires a full daily analysis")
+            evaluation_db = _validate_db_target_path(args.results_db)
+            database = config.get("database", config)
+            source_path = database.get("duckdb_path") if isinstance(database, dict) else None
+            if isinstance(source_path, str) and source_path:
+                source = cli._resolve_repo_relative_path(source_path)
+                if source == evaluation_db or (source.is_file() and evaluation_db.is_file()
+                                                 and source.samefile(evaluation_db)):
+                    raise ValueError("results_db must differ from the input database")
+            command.extend(["--bar-results-db", str(evaluation_db)])
+        except (OSError, ValueError, TypeError) as exc:
+            result = cli._failure_result(
+                action=action, mode="preflight", output_dir=output_dir, run_id=args.run_id,
+                command=command, started_at=started_at, reason="bar_evaluation_store_precondition_failed",
+                exit_code=cli.EXIT_PRECONDITION, metrics={"error": str(exc)}, artifacts=[],
+            )
+            result.error["message"] = str(exc)
+            return result
     if args.config:
         command.extend(["--config", args.config])
     if args.factor:
@@ -114,6 +123,19 @@ def _handle_single_factor_analysis(args: argparse.Namespace) -> HarnessResult:
             command=command, started_at=started_at, reason="missing_config",
             exit_code=cli.EXIT_PRECONDITION, metrics={"error": str(exc)}, artifacts=artifacts,
         ), json_out=args.json_out)
+
+    def bound_metrics(_stdout: str, _stderr: str) -> dict:
+        metrics = cli._bound_result_metrics(
+            result_path, action=action, run_id=effective_run_id, execution_id=execution_id,
+            source_sha256=source_sha256,
+        )
+        if evaluation_db is not None and not metrics["_execution_failed"]:
+            artifact, = [item for item in metrics["_artifacts"] if item["artifact_type"] == "bar_evaluation_manifest"]
+            manifest = json.loads(Path(artifact["path"]).read_text(encoding="utf-8"))
+            metrics["results_db"] = manifest["results_db"]
+            metrics["_artifacts"].extend(manifest["artifacts"])
+        return metrics
+
     return cli._run_subprocess(
         action=action,
         output_dir=output_dir,
@@ -123,10 +145,7 @@ def _handle_single_factor_analysis(args: argparse.Namespace) -> HarnessResult:
         started_at=started_at,
         artifacts=artifacts,
         json_out=args.json_out,
-        success_metrics_builder=lambda stdout, stderr: cli._bound_result_metrics(
-            result_path, action=action, run_id=effective_run_id, execution_id=execution_id,
-            source_sha256=source_sha256,
-        ),
+        success_metrics_builder=bound_metrics,
     )
 
 

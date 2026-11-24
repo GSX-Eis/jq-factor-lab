@@ -148,7 +148,7 @@ def test_futures_roll_uses_raw_prices_from_the_signal_contract() -> None:
         source = ContinuousBarSource(conn)
         prices = source.read('CU', '1d', '2026-01-06', '2026-01-09', adjust='none').assign(factor_value=1.)
         # Hold from Jan 7 across the Jan 8 switch in the displayed chain.
-        assert prices.contract_id.tolist() == ['CU2602', 'CU2602', 'CU2603', 'CU2603']
+        assert prices.contract_id.tolist() == ['CU2602.SHFE', 'CU2602.SHFE', 'CU2603.SHFE', 'CU2603.SHFE']
         assert prices.is_roll_session.tolist() == [False, False, True, False]
         assert (prices.open.iloc[1], prices.close.iloc[3]) == (104., 129.)
         signal = prices.timestamp_utc.iloc[0]

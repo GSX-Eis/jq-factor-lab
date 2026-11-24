@@ -2,6 +2,8 @@ from calendar_test_support import seed_calendar
 """Forward-return prices honor the same configured keys and daily table."""
 import json
 import duckdb
+
+from market_db_samples import declare_market_db
 import pandas as pd
 import pytest
 from backtest_and_analysis.price_fetcher import PriceFetcher
@@ -11,6 +13,7 @@ from utils.data_access_config import load_data_access_config
 def test_configured_forward_prices_do_not_read_legacy_table(tmp_path,table):
     db=tmp_path/'input.duckdb'
     with duckdb.connect(str(db)) as conn:
+        declare_market_db(conn, 'cn_equity')
         seed_calendar(conn)
         conn.execute("CREATE TABLE wanted AS SELECT TIMESTAMP '2024-01-31 15:00:00' AS trade_date, 'A' AS symbol, 99. AS close, 1. AS open, 1. AS high, 1. AS low, 1. AS volume, 1. AS money")
         conn.execute("CREATE TABLE price_data_daily AS SELECT trade_date AS date, symbol AS stock_code, 1. AS close, open,high,low,volume,money FROM wanted")
@@ -31,6 +34,7 @@ def test_implicit_default_matches_explicit_config(tmp_path, monkeypatch, explici
     from utils import data_access_config
     db = tmp_path / 'input.duckdb'
     with duckdb.connect(str(db)) as conn:
+        declare_market_db(conn, 'cn_equity')
         seed_calendar(conn)
         conn.execute("CREATE TABLE wanted AS SELECT TIMESTAMP '2024-01-31 15:00:00' AS day, 'A' AS symbol, 99. AS close, 1. AS open, 1. AS high, 1. AS low, 1. AS volume, 1. AS money")
         conn.execute('CREATE TABLE price_data_daily AS SELECT day AS date, symbol AS stock_code, 1. AS close, open, high, low, volume, money FROM wanted')
@@ -53,6 +57,7 @@ def test_single_database_path_parameter_reads_prices(tmp_path, monkeypatch, as_p
     monkeypatch.delenv('QUANT_DATA_BINDINGS', raising=False)
     db = tmp_path / 'prices.duckdb'
     with duckdb.connect(str(db)) as conn:
+        declare_market_db(conn, 'cn_equity')
         seed_calendar(conn)
         conn.execute("CREATE TABLE price_data_daily AS SELECT DATE '2024-01-02' date, 'A' stock_code, 2. AS close, 1. AS open, 3. AS high, 1. AS low, 10. AS volume, 20. AS money")
     reader = PriceFetcher(duckdb_path=db if as_path else str(db), price_table='price_data_daily')
@@ -81,6 +86,7 @@ def test_removed_connection_options_are_not_silently_ignored(tmp_path, legacy):
 def test_custom_price_alias_and_table_keep_frequency_semantics(tmp_path, frequency, use_alias):
     db = tmp_path / 'input.duckdb'
     with duckdb.connect(str(db)) as conn:
+        declare_market_db(conn, 'cn_equity')
         seed_calendar(conn)
         conn.execute("CREATE TABLE quotes AS SELECT * FROM (VALUES (TIMESTAMP '2024-01-02 10:00:00', 'A', 2.), (TIMESTAMP '2024-01-02 15:00:00', 'A', 9.)) t(day, symbol, close)")
         for column in ('open', 'high', 'low', 'volume', 'money'):

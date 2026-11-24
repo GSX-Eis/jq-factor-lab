@@ -2,14 +2,14 @@
 from __future__ import annotations
 
 import json
-from collections import Counter
+from collections import Counter, defaultdict
 from hashlib import sha256
 from typing import Any
 
 import pandas as pd
 
 from backtest_and_analysis.evaluation.calibration import Trial, TrialLedger
-from backtest_and_analysis.evaluation.types import BOOTSTRAP_V2, BootstrapInterval, HACInterval
+from backtest_and_analysis.evaluation.types import BOOTSTRAP_V2, BOOTSTRAP_V3_P, BootstrapInterval, HACInterval
 
 from .grid_validation import LabelGrid, build_label_grid, matching_calendars, resolve_bucket_strategy
 from .interval_validation import _interval_fields, _usability, _verified_interval
@@ -141,11 +141,43 @@ def _check_fits(fits: Any, keys: set[tuple[str, int, str | None]], field: str) -
     _require(actual == {(f, i) for f, _, i in keys}, field, "fits for the reported instruments")
 
 
+def _check_instrument_pvalue_summaries(
+    summaries: list[Any], bootstraps: dict[tuple[str, int], list[dict[str, Any]]], field: str,
+) -> None:
+    expected = {
+        key: (rows[0]["p_value"], rows[0]["p_value_reason"]) if len(rows) == 1
+        else (None, "multi_asset_pvalue_undefined")
+        for key, rows in bootstraps.items()
+        if any(row.get("method_version") == BOOTSTRAP_V3_P[0] for row in rows)
+    }
+    p_fields = {"p_value", "p_value_reason"}
+    if not expected and not any(isinstance(row, dict) and p_fields & row.keys() for row in summaries):
+        return
+    seen = set()
+    for raw in summaries:
+        row_field = f"{field}[]"
+        row = _object(raw, row_field)
+        frequency, horizon, _ = _key(row, row_field, time_series=False)
+        key = frequency, horizon
+        _require(key in bootstraps and key not in seen, row_field, "a unique verified frequency/horizon group")
+        seen.add(key)
+        if key not in expected:
+            _require(not p_fields & row.keys(), row_field, "P value fields only for verified v3 bootstrap groups")
+            continue
+        _object(row, row_field, "p_value", "p_value_reason")
+        p = _metric(row["p_value"], f"{row_field}.p_value", probability=True)
+        _nullable_text(row["p_value_reason"], f"{row_field}.p_value_reason")
+        _require((p, row["p_value_reason"]) == expected[key], row_field,
+                 "P value and reason matching the verified instrument details")
+    _require(expected.keys() <= seen, field, "one summary for every verified v3 frequency/horizon group")
+
+
 def _split_row(
     row: dict[str, Any], *, split: str, key: StreamKey, time_series: bool,
     trial: dict[str, Any], fit: dict[str, Any] | None, field: str, labels: pd.DataFrame, grid: LabelGrid,
     cutoffs: tuple[pd.Timestamp | None, pd.Timestamp | None], oos_grid_start: pd.Timestamp | None,
-    minimum: SampleMinimum, config: dict[str, Any], code_version: str,
+    minimum: SampleMinimum, config: dict[str, Any], code_version: str, code_version_source: str | None,
+    n_quantiles: int | None,
 ) -> dict[str, Any]:
     frequency, horizon, instrument = key
     method = "bootstrap" if time_series else "hac"
@@ -183,6 +215,7 @@ def _split_row(
         oos_start=cutoffs[1], oos_grid_start=oos_grid_start, grid_size=grid_size,
         minimum=minimum, claimed_count=n, point_reason=ic["reason"], field=field,
         bootstrap_v2=time_series and interval["method_version"] == BOOTSTRAP_V2[0],
+        row=row, n_quantiles=n_quantiles, fit=fit,
     )
     check_point(statistic, actual, f"{field}.ic.{ic_field}")
     _require(n == observed_count, field, "IC observation count matching the split label pairs")
@@ -195,7 +228,7 @@ def _split_row(
         point_reason=ic["reason"] if time_series else None, n=n, cross_section_sizes=section_sizes,
         section_ics=section_ics, pair_pattern=pair_pattern, bounds=bounds, p_value=p, p_method=p_method, alpha=alpha,
         config=config, field=f"{field}.interval_usability", legacy=legacy,
-        raw_interval=raw_interval, code_version=code_version,
+        raw_interval=raw_interval, code_version=code_version, code_version_source=code_version_source,
     )
     if trial:
         _require(
@@ -221,11 +254,12 @@ def _split_row(
 
 def prepare_inference(
     summary: dict[str, Any], identity_hash: str, label_streams: dict[StreamKey, pd.DataFrame], minimum: SampleMinimum,
-    *, instruments: pd.Index, frequencies: pd.Index, code_version: str,
+    *, instruments: pd.Index, frequencies: pd.Index, code_version: str, quantile_counts: dict[StreamKey, int],
 ) -> tuple[dict[str, Any], list[tuple[Any, ...]]]:
     """Check the summary-only v2 sections and retain the whole report alongside projections."""
     _object(summary, "", "splits", "interval_usability", "trial_ledger")
     time_series = summary["analysis_mode"] == "time_series"
+    code_version_source = summary["result_identity"].get("code_version_source")
     config = summary.get("config") or {}
     ic_rows = [row for row in summary["ic_by_horizon"] if not time_series or row.get("scope") == "per_instrument"]
     keys = {_key(row, "ic_by_horizon", time_series) for row in ic_rows}
@@ -291,9 +325,11 @@ def prepare_inference(
         else:
             _require(train_end is None and oos_start is None, field, "null bounds for full sample")
         scheme = "per_cross_section"
+        summaries = []
+        bootstraps: dict[tuple[str, int], list[dict[str, Any]]] = defaultdict(list)
         if time_series:
             scheme = "fitted_on_train" if has_split else "full_sample_descriptive_only"
-            _array(report.get("instrument_ic_summaries"), f"{field}.instrument_ic_summaries")
+            summaries = _array(report.get("instrument_ic_summaries"), f"{field}.instrument_ic_summaries")
         _require(report["quantile_scheme"] == scheme, field, f"quantile_scheme={scheme}")
         fits = report["fit_identity"]
         if scheme == "fitted_on_train":
@@ -331,12 +367,17 @@ def prepare_inference(
                 fit=fits[frequency][instrument] if fits is not None else None, labels=label_streams[key],
                 grid=grids[grid_key],
                 cutoffs=cutoffs, oos_grid_start=oos_grid_starts.get(key), minimum=minimum, config=config,
-                code_version=code_version,
+                code_version=code_version, code_version_source=code_version_source,
+                n_quantiles=quantile_counts.get(key),
             )
+            if time_series:
+                bootstraps[frequency, horizon].append(row["bootstrap"])
             purged[str(horizon)] += record["split_purged_count"]
             record.update(identity_hash=identity_hash, row_index=len(tuples))
             tuples.append(tuple(record[col] for col in _SPLIT_TABLE_COLUMNS))
         _require(seen == keys, field, "the same stream/horizon keys as IC")
+        if time_series:
+            _check_instrument_pvalue_summaries(summaries, bootstraps, f"{field}.instrument_ic_summaries")
         _require(all(_count(n, f"{field}.split_purged_count") == purged[h] for h, n in counts.items()),
                  field, "purge totals matching horizon rows")
         _require(split == "train" or not any(purged.values()), field, "purging only in train")

@@ -1,4 +1,4 @@
-"""Append-only, versioned minute/bar factor value store (Scheme B).
+"""Append-only, versioned market factor value store (Scheme B).
 
 Storage layout under an explicit store root:
   - parquet_data/factor_id=<fid>/frequency=<freq>/year_month=<YYYY-MM>/*.parquet (ZSTD)
@@ -43,8 +43,10 @@ from utils.time_axis import BarSchedule, Frequency
 
 from .bridge import (
     save_bar_factor_values,
+    save_factor_values,
 )
 from .identity import (
+    _validate_identity_record as validate_identity_record,
     build_identity_record,
     compute_factor_identity_hash,
 )
@@ -54,6 +56,7 @@ from .schema import (
     LEAF_ARROW_SCHEMA,
     LEAF_COLUMNS,
     MARKET_FACTOR_IDENTITY_SCHEMA_VERSION,
+    SUPPORTED_IDENTITY_SCHEMA_VERSIONS,
     NAN_CANONICAL_BITS,
     TABLE_COLUMNS,
     VALID_ADJUSTMENTS,
@@ -94,6 +97,7 @@ __all__ = [
     "Path",
     "Sequence",
     "SessionCalendar",
+    "SUPPORTED_IDENTITY_SCHEMA_VERSIONS",
     "TABLE_COLUMNS",
     "VALID_ADJUSTMENTS",
     "VALID_ANALYSIS_MODES",
@@ -125,10 +129,12 @@ __all__ = [
     "re",
     "resolve_code_version",
     "save_bar_factor_values",
+    "save_factor_values",
     "shutil",
     "sql_canonical_float",
     "table_exists",
     "uuid",
     "validate_factor_id",
+    "validate_identity_record",
     "validate_sha256_hex",
 ]

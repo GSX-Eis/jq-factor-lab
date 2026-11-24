@@ -1,7 +1,34 @@
 """Reusable factor synthesis algorithms; no experiment presets or dashboards."""
 from .factor_reader import FactorReader
+from .strategy_bundle import (
+    BundleArtifactRef,
+    MANIFEST_FILENAME,
+    STRATEGY_BUNDLE_SCHEMA_VERSION,
+    StrategyBundle,
+    StrategyBundleError,
+    StrategyFactorSpec,
+    compute_bundle_hash,
+    load_strategy_bundle,
+    verify_strategy_bundle,
+    write_strategy_bundle,
+)
 
-__all__ = ["FactorComposer", "SynthesisConfig", "FactorReader", "CompositeFactorBase"]
+__all__ = [
+    "FactorComposer",
+    "SynthesisConfig",
+    "FactorReader",
+    "CompositeFactorBase",
+    "BundleArtifactRef",
+    "MANIFEST_FILENAME",
+    "STRATEGY_BUNDLE_SCHEMA_VERSION",
+    "StrategyBundle",
+    "StrategyBundleError",
+    "StrategyFactorSpec",
+    "compute_bundle_hash",
+    "load_strategy_bundle",
+    "verify_strategy_bundle",
+    "write_strategy_bundle",
+]
 
 
 def __getattr__(name: str):

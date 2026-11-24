@@ -33,5 +33,510 @@
     "net_amount_xl": {
       "field": "net_amount_xl"
     }
+  },
+  "schema_version": 2,
+  "field_contracts": {
+    "FACTOR_CNE5_BETA": {
+      "local": {
+        "table": "style_factor_exposure",
+        "column": "beta"
+      },
+      "cloud": {
+        "api": "get_factor_values",
+        "field": "beta"
+      },
+      "frequency": [
+        "daily"
+      ],
+      "available_at": "asof_date",
+      "unit": "provider_native",
+      "adjustment": "none",
+      "missing": "preserve_nan; missing_column_or_api_failure_is_error"
+    },
+    "FACTOR_CNE5_SIZE": {
+      "local": {
+        "table": "style_factor_exposure",
+        "column": "size"
+      },
+      "cloud": {
+        "api": "get_factor_values",
+        "field": "size"
+      },
+      "frequency": [
+        "daily"
+      ],
+      "available_at": "asof_date",
+      "unit": "provider_native",
+      "adjustment": "none",
+      "missing": "preserve_nan; missing_column_or_api_failure_is_error"
+    },
+    "open": {
+      "local": {
+        "table": "price_data_{frequency}",
+        "column": "open"
+      },
+      "cloud": {
+        "api": "get_price",
+        "field": "open"
+      },
+      "frequency": [
+        "daily",
+        "1m",
+        "5m",
+        "15m",
+        "30m",
+        "60m"
+      ],
+      "available_at": "bar_end",
+      "unit": "CNY/share",
+      "adjustment": "price_ratio",
+      "missing": "preserve_nan; missing_column_or_api_failure_is_error"
+    },
+    "close": {
+      "local": {
+        "table": "price_data_{frequency}",
+        "column": "close"
+      },
+      "cloud": {
+        "api": "get_price",
+        "field": "close"
+      },
+      "frequency": [
+        "daily",
+        "1m",
+        "5m",
+        "15m",
+        "30m",
+        "60m"
+      ],
+      "available_at": "bar_end",
+      "unit": "CNY/share",
+      "adjustment": "price_ratio",
+      "missing": "preserve_nan; missing_column_or_api_failure_is_error"
+    },
+    "high": {
+      "local": {
+        "table": "price_data_{frequency}",
+        "column": "high"
+      },
+      "cloud": {
+        "api": "get_price",
+        "field": "high"
+      },
+      "frequency": [
+        "daily",
+        "1m",
+        "5m",
+        "15m",
+        "30m",
+        "60m"
+      ],
+      "available_at": "bar_end",
+      "unit": "CNY/share",
+      "adjustment": "price_ratio",
+      "missing": "preserve_nan; missing_column_or_api_failure_is_error"
+    },
+    "low": {
+      "local": {
+        "table": "price_data_{frequency}",
+        "column": "low"
+      },
+      "cloud": {
+        "api": "get_price",
+        "field": "low"
+      },
+      "frequency": [
+        "daily",
+        "1m",
+        "5m",
+        "15m",
+        "30m",
+        "60m"
+      ],
+      "available_at": "bar_end",
+      "unit": "CNY/share",
+      "adjustment": "price_ratio",
+      "missing": "preserve_nan; missing_column_or_api_failure_is_error"
+    },
+    "volume": {
+      "local": {
+        "table": "price_data_{frequency}",
+        "column": "volume"
+      },
+      "cloud": {
+        "api": "get_price",
+        "field": "volume"
+      },
+      "frequency": [
+        "daily",
+        "1m",
+        "5m",
+        "15m",
+        "30m",
+        "60m"
+      ],
+      "available_at": "bar_end",
+      "unit": "shares",
+      "adjustment": "inverse_price_ratio",
+      "missing": "preserve_nan; missing_column_or_api_failure_is_error"
+    },
+    "money": {
+      "local": {
+        "table": "price_data_{frequency}",
+        "column": "money"
+      },
+      "cloud": {
+        "api": "get_price",
+        "field": "money"
+      },
+      "frequency": [
+        "daily",
+        "1m",
+        "5m",
+        "15m",
+        "30m",
+        "60m"
+      ],
+      "available_at": "bar_end",
+      "unit": "CNY",
+      "adjustment": "none",
+      "missing": "preserve_nan; missing_column_or_api_failure_is_error"
+    },
+    "factor": {
+      "local": {
+        "table": "price_data_{frequency}",
+        "column": "factor"
+      },
+      "cloud": {
+        "api": "get_price",
+        "field": "factor"
+      },
+      "frequency": [
+        "daily",
+        "1m",
+        "5m",
+        "15m",
+        "30m",
+        "60m"
+      ],
+      "available_at": "bar_end",
+      "unit": "ratio",
+      "adjustment": "none",
+      "missing": "preserve_nan; missing_column_or_api_failure_is_error"
+    },
+    "high_limit": {
+      "local": {
+        "table": "price_data_{frequency}",
+        "column": "high_limit"
+      },
+      "cloud": {
+        "api": "get_price",
+        "field": "high_limit"
+      },
+      "frequency": [
+        "daily",
+        "1m",
+        "5m",
+        "15m",
+        "30m",
+        "60m"
+      ],
+      "available_at": "bar_end",
+      "unit": "CNY/share",
+      "adjustment": "price_ratio",
+      "missing": "preserve_nan; missing_column_or_api_failure_is_error"
+    },
+    "low_limit": {
+      "local": {
+        "table": "price_data_{frequency}",
+        "column": "low_limit"
+      },
+      "cloud": {
+        "api": "get_price",
+        "field": "low_limit"
+      },
+      "frequency": [
+        "daily",
+        "1m",
+        "5m",
+        "15m",
+        "30m",
+        "60m"
+      ],
+      "available_at": "bar_end",
+      "unit": "CNY/share",
+      "adjustment": "price_ratio",
+      "missing": "preserve_nan; missing_column_or_api_failure_is_error"
+    },
+    "avg": {
+      "local": {
+        "table": "price_data_{frequency}",
+        "column": "avg"
+      },
+      "cloud": {
+        "api": "get_price",
+        "field": "avg"
+      },
+      "frequency": [
+        "daily",
+        "1m",
+        "5m",
+        "15m",
+        "30m",
+        "60m"
+      ],
+      "available_at": "bar_end",
+      "unit": "CNY/share",
+      "adjustment": "price_ratio",
+      "missing": "preserve_nan; missing_column_or_api_failure_is_error"
+    },
+    "pre_close": {
+      "local": {
+        "table": "price_data_{frequency}",
+        "column": "pre_close"
+      },
+      "cloud": {
+        "api": "get_price",
+        "field": "pre_close"
+      },
+      "frequency": [
+        "daily",
+        "1m",
+        "5m",
+        "15m",
+        "30m",
+        "60m"
+      ],
+      "available_at": "bar_end",
+      "unit": "CNY/share",
+      "adjustment": "price_ratio",
+      "missing": "preserve_nan; missing_column_or_api_failure_is_error"
+    },
+    "paused": {
+      "local": {
+        "table": "price_data_{frequency}",
+        "column": "paused"
+      },
+      "cloud": {
+        "api": "get_price",
+        "field": "paused"
+      },
+      "frequency": [
+        "daily",
+        "1m",
+        "5m",
+        "15m",
+        "30m",
+        "60m"
+      ],
+      "available_at": "bar_end",
+      "unit": "boolean",
+      "adjustment": "none",
+      "missing": "preserve_nan; missing_column_or_api_failure_is_error"
+    },
+    "market_cap": {
+      "local": {
+        "table": "valuation_daily",
+        "column": "market_cap"
+      },
+      "cloud": {
+        "api": "get_valuation",
+        "field": "market_cap"
+      },
+      "frequency": [
+        "daily"
+      ],
+      "available_at": "asof_date",
+      "unit": "1e8 CNY",
+      "adjustment": "none",
+      "missing": "preserve_nan; missing_column_or_api_failure_is_error"
+    },
+    "pe_ratio": {
+      "local": {
+        "table": "valuation_daily",
+        "column": "pe_ratio"
+      },
+      "cloud": {
+        "api": "get_valuation",
+        "field": "pe_ratio"
+      },
+      "frequency": [
+        "daily"
+      ],
+      "available_at": "asof_date",
+      "unit": "ratio",
+      "adjustment": "none",
+      "missing": "preserve_nan; missing_column_or_api_failure_is_error"
+    },
+    "pb_ratio": {
+      "local": {
+        "table": "valuation_daily",
+        "column": "pb_ratio"
+      },
+      "cloud": {
+        "api": "get_valuation",
+        "field": "pb_ratio"
+      },
+      "frequency": [
+        "daily"
+      ],
+      "available_at": "asof_date",
+      "unit": "ratio",
+      "adjustment": "none",
+      "missing": "preserve_nan; missing_column_or_api_failure_is_error"
+    },
+    "ps_ratio": {
+      "local": {
+        "table": "valuation_daily",
+        "column": "ps_ratio"
+      },
+      "cloud": {
+        "api": "get_valuation",
+        "field": "ps_ratio"
+      },
+      "frequency": [
+        "daily"
+      ],
+      "available_at": "asof_date",
+      "unit": "ratio",
+      "adjustment": "none",
+      "missing": "preserve_nan; missing_column_or_api_failure_is_error"
+    },
+    "pcf_ratio": {
+      "local": {
+        "table": "valuation_daily",
+        "column": "pcf_ratio"
+      },
+      "cloud": {
+        "api": "get_valuation",
+        "field": "pcf_ratio"
+      },
+      "frequency": [
+        "daily"
+      ],
+      "available_at": "asof_date",
+      "unit": "ratio",
+      "adjustment": "none",
+      "missing": "preserve_nan; missing_column_or_api_failure_is_error"
+    },
+    "turnover_ratio": {
+      "local": {
+        "table": "valuation_daily",
+        "column": "turnover_ratio"
+      },
+      "cloud": {
+        "api": "get_valuation",
+        "field": "turnover_ratio"
+      },
+      "frequency": [
+        "daily"
+      ],
+      "available_at": "asof_date",
+      "unit": "percent",
+      "adjustment": "none",
+      "missing": "preserve_nan; missing_column_or_api_failure_is_error"
+    },
+    "capitalization": {
+      "local": {
+        "table": "valuation_daily",
+        "column": "capitalization"
+      },
+      "cloud": {
+        "api": "get_valuation",
+        "field": "capitalization"
+      },
+      "frequency": [
+        "daily"
+      ],
+      "available_at": "asof_date",
+      "unit": "1e4 shares",
+      "adjustment": "none",
+      "missing": "preserve_nan; missing_column_or_api_failure_is_error"
+    },
+    "circulating_cap": {
+      "local": {
+        "table": "valuation_daily",
+        "column": "circulating_cap"
+      },
+      "cloud": {
+        "api": "get_valuation",
+        "field": "circulating_cap"
+      },
+      "frequency": [
+        "daily"
+      ],
+      "available_at": "asof_date",
+      "unit": "1e4 shares",
+      "adjustment": "none",
+      "missing": "preserve_nan; missing_column_or_api_failure_is_error"
+    },
+    "circulating_market_cap": {
+      "local": {
+        "table": "valuation_daily",
+        "column": "circulating_market_cap"
+      },
+      "cloud": {
+        "api": "get_valuation",
+        "field": "circulating_market_cap"
+      },
+      "frequency": [
+        "daily"
+      ],
+      "available_at": "asof_date",
+      "unit": "1e8 CNY",
+      "adjustment": "none",
+      "missing": "preserve_nan; missing_column_or_api_failure_is_error"
+    },
+    "pe_ratio_lyr": {
+      "local": {
+        "table": "valuation_daily",
+        "column": "pe_ratio_lyr"
+      },
+      "cloud": {
+        "api": "get_valuation",
+        "field": "pe_ratio_lyr"
+      },
+      "frequency": [
+        "daily"
+      ],
+      "available_at": "asof_date",
+      "unit": "ratio",
+      "adjustment": "none",
+      "missing": "preserve_nan; missing_column_or_api_failure_is_error"
+    },
+    "net_amount_main": {
+      "local": {
+        "table": "money_flow_daily",
+        "column": "net_amount_main"
+      },
+      "cloud": {
+        "api": "get_money_flow",
+        "field": "net_amount_main"
+      },
+      "unit": "1e4 CNY",
+      "frequency": [
+        "daily"
+      ],
+      "available_at": "asof_date",
+      "adjustment": "none",
+      "missing": "preserve_nan; missing_column_or_api_failure_is_error"
+    },
+    "net_amount_xl": {
+      "local": {
+        "table": "money_flow_daily",
+        "column": "net_amount_xl"
+      },
+      "cloud": {
+        "api": "get_money_flow",
+        "field": "net_amount_xl"
+      },
+      "unit": "1e4 CNY",
+      "frequency": [
+        "daily"
+      ],
+      "available_at": "asof_date",
+      "adjustment": "none",
+      "missing": "preserve_nan; missing_column_or_api_failure_is_error"
+    }
   }
 }

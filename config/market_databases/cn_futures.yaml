@@ -1,0 +1,22 @@
+schema_version: 1
+db_id: cn_futures_v1
+market_domain: cn_futures
+allowed_slot_providers: [cn_futures]
+asset_classes: [futures]
+timezone: Asia/Shanghai
+calendar_id: CN_FUTURES
+calendar_source: instrument_metadata
+calendar_coverage: 2016-01-04..2026-12-31
+exchanges: [SHFE, INE, DCE, CZCE, CFFEX, GFEX]
+exchange_aliases: {}
+instrument_id_pattern: '^[A-Z0-9]+\.(SHFE|INE|DCE|CZCE|CFFEX|GFEX)$'
+currency: CNY
+frequencies: [1d, 5m]
+session_views: [ETH, RTH]
+market_rules:
+  st_filter: false
+  price_limit: false
+  t_plus: 0
+  night_session: true
+default_execution_profile: close_to_close
+created_at_utc: '2026-11-23T00:00:00Z'

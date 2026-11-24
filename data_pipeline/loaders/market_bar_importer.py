@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from contextlib import nullcontext
 import csv
 from dataclasses import dataclass
 from datetime import datetime
+import json
 from numbers import Real
 from pathlib import Path
 import re
@@ -20,13 +22,19 @@ from backtest_and_analysis.time_series.contracts import (
     validate_bar_frame,
 )
 from data_pipeline.loaders._transactions import import_transaction
-from utils.session_calendar import SessionCalendar
+from utils.market_db.storage import _require_same_hash
+from utils.market_db.validation import (
+    market_db_calendar_bounds, require_market_db_profile, validate_market_db_frequencies,
+    validate_market_db_metadata, validate_market_db_provider,
+)
+from utils.session_calendar import SessionCalendar, VERIFIED_XSHG
 from utils.time_axis.futures import futures_calendar
+from utils.time_axis import BarSchedule, Frequency
 
 METADATA_COLUMNS = ('instrument_id', 'asset_class', 'exchange', 'timezone',
                     'contract_expiry', 'price_adjustment', 'point_value',
                     'rth_reference_calendar')
-OPTIONAL_METADATA_COLUMNS = ('calendar_id', 'product_root', 'contract_month')
+OPTIONAL_METADATA_COLUMNS = ('calendar_id', 'product_root', 'contract_month', 'custom_sessions')
 ALL_METADATA_COLUMNS = (*METADATA_COLUMNS, *OPTIONAL_METADATA_COLUMNS)
 STORED_BAR_COLUMNS = (*BAR_COLUMNS, 'money', 'factor')
 CONVERSION_MARKER = 'external_bar_conversion'
@@ -36,12 +44,27 @@ def calendar_name(metadata: Mapping) -> str:
     """Resolve supported exchange aliases; other exchanges use their PMC name."""
     explicit = metadata.get('calendar_id')
     if isinstance(explicit, str) and explicit:
-        return explicit
-    if metadata.get('asset_class') == 'futures' and metadata['exchange'] in (
-            'SHFE', 'INE', 'DCE', 'CZCE', 'CFFEX', 'GFEX'):
-        return futures_calendar(metadata.get('product_root'))['calendar_id']
-    return {'CME': 'CME Globex Equity', 'XSHE': 'XSHG'}.get(
+        return 'XSHG' if explicit == VERIFIED_XSHG else explicit
+    if metadata.get('asset_class') == 'futures':
+        root = metadata.get('product_root')
+        if metadata['exchange'] in ('SHFE', 'INE', 'DCE', 'CZCE', 'CFFEX', 'GFEX'):
+            return futures_calendar(root)['calendar_id']
+        if isinstance(root, str):
+            raise ValueError(f'Explicit calendar_id is required for futures product_root={root}')
+    return {'CME': 'CME Globex Equity', 'XSHE': 'XSHG', 'SSE': 'XSHG', 'SZSE': 'XSHG'}.get(
         metadata['exchange'], metadata['exchange'])
+
+
+def instrument_calendar(metadata: Mapping, start: str, end: str) -> SessionCalendar:
+    template = metadata.get('custom_sessions')
+    return SessionCalendar(calendar_name(metadata), start, end,
+                           rth_reference_calendar=metadata['rth_reference_calendar'],
+                           custom_sessions=json.loads(template) if template is not None else None)
+
+
+def _calendar_key(metadata: Mapping, start: str, end: str) -> tuple:
+    return (calendar_name(metadata), metadata['rth_reference_calendar'],
+            metadata.get('custom_sessions'), start, end)
 
 
 def validate_instrument_metadata(metadata: pd.DataFrame) -> pd.DataFrame:
@@ -69,8 +92,6 @@ def validate_instrument_metadata(metadata: pd.DataFrame) -> pd.DataFrame:
         for name in OPTIONAL_METADATA_COLUMNS:
             if row[name] is not None:
                 _text(row[name], name)
-        if row['product_root'] is not None:
-            futures_calendar(row['product_root'])
         if row['contract_month'] is not None:
             if re.fullmatch(r'\d{4}-(0[1-9]|1[0-2])', row['contract_month']) is None:
                 raise ContractValidationError('contract_month must be YYYY-MM or null')
@@ -79,7 +100,17 @@ def validate_instrument_metadata(metadata: pd.DataFrame) -> pd.DataFrame:
             _text(row[name], name)
         try:
             ZoneInfo(row['timezone'])
-            for name in (calendar_name(row), row['rth_reference_calendar']):
+            name, reference = calendar_name(row), row['rth_reference_calendar']
+            if row['custom_sessions'] is None:
+                names = (name, reference)
+            else:
+                if row['calendar_id'] is None:
+                    raise ValueError('custom_sessions requires an explicit calendar_id')
+                template = json.loads(row['custom_sessions'])
+                if not isinstance(template, dict) or template.get('timezone') != row['timezone']:
+                    raise ValueError('custom_sessions timezone must match instrument timezone')
+                names = () if name == reference else (reference,)
+            for name in names:
                 if name not in pmc.get_calendar_names():
                     raise ValueError(f'Unknown calendar: {name}')
         except (KeyError, RuntimeError, ValueError) as exc:
@@ -111,20 +142,22 @@ def calendars_for_bars(metadata: pd.DataFrame, bars: pd.DataFrame) -> dict[str, 
     """Bind calendars to data dates, padding overnight ownership and label exits."""
     calendars = {}
     cache = {}
+    observed = bars.groupby('instrument_id').timestamp_utc.agg(['min', 'max'])
+    raw_coverage = bars.attrs.get('raw_coverage_by_instrument', {})
     for row in metadata.to_dict('records'):
-        times = bars.loc[bars.instrument_id == row['instrument_id'], 'timestamp_utc']
-        bounds = bars.attrs.get('raw_coverage_by_instrument', {}).get(row['instrument_id'])
-        if bounds is not None:
-            times = pd.Series(pd.DatetimeIndex(bounds))
-        if times.empty:
+        instrument = row['instrument_id']
+        bounds = raw_coverage.get(instrument)
+        if bounds is None and instrument in observed.index:
+            bounds = observed.loc[instrument]
+        if bounds is None or len(bounds) == 0:
             continue
-        local = times.dt.tz_convert(row['timezone'])
+        local = pd.DatetimeIndex(bounds).tz_convert(row['timezone'])
         start = (local.min() - pd.Timedelta(days=1)).strftime('%Y-%m-%d')
         end = (local.max() + pd.Timedelta(days=7)).strftime('%Y-%m-%d')
-        key = (calendar_name(row), row['rth_reference_calendar'], start, end)
+        key = _calendar_key(row, start, end)
         if key not in cache:
-            cache[key] = SessionCalendar(key[0], start, end, rth_reference_calendar=key[1])
-        calendars[row['instrument_id']] = cache[key]
+            cache[key] = instrument_calendar(row, start, end)
+        calendars[instrument] = cache[key]
     return calendars
 
 
@@ -165,8 +198,8 @@ class ExternalBarSourceSpec:
             ZoneInfo(self.source_timezone)
         except (KeyError, ValueError) as exc:
             raise ContractValidationError('source_timezone must be an IANA timezone') from exc
-        if self.volume_mode not in ('interval', 'cumulative_session'):
-            raise ContractValidationError('volume_mode must explicitly be interval or cumulative_session')
+        if self.volume_mode not in ('interval', 'cumulative', 'cumulative_session'):
+            raise ContractValidationError('volume_mode must explicitly be interval or cumulative')
         if (not isinstance(self.column_mapping, Mapping) or not self.column_mapping
                 or any(not isinstance(k, str) or not isinstance(v, str)
                        for k, v in self.column_mapping.items())):
@@ -201,14 +234,18 @@ def adapt_external_bars(data: pd.DataFrame | str | Path, spec: ExternalBarSource
                         metadata: pd.DataFrame, frequency: str, source: str,
                         data_version: str, instrument_id: str | None = None,
                         calendar: SessionCalendar | Mapping[str, SessionCalendar] | None = None,
-                        bucket_strategy: str | None = None
+                        bucket_strategy: str | None = None,
+                        schedule: BarSchedule | None = None,
+                        through_utc: datetime | None = None,
                         ) -> pd.DataFrame:
-    """Normalize IQFeed or another explicitly mapped source exactly once."""
+    """Normalize mapped source data, optionally against the declared Bar schedule."""
     if not isinstance(spec, ExternalBarSourceSpec):
         raise ContractValidationError('spec must be an ExternalBarSourceSpec')
     # Recheck mutable mapping contents at the consumption boundary.
     spec.__post_init__()
     duration = _duration(frequency)
+    if through_utc is not None and schedule is None:
+        raise ContractValidationError('A Bar schedule is required to truncate signal inputs')
     metadata = validate_instrument_metadata(metadata)
     if not isinstance(data, pd.DataFrame):
         with Path(data).open(encoding='utf-8-sig', newline='') as handle:
@@ -235,12 +272,35 @@ def adapt_external_bars(data: pd.DataFrame | str | Path, spec: ExternalBarSource
         raise ContractValidationError('instrument_id must be supplied or explicitly mapped')
     frame['timestamp_utc'] = _external_timestamps(frame.pop('timestamp'), spec.source_timezone)
     if spec.timestamp_anchor == 'bar_end':
-        frame['timestamp_utc'] -= duration
+        if schedule is not None:
+            if through_utc is not None:
+                frame = frame.loc[frame.timestamp_utc.le(through_utc)].copy()
+            starts_by_end = {}
+            for ts in frame.timestamp_utc.unique():
+                if ts in starts_by_end:
+                    continue
+                session = schedule.calendar.session_at(ts - pd.Timedelta(nanoseconds=1), schedule.view)
+                if session is None:
+                    raise ContractValidationError('bar_end must belong to an open Session')
+                slots = schedule.for_session(session)
+                starts_by_end.update(zip(slots.end_utc, slots.start_utc))
+                if ts not in starts_by_end:
+                    raise ContractValidationError('bar_end is off the Bar schedule grid')
+            frame['timestamp_utc'] = pd.DatetimeIndex(
+                frame.timestamp_utc.map(starts_by_end), tz='UTC').astype('datetime64[ns, UTC]')
+        else:
+            frame['timestamp_utc'] -= duration
+    elif schedule is not None:
+        if through_utc is not None:
+            frame = frame.loc[frame.timestamp_utc.lt(through_utc)]
+        ends = {ts: schedule.end_at(ts) for ts in frame.timestamp_utc.unique()}
+        if through_utc is not None:
+            frame = frame.loc[frame.timestamp_utc.isin(ts for ts, end in ends.items() if end <= through_utc)]
     frame = frame.assign(frequency=frequency, source=source, data_version=data_version)
     # Validate cumulative values and unique keys before differencing can hide errors.
     frame = validate_bar_frame(frame).reset_index(drop=True)
     _validate_factors(frame, metadata)
-    if spec.volume_mode == 'cumulative_session':
+    if spec.volume_mode != 'interval':
         calendars = calendar or calendars_for_bars(metadata, frame)
         sessions = []
         for row in frame.itertuples():
@@ -256,7 +316,8 @@ def adapt_external_bars(data: pd.DataFrame | str | Path, spec: ExternalBarSource
             cal = calendars.get(instrument) if isinstance(calendars, Mapping) else calendars
             grid = cal.expected_bar_opens(day, frequency, bucket_strategy=bucket_strategy)
             positions = grid.get_indexer(group.timestamp_utc)
-            if (positions < 0).any() or (np.diff(positions) != 1).any():
+            if ((positions < 0).any() or (np.diff(positions) != 1).any()
+                    or (spec.volume_mode == 'cumulative' and positions[0] != 0)):
                 raise ContractValidationError('cumulative_session volume has off-grid or missing bars')
         difference = groups.volume.diff().fillna(frame.volume)
         if (difference < -1e-9).any():
@@ -292,7 +353,9 @@ def store_instrument_metadata(connection: duckdb.DuckDBPyConnection, metadata: p
 
 def import_market_bars(connection: duckdb.DuckDBPyConnection, bars: pd.DataFrame,
                        metadata: pd.DataFrame, *, bucket_strategy: str | None = None,
-                       derive: tuple[str, ...] = (), legacy_compatibility: bool = True) -> int:
+                       derive: tuple[str, ...] = (), legacy_compatibility: bool = True,
+                       slot_provider: str | None = None, check_only: bool = False,
+                       _transaction_open: bool = False) -> int:
     """Insert metadata and bars atomically; duplicate keys fail without replacement.
 
     The caller owns the explicit connection and its database destination. This
@@ -301,48 +364,82 @@ def import_market_bars(connection: duckdb.DuckDBPyConnection, bars: pd.DataFrame
     New callers set legacy_compatibility=False. Old domestic calls without a
     policy retain only market_bars and do not create frequency/quality entries.
     """
+    profile = require_market_db_profile(connection, write=True)
+    if slot_provider is not None:
+        validate_market_db_provider(profile, slot_provider)
     if not isinstance(legacy_compatibility, bool):
         raise ContractValidationError('legacy_compatibility must be a boolean')
     metadata = validate_instrument_metadata(metadata)
     frame = validate_bar_frame(bars).reset_index(drop=True)
     if derive and len(frame.frequency.unique()) != 1:
         raise ContractValidationError('derive requires a single source frequency')
+    validate_market_db_metadata(profile, metadata, calendar_name=calendar_name)
+    validate_market_db_frequencies(profile, (*frame.frequency.unique(), *derive))
+    if derive:
+        source = Frequency.parse(frame.frequency.iloc[0])
+        targets = [Frequency.parse(target) for target in derive]
+        if len({target.canonical for target in targets}) != len(targets):
+            raise ContractValidationError('Duplicate target frequency')
+        if any(target.duration <= source.duration for target in targets):
+            raise ContractValidationError('Target frequency must be coarser than source frequency')
+    if 'exchange' in frame:
+        pairs = frame[['instrument_id', 'exchange']].drop_duplicates()
+        for instrument, exchange in pairs.itertuples(index=False, name=None):
+            if not isinstance(exchange, str) or profile.exchange_aliases.get(exchange, exchange) != instrument.rsplit('.', 1)[1]:
+                raise ContractValidationError(f'Bar exchange {exchange!r} disagrees with {instrument!r}')
+    if 'asset_class' in frame:
+        assets = frame.instrument_id.map(metadata.set_index('instrument_id').asset_class)
+        if not frame.asset_class.eq(assets).fillna(False).all():
+            raise ContractValidationError('Bar asset_class disagrees with instrument_metadata')
     _validate_factors(frame, metadata)
     for name in ('money', 'factor', 'open_interest'):
         if name not in frame:
             frame[name] = np.nan
     from utils.bar_catalog import CatalogEntry, create_bar_table, register_entry
     from utils.bar_quality import scan_quality
-    from utils.time_axis import BarSchedule, Frequency
-    from utils.bar_builder import instrument_calendar, code_version
+    from utils.bar_builder import code_version
 
     frame['_legacy_frequency'] = frame.frequency
-    frame['frequency'] = frame.frequency.map(lambda value: Frequency.parse(value).canonical)
+    canonical = {value: Frequency.parse(value).canonical for value in frame.frequency.unique()}
+    frame['frequency'] = frame.frequency.map(canonical)
     if frame.frequency.isna().any():
         raise ContractValidationError('Invalid frequency for physical Bar table')
     frame = validate_bar_frame(frame).reset_index(drop=True)
     calendars = calendars_for_bars(metadata, frame)
+    metadata_by_id = metadata.set_index('instrument_id', drop=False).to_dict('index')
+    scoped_calendars = {}
+    grids = {}
     plans = []
     revision = code_version()
     for (instrument, frequency), group in frame.groupby(['instrument_id', 'frequency']):
         cal = calendars[instrument]
+        owners = cal.session_dates_at(pd.DatetimeIndex(group.timestamp_utc))
+        if owners.hasnans:
+            raise ContractValidationError('Imported bars must belong to an open Session')
+        first, last = owners.min(), owners.max()
+        market_db_calendar_bounds(profile, first, last)
+        if cal.timezone != profile.timezone:
+            raise ContractValidationError(f'Calendar timezone {cal.timezone!r} disagrees with {profile.timezone!r}')
         if cal.is_domestic_futures and bucket_strategy is None and legacy_compatibility and not derive:
             # Preserve the stage-5/6.1 raw import entry without inventing a policy.
             continue
-        # Calendar construction, grid validation and policy checks precede any DDL.
-        BarSchedule(cal, frequency, bucket_strategy=bucket_strategy)
-        owners = [cal.session_at(ts) for ts in group.timestamp_utc]
-        if any(owner is None for owner in owners):
-            raise ContractValidationError('Imported bars must belong to an open Session')
-        first, last = min(owner.session_date for owner in owners), max(owner.session_date for owner in owners)
-        meta = metadata.loc[metadata.instrument_id.eq(instrument)].iloc[0].to_dict()
-        cal = instrument_calendar(meta, first, last)
+        meta = metadata_by_id[instrument]
+        key = _calendar_key(meta, first, last)
+        if key not in scoped_calendars:
+            scoped_calendars[key] = instrument_calendar(meta, first, last)
+        cal = scoped_calendars[key]
         schedule = BarSchedule(cal, frequency, bucket_strategy=bucket_strategy)
-        grid = pd.concat([schedule.for_session(day.strftime('%Y-%m-%d')) for day in cal.sessions()])
+        grid_key = (cal.calendar_hash, frequency, schedule.bucket_strategy)
+        if grid_key not in grids:
+            grids[grid_key] = schedule.session_slots()
+        grid = grids[grid_key]
         if not group.timestamp_utc.isin(grid.start_utc).all():
             raise ContractValidationError('Imported timestamp is off the Bar schedule grid')
-        plans.append((instrument, frequency, schedule, first, last))
-    with import_transaction(connection):
+        plans.append((instrument, frequency, schedule, first, last, group.index, grid))
+    if check_only:
+        return len(frame)
+    with nullcontext() if _transaction_open else import_transaction(connection):
+        _require_same_hash(require_market_db_profile(connection, write=True), profile, 'Import database changed')
         store_instrument_metadata(connection, metadata)
         if legacy_compatibility:
             connection.execute('''CREATE TABLE IF NOT EXISTS market_bars (
@@ -362,11 +459,10 @@ def import_market_bars(connection: duckdb.DuckDBPyConnection, bars: pd.DataFrame
             connection.from_df(stored).project(projection).insert_into('market_bars')
         # Stage-5 callers mutate market_bars directly. Keep that compatibility
         # snapshot; stage-6 consumers read only the per-frequency physical tables.
-        for instrument, frequency, schedule, first, last in plans:
+        for instrument, frequency, schedule, first, last, indexes, grid in plans:
             name = create_bar_table(connection, frequency)
-            incoming = frame.loc[frame.instrument_id.eq(instrument) & frame.frequency.eq(frequency),
-                                 [*STORED_BAR_COLUMNS, 'open_interest']].assign(
-                                     n_source_bars=1, n_expected_bars=1, is_complete=True)
+            incoming = frame.loc[indexes, [*STORED_BAR_COLUMNS, 'open_interest']].assign(
+                n_source_bars=1, n_expected_bars=1, is_complete=True)
             # Migration appends columns, so insertion must follow the physical order.
             incoming = incoming[[row[0] for row in connection.execute(f'DESCRIBE {name}').fetchall()]]
             projection = ', '.join(
@@ -374,17 +470,20 @@ def import_market_bars(connection: duckdb.DuckDBPyConnection, bars: pd.DataFrame
                 if column in PRICE_COLUMNS else f'"{column}"' for column in incoming)
             connection.from_df(incoming).project(projection).insert_into(name)
             # Re-audit whole affected sessions so incremental imports can close gaps.
-            observed = connection.execute(f'SELECT * FROM {name} WHERE instrument_id=?',
-                                          [instrument]).fetchdf()
+            observed = connection.execute(
+                f'SELECT timestamp_utc, is_complete FROM {name} WHERE instrument_id=? '
+                'AND timestamp_utc BETWEEN ? AND ?',
+                [instrument, grid.start_utc.min(), grid.start_utc.max()]).fetchdf()
             observed['timestamp_utc'] = pd.to_datetime(observed.timestamp_utc, utc=True)
-            scan_quality(connection, instrument, schedule, observed)
+            scan_quality(connection, instrument, schedule, observed, grid=grid)
             register_entry(connection, CatalogEntry(frequency, name, instrument_id=instrument,
                 source_version=','.join(sorted(set(incoming.data_version))), bucket_strategy=schedule.bucket_strategy,
                 calendar_hash=schedule.calendar.calendar_hash, code_version=revision,
                 coverage_start=first, coverage_end=last, quality_status='scanned'))
-    if derive:
-        from utils.bar_builder import build_bars
-        for instrument, frequency, _, first, last in plans:
-            build_bars(connection, source=frequency, targets=derive, instruments=[instrument],
-                       start=first, end=last, bucket_strategy=bucket_strategy)
+        if derive:
+            from utils.bar_builder import build_bars
+            for instrument, frequency, _, first, last, _, _ in plans:
+                build_bars(connection, source=frequency, targets=derive, instruments=[instrument],
+                           start=first, end=last, bucket_strategy=bucket_strategy,
+                           _transaction_open=True)
     return len(frame)

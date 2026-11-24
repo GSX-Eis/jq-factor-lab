@@ -57,6 +57,17 @@ def _replace_dates(source: str, start: str, end: str) -> str:
     return b"".join(lines).decode("utf-8")
 
 
+def render_bundle_probe(candidate: str) -> str:
+    """Use the candidate's exact factor code, requirement slice and bundle binding."""
+    return candidate + '''
+
+def dump_factor_values(stocks, asof, pool_history=None):
+    """Return the bundle's factor cross-section for a completed as-of timestamp."""
+    initialize(None)
+    return compute_bundle_factors(list(stocks), asof, pool_history)
+'''
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--factor", required=True)

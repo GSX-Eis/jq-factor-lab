@@ -13,6 +13,8 @@ import uuid
 from pathlib import Path
 
 import duckdb
+
+from market_db_samples import declare_equity_bars
 import numpy as np
 import pandas as pd
 import pyarrow as pa
@@ -243,7 +245,8 @@ def test_validation_rejects_inf_naive_non_utc_invalid_freq_view_and_c_rules(tmp_
 
 def test_bitwise_idempotency_nan_signed_zero_and_conflict_rollback(tmp_path: Path) -> None:
     store = MarketFactorValueStore(tmp_path / "store")
-    df, id_rec, cal = _make_sample_batch()
+    all_days, id_rec, cal = _make_sample_batch(end_date="2026-01-07")
+    df = all_days.loc[all_days["session_id"] < "2026-01-07"].copy()
     df.loc[0, "factor_value"] = np.nan
     df.loc[1, "factor_value"] = -0.0
     df.loc[2, "factor_value"] = 1.25
@@ -284,16 +287,10 @@ def test_bitwise_idempotency_nan_signed_zero_and_conflict_rollback(tmp_path: Pat
     assert exc_fin.value.conflict_count == 1
 
     # Partial overlap batch with 1 conflict and brand-new rows -> zero partial writes
-    df_day3, _, cal3 = _make_sample_batch(
-        start_date="2026-01-05", end_date="2026-01-07", source_build_id="build-1"
-    )
-    # Build overlapping partial batch sharing identity hash of df, changing row 2 and adding 2026-01-07
-    new_day = df_day3.loc[df_day3["session_id"] == "2026-01-07"].copy()
-    new_day["factor_identity_hash"] = df["factor_identity_hash"].iloc[0]
-    new_day["calendar_hash"] = df["calendar_hash"].iloc[0]
+    new_day = all_days.loc[all_days["session_id"] == "2026-01-07"]
     partial_bad = pd.concat([ulp_bad, new_day], ignore_index=True)
     with pytest.raises(FactorValueConflictError):
-        store.append_factor_values(partial_bad, identity_record=id_rec, calendar=cal3)
+        store.append_factor_values(partial_bad, identity_record=id_rec, calendar=cal)
 
     after = store.read_factor_values(factor_id="alpha_test")
     assert len(after) == len(df)
@@ -431,6 +428,7 @@ def _build_derived_factor_db(db_path: Path, *, with_build: bool) -> tuple[Sessio
         ]
     )
     with duckdb.connect(str(db_path)) as conn:
+        declare_equity_bars(conn)
         import_market_bars(conn, bars, meta, bucket_strategy="segment_anchored", legacy_compatibility=False)
         if with_build:
             build_bars(
@@ -459,8 +457,7 @@ def test_reviewer_a_factor_base_integration_and_granularity_rules(tmp_path: Path
     cal, inst = _build_derived_factor_db(db_derived, with_build=True)
     store = MarketFactorValueStore(tmp_path / "store")
 
-    # Derived 15min bars: FactorBase._fetch_market_bars drops attrs['build_ids'],
-    # so save_bar_factor_values must actively query bar_build_log.
+    # The bound feed supplies the per-session build IDs for derived bars.
     f_derived = _MinuteMeanFactor(
         None,
         "minute_mean",
@@ -544,7 +541,7 @@ def test_reviewer_a_factor_base_integration_and_granularity_rules(tmp_path: Path
     r_exact = save_bar_factor_values(f_rebuilt, store, identity_scope="exact")
     assert r_exact.factor_identity_hash != receipt.factor_identity_hash
 
-    # Native 5min DB without bar_build_log and without explicit source_build_ids must fail clearly
+    # Native data without build IDs gets a deterministic source fingerprint.
     db_native = tmp_path / "native.duckdb"
     _build_derived_factor_db(db_native, with_build=False)
     f_native = _MinuteMeanFactor(
@@ -560,12 +557,14 @@ def test_reviewer_a_factor_base_integration_and_granularity_rules(tmp_path: Path
         data_version="v1",
         session_calendar=cal,
     )
-    with pytest.raises(ValueError, match="source_build_id"):
-        save_bar_factor_values(f_native, store)
+    native = save_bar_factor_values(f_native, store)
+    assert native.inserted > 0
+    assert save_bar_factor_values(f_native, store).skipped == native.inserted
 
-    # Explicit source_build_ids works
+    # Explicit source_build_ids creates a separate exact identity.
     r_nat = save_bar_factor_values(f_native, store, source_build_ids="native-import-v1")
     assert r_nat.inserted > 0
+    assert r_nat.factor_identity_hash != native.factor_identity_hash
 
 
 def test_persisted_bar_identity_tracks_extracted_rolling_source(tmp_path: Path) -> None:
@@ -630,9 +629,9 @@ print(json.dumps([receipt.factor_identity_hash, written["factor_value"].dropna()
 
 def test_multiprocess_concurrent_write_lock_and_immediate_read(tmp_path: Path) -> None:
     store_root = tmp_path / "mp_store"
-    df1, id1, _ = _make_sample_batch(start_date="2026-01-05", end_date="2026-01-05", seed=101)
-    df2, _, _ = _make_sample_batch(start_date="2026-01-06", end_date="2026-01-06", seed=102)
-    df2["factor_identity_hash"] = df1["factor_identity_hash"].iloc[0]
+    frame, id1, _ = _make_sample_batch(seed=101)
+    df1 = frame.loc[frame["session_id"] == "2026-01-05"]
+    df2 = frame.loc[frame["session_id"] == "2026-01-06"]
 
     p1 = tmp_path / "df1.pkl"
     p2 = tmp_path / "df2.pkl"
@@ -653,7 +652,7 @@ def test_multiprocess_concurrent_write_lock_and_immediate_read(tmp_path: Path) -
         assert lock_acquired.wait(timeout=15.0), "Writer did not acquire lock in time"
         store = MarketFactorValueStore(store_root)
         t0 = time.monotonic()
-        immediate = store.read_factor_values(factor_id="alpha_test")
+        immediate = store.read_factor_values(factor_id="alpha_test", slot_id=id1["slot_id"])
         elapsed = time.monotonic() - t0
         # Must succeed immediately without waiting for writer lock release
         assert len(immediate) == len(df1)
@@ -847,7 +846,7 @@ def test_cli_end_to_end_write_read_verify(tmp_path: Path, capsys: pytest.Capture
     assert rc == 2
 
     # Conflict on full schema CSV -> exit 4 (EXIT_QUALITY_GATE)
-    stored_df = pd.read_csv(export_csv)
+    stored_df = pd.read_csv(export_csv, float_precision="round_trip")
     stored_df.loc[0, "factor_value"] = 999.999
     conflict_csv = tmp_path / "conflict_full.csv"
     stored_df.to_csv(conflict_csv, index=False)

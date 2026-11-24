@@ -6,6 +6,8 @@ from typing import Callable
 import numpy as np
 import pandas as pd
 
+from utils.data_revision import capture_factor_inputs, factor_input_fingerprint, frame_digest, window_factor_input_fingerprint
+
 
 def _normalize_factor_dataframe(values: pd.DataFrame, raw_data: pd.DataFrame) -> pd.DataFrame:
     """Preserve keyed outputs; only legacy single-column outputs may use raw row order."""
@@ -51,23 +53,24 @@ def _normalize_factor_dataframe(values: pd.DataFrame, raw_data: pd.DataFrame) ->
 
 
 def get_factor_values(self, factor_base_cls: type, force_recalculate: bool = False) -> pd.DataFrame:
-    if getattr(getattr(self, '_frequency_route', None), 'bar_grid', False):
+    if not getattr(self, '_ashare_panel', True) or getattr(getattr(self, '_frequency_route', None), 'bar_grid', False):
         return self._get_market_factor_values(force_recalculate)
-    # Read first: mutable files and borrowed connections have no immutable
-    # version token. Cache calculations only after identifying actual inputs.
+    # A mutable source must be read before its calculation cache can be identified.
     raw_data = self._get_raw_data_for_factor()
-    cache_key = self._get_cache_key(raw_data) if self.cache_dir else None
-    if not force_recalculate and cache_key:
-        cached_result = self._load_from_cache(cache_key)
-        if cached_result is not None:
-            self.logger.info(f"从缓存加载因子 {self.factor_name}")
-            return cached_result
-
     # Expose raw inputs to diagnostics while tolerating read-only overrides.
     try:
         self.last_raw_data = raw_data
     except Exception:
         pass
+    provenance = factor_input_fingerprint(self, raw_data)
+    cache_key = self._get_cache_key(raw_data, captured_inputs=provenance) if self.cache_dir else None
+    if not force_recalculate and cache_key:
+        cached_result = self._load_from_cache(cache_key)
+        if cached_result is not None:
+            self.logger.info(f"从缓存加载因子 {self.factor_name}")
+            cached_result.attrs['factor_input_fingerprint'] = provenance
+            return cached_result
+
     if raw_data.empty:
         self.logger.warning("原始数据为空，返回空DataFrame")
         return pd.DataFrame()
@@ -85,6 +88,7 @@ def get_factor_values(self, factor_base_cls: type, force_recalculate: bool = Fal
     if self.use_dynamic_pool and self.stock_pools_by_period and self.dynamic_pool_mode in ('factor', 'both'):
         factor_values = self._apply_dynamic_pool_to_factor_df(factor_values)
 
+    factor_values.attrs['factor_input_fingerprint'] = provenance
     if self.cache_dir:
         try:
             self._save_to_cache(factor_values, cache_key)
@@ -96,8 +100,6 @@ def get_factor_values(self, factor_base_cls: type, force_recalculate: bool = Fal
 
 def get_factor_values_unfiltered(self, factor_base_cls: type, force_recalculate: bool = False) -> pd.DataFrame:
     """Compute inside the current stock universe. Only the Bar route uses the disk cache."""
-    if getattr(getattr(self, '_frequency_route', None), 'bar_grid', False):
-        return self._get_market_factor_values(force_recalculate)
     started = time.perf_counter()
     self.last_performance_metrics = {}
     original_all_stocks = self.all_stocks
@@ -107,6 +109,8 @@ def get_factor_values_unfiltered(self, factor_base_cls: type, force_recalculate:
     try:
         self.use_dynamic_pool = False
         self.dynamic_pool_mode = 'factor'  # 不在原始数据阶段过滤
+        if not getattr(self, '_ashare_panel', True) or getattr(getattr(self, '_frequency_route', None), 'bar_grid', False):
+            return self._get_market_factor_values(force_recalculate)
 
         self.logger.info(f"get_factor_values_unfiltered: 使用当前股票范围 ({len(self.all_stocks)} 只股票)")
 
@@ -125,6 +129,7 @@ def get_factor_values_unfiltered(self, factor_base_cls: type, force_recalculate:
             self.logger.warning("原始数据为空，返回空DataFrame")
             return pd.DataFrame()
 
+        provenance = factor_input_fingerprint(self, raw_data)
         if self.pit_enabled:
             pit_started = time.perf_counter()
             try:
@@ -142,10 +147,9 @@ def get_factor_values_unfiltered(self, factor_base_cls: type, force_recalculate:
         if factor_values.empty:
             self.logger.warning("因子计算返回空DataFrame")
             return pd.DataFrame()
-
         self.logger.info(f"get_factor_values_unfiltered 返回因子形状: {factor_values.shape} (未应用动态股票池过滤)")
+        factor_values.attrs['factor_input_fingerprint'] = provenance
         return factor_values
-
     finally:
         self.all_stocks = original_all_stocks
         self.use_dynamic_pool = original_use_dynamic_pool
@@ -164,9 +168,7 @@ def get_factor_values_unfiltered_chunked(self, factor_base_cls: type, chunk_size
         result = self.get_factor_values_unfiltered()
         self.last_performance_metrics['stock_chunk_mode'] = 'fallback_full'
         return result
-
-    original_stocks = self.all_stocks
-    started = time.perf_counter()
+    original_stocks, started = self.all_stocks, time.perf_counter()
     probe_count = min(len(stocks), chunk_size * 2)
     probe_stocks = stocks[:probe_count]
     try:
@@ -192,12 +194,13 @@ def get_factor_values_unfiltered_chunked(self, factor_base_cls: type, chunk_size
             result = self.get_factor_values_unfiltered(force_recalculate=True)
             self.last_performance_metrics['stock_chunk_mode'] = 'fallback_full'
             return result
-
         results = [probe_full]
         for offset in range(probe_count, len(stocks), chunk_size):
             self.all_stocks = stocks[offset:offset + chunk_size]
             results.append(self.get_factor_values_unfiltered(force_recalculate=True))
         result = pd.concat(results, axis=1).sort_index().sort_index(axis=1)
+        result.attrs['factor_input_fingerprint'] = {**window_factor_input_fingerprint(results), 'stock_chunks': [
+            part.attrs.get('factor_input_fingerprint', {}).get('factor_input_sha256') for part in results]}
         self.last_performance_metrics.update({
             'stock_chunk_mode': 'verified',
             'stock_chunk_size': chunk_size,
@@ -218,18 +221,16 @@ def _get_factor_values_from_prepared_stock_chunks(
     min_total_rows: int = 0,
 ) -> pd.DataFrame:
     """Reduce stock chunks, then calculate once if total input rows suffice.
-
     min_total_rows applies to all raw rows, never to an individual chunk.
     The full-calculation entry must enforce the same admission threshold.
     """
     stocks = sorted(set(self.all_stocks or []))
     if chunk_size <= 0 or len(stocks) <= chunk_size:
         return self.get_factor_values_unfiltered()
-
     original_stocks = self.all_stocks
     original_use_dynamic_pool = self.use_dynamic_pool
     original_dynamic_pool_mode = self.dynamic_pool_mode
-    prepared_parts = []
+    prepared_parts, input_hashes = [], []
     raw_rows = 0
     prepared_rows = 0
     peak_raw_memory_mb = 0.0
@@ -239,7 +240,6 @@ def _get_factor_values_from_prepared_stock_chunks(
     calculate_seconds = 0.0
     started = time.perf_counter()
     self.last_performance_metrics = {}
-
     try:
         self.use_dynamic_pool = False
         self.dynamic_pool_mode = "factor"
@@ -252,7 +252,7 @@ def _get_factor_values_from_prepared_stock_chunks(
                 fetch_seconds += time.perf_counter() - fetch_started
             if raw_data.empty:
                 continue
-
+            input_hashes.append(frame_digest(raw_data))
             raw_rows += len(raw_data)
             peak_raw_memory_mb = max(
                 peak_raw_memory_mb,
@@ -264,7 +264,6 @@ def _get_factor_values_from_prepared_stock_chunks(
                     raw_data = self._apply_pit_adjustment(raw_data)
                 finally:
                     pit_seconds += time.perf_counter() - pit_started
-
             prepare_started = time.perf_counter()
             try:
                 prepared = prepare_chunk(raw_data)
@@ -275,14 +274,16 @@ def _get_factor_values_from_prepared_stock_chunks(
                 prepared_parts.append(prepared)
             del raw_data, prepared
             gc.collect()
-
         if raw_rows < min_total_rows or not prepared_parts:
             return pd.DataFrame()
         prepared_all = pd.concat(prepared_parts, ignore_index=True)
         self.all_stocks = original_stocks
         calculate_started = time.perf_counter()
         try:
-            return calculate_prepared(prepared_all)
+            provenance = {'factor_input_sha256_by_chunk': input_hashes, 'declared_params': capture_factor_inputs(self)}
+            values = calculate_prepared(prepared_all)
+            values.attrs['factor_input_fingerprint'] = provenance
+            return values
         finally:
             calculate_seconds = time.perf_counter() - calculate_started
     finally:

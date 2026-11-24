@@ -11,10 +11,13 @@ import pandas as pd
 import numpy as np
 
 
-def build_trading_calendar(price_df: pd.DataFrame, *, calendar=None) -> pd.DatetimeIndex:
+def build_trading_calendar(price_df: pd.DataFrame, *, calendar=None, slot=None) -> pd.DatetimeIndex:
     """Validate observations against the independent calendar and expose sessions."""
-    from utils.trading_calendar import load_trading_calendar
-    calendar = calendar if calendar is not None else load_trading_calendar()
+    if calendar is None and slot is not None:
+        calendar = slot.calendar
+    if calendar is None:
+        from utils.trading_calendar import load_trading_calendar
+        calendar = load_trading_calendar()
     return calendar.align(price_df).index
 
 

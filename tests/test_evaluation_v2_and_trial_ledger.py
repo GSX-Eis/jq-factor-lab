@@ -1133,3 +1133,51 @@ def test_public_ledgers_gate_candidates_without_matching_calibration_design(meth
     assert keys[2] in selection.inference_adjusted_p_values
     assert [row.significant for row in selection.trials] == [row['significant'] for row in rows] == [False, True, False]
     assert selection.best == report['best'] == keys[1]
+
+
+def test_bootstrap_pvalue_bar_roundtrip_preserves_null_reason_and_ledger_gate(tmp_path):
+    labeler = BarReturnLabeler(_labeler().calendar, horizons=[1])
+    options = dict(p_value=True, n_boot=19, min_valid_replicates=15)
+    result = evaluate_bars(_bars(32), labeler=labeler, analysis_mode="time_series", bootstrap=options)
+    row, = result.splits["full"]["horizons"]
+    assert row["bootstrap"]["method_version"] == "ts_boot_adaptive_v3_p"
+    assert row["bootstrap"]["p_value"] is None
+    assert row["bootstrap"]["p_value_reason"] == "insufficient_replicates_for_pvalue"
+    assert result.trial_ledger["selection_complete"] is False
+    paths = _publish_python_result(result, tmp_path, config={"bootstrap": options})
+    db = tmp_path / "diagnostic.duckdb"
+    receipt = _ingest_published(db, paths)
+    detail = query_bar_evaluation_detail(db, receipt.identity_hash)
+    interval = detail["split_metrics"][0]["metrics_json"]["bootstrap"]
+    assert interval["p_value"] is None
+    assert interval["p_value_reason"] == row["bootstrap"]["p_value_reason"]
+
+
+@pytest.mark.parametrize('case', ['multi_value', 'single_reason', 'missing_field', 'duplicate', 'missing_group'])
+def test_v3_instrument_summary_rejects_tampering_at_ingest(tmp_path, case):
+    assets = ('A',) if case == 'single_reason' else ('A', 'B')
+    labeler = BarReturnLabeler(_labeler().calendar, horizons=[1])
+    options = dict(p_value=True, n_boot=19, min_valid_replicates=15)
+    result = evaluate_bars(_bars(32, assets), labeler=labeler, analysis_mode='time_series', bootstrap=options)
+    paths = _publish_python_result(result, tmp_path, config={'bootstrap': options})
+    db = tmp_path / 'valid.duckdb'
+    receipt = _ingest_published(db, paths)
+    stored, = query_bar_evaluation_detail(db, receipt.identity_hash)['run']['split_config_json']['full'][
+        'instrument_ic_summaries'
+    ]
+    reason = 'insufficient_replicates_for_pvalue' if len(assets) == 1 else 'multi_asset_pvalue_undefined'
+    assert (stored['p_value'], stored['p_value_reason']) == (None, reason)
+
+    summary = json.loads(paths['summary'].read_text())
+    summaries = summary['splits']['full']['instrument_ic_summaries']
+    if case == 'multi_value':
+        summaries[0].update(p_value=.001, p_value_reason=None)
+    elif case == 'single_reason':
+        summaries[0]['p_value_reason'] = 'multi_asset_pvalue_undefined'
+    elif case == 'missing_field':
+        del summaries[0]['p_value']
+    elif case == 'duplicate':
+        summaries.append(summaries[0].copy())
+    else:
+        summaries.clear()
+    _assert_rejected_published(tmp_path, paths, summary, 'instrument_ic_summaries')

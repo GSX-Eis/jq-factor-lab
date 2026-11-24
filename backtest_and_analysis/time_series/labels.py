@@ -8,11 +8,11 @@ from typing import TYPE_CHECKING
 import numpy as np
 import pandas as pd
 
-from backtest_and_analysis.evaluation.labels import ExecutionConvention
+from backtest_and_analysis.evaluation.labels import ExecutionConvention, UnifiedReturnLabeler, _LabelAxis
 
 from .contracts import (
     ContractValidationError, LabelRecord, _numeric_column, _validate_aligned_factor_frame,
-    invalid_price_mask, primary_exclusion_reasons, validate_bar_frame,
+    validate_bar_frame,
 )
 from .csv_reader import _check_view
 from utils.time_axis import BarSchedule
@@ -57,9 +57,15 @@ def _grid(calendar: SessionCalendar, frequency: str, start: pd.Timestamp,
     return grids[0].append(grids[1:]), ends[0].append(ends[1:]), np.concatenate(owners)
 
 
-def _window_counts(flags: np.ndarray, starts: np.ndarray, ends: np.ndarray) -> np.ndarray:
-    prefix = np.concatenate(([0], np.cumsum(flags, dtype=np.int64)))
-    return prefix[np.minimum(ends, len(flags))] - prefix[np.minimum(starts, len(flags))]
+def _normalize_bar_horizons(horizons: Sequence[int] | int) -> tuple[int, ...]:
+    if isinstance(horizons, Integral):
+        horizons = (horizons,)
+    if not isinstance(horizons, Sequence) or isinstance(horizons, (str, bytes)) or not horizons:
+        raise ContractValidationError('horizons must be a positive integer or nonempty sequence')
+    periods = tuple(_positive_integer(h, 'horizons') for h in horizons)
+    if len(set(periods)) != len(periods):
+        raise ContractValidationError('horizons must not contain duplicates')
+    return periods
 
 
 class BarReturnLabeler:
@@ -75,18 +81,12 @@ class BarReturnLabeler:
                  view: View = 'ETH', boundary_policy: str = 'same_session',
                  bucket_strategy: str | None = None,
                  continuous_source: ContinuousBarSource | None = None,
-                 include_scheduled_exit: bool = False) -> None:
+                 include_scheduled_exit: bool = False, factor_keys_only: bool = False) -> None:
         # The calendar imports contracts through this package during initialization.
         from utils.session_calendar import SessionCalendar
 
         self.entry_offset_bars = _positive_integer(entry_offset_bars, 'entry_offset_bars', _BAR.min_entry_offset)
-        if isinstance(horizons, Integral):
-            horizons = (horizons,)
-        if not isinstance(horizons, Sequence) or isinstance(horizons, (str, bytes)) or not horizons:
-            raise ContractValidationError('horizons must be a positive integer or nonempty sequence')
-        self.horizons = tuple(_positive_integer(h, 'horizons') for h in horizons)
-        if len(set(self.horizons)) != len(self.horizons):
-            raise ContractValidationError('horizons must not contain duplicates')
+        self.horizons = _normalize_bar_horizons(horizons)
         if view not in ('ETH', 'RTH'):
             raise ContractValidationError('view must be ETH or RTH')
         if boundary_policy != 'same_session' and not (
@@ -105,6 +105,7 @@ class BarReturnLabeler:
         self.boundary_policy = boundary_policy
         self.continuous_source = continuous_source
         self.include_scheduled_exit = include_scheduled_exit
+        self.factor_keys_only = factor_keys_only
 
     def label(self, bars: pd.DataFrame, factors: pd.DataFrame | None = None, *,
               signal_timestamps: Sequence | None = None,
@@ -113,8 +114,12 @@ class BarReturnLabeler:
 
         Factors join on (timestamp_utc, instrument_id); alternatively factor_value
         can be supplied on each Bar. Raw coverage metadata survives view filtering.
+        Set factor_keys_only when the Bar frame contains execution grid placeholders
+        and the supplied factors carry exactly the observed signal keys.
         The input frames and their attrs are never modified.
         """
+        if self.factor_keys_only and factors is None:
+            raise ContractValidationError('factor_keys_only requires aligned factors')
         frame = validate_bar_frame(bars).reset_index(drop=True)
         if 'contract_id' in frame:
             if self.continuous_source is None:
@@ -150,10 +155,12 @@ class BarReturnLabeler:
             if calendar is None:
                 raise ContractValidationError(f'No calendar for instrument_id {instrument}')
             _check_view(group, calendar, self.view)
-            if (instrument, frequency) not in coverage:
-                raise ContractValidationError(f'Missing raw coverage for {(instrument, frequency)}')
+            key = (instrument, frequency)
+            no_execution = self.factor_keys_only and 'is_complete' in group and not group.is_complete.eq(True).any()
+            if key not in coverage and not no_execution:
+                raise ContractValidationError(f'Missing raw coverage for {key}')
             tables.extend(self._label_group(group, factor_index, signals, calendar,
-                                            coverage[(instrument, frequency)], instrument, frequency,
+                                            coverage.get(key, pd.NaT), instrument, frequency,
                                             _incomplete_signals))
         scheduled = ('scheduled_exit_timestamp',) if self.include_scheduled_exit else ()
         columns = (*LABEL_COLUMNS, *scheduled)
@@ -173,10 +180,9 @@ class BarReturnLabeler:
         first, last = group.timestamp_utc.min(), group.timestamp_utc.max()
         calendar.session_at(first)
         calendar.session_at(last)
-        eth, _, _ = _grid(calendar, frequency, first, max(last, coverage_end),
-                                  'ETH', self.bucket_strategy)
-        grid, ends, owners = _grid(calendar, frequency, first, max(last, coverage_end),
-                                     self.view, self.bucket_strategy)
+        grid_end = last if pd.isna(coverage_end) else max(last, coverage_end)
+        eth, _, _ = _grid(calendar, frequency, first, grid_end, 'ETH', self.bucket_strategy)
+        grid, ends, owners = _grid(calendar, frequency, first, grid_end, self.view, self.bucket_strategy)
         if eth.empty or grid.empty:
             return []
         times = pd.DatetimeIndex(group.timestamp_utc)
@@ -187,6 +193,9 @@ class BarReturnLabeler:
         selected = positions >= 0
         if signals is not None:
             selected &= times.isin(signals)
+        if self.factor_keys_only:
+            signal_keys = pd.MultiIndex.from_frame(group[['timestamp_utc', 'instrument_id']])
+            selected &= signal_keys.isin(factors.index)
         candidates = group.loc[selected]
         if candidates.empty:
             return []
@@ -201,58 +210,18 @@ class BarReturnLabeler:
                                               names=['timestamp_utc', 'instrument_id'])
             factor_missing = factors.reindex(keys).factor_value.isna().to_numpy()
         observed = group.set_index('timestamp_utc').reindex(grid)
-        missing = observed.instrument_id.isna().to_numpy()
-        if 'is_complete' in observed:
-            missing |= ~observed.is_complete.eq(True).to_numpy(dtype=bool, na_value=False)
         # An already aligned external signal does not need the current Bar prices.
         incomplete_signal = False
-        if factors is None:
-            incomplete_signal = missing[positions]
-            if incomplete_signals is not None:
-                incomplete_signal |= signal_times.isin(incomplete_signals)
-        invalid = invalid_price_mask(observed).to_numpy()
-        entries = positions + self.entry_offset_bars
-        tables = []
-        for horizon in self.horizons:
-            exit_offset = _BAR.exit_offset(horizon)
-            exits = entries + exit_offset
-            eth_exits = eth_positions + self.entry_offset_bars + exit_offset
-            boundary = ((exits >= len(grid))
-                        | ((self.boundary_policy == 'same_session')
-                           & (owners[positions] != owners[np.minimum(exits, len(grid) - 1)])))
-            insufficient = np.where(boundary,
-                (eth_exits >= len(eth)) | (eth.take(np.minimum(eth_exits, len(eth)-1)) > coverage_end),
-                grid.take(np.minimum(exits, len(grid)-1)) > coverage_end)
-            reasons = primary_exclusion_reasons(pd.DataFrame({
-                'factor_missing': factor_missing,
-                'insufficient_history': insufficient,
-                'session_boundary': boundary,
-                'missing_bar': ((_window_counts(missing, positions + 1, exits + 1) > 0)
-                                | incomplete_signal),
-                'invalid_price': _window_counts(invalid, entries, exits + 1) > 0,
-            }))
-            valid = reasons.isna().to_numpy()
-            table = pd.DataFrame({
-                'instrument_id': instrument, 'frequency': frequency,
-                'entry_offset_bars': self.entry_offset_bars, 'horizon_bars': horizon,
-                'signal_timestamp': signal_times, 'signal_available_at': ends.take(positions),
-                'entry_timestamp': grid.take(np.minimum(entries, len(grid) - 1)),
-                'exit_bar_timestamp': grid.take(np.minimum(exits, len(grid) - 1)),
-                'exit_timestamp': ends.take(np.minimum(exits, len(grid) - 1)),
-                'status': np.where(valid, 'valid', 'excluded'), 'exclusion_reason': reasons,
-            })
-            if self.include_scheduled_exit:
-                table['scheduled_exit_timestamp'] = table.exit_timestamp.where(~boundary)
-            table.loc[~valid, list(TIME_OUTPUTS)] = pd.NaT
-            table.loc[:, list(VALUE_OUTPUTS)] = np.nan
-            opening = observed[_BAR.entry_price_field].to_numpy(dtype=float, na_value=np.nan)[entries[valid]]
-            close = observed[_BAR.exit_price_field].to_numpy(dtype=float, na_value=np.nan)[exits[valid]]
-            table.loc[valid, 'entry_price'] = opening
-            table.loc[valid, 'exit_price'] = close
-            table.loc[valid, 'price_change_points'] = close - opening
-            table.loc[valid, 'return_pct'] = _BAR.returns(opening, close)
-            tables.append(table)
-        return tables
+        if factors is None and incomplete_signals is not None:
+            incomplete_signal = signal_times.isin(incomplete_signals)
+        return UnifiedReturnLabeler._from_convention(
+            ExecutionConvention.OPEN_TO_CLOSE, self.boundary_policy,
+        )._label_windows(
+            observed, _LabelAxis(grid, grid, ends, owners), positions, eth, eth_positions, coverage_end,
+            instrument, frequency, self.entry_offset_bars, self.horizons, factor_missing,
+            incomplete_signal=incomplete_signal, require_signal_bar=factors is None,
+            include_scheduled_exit=self.include_scheduled_exit,
+        )
 
     def label_records(self, bars: pd.DataFrame, factors: pd.DataFrame | None = None, *,
                       signal_timestamps: Sequence | None = None) -> list[LabelRecord]:

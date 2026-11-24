@@ -18,14 +18,14 @@
 
 公开版同时包含外部编排器（例如 Task Manager）调用的研究后端：
 
-- `tools/agent_harness/cli.py`：结构化 JSON 包装，覆盖 `single-factor-analysis`、`time-series-analysis`、`factor-synthesis`、`symbolic-factor-mining`、`quanta-alpha-realize`、`parent-factor-screen`、`alignment-run`、`monitor-refresh` 和 `outputs-gc`。教学 CLI 位于 `tools/demo_cli.py`。
-- `run_analysis_main.py`、`run_factor_synthesis.py`、`run_symbolic_factor_mining.py` 及其依赖的 `backtest_and_analysis`、`factor_synthesis`（含 VectorBT 适配）、`factor_mining/symbolic`。
-- `scripts/alignment/` 的本地对齐与证据校验工具，以及其余审阅过的 `data_pipeline/loaders`。`alignment-run --factor` 使用 `scripts.build_jq_strategy` 打包，并以 `config/factor_requirements.json` 执行本地兼容性预检。独立的 `prepare_cloud_dumper` 工具需要通过 `--source` 传入自备的云端因子生产脚本。 源文件须在模块顶层或 `main()` 函数体中直接用字符串字面量各赋值一次 `start_date` 和 `end_date`。指定 `--target-date` 时，生成文件的两个日期均设为该日。
+- `tools/agent_harness/cli.py`：结构化 JSON 包装，覆盖 `single-factor-analysis`、`time-series-analysis`、`factor-synthesis`、`symbolic-factor-mining`、`quanta-alpha-realize`、`parent-factor-screen`、`alignment-run`、`market-db`、`export-strategy`、`verify-target-alignment`、`monitor-refresh` 和 `outputs-gc`。教学 CLI 位于 `tools/demo_cli.py`。
+- `run_analysis_main.py`、`run_factor_synthesis.py`、`run_symbolic_factor_mining.py` 及其依赖的 `backtest_and_analysis`、`factor_synthesis`（含 VectorBT 适配与 `strategy_bundle`）、`factor_mining/symbolic`、`slots`（含 `utils/slots` 与 `utils/market_db`）、`targets`（含 `jq_cloud` 与 `signal_export`）。
+- `scripts/alignment/` 的本地对齐与证据校验工具，以及其余审阅过的 `data_pipeline/loaders` 与公开数据源 `data_pipeline/extractors/public_markets`。`alignment-run --factor` 使用 `scripts.build_jq_strategy` 打包，并以 `config/factor_requirements.json` 执行本地兼容性预检。独立的 `prepare_cloud_dumper` 工具需要通过 `--source` 传入自备的云端因子生产脚本。 源文件须在模块顶层或 `main()` 函数体中直接用字符串字面量各赋值一次 `start_date` 和 `end_date`。指定 `--target-date` 时，生成文件的两个日期均设为该日。
 - 后端的默认门槛和参数按源码原样公开。
 
-后端需要调用者自备 DuckDB 数据库、因子文件和运行配置；数据库默认路径为 `./data/duckdb/`。VectorBT 回测与 DSO 符号挖掘分别需要可选依赖 `backtest` 与 `mining`。对齐流程的浏览器上传、下载辅助脚本不在本仓库中。Regime 研究命令不公开。
+后端需要调用者自备 DuckDB 数据库、因子文件和运行配置；数据库默认路径为 `./data/duckdb/`。VectorBT 回测、DSO 符号挖掘与公开数据源提取分别需要可选依赖 `backtest`、`mining` 与 `markets`。对齐流程的浏览器上传、下载辅助脚本不在本仓库中。Regime 研究命令不公开。
 
-数据导入部分见 [本地数据导入](DATA_IMPORT.md)。只保留经过审阅的 loaders；批量下载器、登录、JQData 本地 SDK 和旧在线复权类不包含在公开版本中。
+数据导入与多市场接入见 [本地数据导入](DATA_IMPORT.md)、[市场库契约](MARKET_DATABASE_GUIDE.md)、[公开数据市场库](PUBLIC_MARKET_DATABASES.md) 与 [自定义市场与部署指南](CUSTOM_MARKET_AND_DEPLOY_GUIDE.md)。只保留经过审阅的 loaders 与公开数据源重建脚本 `data_pipeline/extractors/public_markets`；私有批量下载器、登录、JQData 本地 SDK 和旧在线复权类不包含在公开版本中。
 
 ## Harness 输出布局
 

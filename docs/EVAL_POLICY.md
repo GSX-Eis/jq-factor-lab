@@ -18,6 +18,18 @@
   with lag at least `h - 1`. For time-series Spearman IC use paired moving
   blocks of length at least `h`, preserving missing slots and reranking
   each replicate. Record the seed, replicate count and minimum valid count.
+  The opt-in `ts_boot_adaptive_v3_p` reports a diagnostic two-sided P value
+  from the same studentized pivots. It requires at least 9,999 requested
+  replicates, 90% valid replicates and a matching preregistered single-asset
+  design. Validate raw P-value size separately at 0.05, 0.01 and 0.0025 before
+  using this method for candidate selection.
+  NERE-1279 combines Monte Carlo uncertainty from the warp-speed cutoff
+  and evaluation draws. The 162 null threshold rows form one Holm family
+  at 1%. Require each one-sided 99% size upper bound to be at most 1.5α,
+  size pooled within each (T, α) to be at most 1.1α, and directional
+  power of at least 80% for both effect signs. Require the preregistered
+  production P-value equivalence spot check and apply only preregistered
+  scope reductions.
   Validate coverage against independent, serially correlated and overlapping
   synthetic nulls with a predetermined tolerance, plus known positive and
   negative effects. Report coverage failures and the tested settings. The
@@ -37,11 +49,31 @@
   Report a selected test only after every registered p value is available and
   adjusted. Use Holm for family-wise error control under arbitrary dependence,
   or BH for false discovery rate control under independence or suitable
-  positive dependence. An interval alone supplies insufficient evidence for a
-  raw p value. Report the complete family and the adjustment results.
+  positive dependence. Raw P values require calibration applicable to the
+  method, design and selection threshold. The opt-in time-series v3 P value
+  stays diagnostic in its existing single-asset domain. The NERE-1279
+  confirmation failed the hard upper bound for the Gaussian independent
+  null at T=512, h=20 and α=0.0025, outside the registered fallback.
+  Report the complete family and the adjustment results.
 - Require the applicable exposure protocol before opening real OOS data. Record
   data provenance and distinguish synthetic engineering acceptance from real
   OOS evidence.
+- For the NERE-1280 cross-sectional HAC study, freeze exact N, T, horizon
+  and alpha levels before simulation. Require each null cell's one-sided
+  99% exact binomial upper bound to be at most 1.5α. Apply Holm at 1% to
+  the two-sided nominal-size tests over the full preregistered null family.
+  Require the pooled null rejection rate for each (N, T, α) to be at most
+  1.1α and each signed control's power to reach 80%. Apply only the
+  preregistered narrowing rule and retain the original Holm results.
+  The resulting evidence covers complete constant-width Spearman grids at
+  T=1024, N in {256, 1024}, h in {1, 20}, and α in {0.01, 0.05}, in the three
+  registered Gaussian null scenarios. For these new domains, the audit retains
+  the published interval and its raw analytic P value. For selection, compute
+  the preregistered 95% interval's P value and round it up to the smallest
+  supported threshold, or use 1 if it exceeds 0.05. A 95% or 99% interval may
+  be paired with either supported family alpha. Earlier registrations retain
+  their gates.
+  See [NERE-1280 results](../reports/NERE-1280/cs_hac_calibration.json).
 
 See [Unified Evaluation Engine](EVALUATION_ENGINE.md) for formulas, calibration
 results and fixture links.

@@ -51,7 +51,7 @@ def _resolve_repo_relative_path(raw_path: str) -> Path:
 
 
 def _bound_result_metrics(path, *, action, run_id, execution_id, source_sha256,
-                          config_payload=None, stdout="", stderr=""):
+                          config_payload=None, config_path=None, stdout="", stderr=""):
     cli = _cli_bindings(__name__, metrics_parsers, run_result)
     payload = cli.read_execution_result(
         path, command=action, run_id=run_id, execution_id=execution_id,
@@ -63,18 +63,184 @@ def _bound_result_metrics(path, *, action, run_id, execution_id, source_sha256,
             if not isinstance(raw.get(key, []), list) or any(not isinstance(item, dict) for item in raw.get(key, [])):
                 raise ValueError(f"invalid synthesis result field: {key}")
         top_k = (config_payload or {}).get("performance_evaluation", {}).get("top_k_strategy", {})
-        if payload["execution"]["status"] == "succeeded" and top_k.get("enabled") and not any(
-            "error" not in item and all(isinstance(item.get(key), (int, float))
-                                       and math.isfinite(item[key])
-                                       for key in ("annual_return", "sharpe_ratio", "max_drawdown"))
-            for item in raw.get("backtest_runs", [])
-        ):
-            raise ValueError("backtest_metrics_missing")
+        if payload["execution"]["status"] == "succeeded" and top_k.get("enabled"):
+            backtest_runs = raw.get("backtest_runs", [])
+            valid_runs = [
+                item for item in backtest_runs
+                if "error" not in item and all(
+                    isinstance(item.get(key), (int, float))
+                    and math.isfinite(item[key])
+                    for key in ("annual_return", "sharpe_ratio", "max_drawdown")
+                )
+            ]
+            if not valid_runs:
+                raise ValueError("backtest_metrics_missing")
+            for item in backtest_runs:
+                if item not in valid_runs:
+                    raise ValueError(
+                        f"backtest_candidate_failed: trial_id={item.get('trial_id')!r}, error={item.get('error')!r}"
+                    )
+            expected_trials = run_result.expected_backtest_trials(
+                config_payload or {}, config_path=config_path
+            )
+            if expected_trials:
+                expected_by_id = {item["trial_id"]: item for item in expected_trials}
+                expected_ids = [item["trial_id"] for item in expected_trials]
+                expected_id_set = set(expected_ids)
+                non_reranker_runs = [
+                    item for item in backtest_runs if not item.get("local_reranker_profile")
+                ]
+                seen_run_trials: set[str] = set()
+                for item in non_reranker_runs:
+                    tid = str(item.get("trial_id") or "").strip()
+                    if not tid:
+                        raise ValueError("backtest_candidate_missing_trial_id")
+                    if tid in seen_run_trials:
+                        raise ValueError(f"backtest_candidate_duplicate: trial_id={tid!r}")
+                    if tid not in expected_id_set:
+                        raise ValueError(f"backtest_candidate_unexpected: trial_id={tid!r}")
+                    exp = expected_by_id[tid]
+                    run_result._validate_trial_selection_fields(
+                        item,
+                        expected=exp,
+                        context=f"backtest_candidate({tid})",
+                        require_fields=True,
+                    )
+                    if item.get("factor_name") is not None:
+                        fname = str(item.get("factor_name") or "").strip()
+                        if fname != exp["factor_name"]:
+                            raise ValueError(
+                                f"backtest_candidate({tid}) factor_name mismatch: "
+                                f"{fname!r} != {exp['factor_name']!r}"
+                            )
+                    ret_art = item.get("return_series_artifact")
+                    if isinstance(ret_art, Mapping):
+                        if ret_art.get("trial_id") is not None:
+                            rtid = str(ret_art.get("trial_id") or "").strip()
+                            if rtid != tid:
+                                raise ValueError(
+                                    f"backtest_candidate({tid}) return_series_artifact trial_id mismatch: {rtid!r}"
+                                )
+                        run_result._validate_trial_selection_fields(
+                            ret_art,
+                            expected=exp,
+                            context=f"backtest_candidate({tid}).return_series_artifact",
+                            require_fields=False,
+                            check_synthesis_name=False,
+                        )
+                    seen_run_trials.add(tid)
+                missing_run_trials = [tid for tid in expected_ids if tid not in seen_run_trials]
+                if missing_run_trials:
+                    raise ValueError(
+                        f"backtest_candidate_missing: expected trial_id(s) {missing_run_trials}"
+                    )
+
+                bundle_expected_trials = [
+                    item for item in expected_trials if item.get("method") != "pca"
+                ]
+                bundle_expected_ids = [item["trial_id"] for item in bundle_expected_trials]
+                if bundle_expected_ids:
+                    bundle_expected_by_id = {
+                        item["trial_id"]: item for item in bundle_expected_trials
+                    }
+                    bundle_expected_set = set(bundle_expected_ids)
+                    raw_bundles = raw.get("strategy_bundles")
+                    if not isinstance(raw_bundles, list) or not raw_bundles:
+                        raise ValueError(
+                            f"strategy_bundle_missing_for_trials: {bundle_expected_ids}"
+                        )
+                    primary_sb = raw.get("strategy_bundle")
+                    if not isinstance(primary_sb, Mapping):
+                        raise ValueError("strategy_bundle_primary_missing")
+                    seen_bundle_trials: set[str] = set()
+                    bundle_dir_by_trial: Dict[str, str] = {}
+                    for sb in raw_bundles:
+                        if not isinstance(sb, Mapping):
+                            raise ValueError("strategy_bundle_entry_invalid")
+                        tid = str(sb.get("trial_id") or "").strip()
+                        if not tid:
+                            raise ValueError("strategy_bundle_missing_trial_id")
+                        if tid in seen_bundle_trials:
+                            raise ValueError(f"strategy_bundle_duplicate_trial_id: {tid!r}")
+                        if tid not in bundle_expected_set:
+                            raise ValueError(f"strategy_bundle_unexpected_trial_id: {tid!r}")
+                        run_result._validate_trial_selection_fields(
+                            sb,
+                            expected=bundle_expected_by_id[tid],
+                            context=f"strategy_bundles({tid})",
+                            require_fields=True,
+                        )
+                        seen_bundle_trials.add(tid)
+                        bundle_dir_by_trial[tid] = str(Path(str(sb.get("bundle_dir") or "")).resolve())
+                    missing_bundle_trials = [
+                        tid for tid in bundle_expected_ids if tid not in seen_bundle_trials
+                    ]
+                    if missing_bundle_trials:
+                        raise ValueError(
+                            f"strategy_bundle_missing_for_trials: {missing_bundle_trials}"
+                        )
+                    primary_tid = str(primary_sb.get("trial_id") or "").strip()
+                    if not primary_tid:
+                        raise ValueError("strategy_bundle_primary_missing_trial_id")
+                    if primary_tid not in bundle_expected_set:
+                        raise ValueError(
+                            f"strategy_bundle_primary_unexpected_trial_id: {primary_tid!r}"
+                        )
+                    run_result._validate_trial_selection_fields(
+                        primary_sb,
+                        expected=bundle_expected_by_id[primary_tid],
+                        context=f"strategy_bundle({primary_tid})",
+                        require_fields=True,
+                    )
+                    sb_artifacts = [
+                        art for art in payload.get("artifacts", [])
+                        if isinstance(art, Mapping) and art.get("artifact_type") == "strategy_bundle"
+                    ]
+                    artifact_trials: set[str] = set()
+                    for art in sb_artifacts:
+                        bdir = Path(str(art.get("bundle_dir") or "")).resolve()
+                        manifest_data = _safe_read_json(bdir / "manifest.json") or {}
+                        rebal = manifest_data.get("rebalance_config") or {}
+                        manifest_tid = str(rebal.get("trial_id") or "").strip()
+                        if not manifest_tid:
+                            raise ValueError(
+                                f"strategy_bundle_manifest_missing_trial_id: {bdir}"
+                            )
+                        if manifest_tid in artifact_trials:
+                            raise ValueError(
+                                f"strategy_bundle_artifact_duplicate_trial_id: {manifest_tid!r}"
+                            )
+                        if manifest_tid not in bundle_expected_set:
+                            raise ValueError(
+                                f"strategy_bundle_artifact_unexpected_trial_id: {manifest_tid!r}"
+                            )
+                        if bundle_dir_by_trial.get(manifest_tid) != str(bdir):
+                            raise ValueError(
+                                f"strategy_bundle_trial_dir_mismatch: {manifest_tid!r}"
+                            )
+                        run_result._validate_trial_selection_fields(
+                            rebal,
+                            expected=bundle_expected_by_id[manifest_tid],
+                            context=f"strategy_bundle_manifest({manifest_tid})",
+                            require_fields=True,
+                        )
+                        artifact_trials.add(manifest_tid)
+                    missing_art_trials = [
+                        tid for tid in bundle_expected_ids if tid not in artifact_trials
+                    ]
+                    if missing_art_trials:
+                        raise ValueError(
+                            f"strategy_bundle_artifact_missing_for_trials: {missing_art_trials}"
+                        )
         metrics = cli._assemble_factor_synthesis_metrics(
             config_payload or {}, raw.get("ic_summaries", []), raw.get("backtest_runs", []),
             raw.get("synthesis_diagnostics", []), raw.get("benchmark_reports", []),
             cli._extract_neutralized_input_warnings(stdout, stderr),
         )
+        if isinstance(raw.get("strategy_bundle"), dict):
+            metrics["strategy_bundle"] = raw["strategy_bundle"]
+        if isinstance(raw.get("strategy_bundles"), list):
+            metrics["strategy_bundles"] = raw["strategy_bundles"]
     else:
         metrics = dict(raw)
     metrics["execution"] = payload["execution"]
@@ -228,14 +394,20 @@ def _failure_result(
     )
 
 
+def _result_output_paths(output_dir: Path, json_out: str) -> list[Path]:
+    paths = [output_dir / "summary.json"]
+    if output_dir.parent.name == "attempts":
+        paths.append(output_dir.parent.parent / "summary.json")
+    if json_out:
+        paths.append(Path(json_out).expanduser().resolve())
+    return paths
+
+
 def _complete_result(result: HarnessResult, json_out: str = "") -> HarnessResult:
     cli = _cli_bindings(__name__)
     payload = result.to_dict()
-    cli._write_json(result.output_dir / "summary.json", payload)
-    if result.output_dir.parent.name == "attempts":
-        cli._write_json(result.output_dir.parent.parent / "summary.json", payload)
-    if json_out:
-        cli._write_json(Path(json_out).expanduser().resolve(), payload)
+    for path in _result_output_paths(result.output_dir, json_out):
+        cli._write_json(path, payload)
     return result
 
 
@@ -483,35 +655,45 @@ def _run_subprocess_body(
     execution_failed = extra_metrics.pop("_execution_failed", False)
 
     if proc.returncode != 0 or execution_failed:
-        reason, exit_code, failure_detail = cli._classify_subprocess_failure(
-            action=action,
-            subprocess_exit_code=int(proc.returncode),
-            extra_metrics=extra_metrics,
+        store_failure = (
+            extra_metrics.pop("_bar_store_failure", None)
+            if action == "single-factor-analysis" and "--bar-results-db" in command else None
         )
         metrics = {"subprocess_exit_code": proc.returncode, **extra_metrics}
-        if failure_detail:
-            metrics["failure_reason"] = failure_detail
         stderr_tail = proc.stderr
-        if failure_detail and failure_detail not in (stderr_tail or ""):
-            stderr_tail = (stderr_tail or "") + "\n" + failure_detail
-        return cli._complete_result(
-            cli._failure_result(
+        if store_failure is not None:
+            mode, reason, exit_code = "results_db", store_failure["code"], store_failure["exit_code"]
+            metrics.update(store_failure["details"])
+        else:
+            mode = "subprocess"
+            reason, exit_code, failure_detail = cli._classify_subprocess_failure(
                 action=action,
-                mode="subprocess",
-                output_dir=output_dir,
-                run_id=run_id,
-                command=command,
-                started_at=started_at,
-                reason=reason,
-                exit_code=exit_code,
-                metrics=metrics,
-                artifacts=artifacts,
-                warnings=structured_warnings,
-                stdout_tail=cli._tail(proc.stdout),
-                stderr_tail=cli._tail(stderr_tail),
-            ),
-            json_out=json_out,
+                subprocess_exit_code=int(proc.returncode),
+                extra_metrics=extra_metrics,
+            )
+            if failure_detail:
+                metrics["failure_reason"] = failure_detail
+                if failure_detail not in (stderr_tail or ""):
+                    stderr_tail = (stderr_tail or "") + "\n" + failure_detail
+        result = cli._failure_result(
+            action=action,
+            mode=mode,
+            output_dir=output_dir,
+            run_id=run_id,
+            command=command,
+            started_at=started_at,
+            reason=reason,
+            exit_code=exit_code,
+            metrics=metrics,
+            artifacts=artifacts,
+            warnings=structured_warnings,
+            stdout_tail=cli._tail(proc.stdout),
+            stderr_tail=cli._tail(stderr_tail),
         )
+        if store_failure is not None:
+            result.error["message"] = store_failure["details"]["error"]
+            result.error["details"].update(store_failure["cleanup"])
+        return cli._complete_result(result, json_out=json_out)
 
     return cli._complete_result(
         cli._success_result(

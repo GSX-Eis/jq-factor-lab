@@ -10,10 +10,14 @@ import pandas as pd
 def initialize_configured_adapter(
     self, duckdb_path: Optional[str], parquet_dir: Optional[str],
 ) -> None:
-    if not self._frequency_route.bar_grid and (
-        self.duckdb_path or self.parquet_dir or self.data_bindings
-        or os.environ.get('QUANT_DATA_BINDINGS', '{}') not in ('', '{}', 'null')
-    ):
+    if self._frequency_route.bar_grid:
+        return
+    bindings = self.data_bindings
+    if bindings or (bindings is None and os.environ.get('QUANT_DATA_BINDINGS', '{}') not in ('', '{}', 'null')):
+        from utils.data_store import binding_contract
+
+        bindings = binding_contract(bindings)
+    if self.duckdb_path or self.parquet_dir or bindings:
         self._duckdb_adapter = self._init_duckdb_adapter()
         if self._duckdb_adapter:
             self.duckdb_path = str(self._duckdb_adapter.duckdb_path) if self._duckdb_adapter.duckdb_path else None
@@ -62,102 +66,51 @@ def _get_local_data_config(self):
     return self._local_data_config
 
 
-def _apply_pit_adjustment(self, apply_pit_adjustment: Callable, df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Apply Dynamic PIT adjustment by replacing price columns.
-
-    PIT Formula:
-        adjusted_price[i] = price[i] × (factor[i] / factor_end)
-
-    Where factor_end is the factor of the last date in the data window per stock.
-    This ensures:
-    - On the calculation date (window end), price remains unchanged
-    - Historical prices are adjusted relative to the calculation date
-
-    This matches JoinQuant's dynamic PIT behavior where each query window
-    uses its own last date's factor as factor_end.
-
-    Mathematical properties:
-        - At calculation date T: adjusted_price[T] = price[T] (factor[T]/factor[T] = 1)
-        - For historical date i: adjusted_price[i] = price[i] × (factor[i]/factor[T])
-        - Return calculation: adjusted[T]/adjusted[i] = price[T]×factor[T] / (price[i]×factor[i])
-          This correctly accounts for stock splits/dividends between i and T.
-
-    Args:
-        df: DataFrame containing raw prices and factor column
-
-    Returns:
-        DataFrame with price/volume columns replaced by pit-adjusted values
-    """
-    if not self.pit_enabled or df.empty:
-        return df
-
-    factor_col = self.pit_factor_column
-    return apply_pit_adjustment(df, factor_col)
+def _resolve_universe(self, day) -> list[str]:
+    grid = self.slot.calendar.bar_grid('1d', end=day, view=self.session_view, bucket_strategy='session')
+    if grid.empty:
+        return []
+    anchor = grid.timestamp_utc.iloc[-1]
+    session = self.slot.calendar.session_at(anchor, self.session_view, frequency='1d')
+    on_requested_day = pd.Timestamp(session.session_date) == pd.Timestamp(day)
+    as_of = session.segments[0][0] if on_requested_day else session.segments[-1][1]
+    return list(self.slot.universe.resolve_universe(self.universe_id, as_of_utc=as_of))
 
 
-def initialize_stock_pool(
-    self,
-    factor_base_cls: type,
-    manager_factory: Callable,
-    db_connection,
-    use_dynamic_pool: bool,
-    stock_pools_by_period: Optional[Dict[str, List[str]]],
-    stock_pool: Optional[List[str]],
-    stock_filters: Optional[list],
-    fundamental_table: str,
-    price_table: str,
-    db_backend: str,
-    parquet_dir: Optional[str],
-    use_duckdb_cache: bool,
-    duckdb_cache_size_mb: int,
-    start_date: str,
-    end_date: str,
-    max_stocks_per_month: Optional[int],
-    sort_by: Optional[str],
-    ascending: bool,
-    rebalance_period_months: int,
-    rebalance_schedule: str,
-    pool_schedule: Optional[dict],
-) -> None:
-    # Only rule-generated pools need a selector; supplied histories are authoritative.
+def initialize_stock_pool(self, factor_base_cls: type, manager_factory: Callable,
+                          stock_pools_by_period: Optional[Dict[str, List[str]]]) -> None:
+    use_dynamic_pool, stock_pool = self.use_dynamic_pool, self.stock_pool
+    start_date, end_date = self.start_date, self.end_date
+    pool_schedule = self.pool_schedule
+    rebalance_schedule, rebalance_period_months = self.rebalance_schedule, self.rebalance_period_months
     if use_dynamic_pool and stock_pools_by_period is None:
-        if not stock_filters:
-            raise ValueError("使用动态股票池时必须提供stock_filters")
-        self.dynamic_pool_manager = manager_factory(
-            db_connection,
-            fundamental_table=fundamental_table,
-            price_table=price_table,
-            db_backend=db_backend,
-            duckdb_path=self.duckdb_path,
-            parquet_dir=parquet_dir,
-            use_duckdb_cache=use_duckdb_cache,
-            duckdb_cache_size_mb=duckdb_cache_size_mb,
-            data_bindings=self.data_bindings,
-            source_policy=self.source_policy,
-            data_config_path=self.data_config_path,
-        )
-        if not self.dynamic_pool_manager.validate_filters(stock_filters):
-            raise ValueError("股票筛选条件或数据源验证失败，请检查字段、指数条件和数据源")
+        if self.universe_id is None:
+            reader = getattr(self.slot.universe, 'period_pools', None)
+            if reader is None:
+                raise ValueError('Dynamic pools require universe_id or stock_pools_by_period for this MarketSlot')
+            stock_pools_by_period = reader(self, manager_factory)
+        else:
+            from utils.stock_pool_schedule import generate_rebalance_dates, load_pool_policy, resolve_schedule
+
+            spec = resolve_schedule(load_pool_policy(), pool_schedule, legacy=rebalance_schedule,
+                                    months=rebalance_period_months)
+            dates = generate_rebalance_dates(self.slot.calendar, start_date, end_date, spec)
+            stock_pools_by_period = {
+                day.strftime('%Y-%m-%d'): _resolve_universe(self, day) for day in dates
+            }
     elif not use_dynamic_pool and not stock_pool:
-        raise ValueError("不使用动态股票池时必须提供固定的stock_pool")
+        if self.universe_id is None:
+            raise ValueError("不使用动态股票池时必须提供固定的stock_pool")
+        stock_pool = _resolve_universe(self, start_date)
 
     if self.use_dynamic_pool:
-        self.stock_pools_by_period = (
-            stock_pools_by_period if stock_pools_by_period is not None
-            else self.dynamic_pool_manager.get_stock_pools_for_period(
-                start_date, end_date, stock_filters, max_stocks_per_month, sort_by, ascending,
-                rebalance_period_months=rebalance_period_months,
-                rebalance_schedule=rebalance_schedule,
-                schedule=pool_schedule,
-            )
-        )
+        self.stock_pools_by_period = stock_pools_by_period
         factor_base_cls._parse_stock_pool_intervals(self.stock_pools_by_period)
         self.all_stocks = list({stock for stocks in self.stock_pools_by_period.values() for stock in stocks})
         self.logger.info(f"动态股票池包含 {len(self.all_stocks)} 只股票，覆盖 {len(self.stock_pools_by_period)} 个期间")
     else:
         self.stock_pools_by_period = None
-        self.all_stocks = stock_pool
+        self.stock_pool = self.all_stocks = stock_pool
 
 
 def _parse_stock_pool_intervals(stock_pools_by_period, date_timezone=None):
@@ -253,8 +206,14 @@ def _apply_dynamic_pool_to_factor_df(self, factor_base_cls: type, factor_df: pd.
     if not factor_df.empty and not isinstance(factor_df.index, pd.DatetimeIndex):
         factor_df = factor_df.copy()
         factor_df.index = pd.to_datetime(factor_df.index, errors='raise')
-    if getattr(factor_df.index, 'tz', None) is not None:
-        pool_intervals = factor_base_cls._get_stock_pool_intervals(self, factor_df.index.tz)
+    dates = factor_df.index
+    if getattr(dates, 'tz', None) is not None:
+        if getattr(self, '_ashare_panel', True):
+            pool_intervals = factor_base_cls._get_stock_pool_intervals(self, dates.tz)
+        else:
+            sessions = (self.slot.calendar.session_at(date, self.session_view,
+                        frequency=self._frequency_route.frequency) for date in dates)
+            dates = pd.to_datetime([session.session_date if session else None for session in sessions])
     if factor_df.empty:
         return factor_df
 
@@ -266,146 +225,34 @@ def _apply_dynamic_pool_to_factor_df(self, factor_base_cls: type, factor_df: pd.
             continue
         dates_in_period = np.ones(len(factor_df.index), dtype=bool)
         if start_date is not None:
-            dates_in_period &= factor_df.index >= start_date
+            dates_in_period &= dates >= start_date
         if end_date is not None:
-            dates_in_period &= factor_df.index < end_date
+            dates_in_period &= dates < end_date
         available_stocks = factor_df.columns.intersection(pool_stocks)
         pool_membership_mask.loc[dates_in_period, available_stocks] = True
     return factor_df.where(pool_membership_mask)
 
 
-def _fetch_raw_data(self, fields: List[str], date_field: str = 'date',
+def _fetch_raw_data(self, read_slot_panel: Callable, fields: List[str], date_field: str = 'date',
                     code_field: str = 'stock_code', table_name: str = 'factor_data',
                     additional_condition: str = "") -> pd.DataFrame:
-    """Read the configured DuckDB source; dates include the entire final day."""
-    is_price = table_name.startswith('price_data')
-    if self._duckdb_adapter is not None and date_field == 'date' and code_field == 'stock_code' and not additional_condition:
-        return self._fetch_raw_data_duckdb(fields, table_name)
-    if is_price:
-        from utils.bar_source import BarSource
-        if not isinstance(fields, (list, tuple)):
-            raise ValueError('fields must be a list or tuple of column names')
-        selected = list(fields)
-        if self.pit_enabled and self.pit_factor_column not in selected:
-            selected.append(self.pit_factor_column)
-        frame = BarSource.read_panel(self.all_stocks, self.data_frequency,
-            self.start_date, self.end_date, selected, config=self._get_local_data_config(),
-            connection=self.db_connection, adapter=self._duckdb_adapter,
-            date_field=date_field, code_field=code_field, additional_condition=additional_condition)
-        if self.use_dynamic_pool and self.dynamic_pool_mode in ('raw', 'both'):
-            frame = self._filter_data_by_pools(frame)
-        return frame
-    connection = self._duckdb_adapter._get_connection() if self._duckdb_adapter is not None else self.db_connection
-    import duckdb
-    if not isinstance(connection, duckdb.DuckDBPyConnection):
-        raise TypeError("Supply a DuckDB connection, duckdb_path, Parquet directory, or data binding")
-
-    def quote(value: str) -> str:
-        return '"' + value.replace('"', '""') + '"'
-
-    config = self._get_local_data_config()
-    dataset = config.dataset(
-        config.factor_table if table_name == 'factor_data' else table_name)
-    physical_table = dataset.table
-    if date_field == 'date':
-        date_field = dataset.date_column
-    if code_field == 'stock_code':
-        code_field = dataset.stock_column
-    if not isinstance(fields, (list, tuple)):
-        raise ValueError('fields must be a list or tuple of column names')
-    excluded = {date_field, code_field, 'date', 'stock_code', 'code'}
-    selected = list(dict.fromkeys(f for f in fields if f not in excluded))
-    from utils.data_access_config import Dataset
-    from utils.data_store import table_name as quote_table
-    selected = list(Dataset(physical_table, date_field, code_field).fields(selected))
-    if pd.Timestamp(self.start_date) > pd.Timestamp(self.end_date):
-        raise ValueError('start_date must not be after end_date')
-    if not self.all_stocks:
-        frame = pd.DataFrame(columns=['date', 'code', *selected])
-        frame['date'] = pd.to_datetime(frame['date'])
-        return frame
-    columns = [f'{quote(date_field)} AS date', f'{quote(code_field)} AS code'] + [quote(f) for f in selected]
-    placeholders = ', '.join('?' for _ in self.all_stocks)
-    end_exclusive = (pd.Timestamp(self.end_date) + pd.Timedelta(days=1)).to_pydatetime()
-    sql = f"""SELECT {', '.join(columns)} FROM {quote_table(physical_table)}
-        WHERE CAST({quote(date_field)} AS TIMESTAMP) >= ?
-          AND CAST({quote(date_field)} AS TIMESTAMP) < ?
-          AND {quote(code_field)} IN ({placeholders})
-          {additional_condition}
-        ORDER BY {quote(code_field)}, {quote(date_field)}"""
-    frame = connection.execute(sql, [pd.Timestamp(self.start_date).to_pydatetime(), end_exclusive, *self.all_stocks]).fetchdf()
-    frame['date'] = pd.to_datetime(frame['date'])
-    if self.use_dynamic_pool and self.dynamic_pool_mode in ('raw', 'both'):
+    """Retain the FactorBase panel contract while letting the slot supply its rows."""
+    price = table_name.startswith('price_data')
+    component = self.slot.bar_feed if price else self.slot.aux_features
+    read_panel = getattr(component, 'read_factor_panel', None)
+    if read_panel is not None:
+        frame = read_panel(self, fields, date_field, code_field, table_name, additional_condition)
+    else:
+        if additional_condition or date_field != 'date' or code_field != 'stock_code':
+            raise ValueError('SQL panel options require the historical A-share slot')
+        frame = read_slot_panel(self, fields, table_name, price)
+    if read_panel is not None and self.use_dynamic_pool and self.dynamic_pool_mode in ('raw', 'both'):
         frame = self._filter_data_by_pools(frame)
     return frame
 
 
-def _fetch_raw_data_duckdb(
-    self,
-    fields: List[str],
-    table_name: str = 'factor_data'
-) -> pd.DataFrame:
-    """使用 DuckDB 适配器获取原始数据 (高性能路径)
-
-    此方法使用 DuckDB 进行数据查询。
-    仅在本地分析时使用，云端部署会自动跳过。
-
-    Args:
-        fields: 需要查询的字段列表
-        table_name: 数据表名
-
-    Returns:
-        包含查询结果的 DataFrame
-    """
-    if self._duckdb_adapter is None:
-        return None
-
-    # 确定实际表名和数据频率
-    # Fix: Recognize all price table variants (price_data, price_data_daily, price_data_5m)
-    is_price_table = table_name.startswith('price_data')
-
-    # 如果启用 PIT 动态复权，确保查询包含 factor 列
-    query_fields = list(fields)
-    if is_price_table and self.pit_enabled and self.pit_factor_column not in query_fields:
-        query_fields.append(self.pit_factor_column)
-    if is_price_table and self.data_frequency in ('daily', '1d') and 'money' in query_fields and 'paused' not in query_fields:
-        query_fields.append('paused')
-
-    if is_price_table:
-        # 价格数据查询
-        from utils.bar_source import BarSource
-        df = BarSource.read_panel(self.all_stocks, self.data_frequency,
-            self.start_date, self.end_date, query_fields, config=self._get_local_data_config(),
-            adapter=self._duckdb_adapter)
-        from utils.pit import normalize_price_money
-        frequency = self._frequency_route.frequency
-        money_frequency = 'daily' if frequency.kind == 'session' else '1m' if frequency.minutes == 1 else '5m'
-        df = normalize_price_money(df, source='local', frequency=money_frequency)
-        if 'paused' not in fields and 'paused' in df:
-            df = df.drop(columns='paused')
-    else:
-        fetch = (
-            self._duckdb_adapter.fetch_factor_data
-            if table_name == 'factor_data'
-            else self._duckdb_adapter.fetch_table_data
-        )
-        df = fetch(
-            stocks=self.all_stocks,
-            start_date=self.start_date,
-            end_date=self.end_date,
-            fields=query_fields,
-            **({} if table_name == 'factor_data' else {'table_name': table_name}),
-        )
-
-    # 如果配置为在原始数据阶段应用动态股票池过滤
-    if self.use_dynamic_pool and self.dynamic_pool_mode in ('raw', 'both'):
-        df = self._filter_data_by_pools(df)
-
-    return df
-
-
 def get_price_data(self, price_type: str = 'close') -> pd.DataFrame:
-    """Read unadjusted prices from the same DuckDB source as the factor."""
+    """Read the historical unadjusted price panel."""
     frame = self._fetch_raw_data([price_type], table_name='price_data')
     if frame.empty:
         return pd.DataFrame()

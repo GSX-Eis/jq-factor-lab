@@ -3,21 +3,23 @@ from __future__ import annotations
 
 from dataclasses import MISSING, asdict, replace
 from math import ceil, isclose, sqrt
+from pathlib import Path
 import re
 from statistics import NormalDist
+import subprocess
 from typing import Any
 
 import numpy as np
 from scipy.stats import t
 
 from backtest_and_analysis.evaluation.calibration import (
-    REGISTERED_CALIBRATIONS, _registered_adaptive_evidence, evaluate_interval_usability,
-    resolve_interval_calibration,
+    REGISTERED_CALIBRATIONS, _CS_HAC_SIZE_REPORT, _registered_adaptive_evidence, bootstrap_pvalue_reason,
+    evaluate_interval_usability, resolve_interval_calibration,
 )
 from backtest_and_analysis.evaluation.cross_section import bartlett_hac, hac_p_value
 from backtest_and_analysis.time_series.inference import _bootstrap_observation_matches
 from backtest_and_analysis.evaluation.types import (
-    BOOTSTRAP_FIXED, BOOTSTRAP_V1, BOOTSTRAP_V2,
+    BOOTSTRAP_FIXED, BOOTSTRAP_V1, BOOTSTRAP_V2, BOOTSTRAP_V3_P,
     AdaptiveCalibrationObservation, BootstrapInterval, CalibrationEvidence, HACInterval, IntervalUsability,
 )
 
@@ -30,6 +32,34 @@ _PRE_REGISTRATION_BOOTSTRAP_V2_CODE_VERSIONS: frozenset[str] = frozenset((
     "1f062ecd1a1bcc6518e22c97779e704674487be7",
     "8f84c483abec9a117af50c3dfff355157875b74a",
 ))
+
+
+# Reviewed source snapshots from before NERE-1280 entered the registry.
+_PRE_REGISTRATION_HAC_BASE = "8ff43272ca14df94c52f2d0a872059a49d43ca05"
+_PRE_REGISTRATION_HAC_TIPS = (
+    "e77b42e2300a71a361d3d78c9e0539cb5726d9ac",  # Parent of the registration commit.
+    "1dea3770556898d52e6028ed355f7a64ff3c91ea",  # EV-1b integration.
+)
+
+
+def _pre_registration_hac_source(code_version: str, source: str | None) -> bool:
+    if source not in (None, "git") or re.fullmatch(r"[0-9a-f]{40}", code_version) is None:
+        return False
+    if code_version == _PRE_REGISTRATION_HAC_BASE or code_version in _PRE_REGISTRATION_HAC_TIPS:
+        return True
+    root = Path(__file__).resolve().parents[2]
+    if not (root / ".git").exists():
+        return False
+    git = ["git", "--no-replace-objects", "-C", str(root)]
+    try:
+        kind = subprocess.run([*git, "cat-file", "-t", code_version], capture_output=True, timeout=5)
+        return kind.returncode == 0 and kind.stdout.strip() == b"commit" and any(
+            subprocess.run([*git, "merge-base", "--is-ancestor", code_version, tip],
+                           capture_output=True, timeout=5).returncode == 0
+            for tip in _PRE_REGISTRATION_HAC_TIPS
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
 
 
 def _interval_fields(value: Any, field: str, interval_type: type) -> dict[str, Any]:
@@ -100,7 +130,7 @@ def _verified_interval(
     statistic: float, point_reason: str | None, n: int, cross_section_sizes: np.ndarray | None,
     section_ics: np.ndarray | None, pair_pattern: str | None, bounds: list[float] | None, p_value: float | None,
     p_method: str | None, alpha: float, config: dict[str, Any], field: str, legacy: bool,
-    raw_interval: dict[str, Any], code_version: str,
+    raw_interval: dict[str, Any], code_version: str, code_version_source: str | None,
 ) -> None:
     grid_size = interval["grid_size"]
     _require((interval["reason"] is None) == (bounds is not None), field, "interval reason matching bounds")
@@ -119,10 +149,15 @@ def _verified_interval(
 
     if time_series:
         tags = (interval["method_version"], selector, interval["resample_method"], interval["interval_method"])
-        _require(tags in (BOOTSTRAP_FIXED, BOOTSTRAP_V1, BOOTSTRAP_V2), field, "a recognized Bootstrap method")
+        _require(tags in (BOOTSTRAP_FIXED, BOOTSTRAP_V1, BOOTSTRAP_V2, BOOTSTRAP_V3_P), field, "a recognized Bootstrap method")
         _require(-1 <= statistic <= 1 if point_reason is None else bounds is None, field, "a valid Spearman IC")
         _require(bounds is None or -1 <= bounds[0] <= bounds[1] <= 1, field, "bounds in [-1, 1]")
         options = _object(config.get("bootstrap") or {}, "config.bootstrap")
+        request_pvalue = tags == BOOTSTRAP_V3_P
+        if "bootstrap" in config or "analysis_mode" in config:
+            configured_pvalue = options.get("p_value", False)
+            _require(type(configured_pvalue) is bool and configured_pvalue == request_pvalue,
+                     field, "bootstrap p-value method matching the published configuration")
         explicit = options.get("block_length", "auto")
         if explicit != "auto":
             explicit = _count(explicit, "config.bootstrap.block_length", minimum=horizon)
@@ -140,7 +175,7 @@ def _verified_interval(
                 minimum_pairs = max(4, _count(config["min_ic_samples"], "config.min_ic_samples", minimum=2))
                 _require(interval["min_pairs_per_replicate"] == minimum_pairs,
                          field, "Bootstrap pair minimum matching the published configuration")
-            if tags == BOOTSTRAP_V2:
+            if tags in (BOOTSTRAP_V2, BOOTSTRAP_V3_P):
                 _require(window <= min(n // 4, ceil(min(3 * sqrt(grid_size), grid_size / 3))),
                          field, "v2 Bootstrap block length within the PPW cap")
                 pattern = interval["missing_pattern"]
@@ -178,7 +213,22 @@ def _verified_interval(
                      field, "effective Bootstrap blocks matching observed pairs and block length")
             _require(bounds is None or (standard_error is not None and standard_error > 0),
                      field, "positive Fisher-z standard error for finite bounds")
-        _require(p_method is None and p_value is None, field, "Bootstrap without a raw p value")
+        _require(p_method is None and p_value is None, field, "Bootstrap without a ledger p value")
+        if request_pvalue:
+            diagnostic = _metric(interval["p_value"], f"{field}.p_value")
+            diagnostic_reason = bootstrap_pvalue_reason(BootstrapInterval(**interval))
+            _require({"p_value", "p_value_reason"} <= raw_interval.keys()
+                     and interval["p_value_reason"] == diagnostic_reason,
+                     field, "the bootstrap p-value reason matching the design")
+            on_lattice = (
+                diagnostic is not None and 0 < diagnostic <= 1
+                and diagnostic == round(diagnostic * (1 + valid)) / (1 + valid)
+            )
+            _require(diagnostic is None if diagnostic_reason is not None else on_lattice,
+                     field, "a bootstrap p value matching the valid replicate count")
+        else:
+            _require(interval["p_value"] is None and interval["p_value_reason"] is None,
+                     field, "legacy Bootstrap without a diagnostic p value")
     else:
         requested = config.get("hac_lag")
         if requested not in (None, "auto"):
@@ -267,7 +317,12 @@ def _verified_interval(
         typed, point_estimate=statistic, point_reason=point_reason, horizon=horizon,
         cross_section_sizes=cross_section_sizes, ic_method="spearman", intervals_verified=time_series,
     )
-    if (
+    evidence = expected.calibration_evidence
+    historical_hac = (
+        not time_series and evidence is not None and evidence.report_ref == _CS_HAC_SIZE_REPORT
+        and _pre_registration_hac_source(code_version, code_version_source)
+    )
+    if historical_hac or (
         time_series and tags == BOOTSTRAP_V2 and expected.calibration_status == "calibrated_pass"
         and use.calibration_status == "uncalibrated"
         and re.fullmatch(r"[0-9a-f]{40}", code_version)

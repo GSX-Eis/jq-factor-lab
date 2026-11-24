@@ -150,10 +150,10 @@ def test_duplicate_timestamp_is_not_silently_aggregated(connection, kind):
 def test_failed_stock_batch_does_not_return_partial_prices(connection):
     class BrokenSecondBatch:
         def __init__(self): self.calls = 0
-        def execute(self, sql):
+        def execute(self, sql, params):
             self.calls += 1
             if self.calls == 2: raise RuntimeError('second batch failed')
-            return connection.execute(sql)
+            return connection.execute(sql, params)
     with pytest.raises(Exception, match='PIT'):
         read_entry('complete', BrokenSecondBatch(), stocks=['A'] + [f'S{i}' for i in range(500)])
 

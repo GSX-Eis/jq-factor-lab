@@ -1,5 +1,6 @@
 """Source-aware empty-bar amounts, independent of factor and field projection."""
 import duckdb
+from market_db_samples import declare_market_db
 import numpy as np
 import pandas as pd
 import pytest
@@ -38,6 +39,7 @@ def test_unknown_normalization_contract_is_rejected(source, frequency):
 def test_local_daily_price_boundary_reads_paused_before_projection(tmp_path, fields):
     path = tmp_path / 'prices.duckdb'
     with duckdb.connect(str(path)) as conn:
+        declare_market_db(conn, 'cn_equity')
         conn.execute("""CREATE TABLE price_data_daily AS SELECT * FROM (VALUES
             ('A', DATE '2022-03-07', 1., 10., 10., 100., 0),
             ('A', DATE '2022-03-08', 2., NULL, NULL, 0., 1),

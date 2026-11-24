@@ -10,7 +10,7 @@ from typing import Any
 import duckdb
 import pandas as pd
 
-from utils.session_calendar import SessionCalendar
+from utils.slots import CalendarSlot
 
 from . import ledger, reader, verifier, writer
 from .schema import (
@@ -32,6 +32,11 @@ class MarketFactorValueStore:
         self.lock_path = self.root / ".ledger.lock"
         self._last_read_plan: FactorReadPlan | None = None
 
+    @classmethod
+    def beside_results_database(cls, path: str | Path) -> MarketFactorValueStore:
+        database = Path(path).expanduser()
+        return cls(database.with_name(f"{database.name}.market-factors"))
+
     @property
     def last_read_plan(self) -> FactorReadPlan | None:
         return self._last_read_plan
@@ -47,7 +52,7 @@ class MarketFactorValueStore:
         df: pd.DataFrame,
         *,
         identity_record: Mapping[str, Any] | None = None,
-        calendar: SessionCalendar | Mapping[str, SessionCalendar] | None = None,
+        calendar: CalendarSlot | Mapping[str, CalendarSlot] | None = None,
         strict_source_build_id: bool = False,
     ) -> FactorWriteReceipt:
         """Validate and idempotently append a single-identity batch; never updates or deletes."""
@@ -68,12 +73,18 @@ class MarketFactorValueStore:
         self,
         factor_id: str | None = None,
         frequency: str | None = None,
+        *,
+        slot_id: str | None = None,
+        factor_identity_hash: str | None = None,
     ) -> pd.DataFrame:
         """List registered factor_value_identities from the append-only ledger (lock-free)."""
-        return reader.list_identities(self.identities_path, factor_id, frequency)
+        return reader.list_identities(
+            self.identities_path, factor_id, frequency, slot_id=slot_id, factor_identity_hash=factor_identity_hash,
+        )
 
     def _committed_shards(self) -> list[dict[str, Any]]:
-        return reader._committed_shards(self._load_committed_state)
+        identities, batches = self._load_committed_state()
+        return reader._committed_shards(identities, batches)
 
     def plan_read(
         self,
@@ -81,6 +92,7 @@ class MarketFactorValueStore:
         factor_id: str | Sequence[str] | None = None,
         factor_identity_hash: str | Sequence[str] | None = None,
         frequency: str | Sequence[str] | None = None,
+        slot_id: str | None = None,
         session_view: str | None = None,
         instruments: Sequence[str] | None = None,
         start_utc: dt.datetime | pd.Timestamp | str | None = None,
@@ -90,10 +102,11 @@ class MarketFactorValueStore:
     ) -> FactorReadPlan:
         """Resolve target partitions and committed Parquet shard paths from the ledger."""
         return reader.plan_read(
-            self.parquet_root, self._load_committed_state, self._committed_shards,
+            self.parquet_root, self._load_committed_state,
             factor_id=factor_id,
             factor_identity_hash=factor_identity_hash,
             frequency=frequency,
+            slot_id=slot_id,
             session_view=session_view,
             instruments=instruments,
             start_utc=start_utc,
@@ -120,6 +133,7 @@ class MarketFactorValueStore:
         factor_id: str | Sequence[str] | None = None,
         factor_identity_hash: str | Sequence[str] | None = None,
         frequency: str | Sequence[str] | None = None,
+        slot_id: str | None = None,
         session_view: str | None = None,
         instruments: Sequence[str] | None = None,
         start_utc: dt.datetime | pd.Timestamp | str | None = None,
@@ -133,6 +147,7 @@ class MarketFactorValueStore:
             factor_id=factor_id,
             factor_identity_hash=factor_identity_hash,
             frequency=frequency,
+            slot_id=slot_id,
             session_view=session_view,
             instruments=instruments,
             start_utc=start_utc,
@@ -143,6 +158,21 @@ class MarketFactorValueStore:
         self._last_read_plan = plan
         return reader.read_factor_values(plan, connection)
 
-    def verify_store(self) -> dict[str, Any]:
+    def read_factor_wide(self, **filters: Any) -> pd.DataFrame:
+        """Pivot UTC timestamps into columns keyed by factor, identity and instrument."""
+        frame = self.read_factor_values(**filters)
+        return frame.pivot(
+            index="timestamp_utc",
+            columns=["factor_id", "factor_identity_hash", "instrument_id"],
+            values="factor_value",
+        ).sort_index(axis=1)
+
+    def verify_store(
+        self, *, factor_id: str | None = None, frequency: str | None = None,
+        slot_id: str | None = None, factor_identity_hash: str | None = None,
+    ) -> dict[str, Any]:
         """Read-only consistency check reconciling disk shards and staging with JSONL ledger."""
-        return verifier.verify_store(self.root, self.parquet_root, self.identities_path, self.batches_path)
+        return verifier.verify_store(
+            self.root, self.parquet_root, self.identities_path, self.batches_path,
+            factor_id=factor_id, frequency=frequency, slot_id=slot_id, factor_identity_hash=factor_identity_hash,
+        )

@@ -2,10 +2,10 @@
 from __future__ import annotations
 
 from collections.abc import Hashable, Iterable, Mapping
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from numbers import Integral, Real
 from threading import Lock
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
 import pandas as pd
@@ -21,13 +21,17 @@ from backtest_and_analysis.evaluation.panel import EvaluationPanel
 from backtest_and_analysis.evaluation.split import SplitConfig, SplitEvaluation, _validate_split_order
 from backtest_and_analysis.evaluation.time_series import summarize_time_series_horizon
 from backtest_and_analysis.evaluation.types import (
-    BOOTSTRAP_FIXED, BOOTSTRAP_V1, BOOTSTRAP_V2,
+    BOOTSTRAP_FIXED, BOOTSTRAP_V1, BOOTSTRAP_V2, BOOTSTRAP_V3_P,
     AdaptiveCalibrationObservation, CalibrationEvidence, CrossSectionResult, IntervalUsability,
-    TimeSeriesInstrument, TimeSeriesResult, interval_usability_payload,
+    TimeSeriesInstrument, TimeSeriesResult, bootstrap_interval_payload, interval_usability_payload,
 )
 
 from .contracts import ContractValidationError, _numeric_column
 from .labels import BarReturnLabeler, _grid
+
+if TYPE_CHECKING:
+    from utils.session_calendar import View
+    from utils.slots import CalendarSlot
 
 _SelectionWindow = tuple[Literal['full', 'train'], SplitConfig | None]
 
@@ -137,7 +141,26 @@ class BarTrialFamily:
         )
 
 
-def _bar_panel(labels: pd.DataFrame, labeler: BarReturnLabeler, frequency: str, *,
+@dataclass(frozen=True)
+class _SlotEvaluationGrid:
+    calendar: CalendarSlot
+    view: View
+    bucket_strategy: str | None
+    horizons: tuple[int, ...]
+
+    def between(self, frequency: str, first: pd.Timestamp, last: pd.Timestamp) -> tuple[pd.DatetimeIndex, pd.DatetimeIndex]:
+        from backtest_and_analysis.evaluation.labels import _LabelAxis
+        from utils.time_axis import Frequency
+
+        parsed = Frequency.parse(frequency)
+        start, end = (self.calendar.session_at(stamp, self.view, frequency=parsed).session_date
+                      for stamp in (first, last))
+        grid = self.calendar.bar_grid(parsed, start, end, view=self.view, bucket_strategy=self.bucket_strategy)
+        axis = _LabelAxis.from_slot_grid(self.calendar, grid, parsed, self.view, self.bucket_strategy)
+        return axis.keys, axis.ends
+
+
+def _bar_panel(labels: pd.DataFrame, labeler: BarReturnLabeler | _SlotEvaluationGrid, frequency: str, *,
                scheduled_exits: bool = False, by_availability: bool = False) -> tuple[
                    EvaluationPanel, np.ndarray, np.ndarray, pd.DatetimeIndex,
                    dict[int, np.ndarray], dict[int, np.ndarray],
@@ -148,7 +171,10 @@ def _bar_panel(labels: pd.DataFrame, labeler: BarReturnLabeler, frequency: str, 
     for instrument, group in labels.groupby('instrument_id', sort=True):
         calendar = labeler.calendar[instrument] if isinstance(labeler.calendar, Mapping) else labeler.calendar
         first, last = group.signal_timestamp.min(), group.signal_timestamp.max()
-        starts, ends, _ = _grid(calendar, frequency, first, last, labeler.view, labeler.bucket_strategy)
+        if isinstance(labeler, _SlotEvaluationGrid):
+            starts, ends = labeler.between(frequency, first, last)
+        else:
+            starts, ends, _ = _grid(calendar, frequency, first, last, labeler.view, labeler.bucket_strategy)
         keep = (starts >= first) & (starts <= last)
         starts, ends = starts[keep], ends[keep]
         signals = group.drop_duplicates('signal_timestamp').set_index('signal_timestamp')
@@ -214,7 +240,7 @@ def _time_series_rows(stats: TimeSeriesResult, instrument: str, frequency: str) 
             instrument_id=instrument, frequency=frequency, horizon_bars=h,
             grid_start_utc=stats.datetimes[0], grid_end_utc=stats.datetimes[-1],
             intervals_verified=stats.intervals_verified, ic=ic,
-            bootstrap=asdict(row.bootstrap), interval_usability=interval_usability_payload(usability),
+            bootstrap=bootstrap_interval_payload(row.bootstrap), interval_usability=interval_usability_payload(usability),
             direction=asdict(row.direction), return_distribution=asdict(row.returns),
             quantile_reason=stats.quantile_reasons[0],
             buckets={q: dict(direction=asdict(row.direction_by_bucket[q]), return_distribution=asdict(dist))
@@ -487,7 +513,7 @@ def _record_trials(family: BarTrialFamily, rows: list[dict[str, Any]], *,
 
 def build_bar_splits(
     groups: Iterable[tuple[str, str | None, dict[str, SplitEvaluation]]],
-    *, horizons: tuple[int, ...], mode: str, split: SplitConfig | None,
+    *, horizons: tuple[int, ...], mode: str, split: SplitConfig | None, publish_turnover: bool = False,
 ) -> dict[str, dict[str, Any]]:
     """Assemble split reports from existing engine statistics."""
     time_series = mode == 'time_series'
@@ -515,6 +541,12 @@ def build_bar_splits(
                     instrument_stats[name].setdefault((frequency, h), {}).update(horizon.instruments)
                 rows = _time_series_rows(stats, instrument, frequency)
             else:
+                if publish_turnover:
+                    report.setdefault('turnover', {})[frequency] = dict(
+                        session_close_utc=stats.datetimes.tolist(),
+                        quantiles=list(range(1, stats.turnover.shape[1] + 1)),
+                        values=stats.turnover.tolist(),
+                    )
                 rows = _cross_section_rows(stats, frequency)
             for row in rows:
                 h = row['horizon_bars']
@@ -532,6 +564,8 @@ def build_bar_splits(
                     non_overlapping_ic_summary={offset: asdict(ic)
                                                 for offset, ic in summary.non_overlapping_ic_summary.items()},
                 ))
+                if any(row.bootstrap.method_version == BOOTSTRAP_V3_P[0] for row in instruments.values()):
+                    summaries[-1].update(p_value=summary.p_value, p_value_reason=summary.p_value_reason)
             report['instrument_ic_summaries'] = summaries
 
     return splits

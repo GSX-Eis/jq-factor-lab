@@ -9,6 +9,8 @@ import subprocess
 import sys
 
 import duckdb
+
+from market_db_samples import declare_market_db
 import pandas as pd
 import pytest
 
@@ -22,6 +24,7 @@ ROOT = Path(__file__).resolve().parents[1]
 def test_daily_harness_preserves_execution_and_persisted_evaluation(tmp_path, monkeypatch):
     input_db, result_db = (tmp_path / name for name in ("input.duckdb", "result.duckdb"))
     with duckdb.connect(str(input_db)) as connection:
+        declare_market_db(connection, 'cn_equity')
         seed_calendar(connection, "2024-01-01", "2024-01-31")
         connection.execute("""
             CREATE TABLE price_data_daily AS
@@ -89,13 +92,14 @@ def test_daily_harness_preserves_execution_and_persisted_evaluation(tmp_path, mo
     assert [row[5] for row in rows] == pytest.approx([0.0, -.01, .01] * len(dates), abs=1e-12, rel=0)
 
 
-def test_joinquant_bundle_matches_s6a_sha256(tmp_path, monkeypatch):
+def test_joinquant_bundle_matches_stage6_sha256(tmp_path, monkeypatch):
     class FixedClock(datetime):
         @classmethod
         def now(cls, tz=None):
             return cls(2024, 1, 2, 3, 4, 5, tzinfo=tz)
 
     monkeypatch.setattr(assembler, "datetime", FixedClock)
+    monkeypatch.delenv("FP_KEEP_LOGS", raising=False)
     source = tmp_path / "s6_factor.py"
     source.write_text(
         "from utils.factor_base import FactorBase\n"
@@ -113,9 +117,20 @@ def test_joinquant_bundle_matches_s6a_sha256(tmp_path, monkeypatch):
         "--public", "--factor-files", str(source), "--factors", "S6Return",
         "--requirements", str(requirements), "--single-file", "--out", str(bundle),
     ]) == 0
-    digest = sha256(bundle.read_bytes()).hexdigest()
-    print(f"JoinQuant strategy SHA-256 {digest} ({bundle.stat().st_size} bytes)")
-    assert digest == "6915c894bb77e8b73e48d71a94859235c4a4d32aa47c71fd090983618ae25917"
+    artifact = bundle.read_bytes()
+    tree = ast.parse(artifact, filename=str(bundle), feature_version=(3, 6))
+    allowed_imports = sys.stdlib_module_names | {"duckdb", "jqdata", "jqfactor", "numba", "numpy", "pandas", "scipy"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            assert all(alias.name.split(".")[0] in allowed_imports for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            if node.level:
+                assert node.level == 1 and node.module in {"duckdb_adapter", "dynamic_stock_pool"}
+            else:
+                assert (node.module or "").split(".")[0] in allowed_imports
+
+    # NERE-1227 changes the S6a digest (6915c894...) solely through inlined factor_runtime.py bar support.
+    assert sha256(artifact).hexdigest() == "29e0e431d0c0369bd7fb169884c497493f7e0f76dbf46cd577735b8980e469b8"
 
 
 def test_daily_adapter_has_no_alphalens_import():

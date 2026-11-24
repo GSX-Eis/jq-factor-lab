@@ -2,11 +2,14 @@
 import hashlib
 import json
 from pathlib import Path
+import pickle
 
 import pandas as pd
+import pandas_market_calendars as pmc
 import pytest
 
 from utils.session_calendar import DEFAULT_OVERRIDES, SessionCalendar
+from utils.time_axis import BarSchedule
 from utils.trading_calendar import CalendarCoverageError, TradingCalendar
 
 
@@ -21,7 +24,7 @@ def nq():
 
 @pytest.fixture(scope='module')
 def ashare():
-    return SessionCalendar()
+    return SessionCalendar('XSHG', '2016-01-04', '2026-09-30')
 
 
 @pytest.mark.parametrize('day,opening,closing,overnight,maintenance,next_open', [
@@ -110,7 +113,7 @@ def test_etc_utc_accepted(ashare):
     assert ashare.session_at(pd.Timestamp('2026-09-30 02:00', tz='Etc/UTC')) is not None
 
 
-@pytest.mark.parametrize('frequency', ['0min', '-1min', 'bad', '', '7min', None, 5])
+@pytest.mark.parametrize('frequency', ['0min', '-1min', 'bad', '', '1month', None, 5])
 def test_frequency_validation(ashare, frequency):
     with pytest.raises(ValueError):
         ashare.expected_bar_opens('2026-09-30', frequency)
@@ -210,3 +213,119 @@ def test_reject_invalid_corrections(tmp_path, entry):
     path.write_text(json.dumps({'schema_version': 1, 'calendars': {'XSHG': {'special_sessions': [entry]}}}))
     with pytest.raises(ValueError):
         SessionCalendar('XSHG', '2026-09-30', '2026-09-30', overrides_path=path)
+
+
+def test_verified_date_operations_match_master_exactly():
+    verified = SessionCalendar.from_pmc()
+    assert len(verified.sessions()) == 2611
+    # Frozen identity supplied by the independently cross-checked pre-S1 calendar.
+    assert verified.fingerprint == 'efd8f921da9c8ae20aec39c7c3c73502ad470c8051851133e7af17a9ac0703ea'
+    core = SessionCalendar('XSHG', '2024-09-27', '2024-10-09')
+    expected = pd.DatetimeIndex(['2024-09-27', '2024-09-30', '2024-10-08', '2024-10-09'])
+    explicit = SessionCalendar.from_sessions(expected, '2024-09-27', '2024-10-09')
+    legacy = TradingCalendar(expected, '2024-09-27', '2024-10-09')
+    price = pd.DataFrame({'close': [3.1, 12.5]}, index=expected[[0, -1]].rename('date'))
+    aligned = pd.DataFrame({'close': [3.1, float('nan'), float('nan'), 12.5]}, index=expected.rename('date'))
+    for cal in (core, explicit, legacy, verified):
+        pd.testing.assert_index_equal(cal.sessions('2024-09-27', '2024-10-09'), expected, exact=True)
+        pd.testing.assert_index_equal(cal.previous_sessions('2024-10-08', 2), expected[:2], exact=True)
+        pd.testing.assert_index_equal(cal.next_sessions('2024-09-30', 2), expected[2:], exact=True)
+        pd.testing.assert_frame_equal(cal.align(price), aligned, check_exact=True)
+    assert explicit.fingerprint == legacy.fingerprint
+    with pytest.raises(ValueError, match='verified dates only'):
+        explicit.bar_grid('1d')
+
+
+def test_legacy_calendar_pickle_state_keeps_verified_dates():
+    old = TradingCalendar(['2026-01-05', '2026-01-06'], '2026-01-05', '2026-01-06')
+    days, fingerprint = old.sessions(), old.fingerprint
+    old.__dict__['_sessions'] = old.__dict__.pop('_session_dates')
+    restored = pickle.loads(pickle.dumps(old))
+    pd.testing.assert_index_equal(restored.sessions(), days, exact=True)
+    assert restored.fingerprint == fingerprint
+
+
+def test_custom_sessions_overnight_dst_and_holiday_overrides():
+    cal = SessionCalendar('custom_fx', '2026-03-06', '2026-03-11', custom_sessions={
+        'timezone': 'America/New_York',
+        'weekdays': [0, 1, 2, 3, 4],
+        'dates': ['2026-03-07'],
+        'segments': [{'open': '17:00', 'close': '16:00'}],
+        'overrides': {'2026-03-09': [{'open': '17:00', 'close': '12:00'}], '2026-03-10': None},
+    })
+    expected = pd.DataFrame({
+        'timestamp_utc': pd.to_datetime(['2026-03-06 21:00', '2026-03-07 21:00',
+                                        '2026-03-09 16:00', '2026-03-11 20:00'], utc=True),
+        'session_id': ['2026-03-06', '2026-03-07', '2026-03-09', '2026-03-11'],
+    })
+    pd.testing.assert_frame_equal(cal.bar_grid('1d'), expected, check_exact=True)
+    assert cal.session_at(ts('2026-03-06 22:00')).session_date == '2026-03-07'
+    assert cal.session_at(ts('2026-03-08 21:00')).session_date == '2026-03-09'
+    assert cal.session_at(ts('2026-03-09 16:00')) is None
+    assert cal.session_at(ts('2026-03-09 22:00')) is None
+    assert cal.session_at(ts('2026-03-11 18:00'), frequency='1d') is None
+    for row in expected.itertuples():
+        assert cal.session_at(row.timestamp_utc, frequency='1d').session_date == row.session_id
+
+
+def test_custom_anchor_local_time_and_invalid_dst():
+    template = {'timezone': 'America/New_York', 'dates': ['2026-03-08'],
+                'segments': [{'open': '01:00', 'close': '04:00'}]}
+    cal = SessionCalendar('custom', '2026-03-08', '2026-03-08', custom_sessions=template, daily_anchor='03:30')
+    timestamp = ts('2026-03-08 07:30')
+    assert cal.bar_grid('1d').timestamp_utc.tolist() == [timestamp]
+    assert cal.session_at(timestamp, frequency='1d').session_date == '2026-03-08'
+    template['segments'][0]['open'] = '02:30'
+    with pytest.raises(ValueError, match='nonexistent'):
+        SessionCalendar('custom', '2026-03-08', '2026-03-08', custom_sessions=template)
+
+
+@pytest.mark.parametrize('name', ['24/7', '24/5', 'FOREX', 'NYSE', 'JPX', 'CME Globex Equity'])
+def test_global_pmc_daily_grid_round_trips(name):
+    cal = SessionCalendar(name, '2026-03-06', '2026-03-12')
+    daily = cal.bar_grid('1d')
+    assert not daily.empty
+    for row in daily.itertuples():
+        assert cal.session_at(row.timestamp_utc, frequency='1d').session_date == row.session_id
+    if name in ('24/7', '24/5'):
+        monday = daily.loc[daily.session_id == '2026-03-09', 'timestamp_utc'].iloc[0]
+        assert cal.session_at(monday).session_date == '2026-03-10'
+
+
+@pytest.mark.parametrize('name', pmc.get_calendar_names())
+def test_all_pmc_names_load(name):
+    cal = SessionCalendar(name, '2026-03-09', '2026-03-12')
+    assert cal.sessions().is_monotonic_increasing
+
+
+@pytest.mark.parametrize('day,close', [('2026-03-10', '19:00'), ('2026-12-10', '20:00')])
+def test_santiago_uses_dynamic_exchange_closes(day, close):
+    cal = SessionCalendar('XSGO', day, day)
+    assert cal.bar_grid('1d').timestamp_utc.tolist() == [ts(f'{day} {close}')]
+
+
+def test_wall_clock_anchor_round_trips_without_validating_unrelated_early_close():
+    cal = SessionCalendar('NYSE', '2026-11-23', '2026-11-27', daily_anchor='15:30')
+    schedule = BarSchedule(cal, '1d')
+    grid = schedule.grid('2026-11-23', '2026-11-23')
+    key = ts('2026-11-23 20:30')
+    assert grid.timestamp_utc.tolist() == [key]
+    assert cal.session_at(key, frequency='1d').session_date == '2026-11-23'
+    assert schedule.available_at(key) == ts('2026-11-23 21:00')
+    assert cal.session_at(ts('2026-11-27 20:30'), frequency='1d') is None
+    with pytest.raises(ValueError, match='outside the trading session 2026-11-27'):
+        schedule.grid('2026-11-27', '2026-11-27')
+
+
+@pytest.mark.parametrize('day,close,has_break', [
+    ('2000-05-19', '06:00', True),
+    ('2000-05-22', '06:00', False),
+    ('2026-03-09', '06:30', False),
+])
+@pytest.mark.parametrize('view', ['ETH', 'RTH'])
+def test_xkrx_grid_respects_lunch_break_discontinuation(day, close, has_break, view):
+    cal = SessionCalendar('XKRX', day, day)
+    expected = pd.date_range(ts(f'{day} 00:00'), ts(f'{day} {close}'), freq='min', inclusive='left')
+    if has_break:
+        expected = expected[(expected < ts(f'{day} 03:00')) | (expected >= ts(f'{day} 04:00'))]
+    pd.testing.assert_index_equal(cal.expected_bar_opens(day, '1min', view=view), expected.rename('start_utc'))

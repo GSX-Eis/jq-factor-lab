@@ -11,7 +11,13 @@ import logging
 from typing import List, Dict, Any, Optional, Tuple, Union
 import warnings
 from dataclasses import dataclass
+from collections.abc import Mapping
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
+
+from utils.market_factor import MarketFactorValueStore
+from utils.slots import MarketSlot
+from .factor_reader import FactorReader
 
 # Machine learning imports
 from sklearn.linear_model import Lasso, Ridge
@@ -38,6 +44,8 @@ warnings.filterwarnings('ignore', category=UserWarning)
 def _labels_available(available_at, cutoff):
     """Shared deployment/purge rule: equality is observable after the close."""
     values = pd.DatetimeIndex(available_at)
+    if values.isna().all():
+        return values.notna()
     return values.notna() & (values <= cutoff)
 
 
@@ -111,8 +119,14 @@ class FactorComposer:
     def __init__(
         self,
         config: SynthesisConfig,
-        factor_reader,  # FactorReader instance
-        logger: Optional[logging.Logger] = None
+        factor_reader=None,
+        logger: Optional[logging.Logger] = None,
+        *,
+        slot: MarketSlot | None = None,
+        slot_id: str | None = None,
+        frequency: str | None = None,
+        factor_values_store: MarketFactorValueStore | str | Path | None = None,
+        factor_identities: Mapping[str, str] | None = None,
     ):
         """
         Initialize the FactorComposer.
@@ -123,8 +137,26 @@ class FactorComposer:
             logger: Optional logger instance
         """
         self.config = config
-        self.factor_reader = factor_reader
         self.logger = logger or logging.getLogger(__name__)
+        if any(value is not None for value in (slot, slot_id, frequency, factor_values_store, factor_identities)):
+            if factor_reader is None:
+                if factor_values_store is None:
+                    raise ValueError("Supply factor_values_store when constructing a composer without a reader")
+                factor_reader = FactorReader(
+                    str(factor_values_store.root if isinstance(factor_values_store, MarketFactorValueStore)
+                        else factor_values_store),
+                    logger=self.logger, data_bindings={}, slot=slot, slot_id=slot_id,
+                    frequency=frequency or "1d", factor_values_store=factor_values_store,
+                    factor_identities=factor_identities,
+                )
+            elif isinstance(factor_reader, FactorReader):
+                factor_reader = factor_reader.with_market_input(
+                    slot=slot, slot_id=slot_id, frequency=frequency,
+                    factor_values_store=factor_values_store, factor_identities=factor_identities,
+                )
+            else:
+                raise TypeError("A configurable FactorReader is required for explicit market inputs")
+        self.factor_reader = factor_reader
         
         # Check LightGBM availability if needed
         if config.method == "lightgbm" and not LIGHTGBM_AVAILABLE:
@@ -260,23 +292,33 @@ class FactorComposer:
             f"from {start_date} to {end_date}"
         )
         
-        # Load factor data
+        # Scheme B pins one read plan for the entire input panel.
         factor_data = {}
-        for factor_name in input_factor_names:
-            factor_df = self.factor_reader.get_factor_values(
-                factor_name=factor_name,
-                start_date=start_date,
-                end_date=end_date,
-                stock_pool=stock_pool
-            )
-            
+        sources = {}
+        if isinstance(self.factor_reader, FactorReader):
+            panels = self.factor_reader.get_multiple_factors(input_factor_names, start_date, end_date, stock_pool)
+        else:
+            panels = {
+                name: self.factor_reader.get_factor_values(
+                    factor_name=name, start_date=start_date, end_date=end_date, stock_pool=stock_pool,
+                ) for name in input_factor_names
+            }
+        for factor_name, factor_df in panels.items():
             if not factor_df.index.is_unique or not factor_df.columns.is_unique:
                 raise ValueError(f"duplicate factor keys: {factor_name}")
             if factor_df.empty:
                 self.logger.warning(f"No data found for factor {factor_name}")
                 continue
                 
-            factor_data[factor_name] = factor_df
+            if calendar.tz is not None and isinstance(self.factor_reader, FactorReader):
+                if not factor_df.index.isin(calendar).all():
+                    raise ValueError("factor timestamps must belong to trading_calendar")
+                # Scheme B intraday keys mark the start of the completed source bar.
+                factor_data[factor_name] = factor_df.reindex(calendar).shift(1)
+            else:
+                factor_data[factor_name] = factor_df
+            for source in factor_df.attrs.get("market_factor_inputs", {}).get("factors", []):
+                sources[source["factor_id"]] = source
         
         if not factor_data:
             self.logger.error("No valid factor data found")
@@ -296,7 +338,13 @@ class FactorComposer:
         aligned_returns["available_at"] = pd.to_datetime(availability["target_return"])
         if not aligned_factors["date"].isin(calendar).all():
             raise ValueError("factor dates must belong to trading_calendar")
-        calendar = calendar[(calendar >= pd.Timestamp(start_date)) & (calendar <= pd.Timestamp(end_date))]
+        if calendar.tz is None:
+            calendar = calendar[(calendar >= pd.Timestamp(start_date)) & (calendar <= pd.Timestamp(end_date))]
+        elif getattr(self.factor_reader, "slot", None) is not None:
+            from .core.pool_manager import market_bar_grid
+
+            grid = market_bar_grid(self.factor_reader.slot, self.factor_reader.frequency, start_date, end_date)
+            calendar = calendar[calendar.isin(grid.timestamp_utc)]
 
         # Perform rolling window synthesis
         composite_factor_df = self._rolling_window_synthesis(
@@ -311,6 +359,7 @@ class FactorComposer:
         self.synthesis_results[composite_factor_name] = {
             "factor_data": composite_factor_df,
             "input_factors": input_factor_names,
+            "market_factor_inputs": list(sources.values()),
             "method": self.config.method,
             "config": self.config,
             "training_history": list(self.training_history),

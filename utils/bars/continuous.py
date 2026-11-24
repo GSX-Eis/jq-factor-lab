@@ -21,6 +21,29 @@ if TYPE_CHECKING:
     from backtest_and_analysis.time_series.labels import BarReturnLabeler
 
 
+def apply_roll_adjustments(connection, bars: pd.DataFrame, plans: list[dict],
+                           metadata: Mapping[str, dict], adjust: str) -> None:
+    """Apply the caller's eligible roll chain in reverse effective order."""
+    if adjust == 'none':
+        return
+    for plan in reversed(plans):
+        old, new = plan['from_contract'], plan['to_contract']
+        mask = bars.session_id.lt(plan['effective_session_id'])
+        if pd.isna(old) or old == new:
+            continue
+        prices = [
+            session_close(connection, dict(metadata[contract], instrument_id=contract),
+                          plan['decision_session_id'], 'close')['value']
+            for contract in (old, new)
+        ]
+        if min(prices) <= 0:
+            raise ValueError('Roll adjustment requires positive decision closes')
+        if adjust == 'ratio_back_adjust':
+            bars.loc[mask, list(PRICE_COLUMNS)] *= prices[1]/prices[0]
+        else:
+            bars.loc[mask, list(PRICE_COLUMNS)] += prices[1]-prices[0]
+
+
 class ContinuousBarSource(BarSource):
     def read(self, product_root: str, frequency: str, start, end, view: str = 'ETH', *,
              adjust: str) -> pd.DataFrame:
@@ -122,23 +145,8 @@ class ContinuousBarSource(BarSource):
         if len(strategies) != 1:
             raise ValueError(f'Continuous frequency={frequency} requires one shared bucket_strategy')
         result = pd.concat(frames, ignore_index=True).sort_values('timestamp_utc').reset_index(drop=True)
-        if adjust != 'none':
-            # Only effective Sessions selected above enter the adjustment chain.
-            for plan in reversed(used):
-                old, new = plan['from_contract'], plan['to_contract']
-                if pd.isna(old) or old == new:
-                    continue
-                prices = []
-                for contract in (old, new):
-                    row = dict(by_id[contract], instrument_id=contract)
-                    prices.append(session_close(self.connection, row, plan['decision_session_id'], 'close')['value'])
-                if min(prices) <= 0:
-                    raise ValueError('Roll adjustment requires positive decision closes')
-                mask = result.session_id.lt(plan['effective_session_id'])
-                if adjust == 'ratio_back_adjust':
-                    result.loc[mask, list(PRICE_COLUMNS)] *= prices[1]/prices[0]
-                else:
-                    result.loc[mask, list(PRICE_COLUMNS)] += prices[1]-prices[0]
+        # Only effective Sessions selected above enter the adjustment chain.
+        apply_roll_adjustments(self.connection, result, used, by_id, adjust)
         _record_raw_coverage(result)
         result.attrs.update(session_view=view, calendar_hash={product_root: cal.calendar_hash},
             continuous=dict(product_root=product_root, adjust=adjust, frequency=frequency,
@@ -171,24 +179,33 @@ class ContinuousBarSource(BarSource):
             requests = [(contract, entry, bars.timestamp_utc.min(), bars.timestamp_utc.max())]
             warn_quality(self.connection, frequency, requests)
             raw = raw.assign(instrument_id=root)
-            # The request bounds classify a hole after rolling as missing_bar, not a new contract.
-            raw.attrs = dict(bars.attrs)
+            signals = pd.DatetimeIndex(group.timestamp_utc)
+            if signal_timestamps is not None:
+                signals = signals.intersection(pd.DatetimeIndex(signal_timestamps))
             incomplete_signals = None
             if factors is None:
                 raw = raw.merge(group[['timestamp_utc', 'factor_value']], on='timestamp_utc', how='left')
-                raw.attrs = dict(bars.attrs)
                 if 'is_complete' in group:
                     # Signal quality belongs to the continuous snapshot. Held Bar quality is raw.
                     complete = group.is_complete.eq(True).to_numpy(dtype=bool, na_value=False)
                     incomplete_signals = pd.DatetimeIndex(group.timestamp_utc[~complete])
-            signals = pd.DatetimeIndex(group.timestamp_utc)
-            if signal_timestamps is not None:
-                signals = signals.intersection(pd.DatetimeIndex(signal_timestamps))
+            elif labeler.factor_keys_only:
+                # Keep snapshot signal slots eligible while marking their execution prices missing.
+                missing_signals = group.loc[
+                    group.timestamp_utc.isin(signals.difference(raw.timestamp_utc)),
+                    ['timestamp_utc', 'instrument_id', 'frequency', 'source', 'data_version'],
+                ]
+                if not missing_signals.empty:
+                    raw = pd.concat([raw.assign(is_complete=raw.get('is_complete', True)),
+                                     missing_signals.assign(volume=0., is_complete=False)], ignore_index=True)
+            # Use the snapshot's request coverage to classify holes across a roll.
+            raw.attrs = dict(bars.attrs)
             from backtest_and_analysis.time_series.labels import BarReturnLabeler
             concrete_labeler = BarReturnLabeler(calendar, view=labeler.view,
                 horizons=labeler.horizons, entry_offset_bars=labeler.entry_offset_bars,
                 boundary_policy=labeler.boundary_policy, bucket_strategy=labeler.bucket_strategy,
-                continuous_source=self, include_scheduled_exit=labeler.include_scheduled_exit)
+                continuous_source=self, include_scheduled_exit=labeler.include_scheduled_exit,
+                factor_keys_only=labeler.factor_keys_only)
             # Raw Bars deliberately drop the continuous marker to prevent recursive dispatch.
             raw = raw.drop(columns='contract_id', errors='ignore')
             tables.append(concrete_labeler.label(raw, factors, signal_timestamps=signals,

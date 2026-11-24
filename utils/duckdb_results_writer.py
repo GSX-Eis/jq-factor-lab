@@ -7,9 +7,8 @@ with optional Parquet export for factor_values. It mirrors the functionality of
 ResultWriter and MonthlyPoolResultWriter while providing better write performance.
 
 Key Features:
-    - Write factor_analysis_results, factor_values, factor_monthly_results and
-      monthly_pool_results to DuckDB
-    - Parquet export with year/month partitioning for factor_values
+    - Write factor_analysis_results, factor_monthly_results and monthly_pool_results to DuckDB
+    - Preserve explicit historical factor_values and versioned publication APIs
     - Thread-safe operations using DuckDB's built-in concurrency
 
 Usage:
@@ -21,7 +20,6 @@ Usage:
     )
     
     writer.write_factor_analysis_results(factor_name, results)
-    writer.save_factor_values(factor_df, factor_name)
 """
 
 import os
@@ -33,10 +31,10 @@ import re
 import threading
 from numbers import Real
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, List, Optional, Any, Union, Iterator
+from typing import Dict, List, Optional, Any, Union, Iterator, Callable
 from backtest_and_analysis.forward_returns_calculator import newey_west_mean_test
 
 try:
@@ -113,6 +111,12 @@ class DuckDBWriteSession:
     wait_seconds: float
     lock_path: Path
     last_error: str = ""
+    _discard_callback: Optional[Callable[[], None]] = field(default=None, repr=False, compare=False)
+
+    def discard_new_store(self) -> None:
+        """Mark an unpopulated store created by this session for pre-unlock removal."""
+        if self._discard_callback is not None:
+            self._discard_callback()
 
 
 @contextmanager
@@ -146,7 +150,21 @@ def acquire_exclusive_write_conn(
                 retry_count += 1
                 time.sleep(retry_interval_sec)
 
+        created_db = False
+        discard_new_store = False
+        yielded = False
+
+        def mark_discard_new_store() -> None:
+            nonlocal discard_new_store
+            discard_new_store = True
+
         try:
+            # Re-verify under the write lock before opening DuckDB, in case another
+            # writer created a SQLite file after the pre-lock check.
+            _reject_sqlite_file(db_path)
+            # Check existence under the write lock so we never remove a store published
+            # by another writer before lock acquisition.
+            created_db = not db_path.exists()
             while True:
                 try:
                     conn = duckdb.connect(str(db_path), read_only=False)
@@ -160,17 +178,25 @@ def acquire_exclusive_write_conn(
 
             conn.execute("SET memory_limit='3GB'")
             conn.execute("SET threads=2")
+            yielded = True
             yield DuckDBWriteSession(
                 conn=conn,
                 retry_count=retry_count,
                 wait_seconds=round(time.monotonic() - started, 3),
                 lock_path=lock_path,
                 last_error=last_error,
+                _discard_callback=mark_discard_new_store,
             )
         finally:
-            if conn is not None:
-                conn.close()
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            try:
+                if conn is not None:
+                    conn.close()
+                if created_db and (discard_new_store or not yielded):
+                    db_path.unlink(missing_ok=True)
+                    Path(f"{db_path}.wal").unlink(missing_ok=True)
+            finally:
+                # Keep lock_path intact for waiting writers and unlock only after cleanup.
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 class DuckDBResultsWriter:
@@ -860,6 +886,15 @@ class DuckDBResultsWriter:
         result['return'] = result['return'].where(result['return'].notna(), np.nan).astype(float)
         return result
 
+    def publish_factor_values(self, factor_df: pd.DataFrame, factor_name: str, *, duckdb_conn=None) -> int:
+        """Publish an explicitly versioned snapshot for frozen data bindings."""
+        if not self.publication_metadata:
+            raise RuntimeError("Versioned publication requires publication_metadata")
+        return self._publish_frame(
+            self._prepare_factor_values_frame(factor_df, factor_name),
+            self.factor_values_table, factor_name, duckdb_conn,
+        )
+
     def save_factor_values(
         self,
         factor_df: pd.DataFrame,
@@ -869,6 +904,7 @@ class DuckDBResultsWriter:
         duckdb_conn: Any = None,
         allow_fallback: Optional[bool] = None,
         date_range: Optional[tuple[str, str]] = None,
+        allow_legacy_factor_values_write: bool = False,
     ) -> int:
         """
         Save factor values to DuckDB and optionally export to Parquet.
@@ -886,6 +922,11 @@ class DuckDBResultsWriter:
             factor_name: Name of the factor
             skip_parquet: If True, skip Parquet export for faster writes
         """
+        if allow_legacy_factor_values_write is not True:
+            raise RuntimeError(
+                "Legacy DuckDB factor_values writes are disabled. Use MarketFactorValueStore "
+                "or the agent harness write-factor-values command."
+            )
         import time
         start_time = time.time()
         
@@ -1237,29 +1278,3 @@ class DuckDBResultsWriter:
                 'long_short_return': period_returns[highest_q] - period_returns[lowest_q],
             }
         return monthly_returns
-
-if __name__ == "__main__":
-    # Test the writer
-    import argparse
-    
-    parser = argparse.ArgumentParser(description="Test DuckDB results writer")
-    parser.add_argument("--db", default="./test_results.duckdb")
-    parser.add_argument("--parquet", default="./test_parquet/")
-    
-    args = parser.parse_args()
-    
-    writer = DuckDBResultsWriter(
-        duckdb_path=args.db,
-        parquet_dir=args.parquet
-    )
-    
-    # Create test data
-    dates = pd.date_range('2023-01-01', periods=10, freq='D')
-    factor_df = pd.DataFrame(
-        np.random.randn(10, 5),
-        index=dates,
-        columns=['000001.SZ', '000002.SZ', '000003.SZ', '000004.SZ', '000005.SZ']
-    )
-    
-    writer.save_factor_values(factor_df, 'test_factor')
-    print("Test completed successfully!")

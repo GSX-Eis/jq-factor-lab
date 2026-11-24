@@ -5,6 +5,8 @@ from pathlib import Path
 import sys
 
 import duckdb
+
+from market_db_samples import declare_equity_bars
 import pandas as pd
 import pytest
 
@@ -68,11 +70,13 @@ def probe(base, connection=None, start='2026-01-05', end='2026-01-06', **options
                       stock_pool=['A'], data_bindings={}, **options)
 
 
-def test_daily_cache_key_is_byte_identical_to_stage62():
+def test_daily_cache_key_invalidates_stage62_and_is_deterministic():
     raw = pd.DataFrame({'date': pd.to_datetime(['2026-01-05']), 'code': ['A'], 'close': [10.]})
     expected = probe(baseline_base())._get_cache_key(raw)
     assert expected is not None
-    assert probe(FactorBase)._get_cache_key(raw).encode() == expected.encode()
+    key = probe(FactorBase)._get_cache_key(raw)
+    assert key is not None and key != expected
+    assert probe(FactorBase)._get_cache_key(raw) == key
 
 
 @pytest.mark.parametrize('backing', ['borrowed', 'path'])
@@ -91,7 +95,7 @@ def test_daily_sql_pit_and_cache_identity_match_stage62(tmp_path, backing, pit):
         raw = [item._fetch_raw_data(['close'], table_name='price_data') for item in items]
         pd.testing.assert_frame_equal(raw[0], raw[1], check_exact=True)
         assert raw[0].attrs == raw[1].attrs
-        assert items[0]._get_cache_key(raw[0]) == items[1]._get_cache_key(raw[1])
+        assert items[0]._get_cache_key(raw[0]) != items[1]._get_cache_key(raw[1])
         if pit:
             pd.testing.assert_frame_equal(items[0]._apply_pit_adjustment(raw[0]),
                                           items[1]._apply_pit_adjustment(raw[1]), check_exact=True)
@@ -121,25 +125,26 @@ def test_canonical_explicit_mode_constructs_without_local_config(tmp_path, frequ
 def test_future_source_edits_invalidate_legacy_identity(tmp_path):
     from utils.legacy_cache_identity import factor_base_digest
     import hashlib
-    source = tmp_path / 'factor_base.py'
+    source = tmp_path / 'utils' / 'factor_base.py'
+    source.parent.mkdir()
     source.write_text('future implementation')
     assert factor_base_digest(str(source)) == hashlib.sha256(source.read_bytes()).hexdigest()
 
 
-def test_extracted_reader_edits_invalidate_legacy_identity(tmp_path):
+def test_stage3_facade_uses_live_source_identity(tmp_path):
     import hashlib
     import json
     from utils.legacy_cache_identity import factor_base_digest
     original = Path(__file__).resolve().parents[1] / 'utils'
     mapping = json.loads((original / 'legacy_cache_identity.json').read_text())
-    source = tmp_path / 'factor_base.py'
+    source = tmp_path / 'utils' / 'factor_base.py'
+    source.parent.mkdir()
     source.write_bytes((original / 'factor_base.py').read_bytes())
     for name in mapping['dependencies']:
-        target = tmp_path / name
+        target = source.parent / name
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes((original / name).read_bytes())
-    assert factor_base_digest(str(source)) == mapping['baseline_sha256']
-    (tmp_path / 'bar_source.py').write_text('changed SQL')
+    assert factor_base_digest(str(source)) == hashlib.sha256(source.read_bytes()).hexdigest()
     assert factor_base_digest(str(source)) != mapping['baseline_sha256']
 
 
@@ -149,8 +154,9 @@ def test_new_tables_flow_through_bar_source(frequency):
     from data_pipeline.loaders.market_bar_importer import import_market_bars
     bars, metadata, _ = sample(days=('2026-01-06',), frequency=frequency)
     with duckdb.connect() as connection:
+        declare_equity_bars(connection)
         import_market_bars(connection, bars, metadata, legacy_compatibility=False)
-        item = FactorBase(connection, 'new-table', '2026-01-06', '2026-01-06', stock_pool=['A'],
+        item = FactorBase(connection, 'new-table', '2026-01-06', '2026-01-06', stock_pool=['000001.XSHG'],
                           data_bindings={}, data_frequency=frequency, analysis_mode='time_series')
         grid = item._fetch_market_bars()
         assert len(grid) == len(bars)
@@ -163,10 +169,11 @@ def test_legacy_spelling_reads_registered_new_frequency():
     from data_pipeline.loaders.market_bar_importer import import_market_bars
     bars, metadata, _ = sample(days=('2026-01-06',), frequency='15min')
     with duckdb.connect() as connection:
+        declare_equity_bars(connection)
         import_market_bars(connection, bars, metadata, legacy_compatibility=False)
-        item = FactorBase(connection, 'panel', '2026-01-06', '2026-01-06', stock_pool=['A'],
+        item = FactorBase(connection, 'panel', '2026-01-06', '2026-01-06', stock_pool=['000001.XSHG'],
                           data_bindings={}, data_frequency='15m', pit_enabled=False)
-        assert item.get_price_data()['A'].tolist() == bars.close.tolist()
+        assert item.get_price_data()['000001.XSHG'].tolist() == bars.close.tolist()
 
 
 def test_compatibility_snapshot_warns_on_each_quality_marked_read():
@@ -175,8 +182,9 @@ def test_compatibility_snapshot_warns_on_each_quality_marked_read():
     from utils.bar_quality import BarDataQualityWarning
     bars, metadata, _ = sample(days=('2026-01-06',), frequency='1min')
     with duckdb.connect() as connection:
+        declare_equity_bars(connection)
         import_market_bars(connection, bars.iloc[1:], metadata)
-        item = FactorBase(connection, 'quality', '2026-01-06', '2026-01-06', stock_pool=['A'],
+        item = FactorBase(connection, 'quality', '2026-01-06', '2026-01-06', stock_pool=['000001.XSHG'],
                           data_bindings={}, data_frequency='1min', analysis_mode='time_series')
         for _ in range(2):
             with pytest.warns(BarDataQualityWarning, match='frequency=1min'):

@@ -10,7 +10,7 @@ import hashlib
 from functools import lru_cache
 from pathlib import Path
 from datetime import timedelta
-from typing import Any, Dict, Mapping, Tuple, Optional
+from typing import Any, Dict, Mapping, Tuple, Optional, Unpack
 
 from bisect import bisect_right
 
@@ -21,6 +21,10 @@ import pandas as pd
 from factor_synthesis.qlib_adapter import DataConverter, QlibLinearWrapper
 
 # Dynamic blend module
+from .preprocessing import (
+    MarketInputOptions, bind_synthesis_panel, format_panel_time, prediction_bounds,
+    preprocess_synthesis_features, selected_market_inputs, training_bounds,
+)
 from .dynamic_blend import (
     DynamicBlendConfig,
     compute_prior_composite,
@@ -255,8 +259,10 @@ def _strict_label_exit_index(index, config, boundary):
         label_period=config.get("_label_effective_period"),
         calendar_source=config.get("_label_calendar_source"),
     )
-    boundary = pd.Timestamp(boundary).normalize()
-    if pd.isna(boundary) or boundary.tz is not None:
+    boundary = pd.Timestamp(boundary)
+    if boundary.tz is None:
+        boundary = boundary.normalize()
+    if pd.isna(boundary) or str(boundary.tz) not in ("None", "UTC"):
         raise LabelIsolationError("invalid label isolation boundary")
     eligible = index[(exits < boundary).to_numpy()]
     if not len(eligible):
@@ -268,8 +274,9 @@ def _strict_label_exit_index(index, config, boundary):
 
 def _outer_prediction_index(synthesizer, factor_df, train_end, daily_pools, logger):
     """Use the same prediction window and pool keys as the eventual output."""
-    start = pd.Timestamp(train_end) + timedelta(days=1)
-    end = start + timedelta(days=synthesizer.config["rolling_window"]["predict_window_days"])
+    start, end = prediction_bounds(
+        factor_df, train_end, synthesizer.config["rolling_window"]["predict_window_days"],
+    )
     dates = factor_df.index.get_level_values("date")
     index = factor_df.index[(dates >= start) & (dates <= end)]
     if daily_pools and len(index):
@@ -545,9 +552,8 @@ def _run_blend_only_mode(
     blend_weights = config.get("blend_weights", {})
     
     # Prepare prediction period data
-    predict_start = pd.to_datetime(train_end) + timedelta(days=1)
-    predict_end = predict_start + timedelta(
-        days=synthesizer.config["rolling_window"]["predict_window_days"]
+    predict_start, predict_end = prediction_bounds(
+        factor_df, train_end, synthesizer.config["rolling_window"]["predict_window_days"],
     )
     
     parent_composite = _parent_baseline_scores(config)
@@ -721,14 +727,14 @@ def _run_lasso_with_qlib_adapter(
         sample_weight = np.asarray(sample_weight)[keep]
     X = X.loc[keep]
     y = y.reindex(X.index)
-    train_end_adj = train_keys.get_level_values("date").max().strftime("%Y-%m-%d")
-    valid_start = valid_keys.get_level_values("date").min().strftime("%Y-%m-%d")
-    valid_end = valid_keys.get_level_values("date").max().strftime("%Y-%m-%d")
+    train_end_adj = format_panel_time(train_keys.get_level_values("date").max())
+    valid_start = format_panel_time(valid_keys.get_level_values("date").min())
+    valid_end = format_panel_time(valid_keys.get_level_values("date").max())
     
     # Prediction period dates
     predict_dates = predict_factors.index.get_level_values("date").unique().sort_values()
-    test_start = predict_dates[0].strftime("%Y-%m-%d") if len(predict_dates) > 0 else valid_end
-    test_end = predict_dates[-1].strftime("%Y-%m-%d") if len(predict_dates) > 0 else valid_end
+    test_start = format_panel_time(predict_dates[0]) if len(predict_dates) > 0 else valid_end
+    test_end = format_panel_time(predict_dates[-1]) if len(predict_dates) > 0 else valid_end
     
     logger.info(
         "[Qlib Adapter] 创建数据集: train=%s~%s, valid=%s~%s, test=%s~%s",
@@ -741,7 +747,7 @@ def _run_lasso_with_qlib_adapter(
     
     neutralization_cfg = config.get("neutralization", {})
     if neutralization_cfg.get("enabled", False):
-        logger.info("[中性化] 使用加载阶段的预计算中性化输入；跳过训练阶段市值回归")
+        logger.info("[中性化] 使用已加载的中性化输入")
     
     # Labels
     all_labels = y.reindex(all_factors.index)
@@ -750,7 +756,7 @@ def _run_lasso_with_qlib_adapter(
     dataset = DataConverter.create_dataset_from_factors(
         factor_df=all_factors,
         forward_returns=all_labels,
-        train_start=train_start,
+        train_start=format_panel_time(train_keys.get_level_values("date").min()) if train_keys.get_level_values("date").tz is not None else train_start,
         train_end=train_end_adj,
         valid_start=valid_start,
         valid_end=valid_end,
@@ -811,12 +817,13 @@ def _run_lasso_with_qlib_adapter(
 
 def run_lasso_synthesis(
     synthesizer,
-    factor_df: pd.DataFrame,
+    factor_df: pd.DataFrame | None,
     forward_returns: pd.Series,
     train_start: str,
     train_end: str,
     config: dict,
     daily_pools: Optional[Dict] = None,
+    **market_inputs: Unpack[MarketInputOptions],
 ) -> Tuple[pd.Series, Dict]:
     """
     LASSO / ElasticNet based factor synthesis using Qlib adapter.
@@ -834,6 +841,9 @@ def run_lasso_synthesis(
         composite_series: Synthesized factor Series
         model_info: Model information dict
     """
+    factor_df, config = bind_synthesis_panel(
+        synthesizer, factor_df, config, market_inputs, forward_returns,
+    )
     logger = synthesizer.logger
     DataConverter.convert_index_to_qlib_format(factor_df.index)
     DataConverter.convert_index_to_qlib_format(forward_returns.index)
@@ -864,8 +874,7 @@ def run_lasso_synthesis(
     # Training window (with embargo to avoid look-ahead bias)
     # Purge by the configured label horizon in trading days. This equals
     # target_period for legacy labels and may be longer for rebalance labels.
-    train_start_dt = pd.to_datetime(train_start)
-    train_end_dt = pd.to_datetime(train_end)
+    train_start_dt, train_end_dt = training_bounds(factor_df, train_start, train_end)
 
     # Actual prediction membership defines label availability, not sparse history.
     prediction_index = _outer_prediction_index(
@@ -909,12 +918,15 @@ def run_lasso_synthesis(
         train_factors = train_factors[available_training_cols]
         logger.info("[LASSO训练] 使用 %d 个训练因子", len(available_training_cols))
     
-    # Align target
-    common_index = train_factors.index.intersection(forward_returns.index)
+    # Align target on non-null labels before strict exit isolation so dates with
+    # all-NaN labels do not trigger missing-exit errors while active label exits
+    # remain strictly checked.
+    valid_returns = forward_returns.dropna()
+    common_index = train_factors.index.intersection(valid_returns.index)
     if len(common_index):
         common_index = _strict_label_exit_index(common_index, config, prediction_boundary)
     X_raw = train_factors.loc[common_index]
-    y = forward_returns.loc[common_index]
+    y = valid_returns.loc[common_index]
     metric_returns = y.copy()
     baseline_scores: Optional[pd.Series] = None
 
@@ -1022,7 +1034,7 @@ def run_lasso_synthesis(
     # Phase 2: 统一预处理（在筛选之前！）
     # =========================================================================
     if isinstance(final_preprocess_cfg, dict) and final_preprocess_cfg:
-        X_preprocessed = synthesizer._apply_feature_preprocessing(X_raw, final_preprocess_cfg)
+        X_preprocessed = preprocess_synthesis_features(synthesizer, X_raw, final_preprocess_cfg, history=factor_df)
         logger.info(f"[预处理] 已对 {len(X_raw.columns)} 个因子执行预处理（筛选前）")
     else:
         X_preprocessed = X_raw.copy()
@@ -1277,9 +1289,8 @@ def run_lasso_synthesis(
     logger.info("=" * 60)
     
     try:
-        predict_start = pd.to_datetime(train_end) + timedelta(days=1)
-        predict_end = predict_start + timedelta(
-            days=synthesizer.config["rolling_window"]["predict_window_days"]
+        predict_start, predict_end = prediction_bounds(
+            factor_df, train_end, synthesizer.config["rolling_window"]["predict_window_days"],
         )
         
         predict_mask = (factor_df.index.get_level_values("date") >= predict_start) & (
@@ -1320,8 +1331,8 @@ def run_lasso_synthesis(
         # 预测期预处理：使用与训练期相同的预处理配置 final_preprocess_cfg
         # =========================================================================
         if isinstance(final_preprocess_cfg, dict) and final_preprocess_cfg:
-            predict_factors_preprocessed = synthesizer._apply_feature_preprocessing(
-                predict_factors_raw, final_preprocess_cfg
+            predict_factors_preprocessed = preprocess_synthesis_features(
+                synthesizer, predict_factors_raw, final_preprocess_cfg, history=factor_df,
             )
             logger.debug(f"[预测期预处理] 已对 {len(predict_factors_raw.columns)} 个因子执行预处理")
         else:
@@ -1601,6 +1612,9 @@ def run_lasso_synthesis(
             blend_info["blend_ratio_used"],
         )
         
+        sources = selected_market_inputs(factor_df, set(selected_features).union(blend_weights or {}))
+        if sources:
+            model_info["market_factor_inputs"] = sources
         return composite_series, model_info
         
     except (InsufficientSurvivingFactorsError, IncompleteResearchWindowError):

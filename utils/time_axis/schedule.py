@@ -11,18 +11,18 @@ import pandas as pd
 from .frequency import Frequency
 
 if TYPE_CHECKING:
-    from utils.session_calendar import Session, SessionCalendar
+    from utils.session_calendar import Session, SessionCalendar, View
 
 
 class BarSchedule:
     def __init__(self, calendar: SessionCalendar, frequency: str | Frequency, *,
-                 view: str = 'ETH', bucket_strategy: str | None = None) -> None:
+                 view: View = 'ETH', bucket_strategy: str | None = None) -> None:
         self.frequency = frequency if isinstance(frequency, Frequency) else Frequency.parse(frequency)
         if not self.frequency.is_valid:
             raise ValueError(f'Invalid frequency: {self.frequency.raw!r}')
         calendar._view(view)
         if bucket_strategy is None:
-            if calendar.is_domestic_futures:
+            if calendar.is_domestic_futures and self.frequency.kind != 'week':
                 raise ValueError('Domestic futures require an explicit bucket_strategy')
             bucket_strategy = 'segment_anchored'
         if bucket_strategy not in ('segment_anchored', 'session_clock', 'session'):
@@ -34,41 +34,55 @@ class BarSchedule:
         self._ends: dict[str, dict[pd.Timestamp, pd.Timestamp]] = {}
 
     def end_at(self, timestamp_utc: pd.Timestamp) -> pd.Timestamp:
-        """Look up actual availability without rebuilding a Session per label."""
+        """Return the scheduled end for a Bar's opening timestamp."""
         session = self.calendar.session_at(timestamp_utc, self.view)
         if session is None:
             raise ValueError('timestamp_utc is outside the Bar schedule')
         day = session.session_date
+        if self.frequency.kind == 'week':
+            week = self.calendar._week_on(day, self.view)
+            if not week:
+                raise ValueError('timestamp_utc is outside a covered trading week')
+            day = week[-1].session_date
         if day not in self._ends:
-            slots = self.for_session(session)
+            slots = self.for_session(day)
             self._ends[day] = dict(zip(slots.start_utc, slots.end_utc))
         if timestamp_utc not in self._ends[day]:
             raise ValueError('timestamp_utc is off the Bar schedule grid')
         return self._ends[day][timestamp_utc]
+
+    def available_at(self, grid_timestamp_utc: pd.Timestamp) -> pd.Timestamp:
+        """Return availability for a timestamp emitted by grid()."""
+        if self.frequency.kind == 'intraday':
+            return self.end_at(grid_timestamp_utc)
+        session = self.calendar.session_at(grid_timestamp_utc, self.view, frequency=self.frequency)
+        if session is None:
+            raise ValueError('grid_timestamp_utc is off the Bar schedule grid')
+        return session.segments[-1][1]
 
     def for_session(self, session: Session | str) -> pd.DataFrame:
         found = self.calendar.session_on(session, self.view)
         segments = () if found is None else found.segments
         starts, ends = pd.DatetimeIndex([], tz='UTC'), pd.DatetimeIndex([], tz='UTC')
         partial = np.array([], dtype=bool)
+        if segments and self.frequency.kind == 'week':
+            week = self.calendar._week_on(found.session_date, self.view)
+            segments = (week[0].segments[0], week[-1].segments[-1]) if week and found == week[-1] else ()
         if segments:
-            if self.bucket_strategy == 'session':
-                starts = pd.DatetimeIndex([segments[0][0]])
-                ends = pd.DatetimeIndex([segments[-1][1]])
-                partial = np.array([False])
-            elif self.bucket_strategy == 'segment_anchored':
+            if self.frequency.kind == 'intraday' and self.bucket_strategy == 'segment_anchored':
                 width = self.frequency.duration
-                grids = [pd.date_range(a, b, freq=width, inclusive='left') for a,b in segments]
+                grids = [pd.DatetimeIndex([a]) if width >= b - a
+                         else pd.date_range(a, b, freq=width, inclusive='left') for a, b in segments]
                 starts = grids[0].append(grids[1:])
-                ends = pd.DatetimeIndex([min(t + width, b) for grid, (_,b) in zip(grids, segments)
+                ends = pd.DatetimeIndex([t + min(width, b - t) for grid, (_,b) in zip(grids, segments)
                                          for t in grid])
                 partial = (ends - starts) < width
-            else:
+            elif self.frequency.kind == 'intraday':
                 width = self.frequency.duration.value
                 lengths = np.array([(b-a).value for a,b in segments], dtype=np.int64)
                 offsets = np.concatenate(([0], lengths.cumsum()))
                 left = np.arange(0, offsets[-1], width, dtype=np.int64)
-                right = np.minimum(left + width, offsets[-1])
+                right = left + np.minimum(width, offsets[-1] - left)
                 # A boundary at a pause closes the prior bucket before the pause;
                 # the next bucket starts after it.
                 li = np.searchsorted(offsets[1:], left, side='right')
@@ -78,9 +92,38 @@ class BarSchedule:
                 ends = pd.DatetimeIndex([segments[i][0] + pd.Timedelta(int(t-offsets[i]), 'ns')
                                          for i,t in zip(ri,right)])
                 partial = right-left < width
+            else:
+                starts = pd.DatetimeIndex([segments[0][0]])
+                ends = pd.DatetimeIndex([segments[-1][1]])
+                partial = np.array([False])
         return pd.DataFrame(dict(session_id=[found.session_date]*len(starts) if found else [],
                                  slot=np.arange(len(starts)), start_utc=starts, end_utc=ends,
                                  available_at_utc=ends, is_partial=partial))
+
+    def session_slots(self) -> pd.DataFrame:
+        """Collect physical Bar slots over the calendar's declared coverage."""
+        days = self.calendar.sessions().strftime('%Y-%m-%d')
+        slots = [self.for_session(day) for day in days]
+        return pd.concat(slots, ignore_index=True) if slots else pd.DataFrame()
+
+    def grid(self, start: str | pd.Timestamp | None = None,
+             end: str | pd.Timestamp | None = None) -> pd.DataFrame:
+        """Return intraday opens and daily/weekly anchors keyed by session date."""
+        keys = []
+        for day in self.calendar.sessions(start, end):
+            session = self.calendar.session_on(day, self.view)
+            if session is None:
+                continue
+            slots = self.for_session(session)
+            if slots.empty:
+                continue
+            timestamps = slots.start_utc if self.frequency.kind == 'intraday' else self.calendar._session_anchor(session)
+            keys.append(slots[['session_id']].assign(timestamp_utc=timestamps))
+        columns = ['timestamp_utc', 'session_id']
+        if not keys:
+            return pd.DataFrame({'timestamp_utc': pd.DatetimeIndex([], tz='UTC'),
+                                 'session_id': pd.Series(dtype=object)})
+        return pd.concat(keys, ignore_index=True)[columns]
 
 
 @dataclass(frozen=True)

@@ -53,8 +53,9 @@ def test_cli_subcommand_inventory() -> None:
     parser = cli.build_parser()
     commands = next(action.choices for action in parser._actions if action.dest == "command")
     assert list(commands) == [
-        "outputs-gc", "build-bars", "audit-bars", "import-bars", "build-roll-schedule",
-        "write-factor-values", "read-factor-values", "verify-factor-values", "alignment-run",
+        "outputs-gc", "market-db", "build-bars", "audit-bars", "import-bars", "build-roll-schedule",
+        "write-factor-values", "read-factor-values", "verify-factor-values",
+        "export-strategy", "verify-target-alignment", "alignment-run",
         "single-factor-analysis", "time-series-analysis", "read-bar-evaluations",
         "symbolic-factor-mining", "quanta-alpha-realize", "factor-synthesis", "parent-factor-screen",
         "monitor-refresh",

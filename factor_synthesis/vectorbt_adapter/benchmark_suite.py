@@ -230,6 +230,8 @@ def _run_one(
     all_equal_weight: bool = False,
     score_direction: float = 1.0,
     rebalance_dates: Optional[list[pd.Timestamp]] = None,
+    slot: Optional[Any] = None,
+    frequency: str = "1d",
 ) -> tuple[Dict[str, Any], pd.Series]:
     runner_config = deepcopy(dict(config))
     top_cfg = runner_config.setdefault("top_k_strategy", {})
@@ -241,9 +243,11 @@ def _run_one(
         # EW intentionally assigns a common score to every eligible name; the
         # candidate's anti-tie quality gate is not applicable to that reference.
         top_cfg["selection_quality"] = {"enabled": False}
-    runner = VectorBTBacktestRunner(
-        runner_config, tradeability_cache=tradeability_cache
-    )
+    runner_kwargs: Dict[str, Any] = {"tradeability_cache": tradeability_cache}
+    if slot is not None:
+        runner_kwargs["slot"] = slot
+        runner_kwargs["frequency"] = frequency
+    runner = VectorBTBacktestRunner(runner_config, **runner_kwargs)
     try:
         result = runner.run_backtest(
             factor_df=score_panel,
@@ -275,6 +279,8 @@ def run_benchmark_suite(
     random_seeds: int = 100,
     fixed_cache_path: Optional[Path] = None,
     parent_benchmark: str = "factor1_top",
+    slot: Optional[Any] = None,
+    frequency: str = "1d",
 ) -> Dict[str, Any]:
     """Run P2 references under identical engine/cost/calendar assumptions.
 
@@ -302,6 +308,7 @@ def run_benchmark_suite(
         tradeability_cache: Dict[tuple[str, tuple[str, ...]], list[str]] = {}
 
         def add(name: str, panel: pd.DataFrame, **kwargs: Any) -> None:
+            suite_kwargs = {"slot": slot, "frequency": frequency} if slot is not None else {}
             net, net_returns = _run_one(
                 base_config,
                 panel,
@@ -311,6 +318,7 @@ def run_benchmark_suite(
                 dynamic_pools,
                 tradeability_cache=tradeability_cache,
                 rebalance_dates=rebalance_dates or None,
+                **suite_kwargs,
                 **kwargs,
             )
             gross_config = deepcopy(dict(base_config))
@@ -325,6 +333,7 @@ def run_benchmark_suite(
                 dynamic_pools,
                 tradeability_cache=tradeability_cache,
                 rebalance_dates=rebalance_dates or None,
+                **suite_kwargs,
                 **kwargs,
             )
             records[name] = {"net": _metrics(net), "gross": _metrics(gross)}
@@ -347,6 +356,7 @@ def run_benchmark_suite(
         random_max_holding_counts: list[int] = []
         random_violation_days: list[int] = []
         for seed in range(int(random_seeds)):
+            suite_kwargs = {"slot": slot, "frequency": frequency} if slot is not None else {}
             random_result, _ = _run_one(
                 base_config,
                 random_score_panel(price_df, seed),
@@ -356,6 +366,7 @@ def run_benchmark_suite(
                 dynamic_pools,
                 tradeability_cache=tradeability_cache,
                 rebalance_dates=rebalance_dates or None,
+                **suite_kwargs,
             )
             random_sharpes.append(float(random_result.get("sharpe_ratio", np.nan)))
             random_max_holding_counts.append(

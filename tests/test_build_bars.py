@@ -1,8 +1,11 @@
 import duckdb
+
+from market_db_samples import declare_equity_bars, declare_futures_bars
 import numpy as np
 import pandas as pd
 import pytest
 
+from slots.jq_ashare_local.panel import ASharePanelReader
 from data_pipeline.loaders.market_bar_importer import import_market_bars
 from utils.bar_builder import build_bars
 from utils.bar_source import BarSource
@@ -13,7 +16,7 @@ from utils.time_axis import BarSchedule
 def sample(calendar_id='XSHG', strategy='segment_anchored', days=('2026-01-06', '2026-01-08'), frequency='5min'):
     future = calendar_id != 'XSHG'
     root = calendar_id.split('_')[-1] if future else None
-    instrument = root + '2602' if future else 'A'
+    instrument = f'{root}2602.{calendar_id.split("_")[0]}' if future else '000001.XSHG'
     exchange = calendar_id.split('_')[0]
     reference = exchange + '_Day' if future else 'XSHG'
     cal = SessionCalendar(calendar_id, days[0], days[-1], rth_reference_calendar=reference)
@@ -41,6 +44,10 @@ def test_sql_ohlcv_and_incremental_build(tmp_path, calendar_id, strategy):
     bars.loc[0, 'factor'] = np.nan
     instrument = meta.instrument_id.iloc[0]
     with duckdb.connect(str(tmp_path / 'bars.duckdb'), config={'threads': 1}) as conn:
+        if calendar_id == 'XSHG':
+            declare_equity_bars(conn)
+        else:
+            declare_futures_bars(conn, meta.exchange.item())
         import_market_bars(conn, bars, meta, bucket_strategy=strategy)
         args = dict(source='5min', targets=['15min', '60min', '1d'], instruments=[instrument],
                     start='2026-01-06', end='2026-01-08', bucket_strategy=strategy)
@@ -71,10 +78,11 @@ def test_sql_ohlcv_and_incremental_build(tmp_path, calendar_id, strategy):
 def test_native_daily_refused_and_check_only_never_writes(tmp_path):
     bars, meta, _ = sample(days=('2026-01-06',))
     with duckdb.connect(str(tmp_path / 'native.duckdb')) as conn:
+        declare_equity_bars(conn)
         import_market_bars(conn, bars, meta)
         # Synthetic fixture only; the product code must never write these tables.
-        conn.execute("CREATE TABLE price_data_daily AS SELECT 'A' stock_code, DATE '2026-01-06' date, 100.0 open, 200.0 high, 90.0 low, 148.0 AS \"close\", 96.0 volume, 960.0 money, 1.0 factor")
-        args = dict(source='5min', targets=['1d'], instruments=['A'], start='2026-01-06', end='2026-01-06')
+        conn.execute("CREATE TABLE price_data_daily AS SELECT '000001.XSHG' stock_code, DATE '2026-01-06' date, 100.0 open, 200.0 high, 90.0 low, 148.0 AS \"close\", 96.0 volume, 960.0 money, 1.0 factor")
+        args = dict(source='5min', targets=['1d'], instruments=['000001.XSHG'], start='2026-01-06', end='2026-01-06')
         before = conn.execute('SHOW TABLES').fetchall()
         with pytest.raises(ValueError, match='native'):
             build_bars(conn, **args)
@@ -88,6 +96,7 @@ def test_native_daily_refused_and_check_only_never_writes(tmp_path):
 def test_unaligned_boundaries_refused(tmp_path):
     bars, meta, _ = sample('SHFE_CU', 'session_clock', days=('2026-01-06',), frequency='30min')
     with duckdb.connect(str(tmp_path / 'bad.duckdb')) as conn:
+        declare_futures_bars(conn, 'SHFE')
         import_market_bars(conn, bars, meta, bucket_strategy='session_clock')
         with pytest.raises(ValueError, match='boundar'):
             build_bars(conn, source='30min', targets=['60min'], instruments=list(meta.instrument_id),
@@ -97,6 +106,7 @@ def test_unaligned_boundaries_refused(tmp_path):
 def test_domestic_strategy_required_on_import_and_build(tmp_path):
     bars, meta, _ = sample('DCE_M', days=('2026-01-06',))
     with duckdb.connect(str(tmp_path / 'futures.duckdb')) as conn:
+        declare_futures_bars(conn, 'DCE')
         with pytest.raises(ValueError, match='bucket_strategy'):
             import_market_bars(conn, bars, meta, legacy_compatibility=False)
         import_market_bars(conn, bars, meta, bucket_strategy='segment_anchored')
@@ -109,11 +119,12 @@ def test_disjoint_builds_do_not_claim_unbuilt_sessions(tmp_path):
     from utils.bar_source import MissingBarDataError
     bars, meta, _ = sample()
     with duckdb.connect(str(tmp_path / 'disjoint.duckdb')) as conn:
+        declare_equity_bars(conn)
         import_market_bars(conn, bars, meta)
         for day in ['2026-01-06', '2026-01-08']:
-            build_bars(conn, source='5min', targets=['15min'], instruments=['A'], start=day, end=day)
+            build_bars(conn, source='5min', targets=['15min'], instruments=['000001.XSHG'], start=day, end=day)
         with pytest.raises(MissingBarDataError, match='Session coverage'):
-            BarSource(conn).read(['A'], '15min', '2026-01-06', '2026-01-08', 'ETH')
+            BarSource(conn).read(['000001.XSHG'], '15min', '2026-01-06', '2026-01-08', 'ETH')
 
 
 def test_harness_build_audit_and_import_derive(tmp_path, capsys):
@@ -124,29 +135,31 @@ def test_harness_build_audit_and_import_derive(tmp_path, capsys):
     bars.to_csv(csv, index=False)
     meta.to_json(metadata, orient='records')
     path = tmp_path / 'cli.duckdb'
+    with duckdb.connect(str(path)) as connection:
+        declare_equity_bars(connection)
     common = ['--db', str(path), '--output-root', str(tmp_path / 'reports')]
     assert main(['import-bars', *common, '--bars', str(csv), '--metadata', str(metadata),
                  '--derive', '15min']) == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload['metrics']['imported_bars'] == 48
     assert main(['build-bars', *common, '--source', '5min', '--targets', '60min',
-                 '--instruments', 'A', '--start', '2026-01-06', '--end', '2026-01-06']) == 0
+                 '--instruments', '000001.XSHG', '--start', '2026-01-06', '--end', '2026-01-06']) == 0
     assert json.loads(capsys.readouterr().out)['metrics']['rebuilt_sessions'] == 1
     assert main(['audit-bars', *common]) == 0
     assert json.loads(capsys.readouterr().out)['metrics']['audited_sessions'] == 3
 
 
 def test_legacy_source_in_database_with_other_instrument_metadata(tmp_path):
-    from utils.market_bar_reader import MarketBarReader
     with duckdb.connect(str(tmp_path / 'mixed.duckdb')) as conn:
-        conn.from_df(MarketBarReader._legacy_metadata(['B'], 'Asia/Shanghai')).create('instrument_metadata')
-        legacy = pd.DataFrame(dict(stock_code=['A'], date=pd.to_datetime(['2026-01-06 09:35']),
+        declare_equity_bars(conn)
+        conn.from_df(ASharePanelReader._legacy_metadata(['000002.XSHG'], 'Asia/Shanghai')).create('instrument_metadata')
+        legacy = pd.DataFrame(dict(stock_code=['000001.XSHG'], date=pd.to_datetime(['2026-01-06 09:35']),
             open=[100.], high=[102.], low=[99.], close=[101.], volume=[2.]))
         conn.from_df(legacy).create('price_data_5m')
-        result = build_bars(conn, source='5min', targets=['15min'], instruments=['A'],
+        result = build_bars(conn, source='5min', targets=['15min'], instruments=['000001.XSHG'],
                             start='2026-01-06', end='2026-01-06')
         assert result['rebuilt_sessions'] == 1
         assert conn.execute('SELECT n_source_bars, n_expected_bars FROM market_bars_15min').fetchone() == (1,3)
         from utils.bar_quality import BarDataQualityWarning
         with pytest.warns(BarDataQualityWarning):
-            assert len(BarSource(conn).read(['A'], '15min', '2026-01-06', '2026-01-06', 'ETH')) == 1
+            assert len(BarSource(conn).read(['000001.XSHG'], '15min', '2026-01-06', '2026-01-06', 'ETH')) == 1

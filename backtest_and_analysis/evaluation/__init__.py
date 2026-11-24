@@ -5,6 +5,7 @@ from .calibration import (
     evaluate_interval_usability, resolve_interval_calibration,
 )
 from .engine import EngineResult, EvaluationEngine
+from .labels import UnifiedReturnLabeler
 from .types import (
     AdaptiveCalibrationObservation, CalibrationEvidence, CalibrationMethod, CalibrationStatus, IntervalUsability,
 )
@@ -12,6 +13,6 @@ from .types import (
 __all__ = [
     "AdaptiveCalibrationDomain", "AdaptiveCalibrationObservation", "CalibrationEvidence", "CalibrationMethod",
     "CalibrationStatus", "EngineResult", "EvaluationEngine", "IntervalUsability",
-    "REGISTERED_ADAPTIVE_CALIBRATIONS", "REGISTERED_CALIBRATIONS",
+    "REGISTERED_ADAPTIVE_CALIBRATIONS", "REGISTERED_CALIBRATIONS", "UnifiedReturnLabeler",
     "evaluate_interval_usability", "resolve_interval_calibration",
 ]

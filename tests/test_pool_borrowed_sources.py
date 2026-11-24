@@ -1,6 +1,7 @@
 """Explicit sources retain precedence and borrowed handles retain their owner."""
 from calendar_test_support import seed_calendar
 import duckdb
+from market_db_samples import declare_market_db
 import pandas as pd
 import pytest
 from utils.factor_base import FactorBase
@@ -13,6 +14,7 @@ def test_borrowed_connection_does_not_bypass_dual_source(tmp_path, monkeypatch):
     folder = tmp_path / 'parquet' / 'index_constituents'
     folder.mkdir(parents=True)
     with duckdb.connect(str(db)) as conn:
+        declare_market_db(conn, 'cn_equity')
         seed_calendar(conn)
         conn.execute("CREATE TABLE factor_data AS SELECT DATE '2024-01-31' date, 'A' stock_code, 10. AS close")
         conn.execute('CREATE TABLE price_data AS SELECT * FROM factor_data')

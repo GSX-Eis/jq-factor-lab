@@ -11,6 +11,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from market_db_samples import declare_market_db
 from utils.duckdb_adapter import DataCache, DuckDBAdapter
 from utils.factor_base import FactorBase
 
@@ -51,6 +52,7 @@ def test_5m_end_date_is_inclusive_without_reading_next_day(tmp_path: Path) -> No
 def test_factor_base_5m_read_keeps_full_end_day(tmp_path) -> None:
     db = tmp_path / 'prices.duckdb'
     with duckdb.connect(str(db)) as conn:
+        declare_market_db(conn, 'cn_equity')
         conn.execute("CREATE TABLE price_data_5m(date TIMESTAMP, stock_code VARCHAR, close DOUBLE)")
         conn.execute("INSERT INTO price_data_5m VALUES ('2025-12-30 14:55', 'A', 0), "
                      "('2025-12-31 14:55', 'A', 1), ('2026-01-01 09:35', 'A', 2)")
@@ -67,21 +69,17 @@ def test_factor_base_5m_read_keeps_full_end_day(tmp_path) -> None:
 
 def test_factor_base_honors_non_factor_duckdb_table() -> None:
     class Adapter:
+        duckdb_path = None
+
         def fetch_table_data(self, **kwargs):
             assert kwargs["table_name"] == "valuation_daily"
             return pd.DataFrame(
                 {"date": pd.to_datetime(["2025-12-31"]), "code": ["A"], "capitalization": [1.0]}
             )
 
-    factor = FactorBase.__new__(FactorBase)
+    factor = FactorBase(None, "table-probe", "2025-12-31", "2025-12-31", stock_pool=["A"],
+                        pit_enabled=False, data_bindings={})
     factor._duckdb_adapter = Adapter()
-    factor.pit_enabled = False
-    factor.pit_factor_column = "factor"
-    factor.data_frequency = "daily"
-    factor.all_stocks = ["A"]
-    factor.start_date = factor.end_date = "2025-12-31"
-    factor.use_dynamic_pool = False
-    factor.dynamic_pool_mode = "factor"
 
     result = factor._fetch_raw_data_duckdb(["capitalization"], "valuation_daily")
 

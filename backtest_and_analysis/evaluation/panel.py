@@ -1,11 +1,13 @@
 """Convert long factor observations to a datetime-by-asset panel."""
 
 from collections.abc import Hashable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 import numpy.typing as npt
 import pandas as pd
+
+from utils.market_db.guards import market_db_dimensions
 
 
 @dataclass(frozen=True)
@@ -19,6 +21,7 @@ class EvaluationPanel:
     valid: dict[Hashable, npt.NDArray[np.bool_]]
     _index: pd.MultiIndex
     _columns: pd.Index
+    market_db_sources: dict[str, tuple[str, ...]] = field(default_factory=dict)
 
     @classmethod
     def from_long(
@@ -38,6 +41,10 @@ class EvaluationPanel:
         symbols = index.get_level_values(1)
         if not isinstance(times, pd.DatetimeIndex) or times.hasnans or symbols.hasnans:
             raise ValueError("Expected datetime and asset keys without missing values")
+        market_db = market_db_dimensions(frame)
+        provenance_columns = [key for key in market_db if key in frame and key != factor_column]
+        if provenance_columns:
+            frame = frame.drop(columns=provenance_columns)
         columns = frame.columns
         if (isinstance(columns, pd.MultiIndex) or not columns.is_unique or columns.hasnans
                 or factor_column not in columns or len(columns) < 2):
@@ -86,7 +93,9 @@ class EvaluationPanel:
         returns = {column: scatter(column) for column in columns if column != factor_column}
         finite_factor = np.isfinite(factor)
         valid = {horizon: finite_factor & np.isfinite(label) for horizon, label in returns.items()}
-        return cls(datetimes, assets, factor, returns, valid, index, columns)
+        return cls(datetimes, assets, factor, returns, valid, index, columns, {
+            f"{key}s": values for key, values in market_db.items() if values
+        })
 
     def to_long(self) -> pd.DataFrame:
         """Gather the original observations in their original row and column order."""

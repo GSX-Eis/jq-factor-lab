@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from math import fsum
 from numbers import Integral
 from typing import Sequence
 import uuid
@@ -12,6 +13,10 @@ import numpy as np
 import pandas as pd
 
 from data_pipeline.loaders._transactions import import_transaction
+from data_pipeline.loaders.market_bar_importer import calendar_name
+from slots.futures.policy import (
+    DaysBeforeExpiry, RollContract, RollInputs, RollPolicy, expiry_date, resolve_roll_policy,
+)
 from .builder import instrument_calendar
 from .catalog import BarCatalog, identifier, table_exists
 from utils.code_version import resolve_code_version
@@ -32,56 +37,71 @@ def product_metadata(connection: duckdb.DuckDBPyConnection, product_root: str) -
     metadata = BarSource(connection).get_instrument_metadata(ids)
     if metadata.contract_month.isna().any():
         raise ValueError(f'contract_month is required for product_root={product_root}')
-    identities = {(row['calendar_id'], row['exchange'], row['rth_reference_calendar'])
+    identities = {(calendar_name(row), row['exchange'], row['rth_reference_calendar'], row['timezone'])
                   for row in metadata.to_dict('records')}
     if len(identities) != 1:
         raise ValueError(f'Contracts must share a calendar for product_root={product_root}')
     return metadata.sort_values(['contract_month', 'instrument_id']).reset_index(drop=True)
 
 
+class MissingSessionCloseError(ValueError):
+    """A scheduled close observation is absent or invalid."""
+
+
 def session_close(connection: duckdb.DuckDBPyConnection, metadata: dict,
                   session_id: str, field: str) -> dict:
-    """Prefer a daily dataset; otherwise use the finest stored minute dataset.
+    """Read the close snapshot or the volume of the entire closed Session.
 
-    An existing daily dataset with a hole/NULL fails instead of hiding that hole.
-    The last minute must be the scheduled close slot, never an earlier quote.
+    Close and OI retain daily precedence and require the scheduled close slot.
+    Volume can use any complete representation of the same Session.
     """
-    if field not in ('open_interest', 'close'):
-        raise ValueError('session_close field must be open_interest or close')
+    if field not in ('open_interest', 'volume', 'close'):
+        raise ValueError('session_close field must be open_interest, volume or close')
     root, instrument = metadata['product_root'], metadata['instrument_id']
     catalog = BarCatalog(connection)
     entries = [entry for entry in catalog.available(instrument, asset_class='futures')
-               if entry.timestamp_semantics == 'UTC_bar_start']
+               if entry.timestamp_semantics == 'UTC_bar_start' and Frequency.parse(entry.frequency).kind != 'week']
     frequencies = sorted({entry.frequency for entry in entries},
                          key=lambda freq: (freq != '1d', Frequency.parse(freq).duration))
     message = f'Missing {field}: product_root={root} Session={session_id} contract={instrument}'
     if not frequencies:
-        raise ValueError(message)
-    entry = catalog.resolve(frequencies[0], instrument, asset_class='futures')
+        raise MissingSessionCloseError(message)
     cal = instrument_calendar(metadata, session_id, session_id)
-    slots = BarSchedule(cal, entry.frequency,
-        bucket_strategy='session' if entry.frequency == '1d' else entry.bucket_strategy).for_session(session_id)
-    columns = {row[0] for row in connection.execute(f'DESCRIBE {identifier(entry.table_name)}').fetchall()}
-    if field not in columns or slots.empty:
-        raise ValueError(message)
-    complete = 'is_complete' if 'is_complete' in columns else 'true'
-    row = connection.execute(f'SELECT {field}, data_version, {complete} FROM {identifier(entry.table_name)} '
-        'WHERE instrument_id=? AND timestamp_utc=? AND frequency=?',
-        [instrument, slots.start_utc.iloc[-1], entry.frequency]).fetchone()
-    if (row is None or row[0] is None or not np.isfinite(row[0]) or not row[2]
-            or (field == 'open_interest' and row[0] < 0)):
-        raise ValueError(message)
-    return dict(value=float(row[0]), table=entry.table_name, data_version=row[1],
-                timestamp_utc=slots.start_utc.iloc[-1].isoformat(),
-                calendar_hash=cal.calendar_hash, bucket_strategy=entry.bucket_strategy)
+    whole_session = field == 'volume'
+    for frequency in frequencies if whole_session else frequencies[:1]:
+        entry = catalog.resolve(frequency, instrument, asset_class='futures')
+        slots = BarSchedule(cal, entry.frequency,
+            bucket_strategy='session' if frequency == '1d' else entry.bucket_strategy).for_session(session_id)
+        table = identifier(entry.table_name)
+        columns = {row[0] for row in connection.execute(f'DESCRIBE {table}').fetchall()}
+        if field not in columns or slots.empty:
+            continue
+        starts = slots.start_utc.tolist() if whole_session else [slots.start_utc.iloc[-1]]
+        complete = 'is_complete' if 'is_complete' in columns else 'true'
+        rows = connection.execute(f'SELECT {field}, data_version, {complete} FROM {table} '
+            'WHERE instrument_id=? AND timestamp_utc=ANY(?) AND frequency=?',
+            [instrument, starts, frequency]).fetchall()
+        if len(rows) != len(starts) or any(
+            value is None or not np.isfinite(value) or not valid
+            or (field in ('open_interest', 'volume') and value < 0)
+            for value, _, valid in rows
+        ):
+            continue
+        value = fsum(row[0] for row in rows) if whole_session else float(rows[0][0])
+        version = ','.join(sorted({row[1] for row in rows})) if whole_session else rows[0][1]
+        return dict(value=value, table=entry.table_name, data_version=version,
+                    timestamp_utc=starts[0].isoformat(), calendar_hash=cal.calendar_hash,
+                    bucket_strategy=entry.bucket_strategy)
+    raise MissingSessionCloseError(message)
 
 
 def build_roll_schedule(connection: duckdb.DuckDBPyConnection, *, product_roots: Sequence[str],
-                        start: str, end: str, rule: str = 'max_oi', confirm_days: int = 1,
-                        forward_only: bool = True) -> dict:
+                        start: str, end: str, rule: str | RollPolicy = 'max_oi',
+                        confirm_days: int = 1, forward_only: bool = True) -> dict:
+    """Materialize policy decisions in the existing per-product session table."""
     roots = _instrument_ids(product_roots)
-    if rule != 'max_oi':
-        raise ValueError('rule must be max_oi')
+    policy = resolve_roll_policy(rule)
+    rule_name = policy.name
     if isinstance(confirm_days, bool) or not isinstance(confirm_days, Integral) or confirm_days < 1:
         raise ValueError('confirm_days must be an integer >= 1')
     if not isinstance(forward_only, bool):
@@ -92,9 +112,7 @@ def build_roll_schedule(connection: duckdb.DuckDBPyConnection, *, product_roots:
         metadata = product_metadata(connection, root)
         meta = metadata.iloc[0].to_dict()
         # Validate the public date bounds before constructing the lookback calendar.
-        requested = instrument_calendar(meta, start, end)
-        if not requested.is_domestic_futures:
-            raise ValueError(f'Only domestic futures supported: product_root={root}')
+        instrument_calendar(meta, start, end)
         existing = {}
         if table_exists(connection, 'futures_roll_schedule'):
             existing = {row['effective_session_id']: row for row in connection.execute(
@@ -112,70 +130,82 @@ def build_roll_schedule(connection: duckdb.DuckDBPyConnection, *, product_roots:
             if sum(day < effective_start for day in days) >= confirm_days:
                 break
             span *= 2
-        records = metadata.to_dict('records')
-        by_id = {row['instrument_id']: row for row in records}
-        current = existing[max(prior)]['to_contract'] if prior else None
+        by_id = metadata.set_index('instrument_id', drop=False).to_dict('index')
+        contracts = tuple(RollContract(row['instrument_id'], row['contract_month'],
+                                       expiry_date(row['contract_expiry'])) for row in by_id.values())
+        prior_row = existing[max(prior)] if prior else None
+        if prior_row and prior_row['rule'] != rule_name:
+            raise ValueError(f'Rebuild {root} from its first effective Session to change the roll policy')
+        current = prior_row['to_contract'] if prior_row else None
+        if current is not None and current not in by_id:
+            raise ValueError(f'Missing incumbent contract={current} for product_root={root}')
         observations = {}
+        expiry_calendars = {}
+
+        def sessions_to_expiry(effective: str, expiry: pd.Timestamp) -> int:
+            if expiry not in expiry_calendars:
+                expiry_calendars[expiry] = (cal if expiry <= cal.end else
+                    instrument_calendar(meta, effective_start, expiry.strftime('%Y-%m-%d')))
+            return len(expiry_calendars[expiry].sessions(effective, expiry)) - 1
+
         for pos, effective in enumerate(days):
             if effective < effective_start:
                 continue
-            decision_days = days[pos-int(confirm_days):pos]
-            winners, inputs, sources = [], [], {}
-            for decision in decision_days:
-                # The declared universe includes every unexpired registered contract.
-                active = [row for row in records if (
-                    pd.Timestamp(row['contract_expiry']) + (pd.offsets.MonthEnd(0)
-                        if len(row['contract_expiry']) == 7 else pd.Timedelta(0))) >= pd.Timestamp(decision)]
-                if not active:
-                    raise ValueError(f'Missing open_interest: product_root={root} Session={decision}')
-                values = {}
-                for row in active:
-                    key = (decision, row['instrument_id'])
-                    if key not in observations:
-                        observations[key] = session_close(connection, row, decision, 'open_interest')
-                    observation = observations[key]
-                    values[row['instrument_id']] = observation['value']
-                    sources[f'{decision}/{row["instrument_id"]}'] = observation['table']
-                    inputs.append([decision, row['instrument_id'], row['contract_month'], observation])
-                winner = min(values, key=lambda contract: (
-                    -values[contract], by_id[contract]['contract_month'], contract))
-                winners.append(winner)
+            decision_days = tuple(days[pos-int(confirm_days):pos])
             decision = decision_days[-1]
+            if cal.session_on(decision).segments[-1][1] > cal.session_on(effective).segments[0][0]:
+                raise ValueError(f'Decision Session must close before effective open: {root} {effective}')
+            inputs, sources, recorded = [], {}, set()
+
+            def observe(day: str, contract: str, field: str) -> float:
+                if day not in decision_days or contract not in by_id:
+                    raise ValueError(f'Roll observation must belong to the decision window for {root}: {day}/{contract}')
+                key = (day, contract, field)
+                if key not in observations:
+                    observations[key] = session_close(connection, by_id[contract], day, field)
+                observation = observations[key]
+                if key not in recorded:
+                    evidence = observation if rule_name == 'max_oi' else dict(observation, field=field)
+                    inputs.append([day, contract, by_id[contract]['contract_month'], evidence])
+                    sources[f'{day}/{contract}'] = observation['table']
+                    recorded.add(key)
+                return observation['value']
+
             previous = current
-            if current is None:
-                # Bootstrap from the first observed leader, then apply the same streak rule.
-                current = winners[0]
-            candidate = winners[-1]
-            confirmed = len(set(winners)) == 1
-            if confirmed and (not forward_only or by_id[candidate]['contract_month'] > by_id[current]['contract_month']):
-                current = candidate
-            for contract in (previous, current):
-                if contract and not any(item[:2] == [decision, contract] for item in inputs):
-                    key = (decision, contract)
-                    if key not in observations:
-                        observations[key] = session_close(connection, by_id[contract], decision, 'open_interest')
-                    observation = observations[key]
-                    inputs.append([decision, contract, by_id[contract]['contract_month'], observation])
-                    sources[f'{decision}/{contract}'] = observation['table']
+            try:
+                current = policy.select(RollInputs(contracts, current, decision_days, effective,
+                                                   forward_only, observe, sessions_to_expiry))
+            except MissingSessionCloseError:
+                raise
+            except ValueError as exc:
+                raise ValueError(f'Roll policy {rule_name} failed for product_root={root}: {exc}') from exc
+            if not isinstance(current, str) or current not in by_id:
+                raise ValueError(f'Roll policy {rule_name} selected an unknown contract for {root}: {current!r}')
+            previous_oi = current_oi = None
+            if rule_name == 'max_oi':
+                # Existing rows retain their evidence order and source hash.
+                previous_oi = observe(decision, previous, 'open_interest') if previous else None
+                current_oi = observe(decision, current, 'open_interest')
             params = dict(confirm_days=int(confirm_days), forward_only=forward_only,
-                          tie_break='contract_month_ascending_then_instrument_id', oi_sources=sources)
+                          tie_break='contract_month_ascending_then_instrument_id')
+            if rule_name == 'max_oi':
+                params['oi_sources'] = sources
+            elif rule_name == 'max_volume':
+                params['volume_sources'] = sources
+            elif isinstance(policy, DaysBeforeExpiry):
+                params = {'days_before_expiry': int(policy.days),
+                          'tie_break': 'expiry_then_contract_month_then_instrument_id',
+                          'expiries': {contract.instrument_id: contract.expiry.strftime('%Y-%m-%d')
+                                       for contract in contracts}}
             payload = dict(inputs=inputs, previous_contract=previous, to_contract=current,
-                           rule=rule, rule_params=params)
+                           rule=rule_name, rule_params=params)
             digest = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(',', ':'),
                                                allow_nan=False).encode()).hexdigest()
             old = existing.get(effective)
             if old and old['source_hash'] == digest:
                 continue
-            # Both decision values must exist even when the incumbent is no longer active.
-            def oi(contract):
-                if contract is None:
-                    return None
-                key = (decision, contract)
-                if key not in observations:
-                    observations[key] = session_close(connection, by_id[contract], decision, 'open_interest')
-                return observations[key]['value']
-            jobs.append((root, effective, decision, previous, current, rule,
-                json.dumps(params, sort_keys=True), oi(previous), oi(current), digest,
+            jobs.append((root, effective, decision, previous, current, rule_name,
+                json.dumps(params, sort_keys=True), previous_oi, current_oi, digest,
                 int(old['version'])+1 if old else 1, uuid.uuid4().hex, revision, revision_source))
     if jobs:
         with import_transaction(connection):
@@ -189,4 +219,4 @@ def build_roll_schedule(connection: duckdb.DuckDBPyConnection, *, product_roots:
             for row in jobs:
                 connection.execute('INSERT OR REPLACE INTO futures_roll_schedule VALUES ('
                                    + ','.join('?' for _ in row) + ')', row)
-    return dict(rebuilt_sessions=len(jobs), product_roots=roots, rule=rule)
+    return dict(rebuilt_sessions=len(jobs), product_roots=roots, rule=rule_name)

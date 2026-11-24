@@ -95,7 +95,8 @@ def write_evaluation_artifacts(evaluation_result: EvaluationResult, output_dir: 
         raise ContractValidationError('result_identity must be a ResultIdentity')
     result = evaluation_result
     _mode(result.analysis_mode)
-    _prepare(result.per_bar_labels, None)
+    slot_artifact = "slot_id" in result.data_identity
+    _prepare(result.per_bar_labels, None, minimum_offset=0 if slot_artifact else 1)
     if result_identity.result_schema_version != RESULT_SCHEMA_VERSION:
         raise ContractValidationError(f'result_schema_version must be {RESULT_SCHEMA_VERSION}')
     calendar_hash = result.calendar_identity.get('calendar_hash')
@@ -107,7 +108,8 @@ def write_evaluation_artifacts(evaluation_result: EvaluationResult, output_dir: 
         raise ContractValidationError('Invalid code_version_source')
     payload = dict(
         result_schema_version=RESULT_SCHEMA_VERSION, analysis_mode=result.analysis_mode,
-        frequency='bar', return_unit='percent',
+        frequency=result.data_identity['frequencies'][0] if slot_artifact else 'bar',
+        return_unit=result.data_identity.get('return_unit', 'percent'),
         config=dict(config) if config is not None else {}, data_identity=result.data_identity,
         calendar_identity=dict(calendar_id=None, calendar_hash=result_identity.calendar_hash,
                                view=None, boundary_policy=None) | result.calendar_identity,
@@ -145,14 +147,11 @@ def write_evaluation_artifacts(evaluation_result: EvaluationResult, output_dir: 
         for name, table in tables.items():
             _csv_table(table).to_csv(staged / paths[name].name, index=False)
         if 'diagnostics_report_csv' in paths:
-            from .diagnostics_report import DIAGNOSTICS_CSV_COLUMNS, diagnostics_rows, render_diagnostics_markdown
+            from .diagnostics_report import diagnostics_csv_columns, diagnostics_rows, render_diagnostics_markdown
             report = payload['diagnostics_report']
-            columns = DIAGNOSTICS_CSV_COLUMNS
-            if report['schema'] == 'time_series_diagnostics.v2':
-                columns = ('split', *columns, 'split_purged_count')
             rows = diagnostics_rows(report)
             with (staged / DIAGNOSTICS_CSV).open('w', encoding='utf-8', newline='') as stream:
-                writer = csv.DictWriter(stream, fieldnames=columns)
+                writer = csv.DictWriter(stream, fieldnames=diagnostics_csv_columns(report))
                 writer.writeheader()
                 writer.writerows(rows)
             (staged / DIAGNOSTICS_MARKDOWN).write_text(render_diagnostics_markdown(report, rows), encoding='utf-8')

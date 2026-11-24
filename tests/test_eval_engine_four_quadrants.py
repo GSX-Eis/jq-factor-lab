@@ -7,6 +7,8 @@ import json
 from pathlib import Path
 
 import duckdb
+
+from market_db_samples import declare_futures_bars
 import numpy as np
 import pandas as pd
 import pytest
@@ -453,27 +455,30 @@ def test_synthetic_nq_continuous_roll_keeps_origin_contract(tmp_path, monkeypatc
     _, prices, scores = prices_and_scores
     bars = _minute_bars(times, prices[:len(times) + 1], scores[:len(times)])
     bars = bars.loc[bars.instrument_id.isin(ASSETS[:2])].copy()
+    contracts = [f'{instrument}.CME' for instrument in ASSETS[:2]]
+    bars['instrument_id'] = bars.instrument_id.map(dict(zip(ASSETS[:2], contracts)))
     # A distinct new-contract price level makes any stitching error visible.
-    bars.loc[bars.instrument_id.eq(ASSETS[1]), ["open", "high", "low", "close"]] += 200
+    bars.loc[bars.instrument_id.eq(contracts[1]), ["open", "high", "low", "close"]] += 200
     meta = pd.DataFrame({
-        "instrument_id": ASSETS[:2], "asset_class": "futures", "exchange": "CME",
+        "instrument_id": contracts, "asset_class": "futures", "exchange": "CME",
         "timezone": "America/Chicago", "calendar_id": calendar_id, "rth_reference_calendar": "NYSE",
         "product_root": "NQ", "contract_expiry": ["2024-03-15", "2024-06-21"],
         "contract_month": ["2024-03", "2024-06"], "price_adjustment": "none", "point_value": 20.,
     })
     with duckdb.connect(":memory:", config={"threads": 1}) as connection:
+        declare_futures_bars(connection, 'CME')
         market_bar_importer.import_market_bars(connection, bars, meta, legacy_compatibility=False)
         connection.execute("""
             CREATE TABLE futures_roll_schedule AS SELECT * FROM (VALUES
-                ('NQ', '2024-03-08', '2024-03-07', NULL, 'NQH24', 'synthetic-v1'),
-                ('NQ', '2024-03-11', '2024-03-08', 'NQH24', 'NQM24', 'synthetic-v1')
+                ('NQ', '2024-03-08', '2024-03-07', NULL, 'NQH24.CME', 'synthetic-v1'),
+                ('NQ', '2024-03-11', '2024-03-08', 'NQH24.CME', 'NQM24.CME', 'synthetic-v1')
             ) AS plan(product_root, effective_session_id, decision_session_id, from_contract, to_contract, build_id)
         """)
         source = ContinuousBarSource(connection)
         with pytest.warns(BarDataQualityWarning, match="incomplete_buckets="):
             continuous = source.read("NQ", "1min", "2024-03-08", "2024-03-11", adjust="none")
         assert pd.DatetimeIndex(continuous.timestamp_utc).equals(times)
-        assert continuous.contract_id.tolist() == [ASSETS[0]] * 3 + [ASSETS[1]] * 6
+        assert continuous.contract_id.tolist() == [contracts[0]] * 3 + [contracts[1]] * 6
         assert continuous.is_roll_session.tolist() == [False] * 3 + [True] * 6
         continuous["factor_value"] = 1.
         calendars = source.get_calendars(continuous)
@@ -497,7 +502,7 @@ def test_synthetic_nq_continuous_roll_keeps_origin_contract(tmp_path, monkeypatc
                 assert (old.entry_price, old.exit_price) == (prices[3, 0], prices[5, 0])
                 assert old.return_pct == pytest.approx((prices[5, 0] / prices[3, 0] - 1) * 100, abs=1e-12)
         connection.execute("DELETE FROM market_bars_1min WHERE instrument_id=? AND timestamp_utc=?",
-                           [ASSETS[0], sunday_open + minute])
+                           [contracts[0], sunday_open + minute])
         with pytest.warns(BarDataQualityWarning, match="incomplete_buckets="):
             missing, = labeler.label(continuous, signal_timestamps=[friday_close_bar]).itertuples()
         assert missing.status == "excluded" and missing.exclusion_reason == "missing_bar"

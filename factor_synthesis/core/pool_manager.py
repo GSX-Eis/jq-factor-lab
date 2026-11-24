@@ -11,12 +11,17 @@ Date: 2026-01-12
 """
 
 import logging
+from dataclasses import replace
+from collections.abc import Sequence
 from datetime import timedelta
 from functools import lru_cache
 from numbers import Number
 from typing import Any, Dict, List, Optional, Set, Union, Mapping
 
 import pandas as pd
+
+from utils.slots import MarketSlot
+from utils.time_axis import BarSchedule, Frequency
 
 from utils.dynamic_stock_pool import (
     DynamicStockPoolManager,
@@ -27,6 +32,281 @@ from utils.dynamic_stock_pool import (
 from .calendar_skip import SkipRules, describe_skip_rules, skip_mask
 
 logger = logging.getLogger(__name__)
+
+
+MARKET_CAP_FEATURE = "factor_data.natural_log_of_market_cap"
+INDUSTRY_FEATURE = "industry_membership.sw_l1_code"
+
+
+def _bar_bucket_strategy(slot: MarketSlot, frequency: Frequency) -> str | None:
+    if frequency.kind != "intraday":
+        return None
+    from utils.factor_core.bar_bridge import _bucket_strategy
+
+    return _bucket_strategy(slot.bar_feed, frequency, getattr(slot.bar_feed, "root", None))
+
+
+def synthesis_bar_schedule(slot: MarketSlot, frequency: str) -> BarSchedule:
+    parsed = Frequency.parse(frequency)
+    return BarSchedule(
+        getattr(slot.calendar, "default", slot.calendar), parsed,
+        view=getattr(slot.bar_feed, "view", "ETH"), bucket_strategy=_bar_bucket_strategy(slot, parsed),
+    )
+
+
+def market_bar_grid(slot: MarketSlot, frequency: str, start, end) -> pd.DataFrame:
+    # Slot providers can configure bucket alignment independently of the exchange calendar.
+    feed = slot.bar_feed
+    parsed = Frequency.parse(frequency)
+    bounds = [pd.Timestamp(value) if value is not None else None for value in (start, end)]
+    view = getattr(feed, "view", "ETH")
+    days = []
+    for bound in bounds:
+        session = (slot.calendar.session_at(bound, view=view, frequency=parsed)
+                   if bound is not None and bound.tz is not None else None)
+        days.append(session.session_date if session is not None else None if bound is None else bound.date())
+    grid = slot.calendar.bar_grid(
+        parsed, *days, view=view,
+        bucket_strategy=_bar_bucket_strategy(slot, parsed),
+    )
+    if bounds[0] is not None and bounds[0].tz is not None:
+        grid = grid.loc[grid.timestamp_utc.ge(bounds[0])]
+    if bounds[1] is not None and bounds[1].tz is not None:
+        grid = grid.loc[grid.timestamp_utc.le(bounds[1])]
+    return grid
+
+
+def synthesis_calendar(slot: MarketSlot | None, price_conn, frequency: str, start, end):
+    if slot is None:
+        if frequency != "1d":
+            raise ValueError("Synthesis panel alignment requires a MarketSlot for non-daily frequencies")
+        from utils.trading_calendar import load_trading_calendar
+        calendar = load_trading_calendar(price_conn)
+        calendar.validate_coverage(start, end)
+        return calendar, None
+    if frequency == "1d":
+        return slot.calendar, slot.calendar.sessions(start, end)
+    bars = market_bar_grid(slot, frequency, start, end)
+    return slot.calendar, pd.DatetimeIndex(bars.timestamp_utc)
+
+
+def _relation(name: str) -> str:
+    from utils.data_store import quote, table_name
+
+    return table_name(name) if "." in name else quote(name)
+
+
+class _BoundAShareBarFeed:
+    """Adapt a configured DuckDB relation while preserving historical local-clock rows."""
+
+    def __init__(self, connection, table: str, fields: dict[str, str]) -> None:
+        self.connection, self.table, self.fields = connection, table, fields
+
+    def read_execution_bars(
+        self, instruments: Sequence[str], frequency: Frequency, *, start_utc, end_utc,
+    ) -> pd.DataFrame:
+        from slots.jq_ashare_local.feed import TIMEZONE
+        from utils.data_store import quote
+
+        start = start_utc.tz_convert(TIMEZONE).tz_localize(None)
+        end = end_utc.tz_convert(TIMEZONE).tz_localize(None)
+        projection = ", ".join(f"{quote(source)} AS {quote(field)}" for field, source in self.fields.items())
+        rows = self.connection.execute(
+            f"SELECT CAST(date AS TIMESTAMP_NS) AS date, stock_code AS instrument_id, {projection} "
+            f"FROM {_relation(self.table)} WHERE stock_code = ANY(?) "
+            "AND CAST(date AS TIMESTAMP_NS) >= ? AND CAST(date AS TIMESTAMP_NS) < ? ORDER BY stock_code, date",
+            [list(instruments), start, end],
+        ).fetchdf()
+        return rows.assign(
+            timestamp_utc=rows.date.dt.tz_localize(TIMEZONE).dt.tz_convert("UTC"),
+            session_id=rows.date.dt.strftime("%Y-%m-%d"),
+        ).drop(columns="date")
+
+    def read_signal_bars(self, instruments, frequency, *, start_utc, end_utc, as_of_utc) -> pd.DataFrame:
+        return self.read_execution_bars(instruments, frequency, start_utc=start_utc, end_utc=min(end_utc, as_of_utc))
+
+
+def read_synthesis_bars(
+    slot: MarketSlot | None, price_conn, table: str, stocks: Sequence[str], start, end,
+    *, frequency: str, fields: dict[str, str], daily_open_label: bool = False, batch_size: int | None = None,
+) -> pd.DataFrame:
+    parsed = Frequency.parse(frequency)
+    if not parsed.is_valid:
+        raise ValueError(f"Invalid synthesis frequency: {frequency!r}")
+    if slot is not None:
+        grid = market_bar_grid(slot, parsed.canonical, start, end)
+        if grid.empty or not stocks:
+            return pd.DataFrame(columns=["date", "stock_code", *fields])
+        rows = slot.bar_feed.read_execution_bars(
+            stocks, parsed, start_utc=grid.timestamp_utc.min(), end_utc=grid.timestamp_utc.max(),
+        )
+        dates = pd.to_datetime(rows.session_id) if parsed.kind == "session" else rows.timestamp_utc
+    else:
+        if parsed.kind != "session":
+            raise ValueError("Pass a MarketSlot to request non-daily synthesis prices")
+        from slots.jq_ashare_local.feed import PRICE_TABLES, TIMEZONE
+        from .result_persistence import check_table_exists
+
+        if daily_open_label and check_table_exists(price_conn, PRICE_TABLES["1d"]):
+            table = PRICE_TABLES["1d"]
+        slot = replace(legacy_aux_slot(price_conn), bar_feed=_BoundAShareBarFeed(price_conn, table, fields))
+        first = pd.Timestamp(start).normalize().tz_localize(TIMEZONE).tz_convert("UTC")
+        stop = (pd.Timestamp(end).normalize() + pd.Timedelta(days=1)).tz_localize(TIMEZONE).tz_convert("UTC")
+        step = batch_size or len(stocks) or 1
+        chunks = [
+            slot.bar_feed.read_execution_bars(stocks[i:i + step], parsed, start_utc=first, end_utc=stop)
+            for i in range(0, len(stocks), step)
+        ]
+        if not chunks:
+            return pd.DataFrame(columns=["date", "stock_code", *fields])
+        rows = pd.concat(chunks, ignore_index=True)
+        dates = rows.timestamp_utc.dt.tz_convert(TIMEZONE).dt.tz_localize(None)
+    return rows.assign(date=dates, stock_code=rows.instrument_id).sort_values(["stock_code", "date"])
+
+
+class _BoundAShareCapFeatures:
+    """Resolve legacy fundamental-table aliases through the same auxiliary interface."""
+
+    def __init__(self, connection, table: str) -> None:
+        self.connection, self.table = connection, table
+
+    def read_aux_features(self, grid: pd.DataFrame, *, features: Sequence[str]) -> pd.DataFrame:
+        rows = self.connection.execute(
+            f"SELECT CAST(date AS DATE)::VARCHAR AS session_id, stock_code AS instrument_id, "
+            f'natural_log_of_market_cap AS "{MARKET_CAP_FEATURE}" FROM {_relation(self.table)} '
+            "WHERE CAST(date AS DATE) BETWEEN ?::DATE AND ?::DATE AND stock_code = ANY(?)",
+            [grid.session_id.min(), grid.session_id.max(), list(grid.instrument_id.unique())],
+        ).fetchdf()
+        return grid.merge(rows, on=["session_id", "instrument_id"]).assign(available_at_utc=lambda data: data.timestamp_utc)
+
+
+@lru_cache(maxsize=1)
+def _legacy_ashare_calendar():
+    from utils.session_calendar import SessionCalendar
+
+    return SessionCalendar.from_pmc()
+
+
+def legacy_aux_slot(connection, fundamental_table: str = "factor_data") -> MarketSlot:
+    from slots.jq_ashare_local.aux import AShareAuxFeatures
+    from slots.jq_ashare_local.feed import AShareBarFeed
+    from slots.jq_ashare_local.microstructure import AShareMicrostructure
+    from slots.jq_ashare_local.universe import AShareUniverse
+    from ..factor_reader import DEFAULT_SLOT_ID
+
+    calendar = _legacy_ashare_calendar()
+    auxiliary = (AShareAuxFeatures(connection, calendar) if fundamental_table.removeprefix("main.") == "factor_data"
+                 else _BoundAShareCapFeatures(connection, fundamental_table))
+    return MarketSlot(
+        DEFAULT_SLOT_ID, calendar, AShareBarFeed(connection, calendar), AShareUniverse(connection, calendar),
+        auxiliary, AShareMicrostructure(connection, calendar),
+    )
+
+
+def legacy_cap_instruments(connection, fundamental_table: str, start, end) -> list[str]:
+    rows = connection.execute(
+        f"SELECT DISTINCT stock_code FROM {_relation(fundamental_table)} "
+        "WHERE CAST(date AS DATE) BETWEEN ?::DATE AND ?::DATE ORDER BY stock_code",
+        [start, end],
+    ).fetchall()
+    return [row[0] for row in rows]
+
+
+def aligned_aux_feature(
+    slot: MarketSlot, feature: str, instruments: Sequence[str], start, end, *, frequency: str = "1d",
+    sessions: pd.DatetimeIndex | None = None, shift: int = 1,
+) -> pd.Series:
+    """Read each publication on the native clock, then align with the feature lag."""
+    from slots.jq_ashare_local.aux import AShareAuxFeatures
+
+    calendar_grid = market_bar_grid(slot, frequency, start, end)
+    if sessions is not None and isinstance(slot.aux_features, _BoundAShareCapFeatures):
+        # Aliased historical inputs can carry a bound date-only test/replay calendar.
+        calendar_grid = pd.DataFrame({
+            "session_id": sessions.strftime("%Y-%m-%d"),
+            "timestamp_utc": sessions.tz_localize("Asia/Shanghai").tz_convert("UTC") + pd.Timedelta(hours=15),
+        })
+    if calendar_grid.empty or not instruments:
+        return pd.Series(dtype=float)
+    daily_published = (
+        frequency != "1d"
+        and feature == MARKET_CAP_FEATURE
+        and (slot.slot_id == "jq_ashare_local" or isinstance(slot.aux_features, (AShareAuxFeatures, _BoundAShareCapFeatures)))
+    )
+    query_calendar_grid = calendar_grid
+    prior_session_map: dict[str, str] = {}
+    if daily_published:
+        first_session = pd.Timestamp(calendar_grid.session_id.min())
+        last_session = pd.Timestamp(calendar_grid.session_id.max())
+        pub_start = first_session
+        if first_session > slot.calendar.start:
+            prior = slot.calendar.sessions(slot.calendar.start, first_session)
+            prior = prior[prior < first_session]
+            if len(prior):
+                pub_start = prior[-1]
+        query_calendar_grid = market_bar_grid(slot, "1d", pub_start, last_session)
+        ordered_sessions = list(
+            query_calendar_grid.sort_values("timestamp_utc")["session_id"].drop_duplicates()
+        )
+        prior_session_map = {
+            ordered_sessions[idx]: ordered_sessions[idx - 1]
+            for idx in range(1, len(ordered_sessions))
+        }
+    dates = pd.to_datetime(calendar_grid.session_id) if frequency == "1d" else calendar_grid.timestamp_utc
+    parts = []
+    for offset in range(0, len(instruments), 500):
+        inst_df = pd.DataFrame({"instrument_id": instruments[offset:offset + 500]})
+        grid = query_calendar_grid.merge(inst_df, how="cross")
+        try:
+            rows = slot.read_aux_features(grid, features=[feature])
+        except (KeyError, NotImplementedError):
+            return pd.Series(dtype=float)
+        except ValueError as exc:
+            # Current futures and declarative providers reject feature names outside their capability.
+            if str(exc).startswith(("Futures features must be", "Unknown auxiliary features:")):
+                return pd.Series(dtype=float)
+            raise
+        if feature not in rows or rows.empty:
+            continue
+        rows = rows.dropna(subset=[feature]).copy()
+        if rows.empty:
+            continue
+        if daily_published:
+            pubs = rows.dropna(subset=["available_at_utc"])[
+                ["instrument_id", "session_id", "available_at_utc", feature]
+            ].rename(columns={"session_id": "pub_session_id"}).copy()
+            if pubs.empty:
+                continue
+            target = calendar_grid[["timestamp_utc", "session_id"]].merge(inst_df, how="cross")
+            target["instrument_id"] = target["instrument_id"].astype(object)
+            target["timestamp_utc"] = pd.to_datetime(target["timestamp_utc"], utc=True).astype("datetime64[ns, UTC]")
+            pubs["instrument_id"] = pubs["instrument_id"].astype(object)
+            pubs["available_at_utc"] = pd.to_datetime(pubs["available_at_utc"], utc=True).astype("datetime64[ns, UTC]")
+            pubs = pubs.drop_duplicates(["instrument_id", "available_at_utc"], keep="last").sort_values("available_at_utc")
+            rows = pd.merge_asof(
+                target.sort_values("timestamp_utc"),
+                pubs,
+                by="instrument_id",
+                left_on="timestamp_utc",
+                right_on="available_at_utc",
+                direction="backward",
+            ).dropna(subset=[feature])
+            # A daily session-close publication is valid only through the next trading session.
+            rows = rows.loc[
+                (rows["pub_session_id"] == rows["session_id"])
+                | (rows["pub_session_id"] == rows["session_id"].map(prior_session_map))
+            ]
+            if rows.empty:
+                continue
+            rows["date"] = rows["timestamp_utc"]
+        else:
+            rows["date"] = pd.to_datetime(rows.session_id) if frequency == "1d" else rows.timestamp_utc
+        wide = rows.pivot(index="date", columns="instrument_id", values=feature)
+        aligned = wide.reindex(pd.DatetimeIndex(dates, name="date"))
+        if shift:
+            aligned = aligned.shift(shift)
+        parts.append(aligned.stack().rename_axis(["date", "stock_code"]))
+    return pd.concat(parts).sort_index() if parts else pd.Series(dtype=float)
 
 
 # =============================================================================

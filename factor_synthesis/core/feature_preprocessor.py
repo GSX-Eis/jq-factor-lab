@@ -23,6 +23,8 @@ from typing import Union
 import numpy as np
 import pandas as pd
 
+from utils.market_db.guards import require_single_market_db
+
 logger = logging.getLogger(__name__)
 
 
@@ -39,6 +41,7 @@ def cross_sectional_standardize(df: pd.DataFrame) -> pd.DataFrame:
     Returns:
         标准化后的DataFrame，NaN填充为0
     """
+    require_single_market_db(df)
     try:
         if df.empty:
             return df
@@ -88,6 +91,7 @@ def cross_sectional_binning(
         raise ValueError("n_bins must be a positive integer")
     if not isinstance(data, (pd.DataFrame, pd.Series)):
         raise TypeError("Expected a DataFrame or Series")
+    require_single_market_db(data)
 
     def _bin_group(x: pd.Series) -> pd.Series:
         """对单个截面分组进行分箱"""
@@ -162,6 +166,7 @@ def cross_sectional_winsorize_zscore(
 
     if not isinstance(data, (pd.DataFrame, pd.Series)):
         raise TypeError("Expected a DataFrame or Series")
+    require_single_market_db(data)
 
     def _winsorize_zscore(x):
         return preprocess_series(
@@ -220,6 +225,7 @@ def cross_sectional_zscore(
 
     if not isinstance(data, (pd.DataFrame, pd.Series)):
         raise TypeError("Expected a DataFrame or Series")
+    require_single_market_db(data)
 
     def _zscore_with_winsorize(x):
         return preprocess_series(
@@ -248,3 +254,41 @@ def cross_sectional_zscore(
         raise
 
 
+TIME_SERIES_METHODS = {"time_series_zscore", "time_series_rank"}
+
+
+def time_series_standardize(
+    values: pd.Series, method: str, *, window: int, min_periods: int | None = None,
+) -> pd.Series:
+    """Compare each observation with only its instrument's preceding observations."""
+    from numbers import Integral
+
+    minimum = window if min_periods is None else min_periods
+    if any(isinstance(n, bool) or not isinstance(n, Integral) for n in (window, minimum)):
+        raise ValueError("Time-series window and min_periods must be integers")
+    if not 2 <= minimum <= window:
+        raise ValueError("Time-series preprocessing requires 2 <= min_periods <= window")
+    if method not in TIME_SERIES_METHODS:
+        raise ValueError(f"Unknown time-series preprocessing method: {method}")
+    if not values.index.is_unique:
+        raise ValueError("Time-series preprocessing requires unique date and instrument keys")
+
+    def normalize(group: pd.Series) -> pd.Series:
+        if method == "time_series_zscore":
+            history = group.shift(1).rolling(window, min_periods=minimum)
+            std = history.std(ddof=0)
+            return ((group - history.mean()) / std.where(std > 0)).mask(std.eq(0) & group.notna(), 0.0)
+
+        def percentile(sample):
+            current = sample[-1]
+            history = sample[:-1]
+            if np.isnan(current):
+                return np.nan
+            below = np.count_nonzero(history < current)
+            ties = np.count_nonzero(history == current)
+            return (below + 0.5 * ties) / np.count_nonzero(~np.isnan(history))
+
+        return group.rolling(window + 1, min_periods=minimum + 1).apply(percentile, raw=True)
+
+    ordered = values.replace([np.inf, -np.inf], np.nan).sort_index(level="date")
+    return ordered.groupby(level="stock_code", sort=False).transform(normalize).reindex(values.index)

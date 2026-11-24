@@ -1,17 +1,18 @@
-"""DuckDB-only compatibility facade for analysis result writes.
-
-The public class name and method signatures are retained for callers. SQLite
-engines and fallback writes were removed: every write is transactional DuckDB.
-"""
+"""Write analysis metrics to DuckDB and factor snapshots to Scheme B."""
 
 from __future__ import annotations
 
 from contextlib import contextmanager
-from typing import Any, Iterator, Optional
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Iterator, Optional
 
 import pandas as pd
 
 from utils.duckdb_results_writer import DuckDBResultsWriter
+from utils.market_factor import FactorWriteReceipt, MarketFactorValueStore, save_factor_values
+
+if TYPE_CHECKING:
+    from utils.factor_base import FactorBase
 
 
 def _require_duckdb_path(
@@ -41,7 +42,7 @@ def _require_duckdb_path(
 
 
 class ResultWriter:
-    """Write factor analysis and factor values to DuckDB only."""
+    """Persist analysis metrics in DuckDB and factor values in Scheme B."""
 
     def __init__(
         self,
@@ -51,6 +52,8 @@ class ResultWriter:
         duckdb_path: Optional[str] = None,
         parquet_dir: Optional[str] = None,
         export_parquet: bool = True,
+        *,
+        factor_values_store: str | Path | None = None,
     ) -> None:
         path = _require_duckdb_path(db_backend, duckdb_path, db_conn_str)
         self.db_backend = "duckdb"
@@ -58,6 +61,10 @@ class ResultWriter:
         self.parquet_dir = parquet_dir
         self.export_parquet = export_parquet
         self.output_table = output_table
+        self.factor_values_store = (
+            MarketFactorValueStore(factor_values_store) if factor_values_store is not None
+            else MarketFactorValueStore.beside_results_database(path)
+        )
         self._duckdb_writer = DuckDBResultsWriter(
             duckdb_path=path,
             parquet_dir=parquet_dir,
@@ -74,10 +81,10 @@ class ResultWriter:
         with self._duckdb_writer.acquire_write_session(retry_interval_sec=retry_interval_sec) as session:
             yield session
 
-    def export_factor_values_parquet(self, factor_df: pd.DataFrame, factor_name: str, *, write_session=None) -> int:
-        return self._duckdb_writer.export_factor_values_to_parquet(
-            factor_df, factor_name, write_session=write_session,
-        )
+    def write_market_factor_values(
+        self, factor: FactorBase, factor_df: pd.DataFrame, factor_name: str,
+    ) -> FactorWriteReceipt:
+        return save_factor_values(factor, self.factor_values_store, factor_values=factor_df, factor_id=factor_name)
 
     def write(
         self,
@@ -102,6 +109,7 @@ class ResultWriter:
         duckdb_conn: Any = None,
         allow_fallback: Optional[bool] = None,
         date_range: Optional[tuple[str, str]] = None,
+        allow_legacy_factor_values_write: bool = False,
     ) -> int:
         return self._duckdb_writer.save_factor_values(
             factor_df,
@@ -110,4 +118,5 @@ class ResultWriter:
             duckdb_conn=duckdb_conn,
             allow_fallback=allow_fallback,
             date_range=date_range,
+            allow_legacy_factor_values_write=allow_legacy_factor_values_write,
         )

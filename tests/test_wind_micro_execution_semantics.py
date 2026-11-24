@@ -2,6 +2,8 @@ import json
 from pathlib import Path
 
 import duckdb
+
+from market_db_samples import declare_market_db
 import pandas as pd
 import pytest
 
@@ -170,6 +172,7 @@ def test_pit_adjusted_prices_do_not_apply_corporate_action_ratio_twice():
 
 def test_next_open_tradeability_uses_open_not_later_prices():
     conn = duckdb.connect(":memory:")
+    declare_market_db(conn, 'cn_equity')
     conn.execute(
         "CREATE TABLE price_data_daily "
         "(stock_code VARCHAR, date DATE, open DOUBLE, close DOUBLE, "

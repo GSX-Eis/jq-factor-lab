@@ -1,0 +1,79 @@
+schema_version: 1
+slot_id: cn_index_akshare_v1_1d
+market_domain: cn_equity
+calendar:
+  provider: pmc
+  options:
+    calendar_id: XSHG
+    start: '1990-12-19'
+    end: '2026-10-31'
+bar_feed:
+  provider: duckdb_table
+  options:
+    table: public_bars_1d
+    frequency: 1d
+    timestamp_anchor: bar_start
+    source_timezone: Asia/Shanghai
+    volume_mode: interval
+    data_version: cn_index_akshare_v1
+    column_mapping:
+      timestamp_utc: timestamp
+      instrument_id: instrument_id
+      open: open
+      high: high
+      low: low
+      close: close
+      volume: volume
+universe:
+  provider: static
+  options:
+    instruments:
+      000001.XSHG: {asset_class: index, currency: CNY}
+      000016.XSHG: {asset_class: index, currency: CNY}
+      000300.XSHG: {asset_class: index, currency: CNY}
+      000905.XSHG: {asset_class: index, currency: CNY}
+      000852.XSHG: {asset_class: index, currency: CNY}
+      399006.XSHE: {asset_class: index, currency: CNY}
+      801010.SW: {asset_class: index, currency: CNY}
+      801030.SW: {asset_class: index, currency: CNY}
+      801040.SW: {asset_class: index, currency: CNY}
+      801050.SW: {asset_class: index, currency: CNY}
+      801080.SW: {asset_class: index, currency: CNY}
+      801110.SW: {asset_class: index, currency: CNY}
+      801120.SW: {asset_class: index, currency: CNY}
+      801130.SW: {asset_class: index, currency: CNY}
+      801140.SW: {asset_class: index, currency: CNY}
+      801150.SW: {asset_class: index, currency: CNY}
+      801160.SW: {asset_class: index, currency: CNY}
+      801170.SW: {asset_class: index, currency: CNY}
+      801180.SW: {asset_class: index, currency: CNY}
+      801200.SW: {asset_class: index, currency: CNY}
+      801210.SW: {asset_class: index, currency: CNY}
+      801230.SW: {asset_class: index, currency: CNY}
+      801710.SW: {asset_class: index, currency: CNY}
+      801720.SW: {asset_class: index, currency: CNY}
+      801730.SW: {asset_class: index, currency: CNY}
+      801740.SW: {asset_class: index, currency: CNY}
+      801750.SW: {asset_class: index, currency: CNY}
+      801760.SW: {asset_class: index, currency: CNY}
+      801770.SW: {asset_class: index, currency: CNY}
+      801780.SW: {asset_class: index, currency: CNY}
+      801790.SW: {asset_class: index, currency: CNY}
+      801880.SW: {asset_class: index, currency: CNY}
+      801890.SW: {asset_class: index, currency: CNY}
+      801950.SW: {asset_class: index, currency: CNY}
+      801960.SW: {asset_class: index, currency: CNY}
+      801970.SW: {asset_class: index, currency: CNY}
+      801980.SW: {asset_class: index, currency: CNY}
+aux_features:
+  provider: none
+microstructure:
+  provider: open
+execution_profile:
+  entry_price_field: close
+  exit_price_field: close
+  min_entry_offset_bars: 0
+  exit_adjustment: 0
+  return_unit: decimal
+  gap_rule: endpoints_only
+  boundary_policy: cross_session

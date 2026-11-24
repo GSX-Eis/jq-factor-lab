@@ -9,6 +9,7 @@ from numbers import Real
 from backtest_and_analysis.evaluation import EvaluationEngine, evaluate_interval_usability
 from backtest_and_analysis.evaluation.panel import EvaluationPanel
 from backtest_and_analysis.forward_returns_calculator import ForwardReturnsValidationError
+from utils.market_db.guards import require_single_market_db
 
 
 def _demean_float32_by_date(source: pd.Series) -> pd.Series:
@@ -104,6 +105,7 @@ class AlphalensRunner:
             raise TypeError('pricing must be a Series')
         if forward_returns is not None and not isinstance(forward_returns, pd.DataFrame):
             raise TypeError('forward_returns must be a DataFrame')
+        require_single_market_db(factor_df, pricing, forward_returns)
         if not factor_df.empty:
             if isinstance(factor_df.index, pd.MultiIndex):
                 raise ValueError('factor_df must have a one-dimensional date index')
@@ -317,6 +319,7 @@ class AlphalensRunner:
 
                         pricing_series = prices_df_fixed.stack().dropna()
                         pricing_series.index.names = ['date', 'asset']
+                        pricing_series.attrs = pricing.attrs.copy()
                         forward_returns = ForwardReturnsCalculator(
                             trading_calendar=pricing.attrs.get('trading_calendar')
                         ).calculate_forward_returns(
@@ -643,146 +646,6 @@ class AlphalensRunner:
                         std_err[names[h]] = moments["std"].astype(float) / np.sqrt(moments["count"])
 
 
-            elif isinstance(factor_data, pd.DataFrame) and 'forward_returns' in factor_data.columns:
-                # This is our improved basic fallback result
-                self.logger.info("Processing improved basic fallback results")
-                
-                # Calculate IC for each period
-                ic_results = {}
-                periods_in_data = factor_data['period'].unique()
-                
-                for period in periods_in_data:
-                    period_data = factor_data[factor_data['period'] == period]
-                    if len(period_data) >= 2:
-                        try:
-                            # Use numpy correlation to avoid Series ambiguity
-                            factor_vals = period_data['factor'].values
-                            return_vals = period_data['forward_returns'].values
-                            
-                            # Remove NaN values
-                            valid_mask = ~(np.isnan(factor_vals) | np.isnan(return_vals))
-                            if np.sum(valid_mask) >= 2:
-                                factor_clean = factor_vals[valid_mask]
-                                return_clean = return_vals[valid_mask]
-                                
-                                # Check for sufficient variance
-                                if np.std(factor_clean) > 1e-10 and np.std(return_clean) > 1e-10:
-                                    correlation = np.corrcoef(factor_clean, return_clean)[0, 1]
-                                else:
-                                    correlation = np.nan
-                            else:
-                                correlation = np.nan
-                        except Exception as e:
-                            self.logger.debug(f"Error calculating IC for period {period}: {e}")
-                            correlation = np.nan
-                    else:
-                        correlation = np.nan
-                    
-                    ic_results[period] = correlation
-                
-                # Create IC DataFrame - grouped by date
-                ic_data_dict = {}
-                for period in periods_in_data:
-                    period_data = factor_data[factor_data['period'] == period]
-                    dates = period_data.index.get_level_values(0).unique()
-                    
-                    daily_ic = []
-                    for date in dates:
-                        date_data = period_data[period_data.index.get_level_values(0) == date]
-                        if len(date_data) >= 2:
-                            try:
-                                # Ensure we get a scalar correlation, not a Series
-                                factor_vals = date_data['factor'].values
-                                return_vals = date_data['forward_returns'].values
-                                
-                                # Remove any NaN values
-                                valid_mask = ~(np.isnan(factor_vals) | np.isnan(return_vals))
-                                if np.sum(valid_mask) >= 2:
-                                    factor_clean = factor_vals[valid_mask]
-                                    return_clean = return_vals[valid_mask]
-                                    
-                                    # Calculate correlation using numpy to avoid Series ambiguity
-                                    if np.std(factor_clean) > 1e-10 and np.std(return_clean) > 1e-10:
-                                        daily_corr = np.corrcoef(factor_clean, return_clean)[0, 1]
-                                    else:
-                                        daily_corr = np.nan
-                                else:
-                                    daily_corr = np.nan
-                            except Exception as e:
-                                self.logger.debug(f"Error calculating daily IC for date {date}: {e}")
-                                daily_corr = np.nan
-                        else:
-                            daily_corr = np.nan
-                            
-                        daily_ic.append(daily_corr)
-                    
-                    ic_data_dict[period] = pd.Series(daily_ic, index=dates)
-                
-                ic_data = pd.DataFrame(ic_data_dict)
-                
-                # Calculate IR (Information Ratio)
-                ir_data = {}
-                for period in periods_in_data:
-                    if period in ic_results:
-                        period_ic_series = ic_data[period].dropna()
-                        if len(period_ic_series) > 1:
-                            mean_ic = period_ic_series.mean()
-                            ic_std = period_ic_series.std()
-                            ir = mean_ic / ic_std if ic_std != 0 else np.nan
-                        else:
-                            ir = ic_results[period] if not pd.isna(ic_results[period]) else 0
-                        ir_data[period] = ir
-                
-                ir_df = pd.DataFrame.from_dict(ir_data, orient='index', columns=['ir'])
-                ir_df.index.name = 'period'
-                
-                # Calculate quantile returns
-                quantile_returns_dict = {}
-                for period in periods_in_data:
-                    period_data = factor_data[factor_data['period'] == period]
-                    
-                    if 'factor_quantile' in period_data.columns:
-                        # Group by quantile and calculate mean returns
-                        date_quantile_returns = period_data.groupby([
-                            period_data.index.get_level_values(0),  # date
-                            'factor_quantile'
-                        ])['forward_returns'].mean().unstack(fill_value=np.nan)
-                        
-                        # Convert period to standardized format (e.g., '1D', '5D', '10D')
-                        period_key = f'{period}D' if isinstance(period, int) else str(period)
-                        quantile_returns_dict[period_key] = date_quantile_returns
-                
-                # Combine quantile returns data
-                if quantile_returns_dict:
-                    combined_qr = pd.concat(quantile_returns_dict, axis=1)
-                    combined_qr.columns.names = ['period', 'quantile']
-                    mean_return_by_q = combined_qr
-                else:
-                    mean_return_by_q = pd.DataFrame()
-                
-                std_err = pd.DataFrame()
-                
-            elif isinstance(factor_data, pd.DataFrame) and 'factor' in factor_data.columns:
-                # This is old basic fallback result (maintain compatibility)
-                self.logger.info("Processing basic fallback results")
-                
-                # Calculate simple correlation as IC substitute
-                correlation = np.nan  # Initialize with default value
-                if 'return_1d' in factor_data.columns:
-                    correlation = factor_data['factor'].corr(factor_data['return_1d'])
-                    ic_data = pd.DataFrame({'1D': [correlation]}, index=[factor_data.index.get_level_values(0)[0]])
-                else:
-                    ic_data = pd.DataFrame({'1D': [np.nan]})
-                
-                # Simple IR calculation
-                ir_data = {'1D': correlation if not pd.isna(correlation) else 0}
-                ir_df = pd.DataFrame.from_dict(ir_data, orient='index', columns=['ir'])
-                ir_df.index.name = 'period'
-                
-                # Empty quantile returns data
-                mean_return_by_q = pd.DataFrame()
-                std_err = pd.DataFrame()
-                
             else:
                 # Fallback to minimal results
                 self.logger.warning("Unknown factor_data format, using minimal results")

@@ -11,7 +11,7 @@ import duckdb
 from utils._storage_compat import _legacy_binding
 from utils.duckdb_results_writer import acquire_exclusive_write_conn
 
-from .normalization import _canonical_compare_token, _format_utc_iso
+from .normalization import _canonical_compare_token, _check_data_identity, _format_utc_iso
 from .schema import (
     _CROSS_SECTION_TABLE_COLUMNS,
     _CS_BOOL_COLUMNS,
@@ -33,6 +33,7 @@ from .schema import (
     _RUN_JSON_COLUMNS,
     _RUN_OPTIONAL_COLUMN_TYPES,
     _RUN_SEMANTIC_COLUMNS,
+    _RUN_SLOT_COLUMN_TYPES,
     _SPLIT_BOOL_COLUMNS,
     _SPLIT_FLOAT_COLUMNS,
     _SPLIT_INT_COLUMNS,
@@ -268,9 +269,24 @@ def migrate_bar_evaluation_db(db_path: str | Path) -> None:
     if not resolved_db.is_file():
         raise BarEvaluationPreconditionError(f"results_db does not exist: {resolved_db}")
     with _write_transaction(resolved_db) as conn:
-        _require_write_schema(conn, _catalog_columns(conn), legacy_only=True)
+        catalog = _catalog_columns(conn)
+        _require_write_schema(conn, catalog, legacy_only=True)
         for column, kind in _RUN_OPTIONAL_COLUMN_TYPES.items():
             conn.execute(f"ALTER TABLE bar_evaluation_runs ADD COLUMN IF NOT EXISTS {column} {kind}")
+        for column in _RUN_SLOT_COLUMN_TYPES.keys() - catalog["bar_evaluation_runs"].keys():
+            # A pre-migration package could already have carried the value in its provenance JSON.
+            field = f"$.{column}"
+            rows = conn.execute("""
+                SELECT identity_hash, json_extract_string(try_cast(data_identity AS JSON), ?)
+                FROM bar_evaluation_runs WHERE json_type(try_cast(data_identity AS JSON), ?) = 'VARCHAR'
+            """, [field, field]).fetchall()
+            for identity_hash, value in rows:
+                try:
+                    _check_data_identity({column: value})
+                except BarEvaluationIntegrityError:
+                    continue
+                conn.execute(f"UPDATE bar_evaluation_runs SET {column} = ? WHERE identity_hash = ?",
+                             [value, identity_hash])
         _create_split_table(conn)
         _require_write_schema(conn, _catalog_columns(conn))
 

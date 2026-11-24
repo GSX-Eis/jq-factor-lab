@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, replace
-import json
 from pathlib import Path
 import re
 from typing import Mapping, Sequence
@@ -52,37 +51,31 @@ class CatalogEntry:
 
 
 class BarCatalog:
+    """Resolve explicitly registered canonical Bar tables."""
+
     def __init__(self, connection: duckdb.DuckDBPyConnection | None = None, *,
                  config: Mapping | str | Path | None = None,
                  entries: Sequence[CatalogEntry] = ()) -> None:
         self.connection = connection
-        if config is None:
-            config = Path(__file__).resolve().parents[2] / 'config/data_access.json'
-        if not isinstance(config, Mapping):
-            config = json.loads(Path(config).read_text(encoding='utf-8'))
         self.entries = list(entries)
-        for frequency, name in config.get('price_tables', {}).items():
-            parsed = Frequency.parse(frequency)
-            if not parsed.is_valid:
-                raise ValueError(f'Invalid configured frequency: {frequency!r}')
-            semantics = ('local_midnight_day_identifier_pit' if parsed.kind == 'session'
-                         else 'Asia/Shanghai_bar_end')
-            self.entries.append(CatalogEntry(parsed.canonical, name, dataset='equity',
-                                             timestamp_semantics=semantics))
         if connection is not None and table_exists(connection, 'bar_catalog'):
-            self.entries.extend(CatalogEntry(**row) for row in
-                                connection.execute('SELECT * FROM bar_catalog').fetchdf().where(
-                                    lambda x: x.notna(), None).to_dict('records'))
+            frame = connection.execute('SELECT * FROM bar_catalog').fetchdf()
+            for row in frame.where(frame.notna(), None).to_dict('records'):
+                entry = CatalogEntry(**row)
+                if self._accepts(entry):
+                    self.entries.append(entry)
 
-    def available(self, instrument: str, *, asset_class: str = 'equity',
+    def _accepts(self, entry: CatalogEntry) -> bool:
+        return entry.timestamp_semantics == 'UTC_bar_start'
+
+    def available(self, instrument: str, *, asset_class: str = 'market',
                   dataset: str | None = None) -> list[CatalogEntry]:
         return [entry for entry in self.entries
                 if entry.instrument_id in ('*', instrument)
-                and (entry.dataset != 'equity' or asset_class == 'equity')
                 and (dataset is None or entry.dataset == dataset)
                 and (self.connection is None or table_exists(self.connection, entry.table_name))]
 
-    def resolve(self, frequency: str, instrument: str, *, asset_class: str = 'equity',
+    def resolve(self, frequency: str, instrument: str, *, asset_class: str = 'market',
                 dataset: str | None = None) -> CatalogEntry:
         parsed = Frequency.parse(frequency)
         if not parsed.is_valid:
@@ -96,7 +89,7 @@ class BarCatalog:
             raise ValueError(f'Ambiguous frequency {parsed.canonical}: {sorted(names)}')
         if not matches:
             raise LookupError(f'Missing frequency {parsed.canonical} for {instrument}')
-        # A persisted audit overrides the config's unscanned declaration.
+        # Prefer an instrument-specific registration over a wildcard.
         return next((entry for entry in matches if entry.instrument_id == instrument), matches[0])
 
 

@@ -9,6 +9,24 @@ import duckdb
 
 from backtest_and_analysis.time_series import RESULT_SCHEMA_VERSION
 
+from .schema_columns import (
+    _CROSS_SECTION_TABLE_COLUMNS as _CROSS_SECTION_TABLE_COLUMNS,
+    _CS_BOOL_COLUMNS as _CS_BOOL_COLUMNS,
+    _CS_FLOAT_COLUMNS as _CS_FLOAT_COLUMNS,
+    _CS_INT_COLUMNS as _CS_INT_COLUMNS,
+    _CS_JSON_COLUMNS as _CS_JSON_COLUMNS,
+    _CSV_STRING_DTYPES as _CSV_STRING_DTYPES,
+    _IC_BOOL_COLUMNS as _IC_BOOL_COLUMNS,
+    _IC_FLOAT_COLUMNS as _IC_FLOAT_COLUMNS,
+    _IC_INT_COLUMNS as _IC_INT_COLUMNS,
+    _IC_JSON_COLUMNS as _IC_JSON_COLUMNS,
+    _IC_TABLE_COLUMNS as _IC_TABLE_COLUMNS,
+    _QUANTILE_BOOL_COLUMNS as _QUANTILE_BOOL_COLUMNS,
+    _QUANTILE_FLOAT_COLUMNS as _QUANTILE_FLOAT_COLUMNS,
+    _QUANTILE_INT_COLUMNS as _QUANTILE_INT_COLUMNS,
+    _QUANTILE_TABLE_COLUMNS as _QUANTILE_TABLE_COLUMNS,
+)
+
 _BASE_TABLES: tuple[str, ...] = (
     "bar_evaluation_runs",
     "bar_evaluation_ic",
@@ -25,114 +43,14 @@ VALID_ANALYSIS_MODES: tuple[str, ...] = ("time_series", "cross_sectional")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _DATE_ONLY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
-_CSV_STRING_DTYPES: dict[str, str] = {
-    "scope": "string",
-    "instrument_id": "string",
-    "frequency": "string",
-    "ic_status": "string",
-    "non_overlapping_status": "string",
-    "quantile_status": "string",
-    "quantile_scope": "string",
-    "exclusion_counts": "string",
-    "nonzero_exclusion_counts": "string",
-}
-
-_IC_TABLE_COLUMNS: tuple[str, ...] = (
-    "identity_hash",
-    "row_index",
-    "analysis_mode",
-    "scope",
-    "instrument_id",
-    "frequency",
-    "horizon_bars",
-    "total_count",
-    "valid_count",
-    "excluded_count",
-    "exclusion_counts",
-    "nonzero_exclusion_counts",
-    "spearman_ic",
-    "ic_status",
-    "non_overlapping_ic",
-    "non_overlapping_count",
-    "non_overlapping_status",
-    "requested_quantiles",
-    "actual_quantiles",
-    "quantile_status",
-    "quantile_scope",
-    "descriptive_only",
-    "mean_spearman_ic",
-    "median_spearman_ic",
-    "mean_non_overlapping_ic",
-    "median_non_overlapping_ic",
-    "instrument_count",
-    "valid_instrument_count",
-    "valid_non_overlapping_instrument_count",
-    "mean_ic",
-    "median_ic",
-    "std_ic",
-    "icir",
-    "positive_ic_ratio",
-    "total_cross_sections",
-    "valid_cross_sections",
-    "excluded_cross_sections",
-    "insufficient_cross_section_count",
-    "constant_factor_cross_section_count",
-    "constant_return_cross_section_count",
-    "mean_valid_instruments",
-    "median_valid_instruments",
-)
-
-_QUANTILE_TABLE_COLUMNS: tuple[str, ...] = (
-    "identity_hash",
-    "row_index",
-    "analysis_mode",
-    "instrument_id",
-    "frequency",
-    "horizon_bars",
-    "quantile",
-    "requested_quantiles",
-    "actual_quantiles",
-    "min_actual_quantiles",
-    "max_actual_quantiles",
-    "quantile_status",
-    "quantile_scope",
-    "descriptive_only",
-    "sample_count",
-    "cross_section_count",
-    "total_sample_count",
-    "mean_return_pct",
-    "median_return_pct",
-    "positive_ratio",
-)
-
-_CROSS_SECTION_TABLE_COLUMNS: tuple[str, ...] = (
-    "identity_hash",
-    "row_index",
-    "frequency",
-    "horizon_bars",
-    "signal_timestamp",
-    "total_count",
-    "valid_count",
-    "excluded_count",
-    "exclusion_counts",
-    "nonzero_exclusion_counts",
-    "valid_instruments",
-    "spearman_ic",
-    "cs_status",
-    "requested_quantiles",
-    "actual_quantiles",
-    "quantile_status",
-    "quantile_scope",
-    "descriptive_only",
-)
-
 _RUN_V2_COLUMN_TYPES = {
     "has_split": "BOOLEAN",
     "split_config_json": "VARCHAR",
     "trial_ledger_json": "VARCHAR",
     "calibration_summary_json": "VARCHAR",
 }
-_RUN_OPTIONAL_COLUMN_TYPES = _RUN_V2_COLUMN_TYPES | {"factor_id": "VARCHAR"}
+_RUN_SLOT_COLUMN_TYPES = {"slot_id": "VARCHAR", "slot_config_hash": "VARCHAR"}
+_RUN_OPTIONAL_COLUMN_TYPES = _RUN_V2_COLUMN_TYPES | {"factor_id": "VARCHAR"} | _RUN_SLOT_COLUMN_TYPES
 _RUN_BOOL_COLUMNS = frozenset({"has_split"})
 _RUN_JSON_COLUMNS = frozenset({
     "input_file_hashes", "data_identity", "exclusion_summary",
@@ -180,6 +98,7 @@ _RUN_SEMANTIC_COLUMNS: tuple[str, ...] = (
     "calendar_id",
     "calendar_hash",
     "config_hash",
+    *_RUN_SLOT_COLUMN_TYPES,
     "input_file_hashes",
     "data_identity",
     "code_version",
@@ -224,39 +143,6 @@ _RUN_ALL_COLUMNS: tuple[str, ...] = (
     "ingested_at_utc",
     *_RUN_OPTIONAL_COLUMN_TYPES,
 )
-
-_IC_INT_COLUMNS = frozenset({
-    "row_index", "horizon_bars", "total_count", "valid_count", "excluded_count",
-    "non_overlapping_count", "requested_quantiles", "actual_quantiles",
-    "instrument_count", "valid_instrument_count", "valid_non_overlapping_instrument_count",
-    "total_cross_sections", "valid_cross_sections", "excluded_cross_sections",
-    "insufficient_cross_section_count", "constant_factor_cross_section_count",
-    "constant_return_cross_section_count",
-})
-_IC_FLOAT_COLUMNS = frozenset({
-    "spearman_ic", "non_overlapping_ic", "mean_spearman_ic", "median_spearman_ic",
-    "mean_non_overlapping_ic", "median_non_overlapping_ic", "mean_ic", "median_ic",
-    "std_ic", "icir", "positive_ic_ratio", "mean_valid_instruments", "median_valid_instruments",
-})
-_IC_BOOL_COLUMNS = frozenset({"descriptive_only"})
-_IC_JSON_COLUMNS = frozenset({"exclusion_counts", "nonzero_exclusion_counts"})
-
-_QUANTILE_INT_COLUMNS = frozenset({
-    "row_index", "horizon_bars", "quantile", "requested_quantiles", "actual_quantiles",
-    "min_actual_quantiles", "max_actual_quantiles", "sample_count",
-    "cross_section_count", "total_sample_count",
-})
-_QUANTILE_FLOAT_COLUMNS = frozenset({"mean_return_pct", "median_return_pct", "positive_ratio"})
-_QUANTILE_BOOL_COLUMNS = frozenset({"descriptive_only"})
-
-_CS_INT_COLUMNS = frozenset({
-    "row_index", "horizon_bars", "total_count", "valid_count", "excluded_count",
-    "valid_instruments", "requested_quantiles", "actual_quantiles",
-})
-_CS_FLOAT_COLUMNS = frozenset({"spearman_ic"})
-_CS_BOOL_COLUMNS = frozenset({"descriptive_only"})
-_CS_JSON_COLUMNS = frozenset({"exclusion_counts", "nonzero_exclusion_counts"})
-
 
 class BarEvaluationPreconditionError(ValueError):
     """Raised when results DB path, schema prerequisites, or inputs are invalid."""

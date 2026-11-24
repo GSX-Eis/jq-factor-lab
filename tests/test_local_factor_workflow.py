@@ -6,8 +6,18 @@ import pytest
 from examples.local_factor_workflow import run_workflow
 
 
-def test_synthetic_workflow_uses_price_labels_and_matching_deployment_formula(tmp_path):
+def test_synthetic_workflow_uses_price_labels_and_matching_deployment_formula(tmp_path, monkeypatch):
     import sys
+    from data_pipeline.loaders.price_data_to_duckdb import DuckDBPriceImporter
+    from market_db_samples import declare_market_db
+
+    init_tables = DuckDBPriceImporter.init_tables
+
+    def init_with_profile(self):
+        init_tables(self)
+        declare_market_db(self.conn, 'cn_equity')
+
+    monkeypatch.setattr(DuckDBPriceImporter, 'init_tables', init_with_profile)
     aliases = ('factor_base', 'utils.factor_base', 'jq_adapter', 'utils.jq_adapter')
     missing = object()
     before = {name: sys.modules.get(name, missing) for name in aliases}

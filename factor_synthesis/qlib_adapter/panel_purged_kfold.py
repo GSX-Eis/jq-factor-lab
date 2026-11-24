@@ -12,6 +12,14 @@ class LabelIsolationError(RuntimeError):
     """Label availability cannot be proved; the entire run must fail."""
 
 
+def label_clock(values) -> pd.DatetimeIndex:
+    """Preserve UTC bar timestamps and the historical local-date convention."""
+    clock = pd.DatetimeIndex(values)
+    if clock.hasnans or str(clock.tz) not in ("None", "UTC"):
+        raise ValueError("Label keys must be finite local dates or UTC timestamps")
+    return clock.normalize() if clock.tz is None else clock
+
+
 def resolve_label_exit_dates(
     index: pd.MultiIndex,
     label_exit_dates,
@@ -29,24 +37,22 @@ def resolve_label_exit_dates(
     if not isinstance(index, pd.MultiIndex) or index.nlevels != 2 or not index.is_unique:
         raise LabelIsolationError("label isolation requires unique two-level feature keys")
     try:
-        entries = pd.DatetimeIndex(index.get_level_values(0)).normalize()
-        if entries.hasnans or entries.tz is not None:
-            raise ValueError("invalid entry dates")
+        entries = label_clock(index.get_level_values(0))
         if label_exit_dates is not None:
             if not isinstance(label_exit_dates, (Mapping, pd.Series)):
                 raise ValueError("expected producer date-to-date mapping")
             mapping = {}
             for key, value in label_exit_dates.items():
-                day, exit_day = pd.Timestamp(key), pd.Timestamp(value)
-                if pd.isna(day) or pd.isna(exit_day) or day.tz is not None or exit_day.tz is not None:
-                    raise ValueError("invalid mapped date")
-                day, exit_day = day.normalize(), exit_day.normalize()
+                mapped = label_clock([pd.Timestamp(key), pd.Timestamp(value)])
+                if str(mapped.tz) != str(entries.tz):
+                    raise ValueError("Mapped label exits must use the entry clock")
+                day, exit_day = mapped
                 if day in mapping:
                     raise ValueError("duplicate normalized entry date")
                 mapping[day] = exit_day
             if any(day not in mapping for day in entries):
                 raise ValueError("missing label exit for required entry date")
-            exits = pd.DatetimeIndex([mapping[day] for day in entries])
+            exits = pd.DatetimeIndex([mapping[day] for day in entries], tz=entries.tz)
         else:
             if not isinstance(calendar_source, str) or not calendar_source.strip():
                 raise ValueError("verified trading calendar source is required")
@@ -54,8 +60,8 @@ def resolve_label_exit_dates(
                 raise ValueError("positive effective label period including execution lag is required")
             if trading_calendar is None:
                 raise ValueError("complete trading calendar is required")
-            calendar = pd.DatetimeIndex(trading_calendar).normalize()
-            if (calendar.hasnans or calendar.tz is not None or not calendar.is_unique
+            calendar = label_clock(trading_calendar)
+            if (str(calendar.tz) != str(entries.tz) or not calendar.is_unique
                     or not calendar.is_monotonic_increasing):
                 raise ValueError("calendar sessions must be valid, unique and increasing")
             positions = calendar.get_indexer(entries)
@@ -96,11 +102,11 @@ class PanelPurgedKFold:
         if groups is None or label_exit_dates is None:
             raise LabelIsolationError("PanelPurgedKFold requires date groups and aligned label exits")
         try:
-            dates = pd.DatetimeIndex(groups).normalize()
-            exits = pd.DatetimeIndex(label_exit_dates).normalize()
+            dates = label_clock(groups)
+            exits = label_clock(label_exit_dates)
             if len(dates) != len(X) or len(exits) != len(X):
                 raise ValueError("date/exit lengths must equal feature rows")
-            if dates.hasnans or exits.hasnans or dates.tz is not None or exits.tz is not None:
+            if str(dates.tz) != str(exits.tz):
                 raise ValueError("invalid date/exit vector")
             if (exits <= dates).any():
                 raise ValueError("label exit must be strictly later than entry")

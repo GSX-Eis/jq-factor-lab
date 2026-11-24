@@ -47,10 +47,10 @@ def run_workflow(output_dir: Path | None = None) -> dict:
     from backtest_and_analysis.factor_loader import FactorLoader
     from backtest_and_analysis.forward_returns_calculator import ForwardReturnsCalculator
     from data_pipeline.loaders.price_data_to_duckdb import DuckDBPriceImporter
-    from factor_synthesis.factor_reader import FactorReader
     from factor_synthesis.pipeline.weighted_sum_method import run_weighted_sum_synthesis
     from scripts.build_jq_strategy import build_jq_strategy_main
-    from utils.duckdb_results_writer import DuckDBResultsWriter
+    from utils.market_factor import MarketFactorValueStore
+    from utils.session_calendar import SessionCalendar
     from utils.local_outputs import new_run_directory
 
     if output_dir is None:
@@ -87,20 +87,29 @@ def run_workflow(output_dir: Path | None = None) -> dict:
     requirements.write_text(json.dumps({'factors': {name: {'requirements': {'daily': {
         'min_days': 12, 'fields': ['close', 'factor']}}} for name in classes}}, indent=2))
     names = ['TutorialFast', 'TutorialSlow']
-    store = root/'factors.duckdb'
-    writer = DuckDBResultsWriter(str(store), export_parquet=False)
-    local = {}
+    store = MarketFactorValueStore(root/'market_factor_values')
+    calendar = SessionCalendar(
+        'TUTORIAL_SYNTHETIC', dates[0], dates[-1],
+        custom_sessions={'timezone': 'UTC', 'weekdays': [0, 1, 2, 3, 4],
+                         'segments': [{'open': '09:00', 'close': '16:00'}]},
+    )
+    local, loaded = {}, {}
     for name, cls in classes.items():
         factor = cls(None, name, str(dates[0].date()), str(dates[-1].date()),
-                     stock_pool=codes, duckdb_path=str(market), pit_enabled=True)
+                     stock_pool=codes, duckdb_path=str(market), pit_enabled=True, session_calendar=calendar)
         try:
             local[name] = factor.get_factor_values(force_recalculate=True)
+            local[name].index = local[name].index.as_unit("ns")
+            if name in names:
+                receipt = factor.save_factor_values(store, factor_values=local[name])
+                stored_rows = store.read_factor_values(factor_identity_hash=receipt.factor_identity_hash)
+                loaded[name] = stored_rows.assign(date=pd.to_datetime(stored_rows.session_id)).pivot(
+                    index='date', columns='instrument_id', values='factor_value',
+                )
+            else:
+                composite = factor
         finally:
-            factor._duckdb_adapter.close()
-        if name in names:
-            writer.save_factor_values(local[name], name)
-    reader = FactorReader(str(store))
-    loaded = reader.get_multiple_factors(names, str(dates[0].date()), str(dates[-1].date()))
+            factor.close()
     features = pd.DataFrame({name: values.rename_axis(index='date', columns='stock_code').stack()
                              for name, values in loaded.items()}).dropna().sort_index()
     features.to_csv(root/'features.csv')
@@ -121,7 +130,7 @@ def run_workflow(output_dir: Path | None = None) -> dict:
                      .rename_axis(index='date', columns='stock_code').stack().sort_index())
     pd.testing.assert_series_equal(scores, deploy_values, check_names=False)
     scores.rename('score').to_csv(root/'scores.csv')
-    writer.save_factor_values(scores.unstack('stock_code'), 'TutorialComposite')
+    composite.save_factor_values(store, factor_values=scores.unstack('stock_code'))
 
     with duckdb.connect(str(market), read_only=True) as connection:
         prices = connection.execute('SELECT date, stock_code, close, factor FROM price_data_daily').fetchdf()

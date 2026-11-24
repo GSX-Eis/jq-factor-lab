@@ -2,6 +2,8 @@ import hashlib
 import json
 
 import duckdb
+
+from market_db_samples import declare_market_db
 import pandas as pd
 import pytest
 
@@ -103,6 +105,7 @@ def test_price_fetcher_uses_holiday_calendar_and_rejects_future_overflow(tmp_pat
     from backtest_and_analysis.price_fetcher import PriceFetcher
     db=tmp_path/'prices.duckdb'
     with duckdb.connect(str(db)) as conn:
+        declare_market_db(conn, 'cn_equity')
         seed_calendar(conn,calendar)
         conn.execute("CREATE TABLE price_data_daily AS SELECT d::DATE date, 'A' stock_code, 10. AS close, 10. AS open, 10. AS high, 10. AS low, 1. AS volume, 1. AS money FROM (VALUES ('2024-09-30'),('2024-10-08'),('2024-10-09')) t(d)")
     reader=PriceFetcher(db,'price_data_daily')

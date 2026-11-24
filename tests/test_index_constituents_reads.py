@@ -3,6 +3,7 @@ import json
 
 from calendar_test_support import seed_calendar
 import duckdb
+from market_db_samples import declare_market_db
 import pandas as pd
 import pytest
 
@@ -203,6 +204,7 @@ def test_failed_factor_construction_closes_owned_readers(tmp_path, monkeypatch):
     from utils.dynamic_stock_pool import StockFilter
     path = tmp_path / 'input.duckdb'
     with duckdb.connect(str(path)) as conn:
+        declare_market_db(conn, 'cn_equity')
         seed_calendar(conn)
         conn.execute("CREATE TABLE factor_data AS SELECT DATE '2024-01-31' AS date, 'A' AS stock_code, 10 AS close")
         conn.execute('CREATE TABLE price_data_daily AS SELECT * FROM factor_data')

@@ -1,0 +1,44 @@
+schema_version: 1
+slot_id: crypto_example
+calendar:
+  provider: custom_sessions
+  options:
+    calendar_id: crypto_utc
+    start: "2026-01-03"
+    end: "2026-01-05"
+    custom_sessions:
+      timezone: UTC
+      weekdays: [0, 1, 2, 3, 4, 5, 6]
+      segments:
+        - {open: "00:00", close: "00:00", open_day_offset: 0, close_day_offset: 1}
+bar_feed:
+  provider: csv_files
+  options:
+    paths: [bars.csv]
+    frequency: 1h
+    timestamp_anchor: bar_end
+    source_timezone: UTC
+    volume_mode: interval
+    data_version: example-v1
+    column_mapping: {symbol: instrument_id, time: timestamp, open: open, high: high, low: low, close: close, volume: volume}
+universe:
+  provider: static
+  options:
+    instruments:
+      BTC-USD: {asset_class: crypto, currency: USD}
+    universes:
+      spot: [BTC-USD]
+aux_features:
+  provider: csv_files
+  options:
+    paths: [funding.csv]
+microstructure:
+  provider: open
+execution_profile:
+  entry_price_field: open
+  exit_price_field: close
+  min_entry_offset_bars: 1
+  exit_adjustment: 0
+  return_unit: decimal
+  gap_rule: endpoints_only
+  boundary_policy: cross_session

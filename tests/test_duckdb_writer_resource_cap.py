@@ -51,7 +51,7 @@ def test_writer_session_caps_atomic_publication_without_changing_hashes(tmp_path
             _catalog(conn)
             conn.execute("BEGIN TRANSACTION")
             try:
-                assert writer.save_factor_values(frame, "synthetic", skip_parquet=True, duckdb_conn=conn) == 4
+                assert writer.save_factor_values(frame, "synthetic", allow_legacy_factor_values_write=True, skip_parquet=True, duckdb_conn=conn) == 4
                 assert writer.write_factor_analysis_results("synthetic", analysis, duckdb_conn=conn) == 2
                 conn.execute("COMMIT")
             except BaseException:
@@ -99,7 +99,7 @@ def test_capped_existing_connection_publication_still_rolls_back(tmp_path):
         _catalog(session.conn)
         session.conn.execute("BEGIN TRANSACTION")
         try:
-            assert writer.save_factor_values(frame, "synthetic", skip_parquet=True, duckdb_conn=session.conn) == 1
+            assert writer.save_factor_values(frame, "synthetic", allow_legacy_factor_values_write=True, skip_parquet=True, duckdb_conn=session.conn) == 1
             raise RuntimeError("injected after first publication")
         except RuntimeError:
             session.conn.execute("ROLLBACK")

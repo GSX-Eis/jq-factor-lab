@@ -1,0 +1,21 @@
+schema_version: 1
+db_id: us_equity_fixture_v1
+market_domain: us_equity
+allowed_slot_providers: [duckdb_table]
+asset_classes: [equity, etf]
+timezone: America/New_York
+calendar_id: XNYS
+calendar_source: pmc
+calendar_coverage: 2020-01-02..2026-12-31
+exchanges: [XNYS, XNAS]
+exchange_aliases: {NYSE: XNYS, NASDAQ: XNAS}
+instrument_id_pattern: '^[A-Z.]+\.(XNYS|XNAS)$'
+currency: USD
+frequencies: [1d]
+session_views: [ETH, RTH]
+market_rules:
+  st_filter: false
+  price_limit: false
+  t_plus: 0
+default_execution_profile: close_to_close
+created_at_utc: '2026-11-23T00:00:00Z'

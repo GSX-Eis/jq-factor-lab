@@ -177,6 +177,8 @@ def load_and_parse_config(config_path: str) -> tuple:
         analysis_config['results_duckdb_path'] = duckdb_path
         analysis_config['results_parquet_dir'] = results_database.get('parquet_dir')
         analysis_config['results_export_parquet'] = results_database.get('export_parquet', True)
+        if 'factor_values_store' in results_database:
+            analysis_config['factor_values_store'] = results_database['factor_values_store']
     
     # Add database safety settings
     database_safety = json_config.get('database_safety', {})

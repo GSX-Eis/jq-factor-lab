@@ -14,9 +14,12 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from backtest_and_analysis.time_series.contracts import _utc
+from utils.market_db.identity import market_db_identity
 from utils.time_axis import Frequency
 
 from .ledger import (
+    _identity_filters,
+    _matches_filters,
     _read_jsonl,
 )
 from .schema import (
@@ -27,6 +30,7 @@ from .schema import (
     FactorReadPlan,
     _EPOCH_NS_COLUMNS,
     _require_nonempty_str,
+    _shard_ownership_fields,
     _validate_session_date_str,
     validate_factor_id,
     validate_sha256_hex,
@@ -37,46 +41,38 @@ def list_identities(
     identities_path: Path,
     factor_id: str | None = None,
     frequency: str | None = None,
+    *,
+    slot_id: str | None = None,
+    factor_identity_hash: str | None = None,
 ) -> pd.DataFrame:
     """List registered factor_value_identities from the append-only ledger (lock-free)."""
-    if factor_id is not None:
-        validate_factor_id(factor_id)
-    norm_freq: str | None = None
-    if frequency is not None:
-        parsed = Frequency.parse(frequency)
-        if not parsed.is_valid:
-            raise ValueError(f"Invalid frequency: {frequency!r}")
-        norm_freq = parsed.canonical
-
+    filters = _identity_filters(factor_id, frequency, slot_id, factor_identity_hash)
     records, corrupt, _ = _read_jsonl(identities_path)
     if corrupt:
         raise ValueError(f"Corrupt identity ledger entries: {corrupt}")
-    if not records:
-        empty = pd.DataFrame(columns=list(IDENTITY_COLUMNS))
-        empty["created_at"] = pd.to_datetime(empty["created_at"], utc=True)
-        return empty
-    df = pd.DataFrame(records)
-    for col in IDENTITY_COLUMNS:
-        if col not in df.columns:
-            df[col] = None
-    df = df.loc[:, list(IDENTITY_COLUMNS)]
-    if factor_id is not None:
-        df = df.loc[df["factor_id"] == factor_id]
-    if norm_freq is not None:
-        df = df.loc[df["frequency"] == norm_freq]
-    df["created_at"] = pd.to_datetime(df["created_at"], utc=True)
+    df = pd.DataFrame.from_records(
+        [record for record in records if _matches_filters(record, filters)],
+        columns=list(IDENTITY_COLUMNS),
+    )
+    df["created_at"] = pd.to_datetime(df["created_at"], format="ISO8601", utc=True)
     return df.sort_values(["created_at", "factor_id", "factor_identity_hash"]).reset_index(drop=True)
 
 
-def _committed_shards(load_committed_state: Callable[[], tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]]) -> list[dict[str, Any]]:
-    _, committed_batches = load_committed_state()
+def _committed_shards(
+    identities: dict[str, dict[str, Any]], committed_batches: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
     for batch in committed_batches:
+        fhash = str(batch["factor_identity_hash"])
+        schema_version = identities.get(fhash, {}).get("source_schema_version")
+        expected = _shard_ownership_fields(fhash, batch.get("batch_id"), schema_version)
+        committed_batch_id = _require_nonempty_str(expected["batch_id"], "batch_id") if "batch_id" in expected else None
         for shard in batch.get("shards", []):
             items.append(
                 {
                     "factor_id": str(batch["factor_id"]),
-                    "factor_identity_hash": str(batch["factor_identity_hash"]),
+                    "factor_identity_hash": fhash,
+                    "batch_id": committed_batch_id,
                     "frequency": str(batch["frequency"]),
                     "session_view": str(batch["session_view"]),
                     "year_month": str(shard["year_month"]),
@@ -98,13 +94,13 @@ def _utc_bound_ns(bound: pd.Timestamp) -> int:
     return bound.value
 
 
-def _quote_path(path: Path) -> str:
-    return "'" + str(path).replace("'", "''") + "'"
+def _quote_sql_string(value: str | Path) -> str:
+    return "'" + str(value).replace("'", "''") + "'"
 
 
 def _legacy_timestamp_rows(path: Path) -> Iterator[str]:
     """Extract only rows whose original Parquet timestamps require correction."""
-    sql_path = _quote_path(path)
+    sql_path = _quote_sql_string(path)
     start = 0
     with pq.ParquetFile(path) as file:
         for batch in file.iter_batches(columns=list(_EPOCH_NS_COLUMNS)):
@@ -125,15 +121,27 @@ def _scan_sql(parquet_root: Path, shards: Sequence[dict[str, Any]], paths_sql: s
         row for shard in legacy for row in _legacy_timestamp_rows(parquet_root / shard["part_path"])
     )
     options = (
-        "hive_partitioning=true, "
+        "hive_partitioning=true, filename=true, "
         "hive_types={'factor_id': 'VARCHAR', 'frequency': 'VARCHAR', 'year_month': 'VARCHAR'}"
     )
     if legacy and has_epoch:
         options += ", union_by_name=true"
     join = ""
+    if shards:
+        entries = []
+        for shard in shards:
+            path = _quote_sql_string(parquet_root / shard["part_path"])
+            fhash = _quote_sql_string(shard["factor_identity_hash"])
+            batch_id = "CAST(NULL AS VARCHAR)" if shard["batch_id"] is None else _quote_sql_string(shard["batch_id"])
+            entries.append(f"({path}, {fhash}, {batch_id})")
+        join = (
+            f" INNER JOIN (VALUES {', '.join(entries)}) AS committed(path, identity_hash, batch_id)"
+            " ON raw.filename = committed.path AND raw.factor_identity_hash = committed.identity_hash"
+            " AND (committed.batch_id IS NULL OR raw.batch_id = committed.batch_id)"
+        )
     if corrections:
         options += ", file_row_number=true"
-        join = (
+        join += (
             f" LEFT JOIN (VALUES {corrections}) AS exact(path, row_no, _timestamp_utc_ns, _created_at_ns)"
             " ON raw.filename = exact.path AND raw.file_row_number = exact.row_no"
         )
@@ -159,11 +167,11 @@ def _projection(columns: Sequence[str]) -> str:
 def plan_read(
     parquet_root: Path,
     load_committed_state: Callable[[], tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]],
-    committed_shards: Callable[[], list[dict[str, Any]]],
     *,
     factor_id: str | Sequence[str] | None = None,
     factor_identity_hash: str | Sequence[str] | None = None,
     frequency: str | Sequence[str] | None = None,
+    slot_id: str | None = None,
     session_view: str | None = None,
     instruments: Sequence[str] | None = None,
     start_utc: dt.datetime | pd.Timestamp | str | None = None,
@@ -194,6 +202,8 @@ def plan_read(
 
     if session_view is not None and session_view not in VALID_VIEWS:
         raise ValueError(f"Invalid session_view: {session_view!r}")
+    if slot_id is not None:
+        _require_nonempty_str(slot_id, "slot_id")
 
     req_instruments: list[str] | None = None
     if instruments is not None:
@@ -220,8 +230,8 @@ def plan_read(
     if session_start is not None and session_end is not None and session_start > session_end:
         raise ValueError("session_start must not follow session_end")
 
-    identities, _ = load_committed_state()
-    shards = committed_shards()
+    identities, batches = load_committed_state()
+    shards = _committed_shards(identities, batches)
 
     # Resolve partition values from ledger when factor_identity_hash is specified.
     resolved_fids: list[str] = list(req_fids) if req_fids is not None else []
@@ -250,6 +260,8 @@ def plan_read(
         if req_freqs is not None and item["frequency"] not in req_freqs:
             continue
         if req_hashes is not None and item["factor_identity_hash"] not in req_hashes:
+            continue
+        if slot_id is not None and identities.get(item["factor_identity_hash"], {}).get("slot_id") != slot_id:
             continue
         if session_view is not None and item["session_view"] != session_view:
             continue
@@ -322,6 +334,10 @@ def plan_read(
         shard_paths=shard_paths,
         sql=sql,
         params=tuple(params),
+        market_databases={
+            identity_hash: identity for identity_hash in sorted({item["factor_identity_hash"] for item in selected})
+            if (identity := market_db_identity(identities.get(identity_hash)))
+        },
     )
 
 
@@ -353,7 +369,7 @@ def view_sql(
             "CAST(NULL AS VARCHAR) AS year_month "
             "WHERE 1 = 0"
         )
-    paths_sql = ", ".join(_quote_path(parquet_root / item["part_path"]) for item in shards)
+    paths_sql = ", ".join(_quote_sql_string(parquet_root / item["part_path"]) for item in shards)
     scan = _scan_sql(parquet_root, shards, f"[{paths_sql}]")
     return f'CREATE OR REPLACE VIEW "{view_name}" AS SELECT {_projection(VIEW_COLUMNS)} FROM ({scan})'
 
@@ -401,4 +417,8 @@ def read_factor_values(
     frame["timestamp_utc"] = pd.to_datetime(frame["timestamp_utc"], utc=True).dt.as_unit("ns")
     frame["created_at"] = pd.to_datetime(frame["created_at"], utc=True).dt.as_unit("ns")
     frame["factor_value"] = frame["factor_value"].astype(np.float64)
-    return frame.loc[:, list(TABLE_COLUMNS)].reset_index(drop=True)
+    result = frame.loc[:, list(TABLE_COLUMNS)].reset_index(drop=True)
+    sources = [plan.market_databases[key] for key in frame.factor_identity_hash.unique() if key in plan.market_databases]
+    if sources:
+        result.attrs["market_databases"] = sources
+    return result

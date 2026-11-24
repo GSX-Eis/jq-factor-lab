@@ -155,7 +155,8 @@ def _republished_artifacts(payload: dict) -> list[dict]:
 
 def _make_legacy_schema(conn: duckdb.DuckDBPyConnection) -> str:
     conn.execute("DROP TABLE bar_evaluation_split_metrics")
-    for col in ("has_split", "split_config_json", "trial_ledger_json", "calibration_summary_json", "factor_id"):
+    for col in ("has_split", "split_config_json", "trial_ledger_json", "calibration_summary_json", "factor_id",
+                "slot_id", "slot_config_hash"):
         conn.execute(f"ALTER TABLE bar_evaluation_runs DROP COLUMN {col}")
     current, config, inputs, calendar, version = conn.execute("""
         SELECT identity_hash, config_hash, input_file_hashes, calendar_hash, code_version
@@ -285,7 +286,8 @@ def test_legacy_read_only_and_explicit_migration_preserve_history(tmp_path: Path
     assert read["metrics"]["cross_sections"]
     run, = read["metrics"]["runs"]
     assert run["result_schema_version"] == "bar_evaluation.v1"
-    new_columns = ("has_split", "split_config_json", "trial_ledger_json", "calibration_summary_json", "factor_id")
+    new_columns = ("has_split", "split_config_json", "trial_ledger_json", "calibration_summary_json", "factor_id",
+                   "slot_id", "slot_config_hash")
     assert all(run[c] is None for c in new_columns)
     assert query_bar_evaluation_runs(db, factor_name="factor_value") == [run]
     assert query_bar_evaluation_runs(db, factor_name="factor_value", offset=1) == []
@@ -473,12 +475,12 @@ def test_bar_page_filters_before_reading_child_rows(tmp_path: Path) -> None:
         assert query_bar_evaluation_runs(db, factor_name="selected", frequency="1m", limit=1)
 
 
-def _make_calibrated_hac_config(tmp_path: Path) -> Path:
+def _make_calibrated_hac_config(tmp_path: Path, *, width: int = 32, train_slots: int = 512) -> Path:
     rng = np.random.default_rng(511)
-    start = pd.Timestamp("2026-12-01T11:31Z")
-    times = pd.date_range(start, periods=525, freq="1min")
+    start = pd.Timestamp("2026-12-01T20:03Z") - pd.Timedelta(minutes=train_slots)
+    times = pd.date_range(start, periods=train_slots + 13, freq="1min")
     frames = []
-    for i in range(32):
+    for i in range(width):
         price = rng.uniform(99, 120, len(times))
         noise = rng.uniform(-1, 1, len(times))
         factor = rng.normal(size=len(times))
@@ -491,8 +493,8 @@ def _make_calibrated_hac_config(tmp_path: Path) -> Path:
     pd.concat(frames).to_csv(bars, index=False)
     config = tmp_path / "calibrated.json"
     split = {
-        "train_end": (start + pd.Timedelta(minutes=512)).isoformat(),
-        "oos_start": (start + pd.Timedelta(minutes=516)).isoformat(),
+        "train_end": (start + pd.Timedelta(minutes=train_slots)).isoformat(),
+        "oos_start": (start + pd.Timedelta(minutes=train_slots + 4)).isoformat(),
     }
     config.write_text(json.dumps({
         "bars_csv": str(bars), "analysis_mode": "cross_sectional",
@@ -800,6 +802,79 @@ def test_v2_store_binds_periodic_gaps_to_split_label_clock(tmp_path, monkeypatch
 
     with pytest.raises(BarEvaluationIntegrityError, match="Bootstrap missing pattern"):
         ingest_evaluation(tmp_path / "invalid.duckdb", output, expected_hashes=hashes)
+
+
+def test_pre_registration_hac_artifact_inserts_and_replays_with_frozen_usability(tmp_path, monkeypatch):
+    from tools.agent_harness.time_series_analysis import evaluate
+    from utils import code_version
+
+    settings = json.loads(_make_calibrated_hac_config(tmp_path, width=256, train_slots=1024).read_text())
+    settings["calibration_scenario"] = "independent_null"
+    historical = "8ff43272ca14df94c52f2d0a872059a49d43ca05"
+    output = tmp_path / "historical"
+    with monkeypatch.context() as previous:
+        previous.setattr(code_version, "resolve_code_version", lambda _: (historical, "git"))
+        previous.setattr(calibration, "REGISTERED_ADAPTIVE_CALIBRATIONS", tuple(
+            domain for domain in calibration.REGISTERED_ADAPTIVE_CALIBRATIONS
+            if domain.report_ref != "reports/NERE-1280/cs_hac_calibration.json"
+        ))
+        historical_payload = evaluate(settings, output)
+    row, = historical_payload["metrics"]["splits"]["train"]["horizons"]
+    expected_use = row["interval_usability"]
+    assert row["hac"]["alpha"] == .05
+    assert expected_use["adaptive_observation"]["grid_size"] == 1024
+    assert expected_use["adaptive_observation"]["cross_section_width_min"] == 256
+    assert expected_use["calibration_status"] == "uncalibrated"
+    assert historical_payload["metrics"]["trial_ledger"]["best"] is None
+
+    db = tmp_path / "historical.duckdb"
+    assert ingest_evaluation(db, artifacts=historical_payload["artifacts"]).status == "inserted"
+    assert ingest_evaluation(db, artifacts=historical_payload["artifacts"]).status == "noop"
+    stored, = query_bar_evaluations(db, split="train")["split_metrics"]
+    assert stored["metrics_json"]["interval_usability"] == expected_use
+    assert stored["p_value"] == row["p_value"]
+    assert stored["interval_lower"] == row["hac"]["lower"]
+
+    def relabel_revision(summary_path: Path, revision: str) -> None:
+        summary = json.loads(summary_path.read_text())
+        rid = summary["result_identity"]
+        rid["code_version"] = revision
+        identity = ResultIdentity(**{name: rid[name] for name in ResultIdentity.__dataclass_fields__})
+        rid["identity_hash"] = identity.identity_hash()
+        summary_path.write_text(json.dumps(summary))
+
+    current = "6f734ec1008adfb050646789e82b9ae8509a6e2c"
+    relabel_revision(output / "summary.json", current)
+    with pytest.raises(BarEvaluationIntegrityError, match="interval usability matching"):
+        ingest_evaluation(tmp_path / "rejected.duckdb", artifacts=_republished_artifacts(historical_payload))
+
+    monkeypatch.setattr(code_version, "resolve_code_version", lambda _: (current, "git"))
+    current_payload = evaluate(settings, tmp_path / "current")
+    new_row, = current_payload["metrics"]["splits"]["train"]["horizons"]
+    assert new_row["interval_usability"]["calibration_status"] == "calibrated_pass"
+    assert new_row["interval_usability"]["calibration_evidence"]["report_ref"] == (
+        "reports/NERE-1280/cs_hac_calibration.json"
+    )
+    assert new_row["hac"] == row["hac"]
+    assert new_row["p_value"] == row["p_value"]
+    assert ingest_evaluation(db, artifacts=current_payload["artifacts"]).status == "inserted"
+
+    # A pre-registration identity cannot claim the new evidence.
+    relabel_revision(tmp_path / "current" / "summary.json", historical)
+    with pytest.raises(BarEvaluationIntegrityError, match="interval usability matching"):
+        ingest_evaluation(tmp_path / "rejected.duckdb", artifacts=_republished_artifacts(current_payload))
+
+
+def test_pre_registration_hac_source_requires_a_trusted_clean_commit():
+    from utils.bar_evaluation.interval_validation import _pre_registration_hac_source
+
+    sealed = "8ff43272ca14df94c52f2d0a872059a49d43ca05"
+    preregistration = "cab61ff20af5c4d038e99fc6a5c5de5f9b97ae91"
+    registration = "fd0a20d1b060e5f244aece6efc245d68ed4b6a23"
+    assert _pre_registration_hac_source(sealed, "git")
+    for revision, source in ((sealed + "-dirty", "git"), (sealed[:12], "git"), (sealed, "env"),
+                             ("b" * 40, "git"), (registration, "git")):
+        assert not _pre_registration_hac_source(revision, source)
 
 
 @pytest.mark.parametrize("missing_calendar", [False, True], ids=["complete", "without-calendar"])
@@ -1552,6 +1627,11 @@ def test_streamlit_page_importable_pure_queries_and_read_only(
     if legacy:
         with duckdb.connect(str(results_db)) as conn:
             id_hash = _make_legacy_schema(conn)
+    else:
+        with duckdb.connect(str(results_db)) as conn:
+            conn.execute("""UPDATE bar_evaluation_runs SET slot_id = 'synthetic', slot_config_hash = ?,
+                data_identity = '{"slot_data_fingerprint":{"build_id":"bars-v1"},"sources":["synthetic"],
+                                  "data_versions":["v1"],"build_id":"bars-v1"}' """, ["a" * 64])
 
     # Importing utils.bar_evaluation_app must not touch or write any DB
     connect = duckdb.connect
@@ -1580,6 +1660,7 @@ def test_streamlit_page_importable_pure_queries_and_read_only(
         "analysis_modes": ["time_series"],
         "frequencies": ["1min"],
         "calendar_ids": ["CME Globex Equity"],
+        "slot_ids": [] if legacy else ["synthetic"],
     }
     runs = query_bar_evaluation_runs(results_db, analysis_mode="time_series")
     assert len(runs) == 1 and runs[0]["identity_hash"] == id_hash
@@ -1587,11 +1668,19 @@ def test_streamlit_page_importable_pure_queries_and_read_only(
     assert all_data["run_count"] == 1
 
     fake_st, recorded_frames, recorded_json = dashboard_capture
+    fake_st.sidebar.selectbox = lambda label, options, **kwargs: options[-1] if label == "Slot ID" else options[0]
     monkeypatch.setattr(app_mod, "st", fake_st)
     app_mod.main(["--results-db", str(results_db)])
     assert len(recorded_frames) == (3 if legacy else 4)
     assert recorded_json[0]["has_split"] is (None if legacy else False)
+    assert recorded_json[0]["slot_id"] == (None if legacy else "synthetic")
     if not legacy:
+        assert recorded_json[0]["slot_config_hash"] == "a" * 64
+        assert "synthetic" in app_mod._format_run_label(runs[0])
+        assert recorded_json[1]["source_and_build"] == {
+            "slot_data_fingerprint": {"build_id": "bars-v1"}, "sources": ["synthetic"],
+            "data_versions": ["v1"], "build_id": "bars-v1",
+        }
         assert recorded_json[2]["method"] == "holm"
         split_frame = dict(recorded_frames)["full"]
         assert "significance_interpretation_usable" in split_frame
@@ -1644,25 +1733,13 @@ def dashboard_capture() -> tuple[SimpleNamespace, list[tuple[str | None, pd.Data
     return fake_st, recorded_frames, recorded_json
 
 
-def test_single_factor_daily_rejects_results_db_and_sqlite_rejected(tmp_path: Path) -> None:
-    daily_cfg = tmp_path / "daily.json"
-    daily_cfg.write_text(json.dumps({"analysis_mode": "cross_sectional"}), encoding="utf-8")
-    rc, payload = _run_cli(
-        tmp_path,
-        "--config",
-        str(daily_cfg),
-        "--results-db",
-        str(tmp_path / "out.duckdb"),
-        command="single-factor-analysis",
-    )
-    assert rc == 2
-    assert payload["error"]["code"] == "results_db_unsupported_for_daily"
-
+@pytest.mark.parametrize("command", ["single-factor-analysis", "time-series-analysis"])
+def test_sqlite_evaluation_target_is_rejected(tmp_path: Path, command: str) -> None:
     sqlite_file = tmp_path / "legacy.db"
     sqlite_file.write_bytes(b"SQLite format 3\x00" + b"\x00" * 100)
     with pytest.raises(ValueError, match="SQLite"):
         ingest_evaluation(sqlite_file, tmp_path)
-    rc, payload = _run_cli(tmp_path, "--results-db", str(sqlite_file))
+    rc, payload = _run_cli(tmp_path, "--results-db", str(sqlite_file), command=command)
     assert rc == 2
     assert payload["error"]["code"] == "bar_evaluation_store_precondition_failed"
 

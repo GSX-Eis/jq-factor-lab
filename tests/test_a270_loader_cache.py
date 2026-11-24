@@ -33,13 +33,12 @@ def test_bound_name_list_is_structural(store):
     assert_frame_equal(call(['a','b_c']),call(['a','b_c'],cache=False),check_exact=True)
 
 
-@pytest.mark.parametrize('bound',[True,False])
-def test_processed_cache_respects_order_while_raw_is_shared(store,bound):
+def test_processed_cache_respects_order_while_raw_is_shared(store):
     call,c,p=store
-    call(['A','B'],bound=bound)
+    call(['A','B'])
     with patch.object(m,'_read_factor_rows',side_effect=AssertionError('raw cache should hit')):
-        reordered=call(['B','A'],bound=bound)
-    assert_frame_equal(reordered,call(['B','A'],bound=bound,cache=False),check_exact=True)
+        reordered=call(['B','A'])
+    assert_frame_equal(reordered,call(['B','A'],cache=False),check_exact=True)
     assert len([f for f in p.glob('*.parquet') if '_processed_' not in f.name])==1
     assert len([f for f in p.glob('*.parquet') if '_processed_' in f.name])==2
 

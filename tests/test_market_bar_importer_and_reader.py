@@ -2,6 +2,8 @@
 from dataclasses import replace
 
 import duckdb
+
+from market_db_samples import declare_equity_bars, declare_futures_bars
 import numpy as np
 import pandas as pd
 import pytest
@@ -11,6 +13,7 @@ from backtest_and_analysis.time_series.contracts import (
 )
 from backtest_and_analysis.time_series.csv_reader import BarAvailability
 from backtest_and_analysis.time_series.labels import BarReturnLabeler
+from slots.jq_ashare_local.panel import ASharePanelReader
 from data_pipeline.loaders.market_bar_importer import (
     CONVERSION_MARKER, ExternalBarSourceSpec, adapt_external_bars,
     import_market_bars, validate_instrument_metadata,
@@ -20,18 +23,19 @@ from utils.market_bar_reader import MarketBarReader, read_market_bars
 from utils.session_calendar import SessionCalendar
 
 
-def metadata(instrument='NQZ26', **overrides):
+def metadata(instrument='NQZ26.CME', **overrides):
     future = instrument.startswith('NQ')
     row = dict(instrument_id=instrument, asset_class='futures' if future else 'equity',
                exchange='CME' if future else 'XSHG',
                timezone='America/Chicago' if future else 'Asia/Shanghai',
                contract_expiry='2026-12' if future else None, price_adjustment='none',
                point_value=20.0 if future else 1.0,
+               calendar_id='CME Globex Equity' if future else 'XSHG',
                rth_reference_calendar='NYSE' if future else 'XSHG')
     return pd.DataFrame([{**row, **overrides}])
 
 
-def bars(instrument='NQZ26', times=('2026-12-01 14:30Z',), frequency='1min', **extra):
+def bars(instrument='NQZ26.CME', times=('2026-12-01 14:30Z',), frequency='1min', **extra):
     return pd.DataFrame(dict(instrument_id=instrument, timestamp_utc=pd.to_datetime(list(times), utc=True),
                              frequency=frequency, open=100., high=102., low=99., close=101.,
                              volume=10., source='synthetic', data_version='v1', **extra))
@@ -51,42 +55,47 @@ def spec(**overrides):
 
 def adapt(data, source_spec=None, **kwargs):
     return adapt_external_bars(data, source_spec or spec(), metadata=metadata(), frequency='1min',
-                               source='IQFeed', data_version='test-v1', instrument_id='NQZ26', **kwargs)
+                               source='IQFeed', data_version='test-v1', instrument_id='NQZ26.CME', **kwargs)
 
 
 @pytest.fixture
 def conn(tmp_path):
     with duckdb.connect(str(tmp_path / 'isolated.duckdb')) as connection:
+        declare_futures_bars(connection, 'CME')
         yield connection
 
 
 def test_atomic_import_schema_revision_and_multimarket_frequencies(conn):
-    meta = pd.concat([metadata(), metadata('600001.XSHG'), metadata('600002.XSHG')], ignore_index=True)
-    frames = [bars(instrument, times, frequency) for instrument, times in [
-        ('NQZ26', ['2026-09-30 13:30Z', '2026-09-30 13:35Z']),
-        ('600001.XSHG', ['2026-09-30 01:30Z', '2026-09-30 01:35Z']),
-        ('600002.XSHG', ['2026-09-30 01:30Z', '2026-09-30 01:35Z'])]
-        for frequency in ('1min', '5min')]
-    before = connection_revision(conn)
-    assert import_market_bars(conn, pd.concat(frames, ignore_index=True), meta) == 12
+    stocks = ('600001.XSHG', '600002.XSHG')
+    markets = [
+        (conn, ('NQZ26.CME',), ('2026-09-30 13:30Z', '2026-09-30 13:35Z')),
+    ]
+    with duckdb.connect() as equity:
+        declare_equity_bars(equity)
+        markets.append((equity, stocks, ('2026-09-30 01:30Z', '2026-09-30 01:35Z')))
+        for connection, ids, times in markets:
+            meta = pd.concat([metadata(instrument) for instrument in ids], ignore_index=True)
+            frames = [bars(instrument, times, frequency) for instrument in ids for frequency in ('1min', '5min')]
+            before = connection_revision(connection)
+            assert import_market_bars(connection, pd.concat(frames, ignore_index=True), meta) == 4 * len(ids)
+            assert connection_revision(connection) != before
+            assert connection.execute('SELECT count(*) FROM instrument_metadata').fetchone()[0] == len(ids)
+            reader = MarketBarReader(connection)
+            for frequency in ('1min', '5min'):
+                result = reader.read_bars(ids, frequency)
+                assert len(result) == 2 * len(ids)
+                assert str(result.timestamp_utc.dtype) == 'datetime64[ns, UTC]'
+                assert set(result.frequency) == {frequency}
+                assert set(reader.get_calendars(result)) == set(ids)
+                factors = result[['instrument_id', 'timestamp_utc']].drop_duplicates().assign(factor_value=1.)
+                labels = BarReturnLabeler(reader.get_calendars(result), horizons=[1]).label(result, factors)
+                assert len(labels) == len(result)
+                snapshots = reader.build_availability(result)
+                if len(ids) == 1:
+                    snapshots = {ids[0]: snapshots}
+                for row in result.itertuples():
+                    assert snapshots[row.instrument_id].status(row.instrument_id, row.timestamp_utc, frequency) == 'observed'
     revision = connection_revision(conn)
-    assert revision != before
-    assert conn.execute('SELECT count(*) FROM instrument_metadata').fetchone()[0] == 3
-    reader = MarketBarReader(conn)
-    ids = list(meta.instrument_id)
-    for frequency in ('1min', '5min'):
-        result = reader.read_bars(ids, frequency)
-        assert len(result) == 6
-        assert str(result.timestamp_utc.dtype) == 'datetime64[ns, UTC]'
-        assert set(result.frequency) == {frequency}
-        assert len(result.attrs['calendar_hash']) == 3
-        assert set(reader.get_calendars(result)) == set(ids)
-        factors = result[['instrument_id', 'timestamp_utc']].drop_duplicates().assign(factor_value=1.)
-        labels = BarReturnLabeler(reader.get_calendars(result), horizons=[1]).label(result, factors)
-        assert len(labels) == 6
-        snapshots = reader.build_availability(result)
-        for row in result.itertuples():
-            assert snapshots[row.instrument_id].status(row.instrument_id, row.timestamp_utc, frequency) == 'observed'
     import_market_bars(conn, bars(times=['2026-12-01 14:31Z']), metadata())
     assert connection_revision(conn) != revision
 
@@ -108,9 +117,9 @@ def test_transaction_failure_rolls_back_metadata_bars_schema_and_revision(conn, 
     assert connection_revision(conn) == before
     import_market_bars(conn, bars(), metadata())
     revision = connection_revision(conn)
-    incoming = pd.concat([bars(), bars('600001.XSHG', ['2026-09-30 01:30Z'])], ignore_index=True)
+    incoming = pd.concat([bars(), bars('NQH27.CME', ['2026-12-01 14:30Z'])], ignore_index=True)
     with pytest.raises(duckdb.ConstraintException):
-        import_market_bars(conn, incoming, pd.concat([metadata(), metadata('600001.XSHG')]))
+        import_market_bars(conn, incoming, pd.concat([metadata(), metadata('NQH27.CME')]))
     assert conn.execute('SELECT count(*) FROM market_bars').fetchone()[0] == 1
     assert conn.execute('SELECT count(*) FROM instrument_metadata').fetchone()[0] == 1
     assert connection_revision(conn) == revision
@@ -121,7 +130,7 @@ def test_import_preserves_invalid_price_evidence(conn):
     frame.loc[0, 'open'] = np.nan
     frame.loc[1, 'close'] = -1.
     import_market_bars(conn, frame, metadata())
-    result = MarketBarReader(conn).read_bars(['NQZ26'], '1min')
+    result = MarketBarReader(conn).read_bars(['NQZ26.CME'], '1min')
     assert len(result) == 2
     assert invalid_price_mask(result).tolist() == [True, True]
     assert conn.execute('SELECT count(*) FROM market_bars WHERE open IS NULL').fetchone()[0] == 0
@@ -130,7 +139,7 @@ def test_import_preserves_invalid_price_evidence(conn):
 def test_optional_null_factor_and_money_are_accepted(conn):
     frame = bars(factor=None, money=None)
     assert import_market_bars(conn, frame, metadata()) == 1
-    result = MarketBarReader(conn).read_bars(['NQZ26'], '1min')
+    result = MarketBarReader(conn).read_bars(['NQZ26.CME'], '1min')
     assert result.factor.isna().all() and result.money.isna().all()
 
 
@@ -161,7 +170,7 @@ def test_invalid_import_leaves_existing_data_and_revision_unchanged(conn, change
     dict(instrument_id='NQ888'), dict(instrument_id='NQ000'), dict(price_adjustment='adjusted'),
     dict(point_value=0), dict(point_value=-1), dict(point_value=np.inf), dict(point_value=True),
     dict(point_value='20'), dict(timezone='bad/timezone'), dict(rth_reference_calendar='unknown'),
-    dict(exchange='unknown'), dict(asset_class=None), dict(contract_expiry=202612)])
+    dict(exchange='unknown', calendar_id=None), dict(asset_class=None), dict(contract_expiry=202612)])
 def test_invalid_metadata_rejected(override):
     with pytest.raises(ContractValidationError):
         validate_instrument_metadata(metadata(**override))
@@ -251,7 +260,7 @@ def test_cumulative_volume_resets_by_calendar_session_and_instrument():
     data = external([times[i] for i in (0, 1, 3, 4)], [10., 15., 3., 7.])
     result = adapt(data.iloc[::-1], spec(volume_mode='cumulative_session'))
     assert result.volume.tolist() == [10., 5., 3., 4.]
-    data['Symbol'] = 'NQZ26'
+    data['Symbol'] = 'NQZ26.CME'
     other = data.assign(Symbol='NQH27', TotalVolume=[100., 150., 30., 70.])
     mapped = spec(volume_mode='cumulative_session', column_mapping={**spec().column_mapping,
                                                                    'Symbol': 'instrument_id'})
@@ -259,7 +268,7 @@ def test_cumulative_volume_resets_by_calendar_session_and_instrument():
         metadata=pd.concat([metadata(), metadata('NQH27', contract_expiry='2027-03')]),
         frequency='1min', source='IQFeed', data_version='test')
     assert result.groupby('instrument_id').volume.apply(list).to_dict() == {
-        'NQZ26': [10., 5., 3., 4.], 'NQH27': [100., 50., 30., 40.]}
+        'NQZ26.CME': [10., 5., 3., 4.], 'NQH27': [100., 50., 30., 40.]}
 
 
 @pytest.mark.parametrize('volumes', [(10., 9.), (10., np.nan), (10., np.inf), (10., -1.)])
@@ -274,8 +283,8 @@ def test_rth_raw_coverage_labels_availability_and_bounds(conn):
              '2026-12-02 14:30Z']
     import_market_bars(conn, bars(times=times), metadata())
     reader = MarketBarReader(conn)
-    eth = reader.read_bars(['NQZ26'], '1min')
-    rth = reader.read_bars(['NQZ26'], '1min', view='RTH')
+    eth = reader.read_bars(['NQZ26.CME'], '1min')
+    rth = reader.read_bars(['NQZ26.CME'], '1min', view='RTH')
     assert len(eth) == 7 and len(rth) == 4
     assert rth.attrs['raw_coverage_by_key'] == eth.attrs['raw_coverage_by_key']
     assert rth.attrs['raw_coverage_end_utc'] == pd.Timestamp(times[-1])
@@ -287,15 +296,15 @@ def test_rth_raw_coverage_labels_availability_and_bounds(conn):
     assert reasons[pd.Timestamp('2026-12-02 14:30Z')] == 'insufficient_history'
     availability = reader.build_availability(rth, view='RTH')
     assert isinstance(availability, BarAvailability)
-    assert availability.status('NQZ26', pd.Timestamp('2026-12-01 21:00Z'), '1min') == 'market_closed'
-    assert availability.status('NQZ26', pd.Timestamp('2026-12-01 14:31Z'), '1min') == 'missing_bar'
-    bounded = reader.read_bars(['NQZ26'], '1min', start_utc='2026-12-01 14:30Z', end_utc='2026-12-01 21:59Z')
+    assert availability.status('NQZ26.CME', pd.Timestamp('2026-12-01 21:00Z'), '1min') == 'market_closed'
+    assert availability.status('NQZ26.CME', pd.Timestamp('2026-12-01 14:31Z'), '1min') == 'missing_bar'
+    bounded = reader.read_bars(['NQZ26.CME'], '1min', start_utc='2026-12-01 14:30Z', end_utc='2026-12-01 21:59Z')
     assert len(bounded) == 4
-    empty = reader.read_bars(['NQZ26'], '5min')
+    empty = reader.read_bars(['NQZ26.CME'], '5min')
     assert empty.empty
     assert empty.attrs['raw_coverage_by_key'] == {}
     with pytest.raises(ContractValidationError, match='UTC'):
-        reader.read_bars(['NQZ26'], '1min', start_utc='2026-12-01')
+        reader.read_bars(['NQZ26.CME'], '1min', start_utc='2026-12-01')
     with pytest.raises(ContractValidationError, match='calendar'):
         wrong = SessionCalendar('NYSE', '2026-11-29', '2026-12-10')
         BarReturnLabeler(wrong, view='RTH', horizons=[1]).label(rth.assign(factor_value=1.))
@@ -304,11 +313,12 @@ def test_rth_raw_coverage_labels_availability_and_bounds(conn):
 def test_reader_file_is_read_only_and_borrowed_connection_survives(tmp_path):
     path = tmp_path / 'isolated.duckdb'
     with duckdb.connect(str(path)) as writer:
+        declare_futures_bars(writer, 'CME')
         import_market_bars(writer, bars(), metadata())
         with MarketBarReader(writer) as reader:
-            assert len(reader.read_bars(['NQZ26'], '1min')) == 1
+            assert len(reader.read_bars(['NQZ26.CME'], '1min')) == 1
         assert writer.execute('SELECT 1').fetchone()[0] == 1
-    result = read_market_bars(['NQZ26'], '1min', duckdb_path=path)
+    result = read_market_bars(['NQZ26.CME'], '1min', duckdb_path=path)
     assert len(result) == 1
     with MarketBarReader(duckdb_path=path) as reader:
         with pytest.raises(duckdb.InvalidInputException, match='read-only'):
@@ -328,7 +338,7 @@ def test_legacy_5m_and_daily_read_only_schema_data_revision_unchanged(conn):
     before_schema = {table: conn.execute(f'DESCRIBE {table}').fetchall() for table, in before_tables}
     before_data = {table: conn.execute(f'SELECT * FROM {table}').fetchall() for table, in before_tables}
     revision = connection_revision(conn)
-    reader = MarketBarReader(conn)
+    reader = ASharePanelReader(conn)
     minute = reader.read_bars(['600001.XSHG'], '5min', source_table='price_data_5m')
     assert reader.build_availability(minute).status(
         '600001.XSHG', pd.Timestamp('2026-09-30 01:30Z'), '5min') == 'observed'

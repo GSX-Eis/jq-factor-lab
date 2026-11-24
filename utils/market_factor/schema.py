@@ -2,20 +2,25 @@
 from __future__ import annotations
 
 import datetime as dt
-import hashlib
 import json
-import pickle
 import re
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import pandas as pd
 import pyarrow as pa
+import pyarrow.compute as pc
+import pyarrow.parquet as pq
 
-MARKET_FACTOR_IDENTITY_SCHEMA_VERSION = "market_factor_identity.v1"
+from utils.market_db.identity import MARKET_DB_FIELDS
+from utils.data_revision import frame_digest as _frame_digest
+
+_V1_IDENTITY_SCHEMA_VERSION = "market_factor_identity.v1"
+MARKET_FACTOR_IDENTITY_SCHEMA_VERSION = "market_factor_identity.v2"
+SUPPORTED_IDENTITY_SCHEMA_VERSIONS = (_V1_IDENTITY_SCHEMA_VERSION, MARKET_FACTOR_IDENTITY_SCHEMA_VERSION)
 NAN_CANONICAL_BITS = np.uint64(0x7FF8000000000000)
 DEFAULT_ROW_GROUP_SIZE = 65536
 
@@ -46,6 +51,8 @@ LEAF_COLUMNS: tuple[str, ...] = tuple(
     col for col in TABLE_COLUMNS if col not in ("factor_id", "frequency")
 )
 
+_V2_IDENTITY_COLUMNS = ("slot_id", "slot_config_hash", "adjustment_policy", "slot_data_fingerprint")
+
 IDENTITY_COLUMNS: tuple[str, ...] = (
     "factor_identity_hash",
     "factor_id",
@@ -60,7 +67,7 @@ IDENTITY_COLUMNS: tuple[str, ...] = (
     "source_schema_version",
     "identity_payload_json",
     "created_at",
-)
+) + _V2_IDENTITY_COLUMNS + MARKET_DB_FIELDS
 
 LEAF_ARROW_SCHEMA = pa.schema([
     ("factor_identity_hash", pa.string()),
@@ -132,6 +139,26 @@ class FactorReadPlan:
     shard_paths: tuple[Path, ...]
     sql: str
     params: tuple[Any, ...]
+    market_databases: dict[str, dict[str, str]] = field(default_factory=dict)
+
+
+def _shard_ownership_fields(
+    factor_identity_hash: str, batch_id: str | None, identity_schema_version: str | None,
+) -> dict[str, str | None]:
+    fields: dict[str, str | None] = {"factor_identity_hash": factor_identity_hash}
+    # V1 stored the caller's batch ID on each row, even within a single committed file.
+    if identity_schema_version != _V1_IDENTITY_SCHEMA_VERSION:
+        fields["batch_id"] = batch_id
+    return fields
+
+
+def _shard_ownership_mismatches(file: pq.ParquetFile, expected: Mapping[str, str | None]) -> list[str]:
+    mismatches = expected.keys() - file.schema_arrow.names
+    for rows in file.iter_batches(columns=list(expected)):
+        for field in expected.keys() - mismatches:
+            if pc.all(pc.equal(rows[field], expected[field]), skip_nulls=False).as_py() is not True:
+                mismatches.add(field)
+    return sorted(mismatches)
 
 
 def sql_canonical_float(expr: str) -> str:
@@ -202,15 +229,3 @@ def _require_nonempty_str(value: Any, name: str) -> str:
 
 def _canonical_json(payload: Any) -> str:
     return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False)
-
-
-def _frame_digest(frame: pd.DataFrame) -> str:
-    digest = hashlib.sha256()
-
-    class _HashWriter:
-        def write(self, data: bytes) -> int:
-            digest.update(data)
-            return len(data)
-
-    pickle.dump(frame, _HashWriter(), protocol=4)
-    return digest.hexdigest()

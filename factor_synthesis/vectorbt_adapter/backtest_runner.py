@@ -13,10 +13,14 @@ from utils.output_paths import open_diagnostic
 from bisect import bisect_right
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Set, Tuple, Union
 
 import numpy as np
 import pandas as pd
+
+from utils.market_factor import MarketFactorValueStore
+from utils.slots.contracts import MarketSlot
+from utils.time_axis import Frequency
 
 from ..portfolio_plugins import get_position_plugin, get_strategy_plugin
 
@@ -45,6 +49,15 @@ from .factor_loader import (
 from utils.strategy_kernel import model_for_date, linear_signal, rank_scores, equal_target_weights, selection_count
 from .alignment_data_writer import AlignmentDataWriter
 from .quality_filter import QualityFilterError, apply_pit_quality_filter
+from .slot_provider import (
+    SlotDataProvider,
+    apply_magnitude_caps,
+    compute_liquidity_weight_caps,
+    compute_long_short_target_weights,
+    has_finite_positive_prices,
+    sanitize_execution_prices,
+)
+from .universe_filter import UniverseFilterPlugin
 
 # LightGBM support
 try:
@@ -97,6 +110,11 @@ class VectorBTBacktestRunner:
         tradeability_cache: Optional[
             Dict[tuple[str, tuple[str, ...]], List[str]]
         ] = None,
+        slot: Optional[MarketSlot] = None,
+        frequency: str = "1d",
+        factor_values_store: Optional[Union[str, Path, MarketFactorValueStore]] = None,
+        factor_identities: Optional[Mapping[str, str]] = None,
+        universe_filter_plugin: Optional[UniverseFilterPlugin] = None,
     ):
         """
         Initialize backtest runner.
@@ -127,21 +145,37 @@ class VectorBTBacktestRunner:
         self._factor_load_cache = factor_load_cache
         self._synthesis_score_cache = synthesis_score_cache
         self._tradeability_cache = tradeability_cache
+        parsed_freq = Frequency.parse(frequency)
+        if not parsed_freq.is_valid or parsed_freq.canonical is None:
+            raise ValueError(f"Invalid frequency: {frequency!r}")
+        self.slot = slot
+        self.frequency = parsed_freq.canonical
+        self.factor_values_store = factor_values_store
+        self.factor_identities = dict(factor_identities or {})
+        self.universe_filter_plugin = universe_filter_plugin
+        self._slot_provider = SlotDataProvider(
+            slot=slot,
+            frequency=self.frequency,
+            logger=logger or logging.getLogger(__name__),
+            tradeability_cache=tradeability_cache,
+            factor_values_store=factor_values_store,
+            factor_identities=self.factor_identities,
+        )
 
-        # Top-K strategy config
+        # Top-K strategy config; priority: top_k > top_pct > default(DEFAULT_TOP_K).
         top_k_cfg = config.get("top_k_strategy", {})
+        from tools.agent_harness.run_result import resolve_candidate_selection
 
-        # Support both top_k (fixed count) and top_pct (percentage-based)
-        # Priority: top_k > top_pct > default(5)
-        self.top_k = top_k_cfg.get("top_k", None)
-        self.top_pct = top_k_cfg.get("top_pct", None)
+        _, self.top_pct, self.top_k = resolve_candidate_selection(
+            top_pct=top_k_cfg.get("top_pct"), top_k=top_k_cfg.get("top_k")
+        )
 
-        # Validate: at least one selection method should exist or use default
-        if self.top_k is None and self.top_pct is None:
-            self.top_k = 5  # Default fallback
-
-        self.cost_rate = top_k_cfg.get("cost_rate", 0.003)
-        self.slippage = top_k_cfg.get("slippage", 0.0)
+        self.buy_cost_rate, self.sell_cost_rate = self._slot_provider.resolve_cost_rates(top_k_cfg)
+        self.cost_rate = self.buy_cost_rate
+        self.slippage = self._slot_provider.resolve_slippage(top_k_cfg)
+        self.allow_short = self._slot_provider.resolve_allow_short(top_k_cfg)
+        self.benchmark_instrument = self._slot_provider.resolve_benchmark_instrument(top_k_cfg)
+        self._last_order_fees: Optional[pd.DataFrame] = None
         self.holding_period = top_k_cfg.get("holding_period", 5)
         self.nth_trading_day = top_k_cfg.get(
             "nth_trading_day", 3
@@ -235,6 +269,7 @@ class VectorBTBacktestRunner:
         self._selection_diagnostics: List[Dict[str, Any]] = []
         self._execution_diagnostics: Dict[str, Any] = {}
         self._mvo_diagnostics: List[Dict[str, Any]] = []
+        self.effective_entry_price_field: str = "close"
 
         # Calendar filters: whole months (1-12) and/or "MM-DD:MM-DD" windows
         cal_cfg = config.get("calendar_filters", {})
@@ -372,13 +407,29 @@ class VectorBTBacktestRunner:
 
         # Missing whole-market rows cannot become shorter holding periods.
         market_calendar = self._trading_calendar()
-        expected = market_calendar.align(price_df).index
+        expected = self._slot_provider.align_price_index(price_df, market_calendar)
         if not pd.DatetimeIndex(price_df.index).as_unit("ns").equals(expected.as_unit("ns")):
             raise ValueError('Backtest prices must cover every market session in order; import missing dates')
         # DuckDB dates may be microseconds; VectorBT requires identical index metadata.
         price_df = price_df.set_axis(expected, axis=0)
         all_price_dates = expected
-        factor_dates = factor_df.index
+        factor_dates = pd.DatetimeIndex(factor_df.index)
+        if factor_dates.hasnans or factor_dates.has_duplicates:
+            raise ValueError("Backtest factor_df index must contain unique non-null timestamps")
+        if expected.tz is not None:
+            if factor_dates.tz is None:
+                raise ValueError(
+                    "Backtest factor_df index must be timezone-aware UTC when price_df uses UTC timestamps"
+                )
+            factor_df = factor_df.set_axis(factor_dates.tz_convert("UTC").as_unit("ns"), axis=0)
+            factor_dates = pd.DatetimeIndex(factor_df.index)
+        else:
+            if factor_dates.tz is not None:
+                raise ValueError(
+                    "Backtest factor_df index must be timezone-naive when price_df uses session dates"
+                )
+            factor_df = factor_df.set_axis(factor_dates.as_unit("ns"), axis=0)
+            factor_dates = pd.DatetimeIndex(factor_df.index)
 
         # Log date coverage
         skip_month_dates_in_price = list(
@@ -402,27 +453,59 @@ class VectorBTBacktestRunner:
             index=all_price_dates, columns=list(common_stocks)
         )
 
-        # Align open prices if provided
+        # Align open prices if provided, or read from Slot execution bars if configured
+        profile = self.slot.microstructure.execution_profile if self.slot is not None else None
+        explicit_close_slot = bool(self.slot is not None and self.slot.slot_id != "jq_ashare_local" and profile is not None and profile.entry_price_field == "close")
+        explicit_open_slot = bool(profile is not None and profile.entry_price_field == "open")
         open_aligned = None
-        if open_df is not None:
-            open_common_stocks = common_stocks.intersection(open_df.columns)
-            if len(open_common_stocks) > 0:
-                # [FIX] 使用排序的列表确保列顺序稳定
-                common_stocks = sorted(
-                    list(set(common_stocks) & set(open_common_stocks))
-                )
-                price_aligned = price_df[common_stocks]
-                factor_aligned = factor_df.reindex(
-                    index=all_price_dates, columns=common_stocks
-                )
-                open_aligned = open_df.reindex(
-                    index=all_price_dates, columns=common_stocks
-                )
-                self.logger.info(f"[VectorBT] 使用开盘价执行订单 (JoinQuant对齐模式)")
+        if explicit_close_slot:
+            if open_df is not None:
+                self.logger.info("[VectorBT] Slot 显式配置 entry_price_field='close'，忽略开盘价并使用收盘价执行订单")
+        elif open_df is not None:
+            open_dates = pd.DatetimeIndex(open_df.index)
+            if expected.tz is not None:
+                if open_dates.tz is None:
+                    raise ValueError(
+                        "Backtest open_df index must be timezone-aware UTC when price_df uses UTC timestamps"
+                    )
+                open_df = open_df.set_axis(open_dates.tz_convert("UTC").as_unit("ns"), axis=0)
             else:
-                self.logger.warning(
-                    "[VectorBT] Open price data alignment failed, falling back to close prices"
+                if open_dates.tz is not None:
+                    raise ValueError(
+                        "Backtest open_df index must be timezone-naive when price_df uses session dates"
+                    )
+                open_df = open_df.set_axis(open_dates.as_unit("ns"), axis=0)
+            open_common_stocks = common_stocks.intersection(open_df.columns)
+            if (
+                len(open_common_stocks) > 0
+                and not open_df.index.intersection(all_price_dates).empty
+            ):
+                candidate_stocks = sorted(list(set(common_stocks) & set(open_common_stocks)))
+                candidate_open = sanitize_execution_prices(
+                    open_df.reindex(index=all_price_dates, columns=candidate_stocks)
                 )
+                if not explicit_open_slot or has_finite_positive_prices(candidate_open):
+                    common_stocks = candidate_stocks
+                    price_aligned = price_df[common_stocks]
+                    factor_aligned = factor_df.reindex(index=all_price_dates, columns=common_stocks)
+                    open_aligned = candidate_open
+                    self.logger.info(f"[VectorBT] 使用开盘价执行订单 (JoinQuant对齐模式)")
+        if open_aligned is None and not explicit_close_slot and self.slot is not None:
+            open_aligned = self._slot_provider.read_execution_price_frame(
+                all_price_dates, list(common_stocks)
+            )
+            if open_aligned is not None:
+                self.logger.info(
+                    f"[VectorBT] 使用 Slot 执行字段 {self.slot.microstructure.execution_profile.entry_price_field!r} 执行订单"
+                )
+        if open_aligned is None and explicit_open_slot:
+            raise ValueError(
+                "Slot requires entry_price_field='open', but execution price frame could not be resolved"
+            )
+        if open_aligned is None and not explicit_close_slot and open_df is not None:
+            self.logger.warning(
+                "[VectorBT] Open price data alignment failed, falling back to close prices"
+            )
 
         # Use price dates as common_dates for subsequent logic
         common_dates = all_price_dates
@@ -433,12 +516,20 @@ class VectorBTBacktestRunner:
 
         # [HIGH PRIORITY 1] Use dynamic_pools keys directly as rebalance dates (align with JQ Local)
         if self.quality_filter.get("enabled", False):
-            quality_db_path = self.price_db_path or self.factor_db_path
-            if not quality_db_path:
-                raise QualityFilterError("quality filter requires price_db_path")
-            dynamic_pools, self._quality_filter_diagnostics = apply_pit_quality_filter(
-                dynamic_pools or {}, db_path=quality_db_path, config=self.quality_filter
-            )
+            if self.slot is not None or self.universe_filter_plugin is not None:
+                dynamic_pools, self._quality_filter_diagnostics = apply_pit_quality_filter(
+                    dynamic_pools or {},
+                    slot=self.slot,
+                    plugin=self.universe_filter_plugin,
+                    config=self.quality_filter,
+                )
+            else:
+                quality_db_path = self.price_db_path or self.factor_db_path
+                if not quality_db_path:
+                    raise QualityFilterError("quality filter requires price_db_path")
+                dynamic_pools, self._quality_filter_diagnostics = apply_pit_quality_filter(
+                    dynamic_pools or {}, db_path=quality_db_path, config=self.quality_filter
+                )
             self.logger.info(
                 "[QUALITY_FILTER] PIT dividend quality applied: %s",
                 self._quality_filter_diagnostics,
@@ -447,9 +538,12 @@ class VectorBTBacktestRunner:
             rebalance_dates = self._load_strategy_rebalance_dates()
         if rebalance_dates is None:
             if dynamic_pools:
-                # Get all pool dates sorted
-                all_pool_dates = sorted(
-                    [pd.to_datetime(d).to_pydatetime() for d in dynamic_pools.keys()]
+                # Get all pool dates sorted and aligned to backtest bar index
+                all_pool_dates = self._slot_provider.resolve_pool_rebalance_dates(
+                    common_dates,
+                    dynamic_pools.keys(),
+                    self.price_db_conn,
+                    self.price_db_path,
                 )
 
                 # Apply holding_period: select every Nth date from pool dates
@@ -465,6 +559,28 @@ class VectorBTBacktestRunner:
                     )
                 else:
                     rebalance_dates = all_pool_dates
+            elif self.frequency != "1d" or common_dates.tz is not None:
+                step = max(1, int(self.holding_period or 1))
+                if rebalance_freq in ("daily", "weekly", "monthly"):
+                    naive_idx = (
+                        common_dates.tz_convert("UTC").tz_localize(None)
+                        if common_dates.tz is not None
+                        else common_dates
+                    )
+                    rebalance_dates = compute_rebalance_dates(
+                        naive_idx,
+                        start_date=naive_idx.min(),
+                        end_date=naive_idx.max(),
+                        rebalance_freq=rebalance_freq,
+                        nth_trading_day=self.nth_trading_day,
+                    )
+                    if common_dates.tz is not None:
+                        rebalance_dates = [
+                            pd.Timestamp(d).tz_localize("UTC").to_pydatetime()
+                            for d in rebalance_dates
+                        ]
+                else:
+                    rebalance_dates = [d.to_pydatetime() for d in common_dates[::step]]
             else:
                 # Fallback: compute rebalance dates from trading calendar
                 trading_calendar = build_trading_calendar(price_aligned, calendar=self._trading_calendar())
@@ -529,23 +645,17 @@ class VectorBTBacktestRunner:
             self.logger.warning("All target weights are NaN")
             return {"error": "All weights NaN"}
 
-        # [DEBUG] 检查权重矩阵
-        non_nan_count = target_weights.notna().sum().sum()
-        total_cells = target_weights.shape[0] * target_weights.shape[1]
-        nan_ratio = 1 - (non_nan_count / total_cells)
-        # self.logger.info(f"[VectorBT DEBUG] 权重矩阵: {target_weights.shape}, 非NaN: {non_nan_count}, NaN比例: {nan_ratio:.2%}")
-
-        # 检查前几个调仓日的权重
-        rebalance_weights = target_weights.dropna(how="all")
-        if len(rebalance_weights) > 0:
-            sample_date = rebalance_weights.index[0]
-            sample_weights = target_weights.loc[sample_date].dropna()
-            # self.logger.info(f"[VectorBT DEBUG] 第一个调仓日 {sample_date}: {len(sample_weights)} 只股票有权重")
-            # self.logger.info(f"[VectorBT DEBUG] 权重值: {sample_weights.head(10).to_dict()}")
-
         # Run VectorBT portfolio simulation
         # JoinQuant alignment: use open prices for order execution, close prices for valuation
         use_open = open_aligned is not None
+        self.effective_entry_price_field = "open" if use_open else "close"
+        self._execution_diagnostics.update({
+            "effective_entry_price_field": self.effective_entry_price_field, "effective_use_open": bool(use_open),
+            "effective_quality_filter": dict(self.quality_filter), "effective_enable_tday_filter": bool(self.enable_tday_filter),
+            "effective_allow_short": bool(self.allow_short), "effective_benchmark_instrument": self.benchmark_instrument,
+            "effective_buy_cost_rate": float(self.buy_cost_rate), "effective_sell_cost_rate": float(self.sell_cost_rate),
+            "effective_slippage": float(self.slippage),
+        })
         self.logger.info(
             f"[VectorBT] Running simulation with top_k={self.top_k}, cost={self.cost_rate}, use_open={use_open}"
         )
@@ -929,9 +1039,15 @@ class VectorBTBacktestRunner:
                 },
                 "regime_filter": {
                     "enabled": bool(regime_filter.get("enabled", False)),
-                    "micro_index": str(regime_filter.get("micro_index", "399101.XSHE")),
-                    "benchmark_index": str(
-                        regime_filter.get("benchmark_index", "000300.XSHG")
+                    "micro_index": (
+                        str(regime_filter["micro_index"])
+                        if regime_filter.get("micro_index")
+                        else None
+                    ),
+                    "benchmark_index": (
+                        str(regime_filter["benchmark_index"])
+                        if regime_filter.get("benchmark_index")
+                        else None
                     ),
                     "spread_window_days": max(
                         2, int(regime_filter.get("spread_window_days", 20))
@@ -1039,9 +1155,15 @@ class VectorBTBacktestRunner:
                 },
                 "spread": {
                     "enabled": bool(spread.get("enabled", True)),
-                    "micro_index": str(spread.get("micro_index", "399101.XSHE")),
-                    "benchmark_index": str(
-                        spread.get("benchmark_index", "000300.XSHG")
+                    "micro_index": (
+                        str(spread["micro_index"])
+                        if spread.get("micro_index")
+                        else None
+                    ),
+                    "benchmark_index": (
+                        str(spread["benchmark_index"])
+                        if spread.get("benchmark_index")
+                        else None
                     ),
                     "spread_window_days": max(
                         2, int(spread.get("spread_window_days", 20))
@@ -1340,71 +1462,55 @@ class VectorBTBacktestRunner:
             return dict(target_map)
         return {s: w / total for s, w in blended.items()}
 
+    def _liquidity_weight_caps(
+        self,
+        stocks: Iterable[str],
+        as_of_date_str: str,
+        deployed_capital: float,
+    ) -> Dict[str, float]:
+        """Compute per-name absolute weight caps implied by the ADV participation limit."""
+        liq = self.overlay["liquidity_cap"]
+        stock_list = sorted(set(stocks))
+        capital_base = liq.get("capital_base")
+        capital = float(capital_base) if capital_base else float(deployed_capital)
+        if not stock_list or capital <= 0:
+            return {}
+        adv = self._average_daily_value(stock_list, as_of_date_str, liq["adv_lookback_days"])
+        return compute_liquidity_weight_caps(
+            adv,
+            stock_list,
+            max_participation=float(liq["max_participation"]),
+            holding_period=max(1, int(self.holding_period or 1)),
+            capital=capital,
+        )
+
     def _apply_liquidity_cap(
         self,
         weights: Dict[str, float],
         as_of_date_str: str,
         deployed_capital: float,
     ) -> Dict[str, float]:
-        """Cap each weight at its ADV participation limit (liquidity-aware weighting).
-
-        weight_i <= max_participation * ADV_i * holding_period / capital, where ADV
-        is the trailing average daily traded value (``money``) up to T-1. Excess is
-        redistributed to names that still have headroom; if all names are capped the
-        residual stays in cash (weights sum < 1). Names without ADV data keep their
-        weight (data gap should not silently zero a position).
-        """
+        """Cap each weight at its ADV participation limit (liquidity-aware weighting)."""
         liq = self.overlay["liquidity_cap"]
         if not weights:
             return weights
-        capital_base = liq.get("capital_base")
-        capital = float(capital_base) if capital_base else float(deployed_capital)
-        if capital <= 0:
+        caps = self._liquidity_weight_caps(weights.keys(), as_of_date_str, deployed_capital)
+        if not caps:
             return weights
-        adv = self._average_daily_value(
-            sorted(weights), as_of_date_str, liq["adv_lookback_days"]
-        )
-        max_participation = float(liq["max_participation"])
-        holding_period = max(1, int(self.holding_period or 1))
-        caps: Dict[str, float] = {}
-        for stock in weights:
-            stock_adv = adv.get(stock)
-            if stock_adv is None or stock_adv <= 0:
-                continue  # no ADV data -> leave uncapped
-            caps[stock] = max_participation * stock_adv * holding_period / capital
-
-        result = dict(weights)
-        for _ in range(100):
-            over = {
-                s: w for s, w in result.items() if s in caps and w > caps[s] + 1e-12
-            }
-            if not over:
-                break
-            excess = sum(result[s] - caps[s] for s in over)
-            for s in over:
-                result[s] = caps[s]
-            headroom = {
-                s: (caps[s] - result[s]) if s in caps else float("inf")
-                for s in result
-                if s not in over and (s not in caps or result[s] < caps[s] - 1e-12)
-            }
-            free_total = sum(result[s] for s in headroom)
-            if not headroom or free_total <= 0:
-                break  # everyone capped -> residual goes to cash
-            for s in list(headroom):
-                add = excess * (result[s] / free_total)
-                result[s] += min(add, headroom[s])
+        result = apply_magnitude_caps(weights, caps)
         capped_names = [
             s
             for s in result
             if s in caps
-            and result[s] <= caps[s] + 1e-9
-            and weights[s] > result[s] + 1e-12
+            and abs(result[s]) <= caps[s] + 1e-9
+            and abs(weights[s]) > abs(result[s]) + 1e-12
         ]
         if capped_names:
+            capital_base = liq.get("capital_base")
+            capital = float(capital_base) if capital_base else float(deployed_capital)
             self.logger.debug(
                 f"[Overlay] liquidity_cap clipped {len(capped_names)} names at {as_of_date_str} "
-                f"(capital={capital:,.0f}, participation={max_participation})"
+                f"(capital={capital:,.0f}, participation={float(liq['max_participation'])})"
             )
         return result
 
@@ -1414,46 +1520,14 @@ class VectorBTBacktestRunner:
         as_of_date_str: str,
         lookback_days: int,
     ) -> Dict[str, float]:
-        """Trailing average daily traded value (yuan) per stock up to as_of_date (inclusive)."""
-        conn = self.price_db_conn
-        if conn is None or not stocks:
-            return {}
-        cache_key = (as_of_date_str, int(lookback_days))
-        cache = getattr(self, "_adv_cache", None)
-        if cache is None:
-            cache = {}
-            self._adv_cache = cache
-        cached = cache.get(cache_key)
-        if cached is None:
-            cached = {}
-            cache[cache_key] = cached
-        missing = [s for s in stocks if s not in cached]
-        if missing:
-            stocks_str = "', '".join(missing)
-            sql = f"""
-            SELECT stock_code, AVG(money) AS adv
-            FROM (
-                SELECT stock_code, money,
-                       ROW_NUMBER() OVER (PARTITION BY stock_code ORDER BY date DESC) AS rn
-                FROM price_data_daily
-                WHERE date <= '{as_of_date_str}'
-                  AND stock_code IN ('{stocks_str}')
-                  AND money IS NOT NULL AND money > 0
-            )
-            WHERE rn <= {int(lookback_days)}
-            GROUP BY stock_code
-            """
-            try:
-                rows = conn.execute(sql).fetchall()
-                for stock_code, adv in rows:
-                    cached[str(stock_code)] = float(adv)
-            except Exception as e:
-                self.logger.warning(
-                    f"[Overlay] ADV query failed at {as_of_date_str}: {e}"
-                )
-            for s in missing:
-                cached.setdefault(s, None)
-        return {s: cached.get(s) for s in stocks if cached.get(s) is not None}
+        """Trailing average daily traded value per instrument up to as_of_date (inclusive)."""
+        return self._slot_provider.average_daily_value(
+            stocks,
+            as_of_date_str,
+            lookback_days,
+            self.price_db_conn,
+            self.price_db_path,
+        )
 
     # =====================================================================
     # [PORTFOLIO OVERLAY] Mean-variance optimizer (weighting.scheme == "mvo")
@@ -1671,71 +1745,17 @@ class VectorBTBacktestRunner:
         self, stocks: List[str], as_of_date_str: str
     ) -> Optional[pd.DataFrame]:
         """Latest style exposures (<= as_of_date) per stock; NaN filled with 0."""
-        conn = self.price_db_conn
-        if conn is None:
-            return None
-        cache = getattr(self, "_style_exposure_cache", None)
-        if cache is None:
-            cache = {}
-            self._style_exposure_cache = cache
-        key = as_of_date_str
-        if key not in cache:
-            try:
-                stocks_str = "', '".join(sorted(set(stocks)))
-                frame = conn.execute(
-                    f"""
-                    SELECT * FROM style_factor_exposure
-                    WHERE date = (SELECT MAX(date) FROM style_factor_exposure WHERE date <= '{as_of_date_str}')
-                      AND stock_code IN ('{stocks_str}')
-                    """
-                ).fetchdf()
-            except Exception as e:
-                self.logger.debug(
-                    f"[Overlay] style exposure query failed at {as_of_date_str}: {e}"
-                )
-                cache[key] = None
-                return None
-            if frame.empty:
-                cache[key] = None
-            else:
-                frame = frame.set_index("stock_code").drop(
-                    columns=["date"], errors="ignore"
-                )
-                cache[key] = frame
-        base = cache[key]
-        if base is None:
-            return None
-        return base.reindex(stocks).fillna(0.0)
+        return self._slot_provider.style_exposures_for(
+            stocks, as_of_date_str, self.price_db_conn, self.price_db_path
+        )
 
     def _industry_groups_for(
         self, stocks: List[str], as_of_date_str: str
     ) -> Dict[str, str]:
         """Latest SW level-1 industry membership (<= as_of_date) per stock."""
-        conn = self.price_db_conn
-        if conn is None:
-            return {}
-        cache = getattr(self, "_industry_cache", None)
-        if cache is None:
-            cache = {}
-            self._industry_cache = cache
-        key = as_of_date_str
-        if key not in cache:
-            try:
-                stocks_str = "', '".join(sorted(set(stocks)))
-                rows = conn.execute(
-                    f"""
-                    SELECT stock_code, sw_l1_code FROM industry_membership
-                    WHERE date = (SELECT MAX(date) FROM industry_membership WHERE date <= '{as_of_date_str}')
-                      AND stock_code IN ('{stocks_str}')
-                    """
-                ).fetchall()
-                cache[key] = {str(code): str(ind) for code, ind in rows if ind}
-            except Exception as e:
-                self.logger.debug(
-                    f"[Overlay] industry query failed at {as_of_date_str}: {e}"
-                )
-                cache[key] = {}
-        return {s: cache[key][s] for s in stocks if s in cache[key]}
+        return self._slot_provider.industry_groups_for(
+            stocks, as_of_date_str, self.price_db_conn, self.price_db_path
+        )
 
     def _trailing_volatility(
         self,
@@ -1774,7 +1794,21 @@ class VectorBTBacktestRunner:
         - regime_filter: micro-cap vs large-cap index spread z-score de-risk
         """
         risk = self.overlay["risk_overlay"]
-        returns = returns.fillna(0.0)
+        ret_idx = pd.DatetimeIndex(returns.index)
+        is_daily_naive = self._slot_provider.is_daily_naive_index(ret_idx)
+        if not is_daily_naive and ret_idx.empty and not price_df.empty:
+            is_daily_naive = self._slot_provider.is_daily_naive_index(
+                pd.DatetimeIndex(price_df.index)
+            )
+        try:
+            market_cal = self._trading_calendar()
+        except Exception:
+            market_cal = None
+
+        norm_ret_idx = pd.DatetimeIndex(
+            [self._slot_provider.norm_bar_ts(ts, daily_naive=is_daily_naive) for ts in ret_idx]
+        )
+        returns = returns.set_axis(norm_ret_idx).fillna(0.0)
         equity = (1.0 + returns).cumprod()
         running_max = equity.cummax()
         drawdown = equity / running_max - 1.0
@@ -1799,6 +1833,13 @@ class VectorBTBacktestRunner:
             if pool_cols:
                 daily_rets = price_df[pool_cols].pct_change()
                 breadth_series = (daily_rets < bf["loss_threshold"]).mean(axis=1)
+                breadth_idx = pd.DatetimeIndex(
+                    [
+                        self._slot_provider.norm_bar_ts(ts, daily_naive=is_daily_naive)
+                        for ts in breadth_series.index
+                    ]
+                )
+                breadth_series = breadth_series.set_axis(breadth_idx)
 
         # Micro-cap vs large-cap regime spread z-score (data-driven replacement
         # for calendar-based skip-month heuristics).
@@ -1812,17 +1853,28 @@ class VectorBTBacktestRunner:
         if cg["enabled"]:
             crisis_votes = self._crisis_guard_vote_series(cg, pool_stocks, price_df)
 
-        rebalance_norm = sorted({pd.Timestamp(d).normalize() for d in rebalance_dates})
+        rebalance_norm = sorted(
+            {
+                self._slot_provider.norm_bar_ts(d, daily_naive=is_daily_naive)
+                for d in rebalance_dates
+            }
+        )
         exposure_by_date: Dict[Any, float] = {}
+        _, _, bars_per_year = self._slot_provider.annualization_spec(
+            self.price_db_conn, self.price_db_path
+        )
         derisk_state = False  # drawdown_control latch
         crisis_cooldown = 0  # crisis_guard cooldown counter (rebalance steps)
         for reb_date in rebalance_norm:
-            # Use data strictly before this rebalance date.
+            reb_session_day = self._slot_provider.session_date_for_bar(
+                reb_date, daily_naive=is_daily_naive, cal=market_cal
+            )
+            # Use data strictly before this rebalance bar.
             prior = equity.index[equity.index < reb_date]
             exposure = 1.0
             if vt["enabled"] and len(prior) > vt["lookback_days"]:
                 recent = returns.loc[prior].tail(vt["lookback_days"])
-                realized = float(recent.std()) * np.sqrt(252.0)
+                realized = float(recent.std()) * np.sqrt(bars_per_year)
                 if realized > 1e-9:
                     exposure *= float(
                         np.clip(
@@ -1850,7 +1902,15 @@ class VectorBTBacktestRunner:
                     if cur_breadth >= bf["breadth_threshold"]:
                         exposure *= bf["derisk_exposure"]
             if rf["enabled"] and regime_z is not None:
-                prior_z = regime_z.index[regime_z.index < reb_date]
+                if regime_z.index.tz is not None:
+                    reb_cmp = (
+                        reb_date
+                        if reb_date.tzinfo is not None
+                        else self._slot_provider.norm_bar_ts(reb_date, daily_naive=False)
+                    )
+                    prior_z = regime_z.index[regime_z.index.tz_convert("UTC") < reb_cmp]
+                else:
+                    prior_z = regime_z.index[regime_z.index < reb_session_day]
                 if len(prior_z) > 0:
                     cur_z = float(regime_z.loc[prior_z].iloc[-1])
                     if cur_z <= rf["exit_z"]:
@@ -1859,14 +1919,14 @@ class VectorBTBacktestRunner:
                         exposure *= rf["derisk_exposure"]
             if external_signal is not None and position_plugin is not None:
                 eligible = external_signal.loc[
-                    (external_signal["effective_date"] <= reb_date)
-                    & (external_signal["observed_through"] < reb_date)
+                    (external_signal["effective_date"] <= reb_session_day)
+                    & (external_signal["observed_through"] < reb_session_day)
                 ]
                 regime_exposure = external_regime["missing_exposure"]
                 if not eligible.empty:
                     latest = eligible.iloc[-1]
                     # Do not fall back to an older vintage if the latest expired.
-                    if "valid_until" not in eligible or latest["valid_until"] >= reb_date:
+                    if "valid_until" not in eligible or latest["valid_until"] >= reb_session_day:
                         regime_exposure = position_plugin(
                             float(latest["score"]), external_regime
                         )
@@ -1874,7 +1934,15 @@ class VectorBTBacktestRunner:
             if cg["enabled"] and crisis_votes:
                 votes = 0
                 for sig in crisis_votes:
-                    prior_s = sig.index[sig.index < reb_date]
+                    if sig.index.tz is not None:
+                        reb_cmp = (
+                            reb_date
+                            if reb_date.tzinfo is not None
+                            else self._slot_provider.norm_bar_ts(reb_date, daily_naive=False)
+                        )
+                        prior_s = sig.index[sig.index.tz_convert("UTC") < reb_cmp]
+                    else:
+                        prior_s = sig.index[sig.index < reb_session_day]
                     if len(prior_s) > 0 and bool(sig.loc[prior_s].iloc[-1]):
                         votes += 1
                 if votes >= cg["min_triggers"]:
@@ -1977,79 +2045,13 @@ class VectorBTBacktestRunner:
         return [date.to_pydatetime() for date in dates]
 
     def _regime_spread_zscore(self, rf: Dict[str, Any]) -> Optional[pd.Series]:
-        """Z-score of the micro-cap minus large-cap rolling return spread.
-
-        Built from ``index_price_daily`` (e.g. 399101.XSHE vs 000300.XSHG). The
-        spread is the difference of trailing ``spread_window_days`` returns and
-        the z-score is computed against a trailing ``zscore_window_days`` window,
-        so each value only uses information available on that day.
-        """
-        cached = getattr(self, "_regime_z_cache", None)
-        cache_key = (
-            rf["micro_index"],
-            rf["benchmark_index"],
-            rf["spread_window_days"],
-            rf["zscore_window_days"],
+        """Z-score of the micro-cap minus benchmark rolling return spread via AuxFeatureSlot."""
+        return self._slot_provider.regime_spread_zscore(
+            rf,
+            self.price_db_conn,
+            self.price_db_path,
+            benchmark_instrument=self.benchmark_instrument,
         )
-        if cached is not None and cached[0] == cache_key:
-            return cached[1]
-        conn = self.price_db_conn
-        if conn is None:
-            self.logger.warning(
-                "[Overlay] regime_filter enabled but no price DB connection; skipping"
-            )
-            self._regime_z_cache = (cache_key, None)
-            return None
-        try:
-            sql = f"""
-            SELECT date, index_code, close
-            FROM index_price_daily
-            WHERE index_code IN ('{rf["micro_index"]}', '{rf["benchmark_index"]}')
-            ORDER BY date
-            """
-            frame = conn.execute(sql).fetchdf()
-        except Exception as e:
-            self.logger.warning(
-                f"[Overlay] regime_filter index query failed ({e}); skipping"
-            )
-            self._regime_z_cache = (cache_key, None)
-            return None
-        if frame.empty:
-            self.logger.warning(
-                "[Overlay] regime_filter: no index_price_daily rows; skipping"
-            )
-            self._regime_z_cache = (cache_key, None)
-            return None
-        wide = frame.pivot(
-            index="date", columns="index_code", values="close"
-        ).sort_index()
-        wide.index = pd.to_datetime(wide.index)
-        if (
-            rf["micro_index"] not in wide.columns
-            or rf["benchmark_index"] not in wide.columns
-        ):
-            self.logger.warning(
-                f"[Overlay] regime_filter: missing index series "
-                f"(have {list(wide.columns)}, need {rf['micro_index']} and {rf['benchmark_index']}); skipping"
-            )
-            self._regime_z_cache = (cache_key, None)
-            return None
-        window = rf["spread_window_days"]
-        z_window = rf["zscore_window_days"]
-        micro_ret = wide[rf["micro_index"]].pct_change(window)
-        bench_ret = wide[rf["benchmark_index"]].pct_change(window)
-        spread = (micro_ret - bench_ret).dropna()
-        rolling_mean = spread.rolling(
-            z_window, min_periods=max(20, z_window // 5)
-        ).mean()
-        rolling_std = spread.rolling(z_window, min_periods=max(20, z_window // 5)).std()
-        z = (
-            ((spread - rolling_mean) / rolling_std)
-            .replace([np.inf, -np.inf], np.nan)
-            .dropna()
-        )
-        self._regime_z_cache = (cache_key, z)
-        return z
 
     def _crisis_guard_vote_series(
         self,
@@ -2057,25 +2059,41 @@ class VectorBTBacktestRunner:
         pool_stocks: List[str],
         price_df: pd.DataFrame,
     ) -> List[pd.Series]:
-        """Build the daily boolean vote series for each enabled crisis signal.
-
-        Signals (all computed from data available at the close of each day, and
-        consumed with a one-day lag by the rebalance loop):
-        - limit_down: fraction of pool names closing at the limit-down price
-        - turnover_collapse: pool aggregate money short-MA / long-MA ratio
-        - breadth: fraction of pool names with a large daily loss
-        - spread: micro-cap minus large-cap rolling return z-score
-        """
+        """Build the daily boolean vote series for each enabled crisis signal."""
         sigs = cg["signals"]
         votes: List[pd.Series] = []
+        start_str: Optional[str] = None
+        end_str: Optional[str] = None
+        if not price_df.empty:
+            long_win = int(sigs.get("turnover_collapse", {}).get("long_window", 60))
+            buf_days = max(30, long_win * 2)
+            min_ts = pd.Timestamp(price_df.index.min())
+            max_ts = pd.Timestamp(price_df.index.max())
+            if min_ts.tzinfo is not None:
+                min_ts = min_ts.tz_convert("UTC").tz_localize(None)
+                max_ts = max_ts.tz_convert("UTC").tz_localize(None)
+            start_str = (min_ts.normalize() - pd.Timedelta(days=buf_days)).strftime("%Y-%m-%d")
+            end_str = max_ts.normalize().strftime("%Y-%m-%d")
         if sigs["limit_down"]["enabled"]:
-            frac = self._pool_limit_down_fraction(pool_stocks)
+            frac = self._slot_provider.pool_limit_down_fraction(
+                pool_stocks,
+                self.price_db_conn,
+                self.price_db_path,
+                start_date=start_str,
+                end_date=end_str,
+            )
             if frac is not None:
                 votes.append(frac >= sigs["limit_down"]["fraction_threshold"])
         if sigs["turnover_collapse"]["enabled"]:
             tc = sigs["turnover_collapse"]
-            ratio = self._pool_turnover_ratio(
-                pool_stocks, tc["short_window"], tc["long_window"]
+            ratio = self._slot_provider.pool_turnover_ratio(
+                pool_stocks,
+                tc["short_window"],
+                tc["long_window"],
+                self.price_db_conn,
+                self.price_db_path,
+                start_date=start_str,
+                end_date=end_str,
             )
             if ratio is not None:
                 votes.append(ratio <= tc["ratio_threshold"])
@@ -2099,80 +2117,22 @@ class VectorBTBacktestRunner:
         return votes
 
     def _pool_limit_down_fraction(self, pool_stocks: List[str]) -> Optional[pd.Series]:
-        """Daily fraction of pool names that closed at the limit-down price.
-
-        Uses ``price_data_daily.low_limit`` (exact exchange limit price), so no
-        return-threshold approximation is needed. Paused names are excluded.
-        """
-        conn = self.price_db_conn
-        if conn is None or not pool_stocks:
-            self.logger.warning(
-                "[Overlay] crisis_guard limit_down: no price DB connection; skipping"
-            )
-            return None
-        try:
-            in_list = ", ".join(f"'{s}'" for s in sorted(set(pool_stocks)))
-            sql = f"""
-            SELECT date,
-                   AVG(CASE WHEN close <= low_limit * 1.0001 THEN 1.0 ELSE 0.0 END) AS frac
-            FROM price_data_daily
-            WHERE stock_code IN ({in_list})
-              AND (paused IS NULL OR paused = 0)
-              AND low_limit IS NOT NULL AND low_limit > 0
-            GROUP BY date
-            ORDER BY date
-            """
-            frame = conn.execute(sql).fetchdf()
-        except Exception as e:
-            self.logger.warning(
-                f"[Overlay] crisis_guard limit_down query failed ({e}); skipping"
-            )
-            return None
-        if frame.empty:
-            return None
-        series = pd.Series(frame["frac"].values, index=pd.to_datetime(frame["date"]))
-        return series.sort_index()
+        """Daily fraction of pool names that closed at the limit-down price."""
+        return self._slot_provider.pool_limit_down_fraction(
+            pool_stocks, self.price_db_conn, self.price_db_path
+        )
 
     def _pool_turnover_ratio(
         self, pool_stocks: List[str], short_window: int, long_window: int
     ) -> Optional[pd.Series]:
-        """Short-MA / long-MA ratio of pool aggregate traded value (money).
-
-        A ratio well below 1 means liquidity in the candidate pool is drying up
-        much faster than its recent norm (the Jan-2024 microcap crisis showed
-        this pattern ahead of the worst drawdown days).
-        """
-        conn = self.price_db_conn
-        if conn is None or not pool_stocks:
-            self.logger.warning(
-                "[Overlay] crisis_guard turnover_collapse: no price DB connection; skipping"
-            )
-            return None
-        try:
-            in_list = ", ".join(f"'{s}'" for s in sorted(set(pool_stocks)))
-            sql = f"""
-            SELECT date, SUM(money) AS pool_money
-            FROM price_data_daily
-            WHERE stock_code IN ({in_list})
-              AND (paused IS NULL OR paused = 0)
-            GROUP BY date
-            ORDER BY date
-            """
-            frame = conn.execute(sql).fetchdf()
-        except Exception as e:
-            self.logger.warning(
-                f"[Overlay] crisis_guard turnover query failed ({e}); skipping"
-            )
-            return None
-        if frame.empty:
-            return None
-        money = pd.Series(
-            frame["pool_money"].values, index=pd.to_datetime(frame["date"])
-        ).sort_index()
-        short_ma = money.rolling(short_window, min_periods=short_window).mean()
-        long_ma = money.rolling(long_window, min_periods=long_window).mean()
-        ratio = (short_ma / long_ma).replace([np.inf, -np.inf], np.nan).dropna()
-        return ratio
+        """Short-MA / long-MA ratio of pool aggregate traded value."""
+        return self._slot_provider.pool_turnover_ratio(
+            pool_stocks,
+            short_window,
+            long_window,
+            self.price_db_conn,
+            self.price_db_path,
+        )
 
     def _load_bundle(self) -> dict:
         """
@@ -2459,20 +2419,15 @@ class VectorBTBacktestRunner:
 
         # Load factors
         if self._factor_loader is None:
-            if self.factor_db_conn is not None:
-                self._factor_loader = FactorLoader(
-                    existing_conn=self.factor_db_conn,
-                    logger=self.logger,
-                    shared_cache=self._factor_load_cache,
-                )
-            elif self.factor_db_path:
-                self._factor_loader = FactorLoader(
-                    duckdb_path=self.factor_db_path,
-                    logger=self.logger,
-                    shared_cache=self._factor_load_cache,
-                )
-            else:
-                self.logger.warning("[LGB_PREDICT] No factor database connection")
+            self._factor_loader = self._slot_provider.create_factor_loader(
+                factor_db_path=self.factor_db_path,
+                factor_db_conn=self.factor_db_conn,
+                shared_cache=self._factor_load_cache,
+                price_db_path=self.price_db_path,
+                price_db_conn=self.price_db_conn,
+            )
+            if self._factor_loader is None:
+                self.logger.warning("[LGB_PREDICT] No factor database or store configured")
                 return pd.Series(dtype=float), None, None
 
         # Dynamic-pool members can originate from a set/SQL result and therefore
@@ -2676,32 +2631,45 @@ class VectorBTBacktestRunner:
             DataFrame with same shape as factor_df, containing TARGET VALUES (not percentages)
         """
         all_dates = factor_df.index
+        all_dates_idx = pd.DatetimeIndex(all_dates)
+        is_daily_naive = self._slot_provider.is_daily_naive_index(all_dates_idx)
+        try:
+            market_cal = self._trading_calendar()
+        except Exception:
+            market_cal = None
+
+        def _bar_key(ts: Any) -> str:
+            return self._slot_provider.bar_key(ts, daily_naive=is_daily_naive)
+
+        def _norm_bar(ts: Any) -> pd.Timestamp:
+            return self._slot_provider.norm_bar_ts(ts, daily_naive=is_daily_naive)
+
         self._score_decay_state = pd.Series(dtype=float)
         self._score_decay_date = None
         self._input_factor_df = factor_df
         all_stocks = factor_df.columns.tolist()
+        if open_df is None and self.slot is not None:
+            open_df = self._slot_provider.read_execution_price_frame(
+                all_dates_idx, all_stocks
+            )
+        elif open_df is not None:
+            open_df = sanitize_execution_prices(open_df)
         self._backtest_previous_dates = {
-            pd.Timestamp(all_dates[idx]).strftime("%Y-%m-%d"): pd.Timestamp(
-                all_dates[idx - 1]
-            ).strftime("%Y-%m-%d")
+            _bar_key(all_dates[idx]): _bar_key(all_dates[idx - 1])
             for idx in range(1, len(all_dates))
         }
         self._factor_replay_dates = sorted({
-            self._backtest_previous_dates[pd.Timestamp(date).strftime("%Y-%m-%d")]
+            self._backtest_previous_dates[_bar_key(date)]
             for date in rebalance_dates
-            if pd.Timestamp(date).strftime("%Y-%m-%d") in self._backtest_previous_dates
+            if _bar_key(date) in self._backtest_previous_dates
         })
         all_stocks_set = set(all_stocks)
-        # Dynamic pools are constant across a benchmark suite.  Parsing and
-        # sorting all pool dates inside every seed/rebalance made a 100-seed
-        # random reference unnecessarily quadratic.  Build the as-of lookup
-        # once while retaining exactly the same "latest pool <= trade date"
-        # semantics as ``filter_stocks_by_pool``.
-        normalized_pools = {
-            pd.Timestamp(key).normalize(): set(values)
-            for key, values in dynamic_pools.items()
-        }
-        sorted_pool_dates = sorted(normalized_pools)
+        sorted_pool_dates, normalized_pools = self._slot_provider.resolve_dynamic_pools(
+            all_dates_idx,
+            dynamic_pools,
+            self.price_db_conn,
+            self.price_db_path,
+        )
 
         # Initialize with NaN (means "no action" in VectorBT)
         weights = pd.DataFrame(
@@ -2710,47 +2678,44 @@ class VectorBTBacktestRunner:
             columns=all_stocks,
             dtype=np.float64,
         )
-
-        # Convert rebalance dates to set for fast lookup
-        rebalance_set = set(pd.to_datetime(d).normalize() for d in rebalance_dates)
-
-        # [JQ-ALIGNED V5] 构建 Skip 清仓日期集合（支持整月与 MM-DD:MM-DD 窗口）
-        # 逻辑：进入每个 skip 区间的第一个交易日作为清仓日
-        skip_month_liquidation_dates = set()
-        if self.skip_months:
-            dates_idx = pd.DatetimeIndex(all_dates)
-            in_skip = skip_mask(dates_idx, self.skip_months)
-            if in_skip.any():
-                prev_in_skip = np.concatenate(([False], in_skip[:-1]))
-                entry_dates = dates_idx.normalize()[in_skip & ~prev_in_skip]
-                skip_month_liquidation_dates = set(entry_dates)
-
-                for d in entry_dates:
-                    self.logger.debug(
-                        f"[Skip] 识别清仓日: {pd.Timestamp(d).strftime('%Y-%m-%d')}"
-                    )
-
-        # Normalize skip_month_liquidation_dates to pd.Timestamp for consistent comparison
-        skip_month_liquidation_dates = set(
-            pd.Timestamp(d).normalize() for d in skip_month_liquidation_dates
+        order_fees = pd.DataFrame(
+            float(self.buy_cost_rate),
+            index=all_dates,
+            columns=all_stocks,
+            dtype=np.float64,
         )
 
-        if skip_month_liquidation_dates:
-            sorted_liq_dates = sorted(
+        # Convert rebalance dates to set for fast lookup
+        rebalance_set = {_norm_bar(d) for d in rebalance_dates}
+
+        # [JQ-ALIGNED V5] 构建 Skip 清仓日期集合（支持整月与 MM-DD:MM-DD 窗口）
+        # 逻辑：先按 Slot 交易日识别跳过区间，再用该区间首根 Bar 的统一时间键触发清仓
+        skip_liquidation_bars: set[pd.Timestamp] = set()
+        if self.skip_months:
+            session_days = pd.DatetimeIndex(
                 [
-                    pd.Timestamp(d).strftime("%Y-%m-%d")
-                    for d in skip_month_liquidation_dates
+                    self._slot_provider.session_date_for_bar(
+                        d, daily_naive=is_daily_naive, cal=market_cal
+                    )
+                    for d in all_dates
                 ]
             )
-            # self.logger.info(
-            #     f"[JQ-ALIGNED V5] Skip Month 清仓日期: {len(skip_month_liquidation_dates)} 个, "
-            #     f"日期: {sorted_liq_dates[:5]}{'...' if len(sorted_liq_dates) > 5 else ''}"
-            # )
+            in_skip = skip_mask(session_days, self.skip_months)
+            if in_skip.any():
+                prev_in_skip = np.concatenate(([False], in_skip[:-1]))
+                entry_bars = all_dates[in_skip & ~prev_in_skip]
+                skip_liquidation_bars = {_norm_bar(d) for d in entry_bars}
+                for d in entry_bars:
+                    self.logger.debug(
+                        f"[Skip] 识别清仓Bar: {_bar_key(d)}"
+                    )
 
         # [JQ-ALIGNED V4] 预模拟：追踪持仓和现金
         # 使用与 JQ 相同的逻辑计算每个调仓日的买入金额
         sim_cash = float(self.init_cash)  # 模拟现金
         sim_positions = {}  # {stock_code: shares}  股数
+        capture_decisions = bool(self.diagnostics_output_dir and self.return_series_trial_id)
+        decision_portfolio_values: dict[pd.Timestamp, float] = {}
         pending_sells: set[str] = set()
         pending_sell_since: Dict[str, pd.Timestamp] = {}
         blocked_exit_notional = 0.0
@@ -2758,25 +2723,33 @@ class VectorBTBacktestRunner:
         blocked_exit_events = 0
         strict_position_buys_skipped = 0
         buy_cost_multiplier = (
-            1.0 + max(float(self.cost_rate), 0.0) + max(float(self.slippage), 0.0)
+            1.0 + max(float(self.buy_cost_rate), 0.0) + max(float(self.slippage), 0.0)
         )
         sell_proceeds_multiplier = max(
-            0.0, 1.0 - max(float(self.cost_rate), 0.0) - max(float(self.slippage), 0.0)
+            0.0, 1.0 - max(float(self.sell_cost_rate), 0.0) - max(float(self.slippage), 0.0)
         )
 
         # 使用开盘价进行模拟（如果提供了开盘价数据）
         exec_price_df = open_df if open_df is not None else price_df
+        self._active_exec_price_df = exec_price_df
+
+        def _valid_positive_price(value: Any) -> Optional[float]:
+            if pd.isna(value):
+                return None
+            px = float(value)
+            return px if np.isfinite(px) and px > 0 else None
 
         def mark_price(current_date: Any, stock: str) -> Optional[float]:
             """Return an observable mark without inventing an executable price."""
             for frame in (exec_price_df, price_df):
                 if stock in frame.columns and current_date in frame.index:
-                    value = frame.loc[current_date, stock]
-                    if pd.notna(value) and float(value) > 0:
-                        return float(value)
+                    px = _valid_positive_price(frame.loc[current_date, stock])
+                    if px is not None:
+                        return px
             if stock in price_df.columns:
-                history = price_df.loc[:current_date, stock].dropna()
-                if not history.empty and float(history.iloc[-1]) > 0:
+                history = pd.to_numeric(price_df.loc[:current_date, stock], errors="coerce")
+                history = history[np.isfinite(history) & (history > 0)]
+                if not history.empty:
                     return float(history.iloc[-1])
             return None
 
@@ -2787,10 +2760,7 @@ class VectorBTBacktestRunner:
                 or current_date not in exec_price_df.index
             ):
                 return None
-            value = exec_price_df.loc[current_date, stock]
-            if pd.isna(value) or float(value) <= 0:
-                return None
-            return float(value)
+            return _valid_positive_price(exec_price_df.loc[current_date, stock])
 
         def block_exit(current_date: Any, stock: str) -> None:
             nonlocal blocked_exit_events, blocked_exit_notional
@@ -2799,7 +2769,7 @@ class VectorBTBacktestRunner:
                 pending_sell_since[stock] = pd.Timestamp(current_date).normalize()
                 px = mark_price(current_date, stock)
                 if px is not None and stock in sim_positions:
-                    blocked_exit_notional += sim_positions[stock] * px
+                    blocked_exit_notional += abs(sim_positions[stock]) * px
             pending_sells.add(stock)
 
         def finish_exit(current_date: Any, stock: str) -> None:
@@ -2814,80 +2784,95 @@ class VectorBTBacktestRunner:
             pending_sells.discard(stock)
             pending_sell_since.pop(stock, None)
 
-        def liquidate_targetless(current_date: Any, date_str: str) -> None:
-            """Attempt an empty-target liquidation without inventing fills."""
-            nonlocal sim_cash
-            held = set(sim_positions)
-            sellable = set(
-                self._filter_tradeable_stocks(
-                    date_str, sorted(held), side="sell", require_non_st=False
+        def _closable_for_positions(date_str: str, targets: Iterable[str]) -> set[str]:
+            longs = sorted(s for s in targets if sim_positions.get(s, 0.0) > 0)
+            shorts = sorted(s for s in targets if sim_positions.get(s, 0.0) < 0)
+            closable: set[str] = set()
+            if longs:
+                closable.update(
+                    self._filter_tradeable_stocks(
+                        date_str, longs, side="sell", require_non_st=False
+                    )
                 )
-            )
-            for stock in sorted(held):
-                sell_price = execution_price(current_date, stock)
-                if stock not in sellable or sell_price is None:
-                    weights.loc[current_date, stock] = np.nan
-                    block_exit(current_date, stock)
+            if shorts:
+                closable.update(
+                    self._filter_tradeable_stocks(
+                        date_str, shorts, side="buy", require_non_st=False
+                    )
+                )
+            return closable
+
+        def _close_positions(
+            current_date: Any,
+            date_str: str,
+            targets: Iterable[str],
+            *,
+            retry_only: bool = False,
+        ) -> None:
+            nonlocal sim_cash
+            target_list = sorted(set(targets))
+            if not target_list:
+                return
+            closable = _closable_for_positions(date_str, target_list)
+            for stock in target_list:
+                if stock not in sim_positions:
                     continue
+                px = execution_price(current_date, stock)
+                if stock not in closable or px is None:
+                    if not retry_only:
+                        weights.loc[current_date, stock] = np.nan
+                        block_exit(current_date, stock)
+                    continue
+                shares = sim_positions.pop(stock)
                 weights.loc[current_date, stock] = 0.0
-                sim_cash += sim_positions[stock] * sell_price * sell_proceeds_multiplier
-                sim_positions.pop(stock, None)
+                if shares > 0:
+                    sim_cash += shares * px * sell_proceeds_multiplier
+                    order_fees.loc[current_date, stock] = float(self.sell_cost_rate)
+                else:
+                    sim_cash += shares * px * buy_cost_multiplier
+                    order_fees.loc[current_date, stock] = float(self.buy_cost_rate)
                 finish_exit(current_date, stock)
 
+        def liquidate_targetless(current_date: Any, date_str: str) -> None:
+            """Attempt an empty-target liquidation without inventing fills."""
+            _close_positions(current_date, date_str, sim_positions.keys())
+
         for date in all_dates:
-            date_normalized = pd.to_datetime(date).normalize()
+            date_normalized = _norm_bar(date)
+            skip_lookup_day = self._slot_provider.session_date_for_bar(
+                date, daily_naive=is_daily_naive, cal=market_cal
+            )
+            date_key = _bar_key(date)
+
+            if capture_decisions and (
+                date_normalized in rebalance_set
+                or date_normalized in skip_liquidation_bars
+                or pending_sells
+                or not sim_positions  # Includes the leading flat rows written below.
+            ):
+                # The same pre-order book that sizes the instructions, marked at
+                # executable prices. If a held mark is unavailable, the weight
+                # stays unknown instead of using a later close.
+                decision_nav = sim_cash
+                for stock, shares in sorted(sim_positions.items()):
+                    price = execution_price(date, stock)
+                    if price is None:
+                        decision_nav = np.nan
+                        break
+                    decision_nav += shares * price
+                decision_portfolio_values[date] = decision_nav
 
             # A failed exit remains a real holding and consumes NAV.  Retry it
             # on every non-rebalance trading day; rebalance days reconsider the
             # T-1 target before deciding whether the exit is still desired.
             if pending_sells and date_normalized not in rebalance_set:
-                date_str = pd.Timestamp(date).strftime("%Y-%m-%d")
-                sellable = set(
-                    self._filter_tradeable_stocks(
-                        date_str,
-                        sorted(pending_sells),
-                        side="sell",
-                        require_non_st=False,
-                    )
-                )
-                for stock in sorted(pending_sells & sellable):
-                    sell_price = execution_price(date, stock)
-                    if sell_price is None or stock not in sim_positions:
-                        continue
-                    weights.loc[date, stock] = 0.0
-                    sim_cash += (
-                        sim_positions[stock] * sell_price * sell_proceeds_multiplier
-                    )
-                    sim_positions.pop(stock, None)
-                    finish_exit(date, stock)
+                _close_positions(date, date_key, pending_sells, retry_only=True)
 
-            # [JQ-ALIGNED V4] 先检查 Skip Month 清仓日期
-            if date_normalized in skip_month_liquidation_dates:
-                date_str = pd.Timestamp(date).strftime("%Y-%m-%d")
+            # [JQ-ALIGNED V4] 先检查 Skip Month 清仓 Bar
+            if date_normalized in skip_liquidation_bars:
                 held = set(sim_positions)
                 weights.loc[date, :] = 0.0
-                sellable = set(
-                    self._filter_tradeable_stocks(
-                        date_str, sorted(held), side="sell", require_non_st=False
-                    )
-                )
-                for stock in sorted(held):
-                    if stock not in sellable:
-                        weights.loc[date, stock] = np.nan
-                        block_exit(date, stock)
-                        continue
-                    sell_price = execution_price(date, stock)
-                    if sell_price is None:
-                        weights.loc[date, stock] = np.nan
-                        block_exit(date, stock)
-                        continue
-                    weights.loc[date, stock] = 0.0
-                    sim_cash += (
-                        sim_positions[stock] * sell_price * sell_proceeds_multiplier
-                    )
-                    sim_positions.pop(stock, None)
-
-                # self.logger.info(f"📅 Skip Month 清仓: {date_normalized.strftime('%Y-%m-%d')} - 清仓价值={liquidation_value:,.0f}, 现金={sim_cash:,.0f}")
+                _close_positions(date, date_key, held)
                 continue
 
             # Check if this is a rebalance date
@@ -2895,28 +2880,10 @@ class VectorBTBacktestRunner:
                 continue
 
             # Check skip rules (fallback, should not reach here if skip_month_liquidation_dates works)
-            if date_in_skip(date_normalized, self.skip_months):
+            if self.skip_months and date_in_skip(skip_lookup_day, self.skip_months):
                 held = set(sim_positions)
                 weights.loc[date, :] = 0.0
-                sellable = set(
-                    self._filter_tradeable_stocks(
-                        pd.Timestamp(date).strftime("%Y-%m-%d"),
-                        sorted(held),
-                        side="sell",
-                        require_non_st=False,
-                    )
-                )
-                for stock in sorted(held):
-                    sell_price = execution_price(date, stock)
-                    if stock not in sellable or sell_price is None:
-                        weights.loc[date, stock] = np.nan
-                        block_exit(date, stock)
-                        continue
-                    weights.loc[date, stock] = 0.0
-                    sim_cash += (
-                        sim_positions[stock] * sell_price * sell_proceeds_multiplier
-                    )
-                    sim_positions.pop(stock, None)
+                _close_positions(date, date_key, held)
                 continue
 
             # Get valid stocks from dynamic pool
@@ -2931,7 +2898,7 @@ class VectorBTBacktestRunner:
                 )
 
             # [ALIGNMENT] Enhanced pool logging - save pre-filter pool and per-filter removals
-            date_str_log = pd.to_datetime(date).strftime("%Y-%m-%d")
+            date_str_log = date_key
             try:
 
                 with open_diagnostic("local_pools.txt", "a", directory=self.diagnostics_output_dir, enabled=self.verbose_alignment or bool(self.diagnostics_output_dir)) as f:
@@ -2943,26 +2910,28 @@ class VectorBTBacktestRunner:
                 self.logger.warning(f"Failed to dump pool: {e}")
 
             if not valid_stocks:
-                liquidate_targetless(date, pd.Timestamp(date).strftime("%Y-%m-%d"))
+                liquidate_targetless(date, date_key)
                 continue
 
             # [HIGH PRIORITY 2] Get factor values for valid stocks using T-1 data (avoid look-ahead bias)
             # Use database query to get previous trading day (align with JQ Local)
-            date_str = pd.to_datetime(date).strftime("%Y-%m-%d")
+            date_str = date_key
             if self.score_source == "input_factor":
                 position = all_dates.get_loc(date)
                 if isinstance(position, slice):
                     position = position.start
                 prev_date = all_dates[int(position) - 1] if int(position) > 0 else None
                 prev_date = (
-                    pd.Timestamp(prev_date).strftime("%Y-%m-%d")
+                    _bar_key(prev_date)
                     if prev_date is not None
                     else None
                 )
             else:
-                prev_date = self._backtest_previous_dates.get(
-                    date_str
-                ) or self._get_previous_trading_day(date_str)
+                prev_date = self._backtest_previous_dates.get(date_str)
+                if prev_date is None and (
+                    is_daily_naive or pd.Timestamp(date) != pd.Timestamp(all_dates[0])
+                ):
+                    prev_date = self._get_previous_trading_day(date_str)
 
             if prev_date is None:
                 # First date or no previous trading day found, skip
@@ -3054,6 +3023,15 @@ class VectorBTBacktestRunner:
                         date_str, ranked_names, side="buy", require_non_st=True
                     )
                 )
+                sellable_open = (
+                    set(
+                        self._filter_tradeable_stocks(
+                            date_str, ranked_names, side="sell", require_non_st=True
+                        )
+                    )
+                    if self.allow_short
+                    else set()
+                )
                 held_eligible = set(
                     self._filter_tradeable_stocks(
                         date_str,
@@ -3063,7 +3041,9 @@ class VectorBTBacktestRunner:
                     )
                 )
                 tradeable_stocks = [
-                    s for s in ranked_names if s in buyable or s in held_eligible
+                    s
+                    for s in ranked_names
+                    if s in buyable or s in sellable_open or s in held_eligible
                 ]
                 stocks_removed_by_tday = set(ranked.index) - set(tradeable_stocks)
                 if not self.pretrade_fixed_targets:
@@ -3087,6 +3067,11 @@ class VectorBTBacktestRunner:
             strategy_weight_map: Optional[Dict[Any, float]] = None
             if self._strategy_plugin is not None:
                 strategy_weight_map = self._strategy_plugin(ranked, effective_top_k)
+                top_k_stocks = list(strategy_weight_map)
+            elif self.allow_short:
+                strategy_weight_map = compute_long_short_target_weights(
+                    ranked, effective_top_k
+                )
                 top_k_stocks = list(strategy_weight_map)
             elif self.all_equal_weight:
                 top_k_stocks = ranked.index.tolist()
@@ -3125,6 +3110,92 @@ class VectorBTBacktestRunner:
                     f.write(f"TOP_K_SELECTED: {','.join(top_k_stocks)}\n")
             except Exception:
                 pass
+
+            if self.allow_short and not self.overlay_active:
+                target_map = strategy_weight_map or {}
+                target_set = set(target_map)
+                prev_holdings_set = set(sim_positions.keys())
+                for stock in target_set:
+                    cancel_exit(stock)
+                nav = sim_cash
+                for s, shares in sorted(sim_positions.items(), key=lambda x: x[0]):
+                    px = mark_price(date, s)
+                    if px is not None:
+                        nav += shares * px
+                exposure = 1.0
+                if exposure_by_date:
+                    exposure = float(exposure_by_date.get(date_normalized, 1.0))
+                base_capital = nav * exposure / buy_cost_multiplier
+                buy_fee_rate = max(float(self.buy_cost_rate), 0.0) + max(float(self.slippage), 0.0)
+                sell_fee_rate = max(float(self.sell_cost_rate), 0.0) + max(float(self.slippage), 0.0)
+                order_names = sorted(prev_holdings_set | target_set)
+                held_list = sorted(prev_holdings_set)
+                buyable_close = (
+                    set(self._filter_tradeable_stocks(date_str, held_list, side="buy", require_non_st=False))
+                    if held_list
+                    else set()
+                )
+                sellable_close = (
+                    set(self._filter_tradeable_stocks(date_str, held_list, side="sell", require_non_st=False))
+                    if held_list
+                    else set()
+                )
+                if self.enable_tday_filter:
+                    buyable_open = set(
+                        self._filter_tradeable_stocks(date_str, order_names, side="buy", require_non_st=True)
+                    )
+                    sellable_open = set(
+                        self._filter_tradeable_stocks(date_str, order_names, side="sell", require_non_st=True)
+                    )
+                else:
+                    buyable_open = set(order_names)
+                    sellable_open = set(order_names)
+
+                for stock in order_names:
+                    px = execution_price(date, stock)
+                    old_shares = sim_positions.get(stock, 0.0)
+                    tgt_val = float(target_map.get(stock, 0.0)) * base_capital
+                    if px is None:
+                        if stock not in target_set and stock in sim_positions:
+                            weights.loc[date, stock] = np.nan
+                            block_exit(date, stock)
+                        continue
+                    cur_val = old_shares * px
+                    delta = tgt_val - cur_val
+                    if abs(delta) <= 1e-12:
+                        if abs(tgt_val) > 1e-12:
+                            weights.loc[date, stock] = tgt_val
+                        elif stock in sim_positions:
+                            weights.loc[date, stock] = 0.0
+                            sim_positions.pop(stock, None)
+                            finish_exit(date, stock)
+                        continue
+                    if delta > 0:
+                        closing_short = old_shares < 0 and tgt_val <= 1e-12
+                        side_allowed = (stock in buyable_close) if closing_short else (stock in buyable_open)
+                        fee_rate = buy_fee_rate
+                        order_fee = float(self.buy_cost_rate)
+                    else:
+                        closing_long = old_shares > 0 and tgt_val >= -1e-12
+                        side_allowed = (stock in sellable_close) if closing_long else (stock in sellable_open)
+                        fee_rate = sell_fee_rate
+                        order_fee = float(self.sell_cost_rate)
+
+                    if not side_allowed:
+                        weights.loc[date, stock] = np.nan
+                        if stock not in target_set and stock in sim_positions:
+                            block_exit(date, stock)
+                        continue
+
+                    sim_cash -= delta + abs(delta) * fee_rate
+                    weights.loc[date, stock] = tgt_val
+                    order_fees.loc[date, stock] = order_fee
+                    if abs(tgt_val) > 1e-12:
+                        sim_positions[stock] = tgt_val / px
+                    else:
+                        sim_positions.pop(stock, None)
+                        finish_exit(date, stock)
+                continue
 
             if self.overlay_active:
                 # =====================================================
@@ -3181,6 +3252,7 @@ class VectorBTBacktestRunner:
                         weight_map, prev_date_str, nav * exposure
                     )
                 order_names = sorted(prev_holdings_set | target_set)
+                held_list = sorted(prev_holdings_set)
                 buyable = set(
                     self._filter_tradeable_stocks(
                         date_str, order_names, side="buy", require_non_st=True
@@ -3191,6 +3263,17 @@ class VectorBTBacktestRunner:
                     for stock in buyable
                     if execution_price(date, stock) is not None
                 }
+                buyable_close = (
+                    {
+                        stock
+                        for stock in self._filter_tradeable_stocks(
+                            date_str, held_list, side="buy", require_non_st=False
+                        )
+                        if execution_price(date, stock) is not None
+                    }
+                    if held_list
+                    else set()
+                )
                 sellable = set(
                     self._filter_tradeable_stocks(
                         date_str, order_names, side="sell", require_non_st=False
@@ -3201,6 +3284,17 @@ class VectorBTBacktestRunner:
                     for stock in sellable
                     if execution_price(date, stock) is not None
                 }
+                sellable_open = (
+                    {
+                        stock
+                        for stock in self._filter_tradeable_stocks(
+                            date_str, order_names, side="sell", require_non_st=True
+                        )
+                        if execution_price(date, stock) is not None
+                    }
+                    if self.allow_short
+                    else sellable
+                )
                 if self.strict_max_actual_holdings:
                     executable_exits = (prev_holdings_set - target_set) & sellable
                     surviving_holdings = prev_holdings_set - executable_exits
@@ -3228,34 +3322,77 @@ class VectorBTBacktestRunner:
                     if px is not None:
                         current_values[stock] = sim_positions[stock] * px
                 base_capital = nav * exposure / buy_cost_multiplier
+                dollar_caps: Dict[str, float] = {}
+                if self.overlay["liquidity_cap"]["enabled"]:
+                    liq_caps = self._liquidity_weight_caps(
+                        target_set, prev_date_str, nav * exposure
+                    )
+                    dollar_caps = {
+                        stock: cap * base_capital for stock, cap in liq_caps.items()
+                    }
                 desired = {
                     stock: weight_map.get(stock, 0.0) * base_capital
                     for stock in target_set
                 }
+                initial_gross = sum(abs(v) for v in desired.values())
                 forced: Dict[str, float] = {}
-                for stock in order_names:
-                    current = current_values.get(stock, 0.0)
-                    target = desired.get(stock, 0.0)
-                    if stock not in target_set and stock not in sellable:
-                        forced[stock] = current
-                        block_exit(date, stock)
-                    elif target > current and stock not in buyable:
-                        forced[stock] = current
-                    elif target < current and stock not in sellable:
-                        forced[stock] = current
-                if not self.pretrade_fixed_targets:
-                    flexible_targets = [s for s in target_set if s not in forced]
-                    available = max(0.0, base_capital - sum(forced.values()))
-                    flexible_weight = sum(
-                        weight_map.get(s, 0.0) for s in flexible_targets
-                    )
-                    if flexible_targets and flexible_weight > 0:
-                        for stock in flexible_targets:
-                            desired[stock] = (
-                                available
-                                * weight_map.get(stock, 0.0)
-                                / flexible_weight
+                for _ in range(len(order_names) + 1):
+                    newly_forced = False
+                    for stock in order_names:
+                        if stock in forced:
+                            continue
+                        current = current_values.get(stock, 0.0)
+                        target = desired.get(stock, 0.0)
+                        old_shares = sim_positions.get(stock, 0.0)
+                        if stock not in target_set:
+                            exit_ok = (stock in buyable_close) if old_shares < 0 else (stock in sellable)
+                            if not exit_ok:
+                                forced[stock] = current
+                                block_exit(date, stock)
+                                newly_forced = True
+                        elif target > current + 1e-12:
+                            allowed = (
+                                (stock in buyable_close)
+                                if (old_shares < 0 and target <= 1e-12)
+                                else (stock in buyable)
                             )
+                            if not allowed:
+                                forced[stock] = current
+                                newly_forced = True
+                        elif target < current - 1e-12:
+                            allowed = (
+                                (stock in sellable)
+                                if (old_shares > 0 and target >= -1e-12)
+                                else (stock in sellable_open)
+                            )
+                            if not allowed:
+                                forced[stock] = current
+                                newly_forced = True
+                    if self.pretrade_fixed_targets or not forced:
+                        break
+                    flexible_targets = [s for s in target_set if s not in forced]
+                    gross_budget = min(base_capital, initial_gross)
+                    available = max(0.0, gross_budget - sum(abs(v) for v in forced.values()))
+                    flexible_weight = sum(
+                        abs(weight_map.get(s, 0.0)) for s in flexible_targets
+                    )
+                    if not (flexible_targets and flexible_weight > 0):
+                        break
+                    new_desired = {
+                        stock: available * weight_map.get(stock, 0.0) / flexible_weight
+                        for stock in flexible_targets
+                    }
+                    if dollar_caps:
+                        new_desired = apply_magnitude_caps(
+                            new_desired, dollar_caps, tol=1e-9
+                        )
+                    changed = any(
+                        abs(new_desired[stock] - desired.get(stock, 0.0)) > 1e-12
+                        for stock in flexible_targets
+                    )
+                    desired.update(new_desired)
+                    if not newly_forced and not changed:
+                        break
 
                 for stock in order_names:
                     current = current_values.get(stock, 0.0)
@@ -3268,12 +3405,14 @@ class VectorBTBacktestRunner:
                         if stock not in target_set:
                             block_exit(date, stock)
                         continue
-                    if target < current:
+                    if target < current - 1e-12:
                         sim_cash += (current - target) * sell_proceeds_multiplier
-                    elif target > current:
+                        order_fees.loc[date, stock] = float(self.sell_cost_rate)
+                    elif target > current + 1e-12:
                         sim_cash -= (target - current) * buy_cost_multiplier
+                        order_fees.loc[date, stock] = float(self.buy_cost_rate)
                     weights.loc[date, stock] = target
-                    if target > 0:
+                    if abs(target) > 1e-12:
                         sim_positions[stock] = target / px
                     else:
                         sim_positions.pop(stock, None)
@@ -3332,14 +3471,8 @@ class VectorBTBacktestRunner:
                 if stock not in sellable:
                     continue
                 if stock in sim_positions and sim_positions[stock] > 0:
-                    if (
-                        stock not in exec_price_df.columns
-                        or date not in exec_price_df.index
-                    ):
-                        block_exit(date, stock)
-                        continue
-                    sell_price = exec_price_df.loc[date, stock]
-                    if pd.isna(sell_price) or sell_price <= 0:
+                    sell_price = execution_price(date, stock)
+                    if sell_price is None:
                         block_exit(date, stock)
                         continue
                     sell_value = sim_positions[stock] * sell_price
@@ -3380,6 +3513,12 @@ class VectorBTBacktestRunner:
                     for stock in stocks_to_buy
                     if stock in buyable and execution_price(date, stock) is not None
                 ]
+            elif exec_price_df is not price_df and stocks_to_buy:
+                stocks_to_buy = [
+                    stock
+                    for stock in stocks_to_buy
+                    if execution_price(date, stock) is not None
+                ]
 
             # [JQ-ALIGNED V4] 计算每只新股的买入金额
             # JQ 逻辑: value = context.portfolio.cash / (target_num - position_count)
@@ -3405,21 +3544,15 @@ class VectorBTBacktestRunner:
             else:
                 value_per_new_stock = 0.0
 
-            # [DEBUG] 详细日志
-            # [DEBUG] 详细日志
-            # self.logger.info(f"📅 Rebalance Date: {date_str} (T-1: {prev_date_str})")
-            # self.logger.info(f"  Pool Size: {len(valid_stocks)} (Raw), {len(score_series)} (Valid Scores), {len(ranked)} (Tradeable)")
-            # self.logger.info(f"  [JQ-ALIGNED V4] 预模拟状态:")
-            # self.logger.info(f"    - 现金: {sim_cash:,.0f} (释放: {released_cash:,.0f})")
-            # self.logger.info(f"    - 卖出: {list(stocks_to_sell)}")
-            # self.logger.info(f"    - 保持: {list(stocks_to_keep)} (NaN)")
-            # self.logger.info(f"    - 买入: {list(stocks_to_buy)} -> 每只 {value_per_new_stock:,.0f} 元")
-
             # 构建目标市值矩阵 (size_type='targetvalue')
 
             # 1. 只有按 next-open 成功预模拟的卖出设为 0；其余保持。
             for stock in stocks_to_sell:
-                weights.loc[date, stock] = 0.0 if stock in executed_sells else np.nan
+                if stock in executed_sells:
+                    weights.loc[date, stock] = 0.0
+                    order_fees.loc[date, stock] = float(self.sell_cost_rate)
+                else:
+                    weights.loc[date, stock] = np.nan
 
             # 2. 保持的股票：设为 NaN（不操作）
             for stock in stocks_to_keep:
@@ -3428,13 +3561,13 @@ class VectorBTBacktestRunner:
             # 3. 新买入的股票：设置目标市值
             for stock in stocks_to_buy:
                 weights.loc[date, stock] = value_per_new_stock
+                order_fees.loc[date, stock] = float(self.buy_cost_rate)
                 # 模拟买入：扣除现金，增加持仓
-                if stock in exec_price_df.columns and date in exec_price_df.index:
-                    buy_price = exec_price_df.loc[date, stock]
-                    if pd.notna(buy_price) and buy_price > 0:
-                        shares = value_per_new_stock / buy_price
-                        sim_positions[stock] = shares
-                        sim_cash -= value_per_new_stock * buy_cost_multiplier
+                buy_price = execution_price(date, stock)
+                if buy_price is not None:
+                    shares = value_per_new_stock / buy_price
+                    sim_positions[stock] = shares
+                    sim_cash -= value_per_new_stock * buy_cost_multiplier
 
             # [ALIGNMENT] 记录持仓变动到日志文件
             try:
@@ -3469,23 +3602,18 @@ class VectorBTBacktestRunner:
                         target_values[s] = value_per_new_stock
                     else:
                         # For HOLD stocks, estimate current value
-                        if (
-                            s in sim_positions
-                            and s in exec_price_df.columns
-                            and date in exec_price_df.index
-                        ):
-                            price = exec_price_df.loc[date, s]
-                            if pd.notna(price) and price > 0:
+                        if s in sim_positions:
+                            price = execution_price(date, s)
+                            if price is not None:
                                 target_values[s] = sim_positions[s] * price
 
                 # Calculate current NAV
                 # [FIX] 排序sim_positions以确保可重复性
                 current_nav = sim_cash
                 for s, shares in sorted(sim_positions.items(), key=lambda x: x[0]):
-                    if s in exec_price_df.columns and date in exec_price_df.index:
-                        price = exec_price_df.loc[date, s]
-                        if pd.notna(price) and price > 0:
-                            current_nav += shares * price
+                    price = execution_price(date, s)
+                    if price is not None:
+                        current_nav += shares * price
 
                 self._alignment_writer.add_rebalance_snapshot(
                     rebalance_date=date_str,
@@ -3515,11 +3643,7 @@ class VectorBTBacktestRunner:
             before_first = weights.index < first_valid_idx
             weights.loc[before_first] = 0.0
 
-        # [DEBUG] 打印权重矩阵统计
-        # self.logger.debug(f"[VectorBT] 权重矩阵 NaN 分布:")
-        # self.logger.debug(f"  总单元格: {weights.shape[0] * weights.shape[1]}")
-        # self.logger.debug(f"  非 NaN: {weights.notna().sum().sum()}")
-
+        self._last_order_fees = order_fees
         self._execution_diagnostics = {
             "strict_max_actual_holdings": self.strict_max_actual_holdings,
             "strict_position_buys_skipped": strict_position_buys_skipped,
@@ -3534,6 +3658,8 @@ class VectorBTBacktestRunner:
                 int(max(completed_exit_delays)) if completed_exit_delays else None
             ),
         }
+        if capture_decisions:
+            weights.attrs["decision_portfolio_values"] = decision_portfolio_values
         return weights
 
     def _get_synthesis_score(
@@ -3623,28 +3749,23 @@ class VectorBTBacktestRunner:
                 )
             return parent_scores, None, None
 
-        if not self.factor_db_conn and not self.factor_db_path:
+        if not self.factor_values_store and not self.factor_db_conn and not self.factor_db_path:
             self.logger.debug(
-                "[DEBUG _compute_synthesis_score] No factor_db_conn/path, returning empty"
+                "[DEBUG _compute_synthesis_score] No factor_db_conn/path/store, returning empty"
             )
             return pd.Series(dtype=float), None, None
 
         # Lazy initialize only when uncached scores actually need raw factors.
         if self._factor_loader is None:
-            if self.factor_db_conn is not None:
-                self._factor_loader = FactorLoader(
-                    existing_conn=self.factor_db_conn,
-                    logger=self.logger,
-                    shared_cache=self._factor_load_cache,
-                )
-            else:
-                self._factor_loader = FactorLoader(
-                    duckdb_path=self.factor_db_path,
-                    logger=self.logger,
-                    shared_cache=self._factor_load_cache,
-                )
+            self._factor_loader = self._slot_provider.create_factor_loader(
+                factor_db_path=self.factor_db_path,
+                factor_db_conn=self.factor_db_conn,
+                shared_cache=self._factor_load_cache,
+                price_db_path=self.price_db_path,
+                price_db_conn=self.price_db_conn,
+            )
             dates = getattr(self, "_factor_replay_dates", [])
-            if dates:
+            if dates and self._factor_loader is not None:
                 try:
                     factors = set()
                     for model in self._bundle_models or []:
@@ -3661,11 +3782,14 @@ class VectorBTBacktestRunner:
         return (score, processed, raw) if return_raw_factors else (score, None, None)
 
     def _trading_calendar(self):
-        from utils.trading_calendar import load_trading_calendar
-        return load_trading_calendar(self.price_db_conn, duckdb_path=self.price_db_path)
+        return self._slot_provider.resolve_calendar(
+            self.price_db_conn, self.price_db_path
+        )
 
     def _get_previous_trading_day(self, current_date_str: str) -> Optional[str]:
-        return self._trading_calendar().previous_sessions(current_date_str, 1)[0].strftime('%Y-%m-%d')
+        return self._slot_provider.previous_trading_day(
+            current_date_str, self.price_db_conn, self.price_db_path
+        )
 
     def _filter_tradeable_stocks(
         self,
@@ -3675,191 +3799,21 @@ class VectorBTBacktestRunner:
         side: str = "both",
         require_non_st: bool = True,
     ) -> List[str]:
-        """
-        Filter stocks by T-day directional tradeability conditions.
+        """Filter stocks by T-day directional tradeability via ``MicrostructureSlot``."""
+        def _on_conn_opened(conn: Any) -> None:
+            self._price_conn_owned = True
+            self.price_db_conn = conn
 
-        JoinQuant Alignment:
-        - Buy: limit-up blocks; limit-down does not.
-        - Sell: limit-down blocks; limit-up does not.
-        - Hold: requires an observable T-day row but no executable order.
-        - Suspension (停牌): From price_data_daily (paused)
-        - ST status: From factor_data (is_st)
-
-        These checks must be on T-day (trade execution day), not T-1.
-
-        Args:
-            date_str: T-day date string in 'YYYY-MM-DD' format
-            stock_list: List of stock codes to filter
-
-        Returns:
-            List of tradeable stock codes
-        """
-        if not stock_list:
-            return []
-        if side not in {"buy", "sell", "both", "hold"}:
-            raise ValueError(f"unsupported trade side: {side}")
-        cache_key = (
-            "directional",
+        return self._slot_provider.filter_tradeable_stocks(
             date_str,
-            tuple(sorted(stock_list)),
-            side,
-            require_non_st,
+            stock_list,
+            side=side,
+            require_non_st=require_non_st,
+            price_db_conn=self.price_db_conn,
+            price_db_path=self.price_db_path,
+            exec_price_df=getattr(self, "_active_exec_price_df", None),
+            on_conn_opened=_on_conn_opened,
         )
-        if (
-            self._tradeability_cache is not None
-            and cache_key in self._tradeability_cache
-        ):
-            return list(self._tradeability_cache[cache_key])
-
-        conn = self.price_db_conn
-        if conn is None and self.price_db_path:
-            try:
-                import duckdb
-                from utils.data_store import connect_read_only as _connect_data_read_only
-
-                conn = _connect_data_read_only(self.price_db_path)
-                self._price_conn_owned = True
-                self.price_db_conn = conn
-            except Exception as exc:
-                self.logger.warning(f"[VectorBT] Cannot connect to price DB: {exc}")
-                return []
-        if conn is None:
-            # Callers without a market-status connection retain the historical
-            # fallback.  Production/research paths provide the connection and
-            # therefore fail closed on missing rows below.
-            return stock_list
-
-        row_cache = self._tradeability_cache
-        unresolved = [
-            stock
-            for stock in stock_list
-            if row_cache is None
-            or ("directional_row", date_str, stock) not in row_cache
-        ]
-
-        try:
-            if unresolved:
-                stocks_str = "', '".join(unresolved)
-                result_daily = conn.execute(
-                    f"""
-                    SELECT stock_code, open, high_limit, low_limit, paused
-                    FROM price_data_daily
-                    WHERE date = '{date_str}'
-                      AND stock_code IN ('{stocks_str}')
-                    """
-                ).fetchdf()
-                try:
-                    result_st = conn.execute(
-                        f"""
-                        SELECT stock_code, is_st
-                        FROM factor_data
-                        WHERE date = '{date_str}'
-                          AND stock_code IN ('{stocks_str}')
-                        """
-                    ).fetchdf()
-                    if result_st.empty:
-                        non_st = set(unresolved)
-                    else:
-                        normalized = (
-                            result_st["is_st"].astype(str).str.strip().str.lower()
-                        )
-                        non_st = set(
-                            result_st[
-                                result_st["is_st"].isna()
-                                | normalized.isin({"0", "false", "f", "no", "n", ""})
-                            ]["stock_code"]
-                        )
-                except Exception as exc:
-                    self.logger.debug(f"[VectorBT] ST查询失败: {exc}")
-                    non_st = set(unresolved)
-
-                daily_rows = {
-                    str(row.stock_code): row
-                    for row in result_daily.itertuples(index=False)
-                }
-                for stock in unresolved:
-                    row = daily_rows.get(stock)
-                    valid = bool(
-                        row is not None
-                        and pd.notna(row.open)
-                        and float(row.open) > 0
-                        and pd.notna(row.high_limit)
-                        and pd.notna(row.low_limit)
-                    )
-                    active = (
-                        valid and pd.notna(row.paused) and int(row.paused) == 0
-                        if row is not None
-                        else False
-                    )
-                    state = {
-                        "buy": bool(active and float(row.open) < float(row.high_limit))
-                        if valid
-                        else False,
-                        "sell": bool(active and float(row.open) > float(row.low_limit))
-                        if valid
-                        else False,
-                        "both": bool(
-                            active
-                            and float(row.open) < float(row.high_limit)
-                            and float(row.open) > float(row.low_limit)
-                        )
-                        if valid
-                        else False,
-                        "hold": valid,
-                        "non_st": stock in non_st,
-                    }
-                    if row_cache is not None:
-                        row_cache[("directional_row", date_str, stock)] = state
-
-            allowed: List[str] = []
-            for stock in stock_list:
-                state = (
-                    row_cache.get(("directional_row", date_str, stock))
-                    if row_cache is not None
-                    else None
-                )
-                if state is None:
-                    # No shared cache: resolve this one request from the query
-                    # results materialized above.
-                    row = daily_rows.get(stock)
-                    valid = bool(
-                        row is not None
-                        and pd.notna(row.open)
-                        and float(row.open) > 0
-                        and pd.notna(row.high_limit)
-                        and pd.notna(row.low_limit)
-                    )
-                    active = (
-                        valid and pd.notna(row.paused) and int(row.paused) == 0
-                        if row is not None
-                        else False
-                    )
-                    state = {
-                        "buy": bool(active and float(row.open) < float(row.high_limit))
-                        if valid
-                        else False,
-                        "sell": bool(active and float(row.open) > float(row.low_limit))
-                        if valid
-                        else False,
-                        "both": bool(
-                            active
-                            and float(row.open) < float(row.high_limit)
-                            and float(row.open) > float(row.low_limit)
-                        )
-                        if valid
-                        else False,
-                        "hold": valid,
-                        "non_st": stock in non_st,
-                    }
-                if state[side] and (not require_non_st or state["non_st"]):
-                    allowed.append(stock)
-
-            if row_cache is not None:
-                row_cache[cache_key] = list(allowed)
-            return allowed
-        except Exception as e:
-            self.logger.warning(f"[VectorBT] T-day tradeability check failed: {e}")
-            return []
 
     def _log_rebalance_debug(
         self,
@@ -4028,6 +3982,11 @@ class VectorBTBacktestRunner:
             self._factor_loader.close()
             self._factor_loader = None
 
+        owned_by_provider = self._slot_provider.close()
+        if owned_by_provider is not None and self.price_db_conn is owned_by_provider:
+            self.price_db_conn = None
+            self._price_conn_owned = False
+
         # Close price connection if we own it
         if self._price_conn_owned and self.price_db_conn is not None:
             try:
@@ -4037,6 +3996,16 @@ class VectorBTBacktestRunner:
             self.price_db_conn = None
             self._price_conn_owned = False
 
+    def _vbt_freq_and_year_freq(
+        self, index: pd.DatetimeIndex
+    ) -> Tuple[str, Union[str, pd.Timedelta]]:
+        """Resolve VectorBT bar frequency and annualization convention from slot/frequency."""
+        del index
+        vbt_freq, year_freq, _ = self._slot_provider.annualization_spec(
+            self.price_db_conn, self.price_db_path
+        )
+        return vbt_freq, year_freq
+
     def _simulate_portfolio(
         self,
         target_weights: pd.DataFrame,
@@ -4045,32 +4014,33 @@ class VectorBTBacktestRunner:
         use_open: bool,
     ):
         """Run the VectorBT target-value simulation. Extracted for two-pass reuse."""
+        vbt_freq, _ = self._vbt_freq_and_year_freq(pd.DatetimeIndex(price_aligned.index))
+        fees_arg: Any = self.buy_cost_rate
+        if (
+            self.buy_cost_rate != self.sell_cost_rate
+            and self._last_order_fees is not None
+            and self._last_order_fees.shape == target_weights.shape
+            and self._last_order_fees.index.equals(target_weights.index)
+            and self._last_order_fees.columns.equals(target_weights.columns)
+        ):
+            fees_arg = self._last_order_fees
+        kwargs: Dict[str, Any] = {
+            "close": price_aligned,
+            "size": target_weights,
+            "size_type": "targetvalue",
+            "fees": fees_arg,
+            "slippage": self.slippage,
+            "cash_sharing": True,
+            "call_seq": "auto",
+            "freq": vbt_freq,
+            "init_cash": self.init_cash,
+            "log": self.portfolio_audit_enabled,
+        }
         if use_open:
-            return vbt.Portfolio.from_orders(
-                close=price_aligned,
-                price=open_aligned,  # Execution price = open (not close)
-                size=target_weights,
-                size_type="targetvalue",
-                fees=self.cost_rate,
-                slippage=self.slippage,
-                cash_sharing=True,
-                call_seq="auto",
-                freq="1D",
-                init_cash=self.init_cash,
-                log=self.portfolio_audit_enabled,
-            )
-        return vbt.Portfolio.from_orders(
-            close=price_aligned,
-            size=target_weights,
-            size_type="targetvalue",
-            fees=self.cost_rate,
-            slippage=self.slippage,
-            cash_sharing=True,
-            call_seq="auto",
-            freq="1D",
-            init_cash=self.init_cash,
-            log=self.portfolio_audit_enabled,
-        )
+            kwargs["price"] = sanitize_execution_prices(open_aligned)
+        if self.allow_short:
+            kwargs["direction"] = "both"
+        return vbt.Portfolio.from_orders(**kwargs)
 
     def _compute_turnover_metrics(
         self,
@@ -4098,8 +4068,11 @@ class VectorBTBacktestRunner:
             if isinstance(value_series, pd.DataFrame):
                 value_series = value_series.mean(axis=1)
             avg_value = float(value_series.mean())
-            n_days = int(len(value_series))
-            years = max(n_days / 252.0, 1e-9)
+            n_bars = int(len(value_series))
+            _, _, bars_per_year = self._slot_provider.annualization_spec(
+                self.price_db_conn, self.price_db_path
+            )
+            years = max(n_bars / bars_per_year, 1e-9)
             if avg_value > 0:
                 # buys ~= sells, so half of total traded value approximates one-way turnover
                 metrics["annual_turnover"] = traded_value / avg_value / years / 2.0
@@ -4119,7 +4092,7 @@ class VectorBTBacktestRunner:
                     int(daily_count.max()) if len(daily_count) else 0
                 )
                 if self.top_k is not None:
-                    cap = max(0, int(self.top_k))
+                    cap = max(0, int(self.top_k) * (2 if self.allow_short else 1))
                     violations = daily_count[daily_count > cap]
                     metrics["holding_count_violation_days"] = int(len(violations))
                     metrics["holding_count_violation_dates"] = [
@@ -4225,21 +4198,24 @@ class VectorBTBacktestRunner:
             # year_freq='252D' corrects annualization: freq='1D' uses ann_factor=365.25
             # but data only has trading days (~244/yr). year_freq='252D' tells VectorBT
             # "1 year = 252 data points", matching the business-day convention.
+            _, year_freq = self._vbt_freq_and_year_freq(
+                pd.DatetimeIndex(portfolio.wrapper.index)
+            )
             total_ret = _scalar(portfolio.total_return())
-            annual_ret = _scalar(portfolio.annualized_return(year_freq="252D"))
-            sharpe = _scalar(portfolio.sharpe_ratio(year_freq="252D"), default=np.nan)
+            annual_ret = _scalar(portfolio.annualized_return(year_freq=year_freq))
+            sharpe = _scalar(portfolio.sharpe_ratio(year_freq=year_freq), default=np.nan)
             max_dd = _scalar(portfolio.max_drawdown())
 
             # Additional risk-adjusted metrics
             try:
                 calmar = _scalar(
-                    portfolio.calmar_ratio(year_freq="252D"), default=np.nan
+                    portfolio.calmar_ratio(year_freq=year_freq), default=np.nan
                 )
             except Exception:
                 calmar = np.nan
             try:
                 sortino = _scalar(
-                    portfolio.sortino_ratio(year_freq="252D"), default=np.nan
+                    portfolio.sortino_ratio(year_freq=year_freq), default=np.nan
                 )
             except Exception:
                 sortino = np.nan
@@ -4290,7 +4266,7 @@ class VectorBTBacktestRunner:
                 "return_series_artifact": return_series_artifact,
             }
             # [OVERLAY] Turnover / exposure diagnostics + overlay echo.
-            results.update(self._compute_turnover_metrics(portfolio, exposure_by_date))
+            results.update(self._slot_provider.market_db_identity | self._compute_turnover_metrics(portfolio, exposure_by_date))
             if self.overlay_active:
                 results["overlay"] = self._overlay_summary(self.overlay)
             return results
@@ -4336,6 +4312,13 @@ class VectorBTBacktestRunner:
             requested["date"] = pd.to_datetime(requested["date"])
             requested["portfolio_value"] = requested["date"].map(value)
             requested["target_weight"] = requested["target_value"] / requested["portfolio_value"]
+            decision_values = target_values.attrs.get("decision_portfolio_values")
+            if decision_values is not None:
+                decision_nav = requested["date"].map(decision_values).astype(float)
+                requested["decision_portfolio_value"] = decision_nav
+                requested["decision_target_weight"] = requested["target_value"] / decision_nav.where(
+                    np.isfinite(decision_nav) & decision_nav.gt(0)
+                )
             requested_path = output_dir / f"{safe_trial_id}.target_instructions.csv"
             requested.to_csv(requested_path, index=False)
 
@@ -4411,6 +4394,11 @@ class VectorBTBacktestRunner:
                 "execution_logs_path": str(logs_path),
                 "mvo_diagnostics_path": str(mvo_path),
             }
+            if decision_values is not None:
+                manifest["decision_target_weight_semantics"] = (
+                    "target_value divided by the planner's pre-order NAV at execution prices"
+                )
+                manifest["decision_price_field"] = self.effective_entry_price_field
             manifest_path = output_dir / f"{safe_trial_id}.manifest.json"
             manifest_path.write_text(
                 json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
@@ -4465,9 +4453,19 @@ class VectorBTBacktestRunner:
                 self.return_series_output_dir / f"{safe_trial_id}.metadata.json"
             )
 
+            is_daily_series = bool(
+                self.frequency == "1d"
+                and series.index.tz is None
+                and series.index.equals(series.index.normalize())
+            )
+            date_values = (
+                series.index.strftime("%Y-%m-%d")
+                if is_daily_series
+                else [pd.Timestamp(ts).isoformat() for ts in series.index]
+            )
             frame = pd.DataFrame(
                 {
-                    "date": series.index.strftime("%Y-%m-%d"),
+                    "date": date_values,
                     "net_return": series.astype(float).values,
                 }
             )
@@ -4498,7 +4496,7 @@ class VectorBTBacktestRunner:
                     key: value
                     for key, value in self.return_series_metadata.items()
                     if key not in metadata and value is not None
-                }
+                } | self._slot_provider.market_db_identity
             )
             metadata_path.write_text(
                 json.dumps(metadata, ensure_ascii=False, indent=2) + "\n",

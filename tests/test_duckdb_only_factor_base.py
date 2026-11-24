@@ -1,5 +1,6 @@
 """Local factor reads must use one DuckDB source, including in-memory callers."""
 import duckdb
+from market_db_samples import declare_market_db
 import pandas as pd
 import pytest
 
@@ -39,6 +40,7 @@ def test_memory_duckdb_factor_and_price_reads_include_end_day(frequency, times):
 def test_path_backed_factor_prices_and_forward_returns(tmp_path):
     path = tmp_path / 'prices.duckdb'
     with duckdb.connect(str(path)) as conn:
+        declare_market_db(conn, 'cn_equity')
         conn.execute("CREATE TABLE price_data_daily AS SELECT DATE '2024-01-02' AS date, 'A' AS stock_code, 10. AS close UNION ALL SELECT DATE '2024-01-03', 'A', 12.")
     factor = make_factor(duckdb_path=str(path))
     assert factor.get_price_data()['A'].tolist() == [10., 12.]
@@ -49,6 +51,7 @@ def test_path_backed_factor_prices_and_forward_returns(tmp_path):
 def test_empty_adapter_result_does_not_read_borrowed_connection(tmp_path):
     path = tmp_path / 'empty.duckdb'
     with duckdb.connect(str(path)) as conn:
+        declare_market_db(conn, 'cn_equity')
         conn.execute('CREATE TABLE price_data_daily(date DATE, stock_code VARCHAR, close DOUBLE)')
     with duckdb.connect(':memory:') as borrowed:
         borrowed.execute("CREATE TABLE price_data_daily AS SELECT DATE '2024-01-02' AS date, 'A' AS stock_code, 99. AS close")

@@ -2,7 +2,7 @@
 from .catalog import BarCatalog, CatalogEntry, create_bar_table, identifier, register_entry, table_exists
 from .quality import BarDataQualityWarning, scan_quality, warn_quality, write_quality
 from .source import (
-    LEGACY_5M_TIMESTAMP_ANCHOR, LEGACY_5M_TIMEZONE, BarSource, MarketBarReader,
+    BarSource, MarketBarReader,
     MissingBarDataError, read_market_bars,
 )
 from .builder import audit_bars, build_bars, code_version, instrument_calendar, slot_mapping
@@ -16,8 +16,6 @@ __all__ = [
     'BarSource',
     'CatalogEntry',
     'ContinuousBarSource',
-    'LEGACY_5M_TIMESTAMP_ANCHOR',
-    'LEGACY_5M_TIMEZONE',
     'MarketBarReader',
     'MissingBarDataError',
     'audit_bars',

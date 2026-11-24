@@ -12,11 +12,43 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from utils.market_db.identity import market_db_identity
+
 from .schema import (
     _DATE_ONLY_RE,
+    _SHA256_RE,
     BarEvaluationIntegrityError,
     BarEvaluationPreconditionError,
 )
+
+
+def _identity_text(value: Any) -> bool:
+    return isinstance(value, str) and bool(value) and value == value.strip() and value.isprintable()
+
+
+def _check_data_identity(payload: Mapping[str, Any]) -> None:
+    if "slot_id" in payload:
+        _require(_identity_text(payload["slot_id"]), "data_identity.slot_id", "a nonempty identifier")
+    if "slot_config_hash" in payload:
+        digest = payload["slot_config_hash"]
+        _require(isinstance(digest, str) and _SHA256_RE.fullmatch(digest) is not None,
+                 "data_identity.slot_config_hash", "a lowercase SHA-256 digest")
+    if "slot_data_fingerprint" in payload:
+        fingerprint = payload["slot_data_fingerprint"]
+        _require(_identity_text(fingerprint) or (isinstance(fingerprint, dict) and bool(fingerprint)),
+                 "data_identity.slot_data_fingerprint", "a nonempty string or JSON object")
+    try:
+        market_db = market_db_identity(payload)
+        fingerprint_db = market_db_identity(payload.get("slot_data_fingerprint"))
+    except ValueError as exc:
+        raise BarEvaluationIntegrityError(f"Invalid data_identity: {exc}") from exc
+    if market_db != fingerprint_db:
+        raise BarEvaluationIntegrityError("data_identity market database must match slot_data_fingerprint")
+    for field in ("data_versions", "sources"):
+        if field in payload:
+            values = _array(payload[field], f"data_identity.{field}")
+            _require(all(isinstance(value, str) and value.strip() for value in values), f"data_identity.{field}",
+                     "an array of nonempty strings")
 
 
 def _factor_id_from_ledger(ledger: Mapping[str, Any] | None) -> str | None:

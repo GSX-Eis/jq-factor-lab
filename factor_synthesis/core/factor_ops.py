@@ -18,6 +18,9 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+from utils.market_db.identity import slot_market_db_identity
+from utils.market_db.guards import require_single_market_db
+from utils.slots import MarketSlot
 
 logger = logging.getLogger(__name__)
 
@@ -152,7 +155,10 @@ def calculate_forward_returns(
     fundamental_table: str,
     period: int = 5,
     custom_logger: Optional[logging.Logger] = None,
-    pit_enabled: bool = True,
+    pit_enabled: bool | None = None,
+    *,
+    slot: MarketSlot | None = None,
+    frequency: str = "1d",
 ) -> pd.Series:
     """
     计算前瞻收益率
@@ -172,120 +178,127 @@ def calculate_forward_returns(
     Returns:
         前瞻收益率 Series，MultiIndex (date, stock_code)
     """
-    from .factor_data_loader import PITValidationError, validate_pit_price_rows
-    log = custom_logger or logger
-    
-    # [ALIGNMENT] Logic update: Removed execution_lag support. 
-    # Always calculates returns starting from signal date T (Trade at T).
-    
-    # 获取日期和股票范围
-    dates = factor_df.index.get_level_values('date').unique()
-    stocks = factor_df.index.get_level_values('stock_code').unique()
-    
-    # 扩展日期范围获取价格数据
-    from utils.trading_calendar import load_trading_calendar
+    from .factor_data_loader import _adjust_equity_prices, _prepare_price_rows, _price_rows, _pricing_window
+    from ..factor_reader import resolve_market_input
     from backtest_and_analysis.evaluation.labels import ExecutionConvention, validate_daily_horizons
-    (period,) = validate_daily_horizons((period,), 0)
-    calendar = load_trading_calendar(price_conn)
-    calendar.validate_coverage(dates.min(), dates.max())
-    extended_start = dates.min()
-    extended_end = calendar.next_sessions(dates.max(), period)[-1]
-    end_exclusive = (extended_end + pd.Timedelta(days=1)).strftime('%Y-%m-%d')
-    
-    stocks_str = "', '".join(stock.replace("'", "''") for stock in stocks)
-    
-    # 根据是否启用 PIT 决定查询的列
-    if pit_enabled:
-        select_columns = "date, stock_code, close, factor"
-        log.info("[PIT] 前瞻收益率计算启用 factor_end 复权")
-    else:
-        select_columns = "date, stock_code, close"
-    
-    # 首先尝试从价格数据库的price_data表获取价格
-    sql_price = f"""
-    SELECT {select_columns}
-    FROM {price_table}
-    WHERE stock_code IN ('{stocks_str}')
-    AND date >= '{extended_start.strftime('%Y-%m-%d')}' AND date < '{end_exclusive}'
-    ORDER BY stock_code, date
-    """
-    
-    try:
-        price_df = price_conn.execute(sql_price).fetchdf()
-        if price_df.empty and not pit_enabled:
-            raise ValueError("price_data表中未找到数据")
-    except Exception as e:
-        if pit_enabled:
-            raise PITValidationError(f"PIT training-price query failed for {price_table}: {e}") from e
-        # 如果price_data表没有数据，从factor_data表获取
-        log.info(f"{price_table}表无数据 ({e})，尝试从{fundamental_table}表获取价格数据")
-        # 仅显式关闭 PIT 时允许从无 factor 的价格表回退。
-        sql_factor = f"""
-        SELECT date, stock_code, close
-        FROM {fundamental_table}
-        WHERE stock_code IN ('{stocks_str}')
-        AND date >= '{extended_start.strftime('%Y-%m-%d')}' AND date < '{end_exclusive}'
-        ORDER BY stock_code, date
-        """
-        price_df = price_conn.execute(sql_factor).fetchdf()
-    
-    if price_df.empty:
-        log.error("未找到价格数据")
-        return pd.Series()
-    
-    observed = price_df['close'].notna()
-    if (observed & ((price_df['close'] <= 0) | ~np.isfinite(price_df['close']))).any():
-        raise ValueError("Observed label prices must be positive and finite")
 
-    # 检查是否有 factor 列
-    has_factor_column = 'factor' in price_df.columns
-    if pit_enabled:
-        validate_pit_price_rows(price_df, 'close')
-        price_df.loc[price_df['close'].isna(), 'factor'] = float('nan')
-    
-    # 处理日期格式，可能是带时间戳的5分钟数据
-    price_df['datetime'] = pd.to_datetime(price_df['date'])
-    price_df['date_only'] = price_df['datetime'].dt.date
-    
-    # 如果是5分钟数据，需要聚合为日度数据（取每日最后一个收盘价）
-    if len(price_df) > len(price_df.groupby(['stock_code', 'date_only'])):
-        log.info("检测到高频数据，聚合为日度数据进行前瞻收益率计算")
-        agg_dict = {'close': 'last'}
-        if has_factor_column:
-            agg_dict['factor'] = 'last'
-        price_df = price_df.groupby(['stock_code', 'date_only']).agg(agg_dict).reset_index()
-        price_df['date'] = pd.to_datetime(price_df['date_only'])
-    else:
-        price_df['date'] = price_df['datetime']
-    
+    log = custom_logger or logger
+    dates = factor_df.index.get_level_values("date").unique()
+    stocks = factor_df.index.get_level_values("stock_code").unique().tolist()
+    if not len(dates):
+        return pd.Series(dtype=float)
+    _, frequency = resolve_market_input(slot, None, frequency)
+    (period,) = validate_daily_horizons((period,), 0)
+    calendar, extended_start, extended_end = _pricing_window(slot, price_conn, frequency, dates, period)
+    pit_enabled = _adjust_equity_prices(slot, pit_enabled)
+    price_df = _price_rows(
+        price_conn, price_table, stocks, extended_start, extended_end, "close",
+        slot=slot, frequency=frequency, pit_enabled=pit_enabled, fallback=(fundamental_table, "close"),
+    )
+    if price_df.empty:
+        return pd.Series(dtype=float)
+    observed = price_df.close.notna()
+    if (observed & ((price_df.close <= 0) | ~np.isfinite(price_df.close))).any():
+        raise ValueError("Observed label prices must be positive and finite")
+    price_df = _prepare_price_rows(
+        price_df, "close", pit_enabled=pit_enabled, legacy_daily=slot is None,
+    )
+
     close_wide = price_df.pivot(index='date', columns='stock_code', values='close').sort_index()
     if pit_enabled:
         from .factor_data_loader import apply_pit_adjustment_factor_end_df
         factor_wide = price_df.pivot(index='date', columns='stock_code', values='factor').sort_index()
         close_wide = apply_pit_adjustment_factor_end_df(close_wide, factor_wide, log)
-    close_wide = calendar.align(close_wide, extended_start, extended_end)
+    availability = None
+    if frequency == "1d":
+        sessions = calendar.sessions(extended_start, extended_end)
+        if not close_wide.index.isin(sessions).all():
+            raise ValueError("Panel contains observations on non-session dates")
+        close_wide = close_wide.reindex(sessions.rename("date"))
+    else:
+        from .pool_manager import market_bar_grid, synthesis_bar_schedule
+
+        grid = market_bar_grid(slot, frequency, extended_start, extended_end)
+        close_wide = close_wide.reindex(pd.DatetimeIndex(grid.timestamp_utc, name="date"))
+        schedule = synthesis_bar_schedule(slot, frequency)
+        availability = [schedule.available_at(timestamp) for timestamp in close_wide.index]
     rule = ExecutionConvention.CLOSE_TO_CLOSE.value
-    forward_returns_long = rule.returns(close_wide, close_wide.shift(-rule.exit_offset(period))).stack()
-    forward_returns_long.index.names = ['date', 'stock_code']
-    forward_return_series = forward_returns_long.reindex(factor_df.index).dropna()
-    forward_return_series.name = 'forward_return'
-    # This is the calendar used by align/shift above, not the sparse factor index.
-    forward_return_series.attrs['label_exit_dates'] = {
-        entry.strftime('%Y-%m-%d'): calendar.next_sessions(entry, period)[-1].strftime('%Y-%m-%d')
-        for entry in forward_return_series.index.get_level_values('date').unique()
+    offset = rule.exit_offset(period)
+    forward_returns = rule.returns(close_wide, close_wide.shift(-offset)).stack()
+    forward_returns.index.names = ["date", "stock_code"]
+    result = forward_returns.reindex(factor_df.index).dropna().rename("forward_return")
+    exits = dict(zip(close_wide.index, (close_wide.index if availability is None else availability)[offset:]))
+    result.attrs["label_exit_dates"] = {
+        entry.strftime("%Y-%m-%d") if frequency == "1d" else entry.isoformat():
+        exits[entry].strftime("%Y-%m-%d") if frequency == "1d" else exits[entry].isoformat()
+        for entry in result.index.get_level_values("date").unique()
     }
-
-    pit_status = "启用 (factor_end)" if (pit_enabled and has_factor_column) else "禁用"
-    log.info(f"成功计算前瞻收益率 (PIT {pit_status})，数据点: {len(forward_return_series)}")
-    
-    return forward_return_series
+    log.info("Calculated %d forward returns", len(result))
+    return result
 
 
-# =============================================================================
-# Market Cap Neutralization
-# =============================================================================
+def neutralize_market_features(
+    frame: pd.DataFrame, config: Mapping[str, Any], *, slot: MarketSlot | None,
+    price_conn=None, frequency: str = "1d", start_date: str, end_date: str,
+    lag_exposures: bool = True,
+) -> pd.DataFrame:
+    """Residualize each cross-section using exposures available at that clock."""
+    from .pool_manager import INDUSTRY_FEATURE, MARKET_CAP_FEATURE, aligned_aux_feature, legacy_aux_slot
 
+    require_single_market_db(frame, slot_market_db_identity(slot))
+    missing_policy = config.get("on_missing_aux", "skip")
+    if missing_policy not in {"skip", "error"}:
+        raise ValueError("neutralization.on_missing_aux must be 'skip' or 'error'")
+    features = [
+        key for key, option in ((MARKET_CAP_FEATURE, "market_cap"), (INDUSTRY_FEATURE, "industry"))
+        if config.get(option, True)
+    ]
+    columns = frame.columns.difference(config.get("skip_factors") or [])
+    if not features or not len(columns):
+        return frame
+    if slot is None and price_conn is not None:
+        slot = legacy_aux_slot(price_conn)
+    instruments = frame.index.get_level_values("stock_code").unique().tolist()
+    exposures = {}
+    for key in features:
+        values = (aligned_aux_feature(slot, key, instruments, start_date, end_date,
+                                      frequency=frequency, shift=1 if lag_exposures else 0)
+                  if slot is not None else pd.Series(dtype=float))
+        if values.empty:
+            if missing_policy == "error":
+                raise ValueError(f"MarketSlot does not supply neutralization feature {key!r}")
+        else:
+            exposures[key] = values
+    if not exposures:
+        return frame
 
+    result = frame.copy()
+    aligned = pd.DataFrame(exposures).reindex(frame.index)
+    if MARKET_CAP_FEATURE in aligned:
+        aligned[MARKET_CAP_FEATURE] = aligned[MARKET_CAP_FEATURE].where(
+            np.isfinite(aligned[MARKET_CAP_FEATURE])
+        )
+    for _, group in aligned.groupby(level="date", sort=False):
+        if missing_policy == "skip":
+            group = group.dropna(axis=1, how="all")
+        group = group.dropna()
+        if group.empty or group.shape[1] == 0 or len(group) < 5:
+            continue
+        predictors = [np.ones(len(group))]
+        if MARKET_CAP_FEATURE in group:
+            predictors.append(group[MARKET_CAP_FEATURE].to_numpy(dtype=float))
+        if INDUSTRY_FEATURE in group:
+            predictors.append(pd.get_dummies(group[INDUSTRY_FEATURE], drop_first=True, dtype=float).to_numpy())
+        design = np.column_stack(predictors)
+        for column in columns:
+            target = frame.loc[group.index, column]
+            valid = np.isfinite(target.to_numpy())
+            if valid.sum() < max(5, design.shape[1] + 1):
+                continue
+            x, y = design[valid], target.to_numpy()[valid]
+            coefficients, _, _, _ = np.linalg.lstsq(x, y, rcond=None)
+            result.loc[target.index[valid], column] = y - x @ coefficients
+    return result
 
 
 # =============================================================================
@@ -305,6 +318,8 @@ def apply_feature_preprocessing(
     df: pd.DataFrame,
     preprocess_cfg: Dict[str, Any],
     custom_logger: Optional[logging.Logger] = None,
+    *,
+    history: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """
     根据配置对特征逐因子进行按日截面预处理。
@@ -346,6 +361,8 @@ def apply_feature_preprocessing(
     if df.empty or not preprocess_cfg:
         return df
     
+    require_single_market_db(df, history)
+
     # 提取参数
     default_mode = preprocess_cfg.get("ALL", "none")
     binning_n_bins = preprocess_cfg.get("_binning_n_bins", 5)
@@ -355,6 +372,12 @@ def apply_feature_preprocessing(
     if default_mode and default_mode != "none":
         log.info(f"[预处理] 默认模式: {default_mode}")
     
+    from .feature_preprocessor import TIME_SERIES_METHODS, time_series_standardize
+
+    rolling_methods = {
+        col: preprocess_cfg.get(col, default_mode) for col in df
+        if preprocess_cfg.get(col, default_mode) in TIME_SERIES_METHODS
+    }
     # 分类因子：哪些用 Native 方法，哪些用 Qlib Processor
     native_factors: Dict[str, str] = {}  # factor_name -> method
     qlib_factors: Dict[str, str] = {}    # factor_name -> method
@@ -362,6 +385,8 @@ def apply_feature_preprocessing(
     for col in df.columns:
         mode = preprocess_cfg.get(col, default_mode)
         
+        if col in rolling_methods:
+            continue
         if mode in _NATIVE_PREPROCESS_METHODS:
             native_factors[col] = mode
             if mode != default_mode:
@@ -386,6 +411,16 @@ def apply_feature_preprocessing(
         )
     
     result_df = df.copy()
+    for col, mode in rolling_methods.items():
+        source = df[col]
+        if history is not None:
+            dates = history.index.get_level_values("date")
+            previous = (dates <= source.index.get_level_values("date").max()) & ~history.index.isin(source.index)
+            source = pd.concat([history.loc[previous, col], source])
+        result_df[col] = time_series_standardize(
+            source, mode, window=preprocess_cfg.get("_ts_window", 20),
+            min_periods=preprocess_cfg.get("_ts_min_periods"),
+        ).reindex(df.index)
     
     # === 1. 处理 Native 方法（zscore, binning, winsorize_zscore）===
     if native_factors:

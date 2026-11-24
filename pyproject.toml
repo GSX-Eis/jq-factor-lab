@@ -30,6 +30,7 @@ dependencies = [
   "duckdb==1.5.3",
   "pyarrow>=19.0.1,<20",
   "python-dateutil>=2.8",
+  "pyyaml>=6.0",
 ]
 
 [project.urls]
@@ -56,9 +57,10 @@ backtest = ["vectorbt>=0.26"]
 mining = ["torch>=2.0"]
 viz = ["streamlit>=1.40,<2", "plotly>=5,<7"]
 mcp = ["mcp>=1.13,<2"]
+markets = ["requests>=2.31", "akshare>=1.14"]
 # Qlib and Torch are heavy, platform-specific installs. Use individual extras
 # when the target platform lacks compatible wheels or needs a custom Torch index.
-all = ["jq-factor-lab[synthesis,qlib,acceleration,backtest,mining,viz,mcp]"]
+all = ["jq-factor-lab[synthesis,qlib,acceleration,backtest,mining,viz,mcp,markets]"]
 
 [project.scripts]
 jq-factor-lab = "tools.demo_cli:main"
@@ -68,11 +70,11 @@ factorpilot-mcp = "tools.mcp_server:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["backtest_and_analysis*", "utils*", "tools*", "examples*", "factor_synthesis*", "factor_mining*", "data_pipeline*", "scripts*", "config"]
+include = ["backtest_and_analysis*", "utils*", "tools*", "examples*", "factor_synthesis*", "factor_mining*", "data_pipeline*", "scripts*", "config", "slots*", "targets*"]
 exclude = ["*.tests", "*.tests.*"]
 
 [tool.setuptools.package-data]
-config = ["data_access.json", "calendar_overrides.json", "futures_calendar_map.json", "demo_calendar.json"]
+config = ["data_access.json", "calendar_overrides.json", "futures_calendar_map.json", "demo_calendar.json", "market_databases/*.yaml", "market_slots/*/*.yaml"]
 utils = ["legacy_cache_identity.json"]
 "scripts.build" = ["cloud_runtime/*.py.txt"]
 

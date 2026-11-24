@@ -7,10 +7,10 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Iterable, Iterator, Mapping
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from copy import copy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from numbers import Integral
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -30,21 +30,26 @@ from backtest_and_analysis.evaluation.time_series import (
 )
 from backtest_and_analysis.evaluation.types import CrossSectionResult, TimeSeriesResult
 
+from utils.market_db.guards import require_single_market_db
+from utils.market_db.identity import slot_market_db_identity
+
 from .contracts import (
     EXCLUSION_PRIORITY, ContractValidationError, DuplicateKeyError,
     _duration, _frame_columns, _mask_unavailable_factor_values, _numeric_column, _text_column,
     _validate_aligned_factor_frame, validate_bar_frame,
 )
 from .inference import (
-    BarTrialFamily, _SelectionWindow, _bar_panel, _record_trials, _selection_window, build_bar_splits,
+    BarTrialFamily, _SelectionWindow, _SlotEvaluationGrid, _bar_panel, _record_trials, _selection_window, build_bar_splits,
 )
-from .labels import BarReturnLabeler, LABEL_COLUMNS
+from .labels import BarReturnLabeler, LABEL_COLUMNS, _normalize_bar_horizons
 
 if TYPE_CHECKING:
     from utils.session_calendar import SessionCalendar
+    from utils.slots import ExecutionProfile, MarketSlot
 
 
 RESULT_SCHEMA_VERSION = 'bar_evaluation.v2'
+SLOT_RETURN_COLUMNS = ('entry_return_price', 'exit_return_price')
 LABEL_KEY = ['instrument_id', 'frequency', 'horizon_bars', 'signal_timestamp']
 EXCLUSION_COLUMNS = [reason.value for reason in EXCLUSION_PRIORITY]
 _PARALLEL_LABEL_ROWS = 1_000_000
@@ -132,7 +137,7 @@ class _PreparedLabels:
     reasons: np.ndarray
 
     def canonical_frame(self) -> pd.DataFrame:
-        columns = (*LABEL_COLUMNS, 'factor_value')
+        columns = (*LABEL_COLUMNS, 'factor_value', *[name for name in SLOT_RETURN_COLUMNS if name in self.frame])
         frame = self.frame
         if tuple(frame.columns) != columns:
             frame = frame.loc[:, list(columns)]
@@ -226,7 +231,7 @@ def _attach_factor_values(labels: pd.DataFrame, factors: pd.DataFrame) -> pd.Dat
         on=['signal_timestamp', 'instrument_id'], how='left', validate='many_to_one')
 
 
-def _prepare(labels: pd.DataFrame, factors: pd.DataFrame | None) -> _PreparedLabels:
+def _prepare(labels: pd.DataFrame, factors: pd.DataFrame | None, *, minimum_offset: int = 1) -> _PreparedLabels:
     _frame_columns(labels, LABEL_COLUMNS)
     frame = labels
     for name in ('signal_timestamp', 'signal_available_at'):
@@ -254,20 +259,23 @@ def _prepare(labels: pd.DataFrame, factors: pd.DataFrame | None) -> _PreparedLab
         frame = frame.copy()
         for name in ('factor_value', 'return_pct'):
             frame[name] = frame[name].astype('float64')
+    times = pd.DatetimeIndex(frame.signal_timestamp).as_unit('ns')
     (instrument_codes, assets), (frequency_codes, frequencies) = text_keys
     for frequency in frequencies:
         _duration(frequency)
     for name in ('horizon_bars', 'entry_offset_bars'):
         column = frame[name]
+        minimum = minimum_offset if name == 'entry_offset_bars' else 1
         if pd.api.types.is_integer_dtype(column.dtype):
-            invalid = column.hasnans or (not column.empty and column.min() < 1)
+            invalid = column.hasnans or (not column.empty and column.min() < minimum)
         else:
-            invalid = any(isinstance(v, (bool, np.bool_)) or not isinstance(v, Integral) or v < 1
+            invalid = any(isinstance(v, (bool, np.bool_)) or not isinstance(v, Integral) or v < minimum
                           for v in column)
         if invalid:
-            raise ContractValidationError(f'{name} must contain positive integers')
+            raise ContractValidationError(f'{name} must contain '+
+                                          ('positive integers' if minimum else 'nonnegative integers'))
     horizons = frame.horizon_bars.to_numpy()
-    keys = (instrument_codes, frequency_codes, horizons, frame.signal_timestamp.array.asi8)
+    keys = (instrument_codes, frequency_codes, horizons, times.asi8)
     order = _canonical_order(keys)
     status_codes = _contract_codes(frame.status, ['excluded', 'valid'], 'status must be valid or excluded')
     if (status_codes < 0).any():
@@ -289,7 +297,6 @@ def _prepare(labels: pd.DataFrame, factors: pd.DataFrame | None) -> _PreparedLab
         native = frame.factor_value.to_numpy(dtype=getattr(dtype, 'numpy_dtype', dtype), na_value=0)
         if int(native.min()) < -(2**53) or int(native.max()) > 2**53:
             values = native
-    times = pd.DatetimeIndex(frame.signal_timestamp)
     if order is not None:
         if len(assets) > 1:
             instrument_codes = instrument_codes[order]
@@ -518,6 +525,7 @@ class BarCrossSectionalEvaluator:
 
     def evaluate(self, per_bar_labels: pd.DataFrame,
                  factors: pd.DataFrame | None = None) -> EvaluationResult:
+        require_single_market_db(per_bar_labels, factors)
         prepared = _prepare(per_bar_labels, factors)
         return self._result(prepared, dict(per_bar_labels.attrs.get('calendar_identity', {})),
                             self._evaluate_groups(prepared))
@@ -615,8 +623,8 @@ class BarCrossSectionalEvaluator:
 
 def _evaluate_bar_groups(
     prepared: _PreparedLabels, evaluator: TimeSeriesEvaluator | BarCrossSectionalEvaluator, *,
-    labeler: BarReturnLabeler, window: _SelectionWindow, options: dict[str, Any],
-    family: BarTrialFamily | None, factor_id: str,
+    labeler: BarReturnLabeler | _SlotEvaluationGrid, window: _SelectionWindow, options: dict[str, Any],
+    family: BarTrialFamily | None, factor_id: str, publish_turnover: bool = False,
 ) -> EvaluationResult:
     selection_split, split = window
     if family is not None:
@@ -665,7 +673,9 @@ def _evaluate_bar_groups(
             tables.extend((group, table, evaluation.descriptive[group.horizon]) for group, table in observed)
             yield frequency, instrument, evaluation.splits
 
-    reports = build_bar_splits(evaluate_groups(), horizons=labeler.horizons, mode=mode, split=split)
+    reports = build_bar_splits(
+        evaluate_groups(), horizons=labeler.horizons, mode=mode, split=split, publish_turnover=publish_turnover,
+    )
     result = evaluator._result(prepared, dict(prepared.frame.attrs.get('calendar_identity', {})), tables)
     result.splits = reports
     if family is not None:
@@ -693,7 +703,7 @@ def _calendar_mapping_hash(calendars: Mapping[str, Mapping[str, Any]]) -> str:
 
 
 def _prepare_bar_evaluation(
-    labeler: BarReturnLabeler | None, *, analysis_mode: str | None, n_quantiles: int,
+    labeler: BarReturnLabeler | _SlotEvaluationGrid | None, *, analysis_mode: str | None, n_quantiles: int,
     min_ic_samples: int, min_cross_section_size: int,
     split: SplitConfig | Mapping[str, str | pd.Timestamp] | None = None,
     bootstrap: Mapping[str, Any] | None = None, hac_lag: int | Literal['auto'] | None = None,
@@ -707,12 +717,10 @@ def _prepare_bar_evaluation(
                                      min_ic_samples=min_ic_samples) if mode == 'time_series' else
                  BarCrossSectionalEvaluator(analysis_mode=mode, n_quantiles=n_quantiles,
                                              min_cross_section_size=min_cross_section_size))
-    if not isinstance(labeler, BarReturnLabeler):
-        raise ContractValidationError('labeler must be a BarReturnLabeler')
     if not isinstance(diagnostics, bool) or (diagnostics and mode != 'time_series'):
         raise ContractValidationError('diagnostics must be a boolean and requires time_series when enabled')
     for name, value, supported in (
-        ('bootstrap', bootstrap, {'block_length', 'n_boot', 'seed', 'min_valid_replicates', 'alpha'}),
+        ('bootstrap', bootstrap, {'block_length', 'n_boot', 'seed', 'min_valid_replicates', 'alpha', 'p_value'}),
         ('trial_selection', trial_selection, {'method', 'alpha'}),
     ):
         if value is not None and (not isinstance(value, Mapping) or value.keys() - supported):
@@ -744,9 +752,10 @@ def _prepare_bar_evaluation(
             raise ContractValidationError('Configure method and alpha on trial_family for a shared selection')
         trial_family._validate_registration((factor_id, h) for h in labeler.horizons)
     family = trial_family
-    if family is None and any(value is not None for value in (
+    uses_inference = any(value is not None for value in (
         split, bootstrap, hac_lag, direction, standardization, calibration_scenario, trial_selection,
-    )):
+    ))
+    if family is None and (uses_inference or (isinstance(labeler, _SlotEvaluationGrid) and mode == 'cross_sectional')):
         family = BarTrialFamily(((factor_id, h) for h in labeler.horizons), **(trial_selection or {}))
     return evaluator, window, family
 
@@ -777,15 +786,11 @@ def evaluate_bars(bars: pd.DataFrame, factors: pd.DataFrame | None = None,
     selection window. Each result carries a snapshot of family progress. Enable
     diagnostics to retain time-series statistics when no inference options are set.
     """
-    evaluator, window, family = _prepare_bar_evaluation(
-        labeler, analysis_mode=analysis_mode, n_quantiles=n_quantiles, min_ic_samples=min_ic_samples,
-        min_cross_section_size=min_cross_section_size, split=split, bootstrap=bootstrap,
-        hac_lag=hac_lag, direction=direction, standardization=standardization,
-        calibration_scenario=calibration_scenario, trial_selection=trial_selection,
-        factor_id=factor_id, trial_family=trial_family, diagnostics=diagnostics,
-    )
-    mode = evaluator.analysis_mode
-    _, split = window
+    _mode(analysis_mode)
+    if analysis_mode == 'cross_sectional':
+        require_single_market_db(bars, factors)
+    if not isinstance(labeler, BarReturnLabeler):
+        raise ContractValidationError('labeler must be a BarReturnLabeler')
     frame = validate_bar_frame(bars)
     labeling = labeler
     if split is not None and not labeler.include_scheduled_exit:
@@ -800,20 +805,13 @@ def evaluate_bars(bars: pd.DataFrame, factors: pd.DataFrame | None = None,
             values['factor_value'] = _mask_unavailable_factor_values(values.factor_value, incomplete)
         labels = labels.merge(values, on=['signal_timestamp', 'instrument_id', 'frequency'],
                               how='left', validate='many_to_one')
-    if family is not None or diagnostics:
-        options = dict(n_quantiles=n_quantiles, direction=1 if direction is None else direction,
-                       standardization=standardization, calibration_scenario=calibration_scenario)
-        if mode == 'time_series':
-            options.update(min_samples=min_ic_samples, **(bootstrap or {}))
-        else:
-            options.update(min_samples=min_cross_section_size, hac_lag=hac_lag,
-                           signal_diagnostics=False)
-        result = _evaluate_bar_groups(
-            _prepare(labels, factors), evaluator, labeler=labeler, window=window, family=family,
-            factor_id=factor_id, options=options,
-        )
-    else:
-        result = evaluator.evaluate(labels, factors)
+    result = _evaluate_labels(
+        labels, factors, labeler, analysis_mode=analysis_mode, n_quantiles=n_quantiles,
+        min_ic_samples=min_ic_samples, min_cross_section_size=min_cross_section_size,
+        split=split, bootstrap=bootstrap, hac_lag=hac_lag, direction=direction,
+        standardization=standardization, calibration_scenario=calibration_scenario,
+        trial_selection=trial_selection, factor_id=factor_id, trial_family=trial_family, diagnostics=diagnostics,
+    )
     result.data_identity = _data_identity(frame, labels)
     if isinstance(labeler.calendar, Mapping):
         calendars = {key: _calendar_spec(cal) for key, cal in sorted(labeler.calendar.items())}
@@ -823,4 +821,107 @@ def evaluate_bars(bars: pd.DataFrame, factors: pd.DataFrame | None = None,
         result.calendar_identity = _calendar_spec(labeler.calendar)
     result.calendar_identity.update(view=labeler.view, boundary_policy=labeler.boundary_policy,
                                     bucket_strategy=labeler.bucket_strategy)
+    return result
+
+
+def evaluate_slot(
+    slot: MarketSlot, factors: pd.DataFrame, *, frequency: str, start_date: str, end_date: str,
+    instruments: Sequence[str], horizons: Sequence[int] | int, entry_offset_bars: int | None = None,
+    bucket_strategy: str | None = None, profile: ExecutionProfile | None = None,
+    apply_tradability_mask: bool = False, **options: Any,
+) -> EvaluationResult:
+    """Evaluate committed signal values against a Slot's execution bars and clock."""
+    from backtest_and_analysis.evaluation.labels import UnifiedReturnLabeler
+    from slots.jq_ashare_local.feed import AShareBarFeed, AShareDailyEvaluationFeed
+    from utils.data_revision import frame_digest
+    from utils.time_axis import Frequency
+
+    market_db = slot_market_db_identity(slot)
+    if options.get('analysis_mode') == 'cross_sectional':
+        require_single_market_db(factors, market_db)
+    if slot.slot_config_hash is None:
+        raise ContractValidationError('Slot evaluation requires a frozen slot_config_hash')
+    parsed = Frequency.parse(frequency)
+    if not parsed.is_valid:
+        raise ContractValidationError('Slot evaluation requires a valid frequency')
+    ashare_daily = parsed.canonical == '1d' and isinstance(slot.bar_feed, AShareBarFeed)
+    if ashare_daily and not isinstance(slot.bar_feed, AShareDailyEvaluationFeed):
+        slot = replace(slot, bar_feed=AShareDailyEvaluationFeed(slot.bar_feed))
+    labeler = UnifiedReturnLabeler.from_slot(slot, profile=profile, apply_tradability_mask=apply_tradability_mask)
+    profile = labeler.profile
+    minimum_offset = max(profile.min_entry_offset_bars, int(profile.entry_price_field == 'open'))
+    if entry_offset_bars is None:
+        entry_offset_bars = max(1, minimum_offset) if ashare_daily else minimum_offset
+    elif isinstance(entry_offset_bars, Integral) and entry_offset_bars < minimum_offset:
+        raise ContractValidationError(f'entry_offset_bars must be >= {minimum_offset}')
+    periods = _normalize_bar_horizons(horizons)
+    strategy = labeler.resolve_bucket_strategy(parsed, instruments, bucket_strategy)
+    labels = labeler.label(
+        instruments, parsed, start_date=start_date, end_date=end_date, horizons=periods,
+        entry_offset_bars=entry_offset_bars, factors=factors, bucket_strategy=strategy, capture_data_identity=True,
+    )
+    keys = ['timestamp_utc', 'instrument_id']
+    observed = labels[['signal_timestamp', 'instrument_id']].rename(columns={'signal_timestamp': 'timestamp_utc'})
+    if labels.empty or not pd.MultiIndex.from_frame(factors[keys]).isin(pd.MultiIndex.from_frame(observed)).all():
+        raise ContractValidationError('Factor values must match the requested Slot signal grid')
+    view = getattr(slot.bar_feed, 'view', 'ETH')
+    grid = _SlotEvaluationGrid(slot.calendar, view, strategy, periods)
+    result = _evaluate_labels(
+        labels.rename(columns={'forward_return': 'return_pct'}), factors, grid,
+        minimum_offset=minimum_offset, publish_turnover=ashare_daily and options.get('analysis_mode') == 'cross_sectional',
+        **options,
+    )
+    provenance = labels.attrs
+    fingerprint = {
+        **market_db,
+        'execution_bars_sha256': provenance['execution_bars_sha256'],
+        'factor_values_sha256': frame_digest(factors),
+        **({'registered': slot.slot_data_fingerprint} if slot.slot_data_fingerprint is not None else {}),
+    }
+    result.data_identity = dict(
+        instruments=sorted(instruments), frequencies=[parsed.canonical], slot_id=slot.slot_id,
+        slot_config_hash=slot.slot_config_hash, slot_data_fingerprint=fingerprint,
+        return_unit=profile.return_unit,
+        **market_db,
+        **{key: value for key, value in provenance.items() if key != 'execution_bars_sha256'},
+    )
+    result.calendar_identity = _calendar_spec(slot.calendar) | dict(
+        view=view, boundary_policy=profile.boundary_policy, bucket_strategy=strategy,
+    )
+    return result
+
+
+def _evaluate_labels(
+    labels: pd.DataFrame, factors: pd.DataFrame | None, labeler: BarReturnLabeler | _SlotEvaluationGrid, *,
+    analysis_mode: str | None = None, n_quantiles: int = 5, min_ic_samples: int = 3,
+    min_cross_section_size: int = 3, split: SplitConfig | Mapping[str, str | pd.Timestamp] | None = None,
+    bootstrap: Mapping[str, Any] | None = None, hac_lag: int | Literal['auto'] | None = None,
+    direction: int | None = None, standardization: Standardization | None = None,
+    calibration_scenario: str | None = None, trial_selection: Mapping[str, Any] | None = None,
+    factor_id: str = 'factor_value', trial_family: BarTrialFamily | None = None, diagnostics: bool = False,
+    minimum_offset: int = 1, publish_turnover: bool = False,
+) -> EvaluationResult:
+    evaluator, window, family = _prepare_bar_evaluation(
+        labeler, analysis_mode=analysis_mode, n_quantiles=n_quantiles, min_ic_samples=min_ic_samples,
+        min_cross_section_size=min_cross_section_size, split=split, bootstrap=bootstrap,
+        hac_lag=hac_lag, direction=direction, standardization=standardization,
+        calibration_scenario=calibration_scenario, trial_selection=trial_selection,
+        factor_id=factor_id, trial_family=trial_family, diagnostics=diagnostics,
+    )
+    mode = evaluator.analysis_mode
+    _, split = window
+    if family is not None or diagnostics or isinstance(labeler, _SlotEvaluationGrid):
+        options = dict(n_quantiles=n_quantiles, direction=1 if direction is None else direction,
+                       standardization=standardization, calibration_scenario=calibration_scenario)
+        if mode == 'time_series':
+            options.update(min_samples=min_ic_samples, **(bootstrap or {}))
+        else:
+            options.update(min_samples=min_cross_section_size, hac_lag=hac_lag,
+                           signal_diagnostics=publish_turnover)
+        result = _evaluate_bar_groups(
+            _prepare(labels, factors, minimum_offset=minimum_offset), evaluator, labeler=labeler, window=window, family=family,
+            factor_id=factor_id, options=options, publish_turnover=publish_turnover,
+        )
+    else:
+        result = evaluator.evaluate(labels, factors)
     return result

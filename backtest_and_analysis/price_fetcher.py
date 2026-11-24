@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import logging
+from functools import cached_property
 from pathlib import Path
-from typing import List, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 import pandas as pd
 
 from utils.duckdb_results_writer import connect_read_only_with_retry
+
+if TYPE_CHECKING:
+    from utils.slots import MarketSlot, SlotConfig
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +64,22 @@ class PriceFetcher:
     def __del__(self) -> None:
         self.close()
 
+    @cached_property
+    def _analysis_slot(self) -> MarketSlot:
+        from slots.jq_ashare_local import build_jq_ashare_local
+
+        return build_jq_ashare_local(self._duckdb_conn)
+
+    def daily_evaluation_slot(self, pricing: pd.Series, config: SlotConfig) -> MarketSlot:
+        from dataclasses import replace
+
+        from slots import build_slot_from_config
+        from slots.jq_ashare_local.feed import AShareDailyEvaluationFeed
+
+        slot = build_slot_from_config(config, connection=self._duckdb_conn)
+        feed = AShareDailyEvaluationFeed(slot.bar_feed, pricing=pricing, source_table=self.price_table)
+        return replace(slot, bar_feed=feed)
+
     def fetch(
         self,
         code_list: List[str],
@@ -70,11 +90,14 @@ class PriceFetcher:
         if not code_list:
             return pd.Series(dtype=float, name="close")
         from utils.trading_calendar import load_trading_calendar
+
+        slot = self._analysis_slot
         calendar = load_trading_calendar(self._duckdb_conn)
         calendar.validate_coverage(start_date, end_date)
         query_start = pd.Timestamp(start_date).normalize()
         future = calendar.next_sessions(end_date, future_periods)
         query_end = future[-1] if len(future) else pd.Timestamp(end_date).normalize()
+        slot.calendar.validate_coverage(query_start, query_end)
         df = self._fetch_from_duckdb(code_list, query_start.date(), query_end.date())
         if df.empty:
             raise ValueError("No price data found for the specified parameters")
@@ -88,19 +111,15 @@ class PriceFetcher:
             daily_prices = df.groupby(["stock_code", df["date"].dt.normalize()])["close"].last()
         daily_prices.index = pd.MultiIndex.from_tuples(daily_prices.index.to_list(), names=["asset", "date"])
         daily_prices.attrs['trading_calendar'] = calendar
+        daily_prices.attrs['execution_profile'] = slot.microstructure.execution_profile
         return daily_prices
 
     def _fetch_from_duckdb(self, code_list: List[str], start_date, end_date) -> pd.DataFrame:
         if self._duckdb_conn is None:
             raise RuntimeError("PriceFetcher is closed")
-        from utils.data_store import quote, table_name
-        date, stock = quote(self.date_column), quote(self.stock_column)
-        # CAST keeps timestamped intraday rows from losing the explicit end date.
-        query = f"""
-            SELECT {stock} AS stock_code, {date} AS date, open, high, low, close, volume, money
-            FROM {table_name(self.price_table)}
-            WHERE {stock} = ANY(?)
-              AND CAST({date} AS DATE) BETWEEN ? AND ?
-            ORDER BY stock_code, date
-        """
-        return self._duckdb_conn.execute(query, [code_list, start_date, end_date]).fetchdf()
+        from slots.jq_ashare_local.feed import read_analysis_price_rows
+
+        return read_analysis_price_rows(
+            self._duckdb_conn, code_list, start_date, end_date,
+            table=self.price_table, date_column=self.date_column, instrument_column=self.stock_column,
+        )

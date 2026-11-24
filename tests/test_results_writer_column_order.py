@@ -25,10 +25,10 @@ def test_factor_values_existing_reordered_table(tmp_path, borrowed, ranged):
     if borrowed:
         with writer.acquire_write_session() as session:
             session.conn.execute('BEGIN')
-            assert writer.save_factor_values(frame, 'alpha', duckdb_conn=session.conn, **options) == 2
+            assert writer.save_factor_values(frame, 'alpha', allow_legacy_factor_values_write=True, duckdb_conn=session.conn, **options) == 2
             session.conn.execute('COMMIT')
     else:
-        assert writer.save_factor_values(frame, 'alpha', **options) == 2
+        assert writer.save_factor_values(frame, 'alpha', allow_legacy_factor_values_write=True, **options) == 2
     with duckdb.connect(str(path), read_only=True) as conn:
         rows = conn.execute('''SELECT CAST(date AS VARCHAR), stock_code, factor_name, factor_value
             FROM factor_values ORDER BY date, stock_code, factor_name''').fetchall()

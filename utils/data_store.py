@@ -27,11 +27,15 @@ def _reject_sqlite_file(path: str | Path) -> None:
     candidate = Path(path).expanduser()
     if not candidate.is_file():
         return
-    with candidate.open("rb") as handle:
-        if handle.read(len(_SQLITE_MAGIC)) == _SQLITE_MAGIC:
-            raise ValueError(
-                "SQLite database files are unsupported; export this source to DuckDB or Parquet first"
-            )
+    try:
+        with candidate.open("rb") as handle:
+            header = handle.read(len(_SQLITE_MAGIC))
+    except FileNotFoundError:
+        return
+    if header == _SQLITE_MAGIC:
+        raise ValueError(
+            "SQLite database files are unsupported; export this source to DuckDB or Parquet first"
+        )
 
 
 def _check_hash_engine():
@@ -789,8 +793,16 @@ def environment_json(name: str, default="{}"):
     return json.loads(raw)
 
 
-def binding_contract(explicit: dict | None = None) -> dict:
-    return validate_binding_contract(explicit if explicit is not None else environment_json("QUANT_DATA_BINDINGS"))
+def binding_contract(explicit: dict | None = None, *, include_market_dbs: bool = False) -> dict:
+    """Read frozen bindings, with an opt-in for resolving market database IDs."""
+    contract = validate_binding_contract(explicit if explicit is not None else environment_json("QUANT_DATA_BINDINGS"))
+    return contract if include_market_dbs else _frozen_binding_fields(contract)
+
+
+def _frozen_binding_fields(contract: dict) -> dict:
+    if "market_dbs" in contract:
+        return {key: value for key, value in contract.items() if key != "market_dbs"}
+    return contract
 
 
 def environment_value(payload: dict, directory: Path) -> str:
@@ -818,12 +830,22 @@ def validate_binding_contract(contract):
             "Retired data binding sources are not supported; migrate the configuration "
             "to input_db/output_db and explicit table/version references"
         )
+    if "market_dbs" in contract:
+        from utils.market_db.errors import MARKET_DB_PROFILE_INVALID, MarketDbProfileError
+        from utils.market_db.profile import is_market_db_id
+
+        market_dbs = contract["market_dbs"]
+        if not isinstance(market_dbs, dict) or any(
+            not is_market_db_id(db_id) or not isinstance(path, str) or not path.strip() or "\x00" in path
+            for db_id, path in market_dbs.items()
+        ):
+            raise MarketDbProfileError(MARKET_DB_PROFILE_INVALID, "market_dbs must map valid db_ids to nonempty local paths")
     return contract
 
 
 def resolve_connection_binding(path, contract, *, allow_labels=False):
     """Resolve only the physical stores declared by an explicit version binding."""
-    validate_binding_contract(contract)
+    contract = _frozen_binding_fields(validate_binding_contract(contract))
     if not contract:
         return path, contract
     requested = str(Path(path).expanduser().resolve())
@@ -959,6 +981,9 @@ def read_frozen_attachment(path, content_hash, *, bindings=None):
     raise ValueError(f"Frozen attachment with the recorded hash is unavailable: {path}")
 
 
+_FROZEN_INPUT_PATH_VARIABLE = "quant_frozen_input_path"
+
+
 def connect_input(path: str | Path, *, bindings: dict | None = None):
     """Legacy explicit paths replay unchanged; bound inputs expose exact versions."""
     contract = binding_contract(bindings)
@@ -997,10 +1022,12 @@ def connect_input(path: str | Path, *, bindings: dict | None = None):
     conn = duckdb.connect()
     try:
         _configure_resources(conn)
-        literal = "'" + str(Path(path).resolve()).replace("'", "''") + "'"
+        physical_path = str(Path(path).resolve())
+        literal = "'" + physical_path.replace("'", "''") + "'"
         conn.execute(f"ATTACH {literal} AS {quote(catalog)} (READ_ONLY)")
         for alias, table in physical.items():
             conn.execute(f"CREATE VIEW {_view_name(conn, alias)} AS SELECT * FROM {quote(catalog)}.{table_name(table)}")
+        conn.execute(f"SET VARIABLE {_FROZEN_INPUT_PATH_VARIABLE} = ?", [physical_path])
         return conn
     except BaseException:
         conn.close()
@@ -1105,7 +1132,12 @@ def output_context(explicit: dict | None = None) -> dict:
     return context
 
 
-def freeze_artifact_file(path: str | Path, file: str | Path) -> Path:
+def freeze_artifact_file(
+    path: str | Path,
+    file: str | Path,
+    *,
+    expected_sha256: str | None = None,
+) -> Path:
     """Keep a verified immutable copy beside the output store, reusable after interruption."""
     import shutil
 
@@ -1114,39 +1146,57 @@ def freeze_artifact_file(path: str | Path, file: str | Path) -> Path:
     with source.open("rb") as handle:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             content.update(chunk)
-    frozen = Path(path).resolve().parent / "artifacts" / content.hexdigest() / source.name
+    actual_sha256 = content.hexdigest()
+    if expected_sha256 is not None and actual_sha256 != expected_sha256:
+        raise ValueError("Frozen import file does not match the declared checksum")
+    frozen = Path(path).resolve().parent / "artifacts" / actual_sha256 / source.name
     if frozen.parent.parent.is_symlink() or frozen.parent.is_symlink():
         raise ValueError("Frozen artifact directory cannot be a symlink")
     if source.parent.parent == frozen.parent.parent:
-        if source.parent.name != content.hexdigest():
+        if source.parent.name != actual_sha256:
             raise ValueError("Frozen artifact content changed")
         return source
-    frozen.parent.mkdir(parents=True, exist_ok=True)
     if frozen.is_symlink():
         raise ValueError("Frozen artifact cannot be a symlink")
+    existed_root = frozen.parent.parent.exists()
+    existed_parent = frozen.parent.exists()
+    frozen.parent.mkdir(parents=True, exist_ok=True)
     import os
     import tempfile
     # Publish a fully verified file without replacing an existing immutable object.
-    with tempfile.TemporaryDirectory(prefix=".publish-", dir=frozen.parent) as staging:
-        temporary = Path(staging) / source.name
-        shutil.copyfile(source, temporary)
-        with temporary.open("rb") as handle:
-            if hashlib.file_digest(handle, "sha256").hexdigest() != content.hexdigest():
-                raise ValueError("Source changed during artifact publication")
-        with temporary.open("rb") as handle:
-            os.fsync(handle.fileno())
-        from utils.local_outputs import output_lock
-        # ponytail: one publication lock per artifact root; shard by hash if throughput requires it.
-        # Rename also supports external filesystems without hard-link support.
-        with output_lock(frozen.parent.parent, metadata=True):
-            if frozen.is_symlink():
-                raise ValueError("Frozen artifact cannot be a symlink")
-            if frozen.exists():
-                with frozen.open("rb") as handle:
-                    if hashlib.file_digest(handle, "sha256").hexdigest() != content.hexdigest():
-                        raise ValueError("Frozen artifact content collision")
-            else:
-                os.replace(temporary, frozen)
+    try:
+        with tempfile.TemporaryDirectory(prefix=".publish-", dir=frozen.parent) as staging:
+            temporary = Path(staging) / source.name
+            shutil.copyfile(source, temporary)
+            with temporary.open("rb") as handle:
+                if hashlib.file_digest(handle, "sha256").hexdigest() != actual_sha256:
+                    raise ValueError("Source changed during artifact publication")
+            with temporary.open("rb") as handle:
+                os.fsync(handle.fileno())
+            from utils.local_outputs import output_lock
+            # ponytail: one publication lock per artifact root; shard by hash if throughput requires it.
+            # Rename also supports external filesystems without hard-link support.
+            with output_lock(frozen.parent.parent, metadata=True):
+                if frozen.is_symlink():
+                    raise ValueError("Frozen artifact cannot be a symlink")
+                if frozen.exists():
+                    with frozen.open("rb") as handle:
+                        if hashlib.file_digest(handle, "sha256").hexdigest() != actual_sha256:
+                            raise ValueError("Frozen artifact content collision")
+                else:
+                    os.replace(temporary, frozen)
+    except BaseException:
+        if not existed_parent:
+            try:
+                frozen.parent.rmdir()
+            except OSError:
+                pass
+        if not existed_root:
+            try:
+                frozen.parent.parent.rmdir()
+            except OSError:
+                pass
+        raise
     return frozen
 
 
@@ -1297,48 +1347,123 @@ def main(argv=None) -> int:
     elif action == "publish_files":
         result = {"ok": True, "refs": publish_outputs(**request)}
     elif action == "publish_batch":
+        from contextlib import ExitStack
         from utils.duckdb_results_writer import acquire_exclusive_write_conn
 
+        _reject_sqlite_file(request["path"])
+        target_path = Path(request["path"]).expanduser().resolve()
+        target_existed = target_path.exists()
+        checkpoint_path = Path(request["checkpoint"]) if request.get("checkpoint") else None
         results = []
-        with acquire_exclusive_write_conn(request["path"]) as session:
-            for item in request["items"]:
-                source = Path(item["file"])
-                if not source.is_file():
-                    results.append({"file": str(source), "ok": False, "error": "frozen artifact missing"})
-                    if request.get("checkpoint"):
-                        Path(request["checkpoint"]).write_text(canonical(results) + "\n")
-                    continue
-                try:
-                    if "sha256" in item:
-                        source = freeze_artifact_file(request["path"], source)
-                        if source.parent.name != item["sha256"]:
-                            raise ValueError("Frozen import file does not match the declared checksum")
-                    if item.get("table") == "meta.artifacts":
-                        ref = publish_attachment(request["path"], source, metadata=item["metadata"], _session=session)
-                    elif source.suffix == ".json":
-                        ref = publish_document(
-                            request["path"],
-                            json.loads(source.read_text()),
-                            metadata=item["metadata"],
-                            original_file=str(source),
-                            _session=session,
+        session = None
+        published_any = False
+
+        def save_checkpoint():
+            if checkpoint_path is not None:
+                checkpoint_path.write_text(canonical(results) + "\n")
+
+        def run_item_step(file_ref: str, step):
+            try:
+                return True, step()
+            except (ValueError, OSError, duckdb.Error) as exc:
+                if "corrupt database file" in str(exc).lower() or "no space left" in str(exc).lower():
+                    raise  # Storage failures stop the batch; do not keep writing a damaged store.
+                results.append({"file": file_ref, "ok": False, "error": str(exc)})
+                if session is not None:
+                    save_checkpoint()
+                return False, None
+
+        with ExitStack() as stack:
+            try:
+                # Existing resolved target stores must open before any item progress or frozen copy is written.
+                if target_existed:
+                    session = stack.enter_context(acquire_exclusive_write_conn(request["path"]))
+
+                for item in request["items"]:
+                    source = Path(item["file"])
+                    file_ref = str(item["file"])
+                    if not source.is_file():
+                        results.append({"file": str(source), "ok": False, "error": "frozen artifact missing"})
+                        if session is not None:
+                            save_checkpoint()
+                        continue
+                    is_attachment = item.get("table") == "meta.artifacts"
+                    is_json_document = not is_attachment and source.suffix == ".json"
+                    has_sha256 = "sha256" in item
+                    expected_sha256 = item["sha256"] if has_sha256 else None
+
+                    def validate_item():
+                        document = None
+                        if is_json_document:
+                            raw_bytes = source.read_bytes()
+                            if has_sha256 and hashlib.sha256(raw_bytes).hexdigest() != expected_sha256:
+                                raise ValueError("Frozen import file does not match the declared checksum")
+                            document = json.loads(raw_bytes.decode("utf-8"))
+                            if not item["metadata"].get("legacy_source"):
+                                canonical(document)
+                        elif has_sha256:
+                            with source.open("rb") as handle:
+                                actual_sha256 = hashlib.file_digest(handle, "sha256").hexdigest()
+                            if actual_sha256 != expected_sha256:
+                                raise ValueError("Frozen import file does not match the declared checksum")
+                        return document
+
+                    ok, document = run_item_step(file_ref, validate_item)
+                    if not ok:
+                        continue
+                    if session is None:
+                        # Defer opening non-existent stores until an item is ready, and before any permanent freeze/checkpoint.
+                        session = stack.enter_context(acquire_exclusive_write_conn(request["path"]))
+                        if results:
+                            save_checkpoint()
+
+                    def freeze_item():
+                        if not has_sha256:
+                            return source
+                        frozen_source = freeze_artifact_file(
+                            request["path"], source, expected_sha256=expected_sha256
                         )
-                    else:
-                        ref = publish_artifact(
+                        if frozen_source.parent.name != expected_sha256:
+                            raise ValueError("Frozen import file does not match the declared checksum")
+                        return frozen_source
+
+                    ok, frozen_source = run_item_step(file_ref, freeze_item)
+                    if not ok:
+                        continue
+
+                    def publish_item():
+                        if is_attachment:
+                            return publish_attachment(
+                                request["path"], frozen_source, metadata=item["metadata"], _session=session
+                            )
+                        if is_json_document:
+                            return publish_document(
+                                request["path"],
+                                document,
+                                metadata=item["metadata"],
+                                original_file=str(frozen_source),
+                                _session=session,
+                            )
+                        return publish_artifact(
                             request["path"],
                             item["table"],
-                            file=source,
+                            file=frozen_source,
                             metadata=item["metadata"],
                             access_class=item.get("access_class", "feature"),
                             _session=session,
                         )
-                    results.append({"file": str(item["file"]), "ok": True, "ref": asdict(ref)})
-                except (ValueError, OSError, duckdb.Error) as exc:
-                    if "corrupt database file" in str(exc).lower() or "no space left" in str(exc).lower():
-                        raise  # Storage failures stop the batch; do not keep writing a damaged store.
-                    results.append({"file": str(item["file"]), "ok": False, "error": str(exc)})
-                if request.get("checkpoint"):
-                    Path(request["checkpoint"]).write_text(canonical(results) + "\n")
+
+                    ok, ref = run_item_step(file_ref, publish_item)
+                    if ok:
+                        published_any = True
+                        results.append({"file": file_ref, "ok": True, "ref": asdict(ref)})
+                        save_checkpoint()
+            finally:
+                if session is not None and not published_any:
+                    session.discard_new_store()
+
+        if session is None:
+            save_checkpoint()
         result = {"ok": all(item["ok"] for item in results), "results": results}
     elif action == "document":
         result = asdict(publish_document(**request))

@@ -35,7 +35,7 @@ Intentional LightGBM-specific differences (NOT alignment bugs):
 from __future__ import annotations
 
 from datetime import timedelta
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, Unpack
 
 import numpy as np
 import pandas as pd
@@ -44,6 +44,10 @@ import pandas as pd
 from factor_synthesis.qlib_adapter import DataConverter, QlibLGBWrapper
 
 # Dynamic blend module
+from .preprocessing import (
+    MarketInputOptions, bind_synthesis_panel, format_panel_time, prediction_bounds,
+    preprocess_synthesis_features, selected_market_inputs, training_bounds,
+)
 from .dynamic_blend import (
     DynamicBlendConfig,
     compute_prior_composite,
@@ -331,14 +335,14 @@ def _run_lightgbm_with_qlib_adapter(
         sample_weight = np.asarray(sample_weight)[keep]
     X_final = X_final.loc[keep]
     y_final = y_final.reindex(X_final.index)
-    train_end_adj = train_keys.get_level_values("date").max().strftime("%Y-%m-%d")
-    valid_start = valid_keys.get_level_values("date").min().strftime("%Y-%m-%d")
-    valid_end = valid_keys.get_level_values("date").max().strftime("%Y-%m-%d")
+    train_end_adj = format_panel_time(train_keys.get_level_values("date").max())
+    valid_start = format_panel_time(valid_keys.get_level_values("date").min())
+    valid_end = format_panel_time(valid_keys.get_level_values("date").max())
 
     # Prediction period dates
     predict_dates = predict_factors.index.get_level_values("date").unique().sort_values()
-    test_start = predict_dates[0].strftime("%Y-%m-%d") if len(predict_dates) > 0 else valid_end
-    test_end = predict_dates[-1].strftime("%Y-%m-%d") if len(predict_dates) > 0 else valid_end
+    test_start = format_panel_time(predict_dates[0]) if len(predict_dates) > 0 else valid_end
+    test_end = format_panel_time(predict_dates[-1]) if len(predict_dates) > 0 else valid_end
     
     logger.info(
         "[Qlib Adapter] 创建数据集: train=%s~%s, valid=%s~%s, test=%s~%s",
@@ -351,7 +355,7 @@ def _run_lightgbm_with_qlib_adapter(
     
     neutralization_cfg = config.get("neutralization", {})
     if neutralization_cfg.get("enabled", False):
-        logger.info("[中性化] 使用加载阶段的预计算中性化输入；跳过训练阶段市值回归")
+        logger.info("[中性化] 使用已加载的中性化输入")
     
     # Labels (only training period has labels)
     all_labels = y_final.reindex(all_factors.index)
@@ -360,7 +364,7 @@ def _run_lightgbm_with_qlib_adapter(
     dataset = DataConverter.create_dataset_from_factors(
         factor_df=all_factors,
         forward_returns=all_labels,
-        train_start=train_start,
+        train_start=format_panel_time(train_keys.get_level_values("date").min()) if train_keys.get_level_values("date").tz is not None else train_start,
         train_end=train_end_adj,
         valid_start=valid_start,
         valid_end=valid_end,
@@ -412,13 +416,14 @@ def _run_lightgbm_with_qlib_adapter(
 
 def run_lightgbm_synthesis(
     synthesizer,
-    factor_df: pd.DataFrame,
+    factor_df: pd.DataFrame | None,
     forward_returns: pd.Series,
     train_start: str,
     train_end: str,
     config: dict,
     output_dir: Optional[str] = None,
     daily_pools: Optional[Dict] = None,
+    **market_inputs: Unpack[MarketInputOptions],
 ) -> Tuple[pd.Series, Dict]:
     """
     LightGBM gradient-boosting based factor synthesis using Qlib adapter.
@@ -437,6 +442,9 @@ def run_lightgbm_synthesis(
         composite_series: Synthesized factor Series
         model_info: Model information dict
     """
+    factor_df, config = bind_synthesis_panel(
+        synthesizer, factor_df, config, market_inputs, forward_returns,
+    )
     logger = synthesizer.logger
     DataConverter.convert_index_to_qlib_format(factor_df.index)
     DataConverter.convert_index_to_qlib_format(forward_returns.index)
@@ -444,8 +452,7 @@ def run_lightgbm_synthesis(
     # [ALIGNED WITH LASSO] Training window with embargo using trading days
     # Purge by the configured label horizon in trading days. This equals
     # target_period for legacy labels and may be longer for rebalance labels.
-    train_start_dt = pd.to_datetime(train_start)
-    train_end_dt = pd.to_datetime(train_end)
+    train_start_dt, train_end_dt = training_bounds(factor_df, train_start, train_end)
 
     # Actual prediction membership defines label availability, not sparse history.
     prediction_index = _outer_prediction_index(
@@ -489,12 +496,15 @@ def run_lightgbm_synthesis(
         train_factors = train_factors[available_training_cols]
         logger.info("[LightGBM训练] 使用 %d 个训练因子", len(available_training_cols))
 
-    # Align target
-    common_index = train_factors.index.intersection(forward_returns.index)
+    # Align target on non-null labels before strict exit isolation so dates with
+    # all-NaN labels do not trigger missing-exit errors while active label exits
+    # remain strictly checked.
+    valid_returns = forward_returns.dropna()
+    common_index = train_factors.index.intersection(valid_returns.index)
     if len(common_index):
         common_index = _strict_label_exit_index(common_index, config, prediction_boundary)
     X_raw = train_factors.loc[common_index]
-    y = forward_returns.loc[common_index]
+    y = valid_returns.loc[common_index]
 
     if len(X_raw) == 0 or len(y) == 0:
         # [DEBUG] 详细诊断无有效数据的原因
@@ -589,7 +599,7 @@ def run_lightgbm_synthesis(
     # [ALIGNED WITH LASSO] Always preprocess if config exists (no standardize guard)
     # =========================================================================
     if isinstance(final_preprocess_cfg, dict) and final_preprocess_cfg:
-        X_preprocessed = synthesizer._apply_feature_preprocessing(X_train_data, final_preprocess_cfg)
+        X_preprocessed = preprocess_synthesis_features(synthesizer, X_train_data, final_preprocess_cfg, history=factor_df)
         logger.info(f"[预处理] 已对 {len(X_train_data.columns)} 个因子执行预处理（筛选前）")
     else:
         X_preprocessed = X_train_data.copy()
@@ -793,9 +803,8 @@ def run_lightgbm_synthesis(
     
     try:
         # Prepare prediction period data
-        predict_start = pd.to_datetime(train_end) + timedelta(days=1)
-        predict_end = predict_start + timedelta(
-            days=synthesizer.config["rolling_window"]["predict_window_days"]
+        predict_start, predict_end = prediction_bounds(
+            factor_df, train_end, synthesizer.config["rolling_window"]["predict_window_days"],
         )
         
         # [FIX] Use factor_df directly - it's already T-1 aligned via shift(1) in process_raw_factor_df()
@@ -832,8 +841,8 @@ def run_lightgbm_synthesis(
         # [ALIGNED WITH LASSO] Always preprocess if config exists (no standardize guard)
         # =========================================================================
         if isinstance(final_preprocess_cfg, dict) and final_preprocess_cfg:
-            predict_factors_processed = synthesizer._apply_feature_preprocessing(
-                predict_factors_raw, final_preprocess_cfg
+            predict_factors_processed = preprocess_synthesis_features(
+                synthesizer, predict_factors_raw, final_preprocess_cfg, history=factor_df,
             )
             logger.debug(f"[预测期预处理] 已对 {len(predict_factors_raw.columns)} 个因子执行预处理")
         else:
@@ -1028,6 +1037,9 @@ def run_lightgbm_synthesis(
             model_info.get("best_iteration", 0),
         )
         
+        sources = selected_market_inputs(factor_df, set(selected_features).union(blend_weights or {}))
+        if sources:
+            model_info["market_factor_inputs"] = sources
         return composite_series, model_info
         
     except InsufficientSurvivingFactorsError:

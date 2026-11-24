@@ -1,11 +1,14 @@
 import duckdb
 
+from market_db_samples import declare_market_db
+
 from factor_synthesis.vectorbt_adapter.backtest_runner import VectorBTBacktestRunner
 
 
 def test_tradeability_opens_configured_price_db_lazily(tmp_path):
     path = tmp_path / "prices.duckdb"
     conn = duckdb.connect(str(path))
+    declare_market_db(conn, 'cn_equity')
     conn.execute(
         "CREATE TABLE price_data_daily "
         "(stock_code VARCHAR, date DATE, open DOUBLE, close DOUBLE, "
