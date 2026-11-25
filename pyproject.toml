@@ -53,7 +53,7 @@ synthesis = [
 # pyqlib 0.9.7 ships CPython 3.11/3.12 wheels for Linux x86_64, macOS and Windows x64.
 qlib = ["pyqlib>=0.9.7,<0.10", "filelock>=3"]
 acceleration = ["numba>=0.59"]
-backtest = ["vectorbt>=0.26"]
+backtest = ["vectorbt>=0.26", "plotly>=5,<6"]
 mining = ["torch>=2.0"]
 viz = ["streamlit>=1.40,<2", "plotly>=5,<7"]
 mcp = ["mcp>=1.13,<2"]

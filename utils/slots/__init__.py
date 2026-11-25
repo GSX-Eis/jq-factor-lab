@@ -5,8 +5,10 @@ from .contracts import (
     CalendarSlot,
     ExecutionProfile,
     InstrumentSpec,
+    LabelExecutionProfile,
     MarketSlot,
     MicrostructureSlot,
+    PortfolioExecutionProfile,
     UniverseSlot,
 )
 from .registry import SlotRegistry
@@ -14,6 +16,7 @@ from .schema import ProviderConfig, SlotConfig, load_slot_config, slot_config_ha
 
 __all__ = [
     'AuxFeatureSlot', 'BarFeedSlot', 'CalendarSlot', 'ExecutionProfile', 'InstrumentSpec',
-    'MarketSlot', 'MicrostructureSlot', 'UniverseSlot', 'SlotRegistry', 'ProviderConfig',
-    'SlotConfig', 'load_slot_config', 'slot_config_hash',
+    'LabelExecutionProfile', 'MarketSlot', 'MicrostructureSlot', 'PortfolioExecutionProfile',
+    'UniverseSlot', 'SlotRegistry', 'ProviderConfig', 'SlotConfig', 'load_slot_config',
+    'slot_config_hash',
 ]

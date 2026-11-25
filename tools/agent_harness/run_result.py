@@ -286,6 +286,11 @@ def validate_execution_result_payload(
         or execution["errors"]
     ):
         raise ValueError("execution result claims success with incomplete work")
+    causal_gate = payload["metrics"].get("causal_gate")
+    if causal_gate is not None:
+        from tools.agent_harness.causal_gate import validate_causal_gate_evidence
+
+        validate_causal_gate_evidence(causal_gate)
     return payload
 
 

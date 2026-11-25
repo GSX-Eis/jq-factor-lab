@@ -9,13 +9,13 @@ and close-old/open-new contract rolls on ``adjust='none'`` concrete prices.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 import logging
 import math
 from numbers import Real
-from typing import Any, Dict, List, Literal, Optional, Tuple, Union
+from typing import Any, Dict, List, Literal, Optional, Set, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -593,120 +593,293 @@ def _valid_positive(value: Any) -> Optional[float]:
     return val if math.isfinite(val) and val > 0.0 else None
 
 
-def _decode_runner_target_weights(
-    *,
-    target_weights: pd.DataFrame,
-    price_aligned: pd.DataFrame,
-    open_aligned: Optional[pd.DataFrame],
-    use_open: bool,
-    init_cash: float,
-    buy_cost_rate: float,
-    sell_cost_rate: float,
-    slippage: float,
-    allow_short: bool,
-) -> pd.DataFrame:
-    """Recover clean signed target weights from ``_compute_target_weights`` dollar matrix.
+class _FuturesOrderValidator:
+    """Unified order tradability verification layer backed by ``MicrostructureSlot``."""
 
-    Replays the nominal pre-sim NAV on the input ``price_aligned`` / ``open_aligned``
-    so any spliced roll-price jump inside ``target_weights`` cancels out cleanly
-    instead of inflating contract-level target notionals.
-    """
-    exec_frame = open_aligned if (use_open and open_aligned is not None) else price_aligned
-    buy_mult = 1.0 + max(float(buy_cost_rate), 0.0) + max(float(slippage), 0.0)
-    sell_mult = max(0.0, 1.0 - max(float(sell_cost_rate), 0.0) - max(float(slippage), 0.0))
-    buy_fee_rate = max(float(buy_cost_rate), 0.0) + max(float(slippage), 0.0)
-    sell_fee_rate = max(float(sell_cost_rate), 0.0) + max(float(slippage), 0.0)
+    def __init__(
+        self,
+        *,
+        slot: Optional[MarketSlot],
+        bar_utc_index: pd.DatetimeIndex,
+        session_ids: Mapping[Tuple[int, str], str],
+    ) -> None:
+        self._slot = slot
+        self._bar_utc_index = bar_utc_index
+        self._session_ids = session_ids
+        self._mask_cache: Dict[Tuple[int, str, str], bool] = {}
 
-    out = pd.DataFrame(
-        np.nan,
-        index=target_weights.index,
-        columns=target_weights.columns,
-        dtype=np.float64,
-    )
-    nom_cash = float(init_cash)
-    nom_pos: Dict[str, float] = {}
+    def is_mask_tradable(
+        self,
+        *,
+        bar_idx: int,
+        inst: str,
+        contract: str,
+        side: str,
+        price: Optional[float] = None,
+    ) -> bool:
+        """Query ``slot.microstructure.tradability_mask`` uniformly across all order types."""
+        if self._slot is None:
+            return True
+        if side not in ("buy", "sell", "hold", "both"):
+            raise ValueError(f"Unsupported futures order side: {side!r}")
+        if side == "both":
+            return self.is_mask_tradable(
+                bar_idx=bar_idx, inst=inst, contract=contract, side="buy", price=price
+            ) and self.is_mask_tradable(
+                bar_idx=bar_idx, inst=inst, contract=contract, side="sell", price=price
+            )
 
-    def _nom_mark(dt: Any, inst: str) -> Optional[float]:
-        for frame in (exec_frame, price_aligned):
-            if inst in frame.columns and dt in frame.index:
-                px = _valid_positive(frame.loc[dt, inst])
-                if px is not None:
-                    return px
-        if inst in price_aligned.columns:
-            hist = pd.to_numeric(price_aligned.loc[:dt, inst], errors="coerce")
-            hist = hist[np.isfinite(hist) & (hist > 0)]
-            if not hist.empty:
-                return float(hist.iloc[-1])
-        return None
+        cache_key = (bar_idx, contract, side)
+        if cache_key in self._mask_cache:
+            return self._mask_cache[cache_key]
 
-    def _nom_exec(dt: Any, inst: str) -> Optional[float]:
-        if inst not in exec_frame.columns or dt not in exec_frame.index:
+        bar_ts = pd.Timestamp(self._bar_utc_index[bar_idx])
+        if bar_ts.tzinfo is None:
+            bar_ts = bar_ts.tz_localize("UTC")
+        else:
+            bar_ts = bar_ts.tz_convert("UTC")
+        session_id = self._session_ids.get((bar_idx, inst), bar_ts.strftime("%Y-%m-%d"))
+
+        grid_data: Dict[str, Any] = {
+            "instrument_id": [contract],
+            "timestamp_utc": pd.DatetimeIndex([bar_ts], tz="UTC"),
+            "session_id": [session_id],
+        }
+        if side in ("buy", "sell"):
+            grid_data["side"] = [side]
+        if price is not None and math.isfinite(price) and price > 0.0:
+            grid_data["close"] = [float(price)]
+        grid = pd.DataFrame(grid_data)
+
+        mask = self._slot.microstructure.tradability_mask(grid, instrument_id=contract)
+        if mask is None or mask.empty:
+            allowed = False
+        else:
+            val = mask.iloc[0]
+            allowed = False if pd.isna(val) else bool(val)
+        self._mask_cache[cache_key] = allowed
+        return allowed
+
+    def validate_order(
+        self,
+        *,
+        bar_idx: int,
+        inst: str,
+        contract: str,
+        side: str,
+        price: Optional[float],
+    ) -> Tuple[bool, str]:
+        """Validate both tradability mask and physical execution price availability."""
+        if not self.is_mask_tradable(
+            bar_idx=bar_idx, inst=inst, contract=contract, side=side, price=price
+        ):
+            return False, "tradability_mask_blocked"
+        if price is None or not math.isfinite(price) or price <= 0.0:
+            return False, "missing_execution_price"
+        return True, "ok"
+
+
+class _FuturesAccountView:
+    """Live single-account state adapter exposing real futures state to ``SharedPortfolioPolicy``."""
+
+    def __init__(
+        self,
+        *,
+        bar_idx: int,
+        equity: float,
+        positions: Dict[str, _OpenPosition],
+        pending_rolls: Dict[str, Dict[str, Any]],
+        pending_liquidations: Set[str],
+        active_contract: Mapping[Tuple[int, str], str],
+        missing_bar_insts: Set[str],
+        exec_price_fn: Callable[[int, str], Optional[float]],
+        last_contract_close: Mapping[str, float],
+        validator: _FuturesOrderValidator,
+        config: FuturesExecutionConfig,
+        get_spec_fn: Callable[[str], InstrumentSpec],
+        buy_cost_rate: float,
+        sell_cost_rate: float,
+        slippage: float,
+    ) -> None:
+        self._bar_idx = bar_idx
+        self._equity = float(equity)
+        self._positions = positions
+        self._pending_rolls = pending_rolls
+        self._pending_liquidations = pending_liquidations
+        self._active_contract = active_contract
+        self._missing_bar_insts = missing_bar_insts
+        self._exec_price_fn = exec_price_fn
+        self._last_contract_close = last_contract_close
+        self._validator = validator
+        self._config = config
+        self._get_spec_fn = get_spec_fn
+        self._buy_cost_rate = float(buy_cost_rate)
+        self._sell_cost_rate = float(sell_cost_rate)
+        self._slippage = float(slippage)
+
+    def held_instruments(self) -> Set[str]:
+        return set(self._positions.keys())
+
+    def held_notional(self, instrument: str) -> float:
+        pos = self._positions.get(instrument)
+        if pos is None:
+            return 0.0
+        px = self.mark_price(instrument)
+        if px is None:
+            px = pos.last_mark_price
+        return float(pos.lots) * float(px) * float(pos.multiplier)
+
+    def nav(self) -> float:
+        return float(self._equity)
+
+    def prev_weight_map(self) -> Dict[str, float]:
+        if self._equity <= 0.0:
+            return {}
+        out: Dict[str, float] = {}
+        denom = self._equity * self._config.leverage
+        if denom <= 0.0:
+            return {}
+        for inst, pos in sorted(self._positions.items()):
+            notional = self.held_notional(inst)
+            if self._config.target_weight_basis == "margin":
+                out[inst] = (notional * pos.margin_rate) / denom
+            else:
+                out[inst] = notional / denom
+        return out
+
+    def execution_price(self, instrument: str) -> Optional[float]:
+        if instrument in self._missing_bar_insts:
             return None
-        return _valid_positive(exec_frame.loc[dt, inst])
+        return self._exec_price_fn(self._bar_idx, instrument)
 
-    for dt in target_weights.index:
-        row = target_weights.loc[dt]
-        if not row.notna().any():
-            continue
+    def mark_price(self, instrument: str) -> Optional[float]:
+        px = self.execution_price(instrument)
+        if px is not None:
+            return px
+        pos = self._positions.get(instrument)
+        if pos is not None:
+            return pos.last_mark_price
+        c_cur = self._active_contract.get((self._bar_idx, instrument), instrument)
+        return self._last_contract_close.get(c_cur)
 
-        # Leading flat rows before first rebalance have 0.0 and no open positions.
-        if not nom_pos and bool((row.fillna(0.0).abs() <= 1e-12).all()):
-            out.loc[dt, row.notna()] = 0.0
-            continue
-
-        nom_nav = nom_cash
-        for s, shares in nom_pos.items():
-            px = _nom_mark(dt, s)
-            if px is not None:
-                nom_nav += shares * px
-
-        for inst in target_weights.columns:
-            raw_val = row[inst]
-            if pd.isna(raw_val):
+    def filter_tradeable(
+        self,
+        date_str: str,
+        instruments: Sequence[str],
+        *,
+        side: str,
+        require_non_st: bool,
+    ) -> List[str]:
+        del date_str, require_non_st
+        allowed: List[str] = []
+        for inst in instruments:
+            if inst in self._pending_liquidations:
                 continue
-            tgt_val = float(raw_val)
-            if abs(tgt_val) <= 1e-12:
-                out.loc[dt, inst] = 0.0
-            elif nom_nav > 0.0:
-                out.loc[dt, inst] = tgt_val * buy_mult / nom_nav
-            else:
-                out.loc[dt, inst] = 0.0
-
-            px = _nom_exec(dt, inst)
-            if px is None:
+            if inst in self._pending_rolls:
+                # Holding an already-open contract while its roll is deferred requires no trade;
+                # excluding it for side="hold" would manufacture a false rebalance exit intent.
+                if side == "hold" and inst in self._positions:
+                    allowed.append(inst)
                 continue
-            old_shares = nom_pos.get(inst, 0.0)
-            if allow_short:
-                cur_val = old_shares * px
-                delta = tgt_val - cur_val
-                if abs(delta) > 1e-12:
-                    fee_r = buy_fee_rate if delta > 0.0 else sell_fee_rate
-                    nom_cash -= delta + abs(delta) * fee_r
-                if abs(tgt_val) > 1e-12:
-                    nom_pos[inst] = tgt_val / px
-                else:
-                    nom_pos.pop(inst, None)
+            pos = self._positions.get(inst)
+            is_closing_held = bool(
+                pos is not None
+                and (
+                    (pos.lots > 0 and side == "sell")
+                    or (pos.lots < 0 and side == "buy")
+                )
+            )
+            contract = (
+                pos.concrete_instrument_id
+                if (pos is not None and (is_closing_held or side == "hold"))
+                else self._active_contract[(self._bar_idx, inst)]
+            )
+            px = self.mark_price(inst) if side == "hold" else self.execution_price(inst)
+            if side == "hold":
+                ok = self._validator.is_mask_tradable(
+                    bar_idx=self._bar_idx,
+                    inst=inst,
+                    contract=contract,
+                    side="hold",
+                    price=px,
+                )
             else:
-                if abs(tgt_val) <= 1e-12 and old_shares > 0.0:
-                    nom_cash += old_shares * px * sell_mult
-                    nom_pos.pop(inst, None)
-                elif tgt_val > 1e-12:
-                    cur_val = old_shares * px
-                    if old_shares > 0.0:
-                        delta = tgt_val - cur_val
-                        if delta > 0.0:
-                            nom_cash -= delta * buy_mult
-                        elif delta < 0.0:
-                            nom_cash += (-delta) * sell_mult
-                    else:
-                        nom_cash -= tgt_val * buy_mult
-                    nom_pos[inst] = tgt_val / px
-    return out
+                ok, _ = self._validator.validate_order(
+                    bar_idx=self._bar_idx,
+                    inst=inst,
+                    contract=contract,
+                    side=side,
+                    price=px,
+                )
+            if ok:
+                allowed.append(inst)
+        return allowed
+
+    def deployed_capital_for_liquidity(self, exposure: float) -> float:
+        cap = max(0.0, self._equity) * float(exposure) * self._config.leverage
+        if self._config.target_weight_basis == "margin":
+            cap /= self._config.margin_rate
+        return cap
+
+    def base_capital(self, exposure: float) -> float:
+        return self.deployed_capital_for_liquidity(exposure)
+
+    def branch3_buy_target_value(
+        self,
+        *,
+        executed_sells: Set[str],
+        remaining_held: Set[str],
+        effective_top_k: int,
+        buy_count: int,
+        exposure: float,
+    ) -> float:
+        if buy_count <= 0:
+            return 0.0
+        if not self._positions:
+            if effective_top_k <= 0:
+                return 0.0
+            base = max(0.0, self._equity) * float(exposure) * self._config.leverage
+            if self._config.target_weight_basis == "margin":
+                base /= self._config.margin_rate
+            return base / float(effective_top_k)
+
+        close_costs = 0.0
+        for s in executed_sells:
+            pos_obj = self._positions.get(s)
+            px = self.execution_price(s)
+            if pos_obj is not None and px is not None:
+                fee_r = (
+                    max(self._sell_cost_rate, 0.0)
+                    if pos_obj.lots > 0
+                    else max(self._buy_cost_rate, 0.0)
+                ) + max(self._slippage, 0.0)
+                close_costs += abs(pos_obj.lots) * px * pos_obj.multiplier * fee_r
+        post_sell_equity = max(0.0, self._equity - close_costs)
+
+        if self._config.target_weight_basis == "margin":
+            used_margin = sum(
+                abs(self.held_notional(s)) * self._positions[s].margin_rate
+                for s in remaining_held
+                if s in self._positions
+            )
+            free_margin = max(0.0, post_sell_equity * float(exposure) - used_margin)
+            return (free_margin / float(buy_count) / self._config.margin_rate) * self._config.leverage
+
+        used_notional = sum(
+            abs(self.held_notional(s))
+            for s in remaining_held
+            if s in self._positions
+        )
+        free_notional = max(
+            0.0,
+            post_sell_equity * float(exposure) * self._config.leverage - used_notional,
+        )
+        return free_notional / float(buy_count)
 
 
 def simulate_futures_contract_portfolio(
     *,
-    target_weights: pd.DataFrame,
+    target_weights: Optional[pd.DataFrame] = None,
     price_aligned: pd.DataFrame,
     open_aligned: Optional[pd.DataFrame],
     use_open: bool,
@@ -718,13 +891,22 @@ def simulate_futures_contract_portfolio(
     slippage: float,
     config: FuturesExecutionConfig,
     allow_short: bool = True,
-    target_value_mode: Literal["runner_target_value", "target_weight", "target_notional"] = "runner_target_value",
+    target_value_mode: Literal["target_weight", "target_notional"] = "target_weight",
     instrument_specs: Optional[Mapping[str, InstrumentSpec]] = None,
     vbt_freq: str = "1D",
     year_freq: Union[str, pd.Timedelta] = "252D",
     logger: Optional[logging.Logger] = None,
+    policy: Optional[Any] = None,
+    policy_ctx: Optional[Any] = None,
+    exposure_by_date: Optional[Dict[Any, float]] = None,
 ) -> Tuple[FuturesPortfolio, Dict[str, Any]]:
-    """Run contract-level futures portfolio simulation with roll close-old/open-new."""
+    """Run contract-level futures portfolio simulation in a single closed-loop account.
+
+    When ``policy`` and ``policy_ctx`` are supplied, strategy targets are evaluated
+    bar-by-bar against the real futures account state (cash/equity, contract lots,
+    margin usage, roll costs, and liquidations). Otherwise ``target_weights`` is
+    consumed directly as ``target_weight`` or ``target_notional``.
+    """
     log = logger or logging.getLogger(__name__)
     all_dates = pd.DatetimeIndex(price_aligned.index)
     instruments = [str(c) for c in price_aligned.columns]
@@ -735,24 +917,17 @@ def simulate_futures_contract_portfolio(
     if all_dates.empty or not instruments:
         raise ValueError("Futures contract simulation requires non-empty prices and instruments")
 
-    # 1. Decode signed target weights / notionals.
-    aligned_targets = target_weights.reindex(index=all_dates, columns=instruments)
-    if target_value_mode == "runner_target_value":
-        signed_weights = _decode_runner_target_weights(
-            target_weights=aligned_targets,
-            price_aligned=price_aligned,
-            open_aligned=open_aligned,
-            use_open=use_open,
-            init_cash=init_cash,
-            buy_cost_rate=buy_cost_rate,
-            sell_cost_rate=sell_cost_rate,
-            slippage=slippage,
-            allow_short=allow_short,
-        )
-    elif target_value_mode in ("target_weight", "target_notional"):
-        signed_weights = aligned_targets.astype(float)
+    policy_driven = policy is not None
+    if policy_driven:
+        if policy_ctx is None:
+            raise ValueError("policy_ctx is required when policy is provided")
+        signed_weights = None
     else:
-        raise ValueError(f"Unsupported target_value_mode: {target_value_mode!r}")
+        if target_weights is None:
+            raise ValueError("target_weights is required when policy is None")
+        if target_value_mode not in ("target_weight", "target_notional"):
+            raise ValueError(f"Unsupported target_value_mode: {target_value_mode!r}")
+        signed_weights = target_weights.reindex(index=all_dates, columns=instruments).astype(float)
 
     # 2. Build UTC bar mapping and load physical adjust='none' execution bars.
     if slot is not None:
@@ -774,6 +949,7 @@ def simulate_futures_contract_portfolio(
     active_contract: Dict[Tuple[int, str], str] = {}
     concrete_open: Dict[Tuple[int, str], Optional[float]] = {}
     concrete_close: Dict[Tuple[int, str], Optional[float]] = {}
+    session_ids: Dict[Tuple[int, str], str] = {}
     last_contract_close: Dict[str, float] = {}
 
     utc_to_pos = {ts: i for i, ts in enumerate(bar_utc_index)}
@@ -804,6 +980,24 @@ def simulate_futures_contract_portfolio(
                 c_id = active_contract[(pos - 1, inst)] if pos > 0 else inst
             active_contract[(pos, inst)] = c_id
 
+            if rec is not None and pd.notna(rec.get("session_id")):
+                session_ids[(pos, inst)] = str(rec["session_id"])
+            elif freq_obj.kind == "session" and dt.tzinfo is None:
+                session_ids[(pos, inst)] = pd.Timestamp(dt).strftime("%Y-%m-%d")
+            elif slot is not None:
+                sess_obj = None
+                try:
+                    sess_obj = slot.calendar.session_at(bar_py_dt, frequency=freq_obj) or slot.calendar.session_at(bar_py_dt)
+                except Exception:
+                    sess_obj = None
+                session_ids[(pos, inst)] = (
+                    str(sess_obj.session_date)
+                    if sess_obj is not None
+                    else pd.Timestamp(bar_ts).strftime("%Y-%m-%d")
+                )
+            else:
+                session_ids[(pos, inst)] = pd.Timestamp(bar_ts).strftime("%Y-%m-%d")
+
             if slot is not None:
                 # Never fall back to spliced/adjusted price_aligned or open_aligned when a slot feed is present.
                 c_px = _valid_positive(rec.get("close")) if rec is not None else None
@@ -824,6 +1018,12 @@ def simulate_futures_contract_portfolio(
                 concrete_close[(pos, inst)] = c_px
                 concrete_open[(pos, inst)] = o_px if o_px is not None else c_px
 
+    validator = _FuturesOrderValidator(
+        slot=slot,
+        bar_utc_index=bar_utc_index,
+        session_ids=session_ids,
+    )
+
     spec_cache: Dict[str, InstrumentSpec] = {}
 
     def _get_spec(contract_id: str) -> InstrumentSpec:
@@ -838,11 +1038,14 @@ def simulate_futures_contract_portfolio(
         spec_cache[contract_id] = spec
         return spec
 
-    roll_close_cache: Dict[Tuple[int, str], Optional[float]] = {}
-    roll_close_errors: Dict[Tuple[int, str], Exception] = {}
+    roll_close_cache: Dict[Tuple[int, str, str], Optional[float]] = {}
+    roll_close_errors: Dict[Tuple[int, str, str], Exception] = {}
 
-    def _resolve_roll_close_price(pos: int, contract_id: str) -> Optional[float]:
-        key = (pos, contract_id)
+    def _resolve_roll_close_price(
+        pos: int, contract_id: str, field_override: Optional[str] = None
+    ) -> Optional[float]:
+        field = field_override or ("open" if use_open else "close")
+        key = (pos, contract_id, field)
         if key in roll_close_cache:
             return roll_close_cache[key]
         price_val: Optional[float] = None
@@ -868,10 +1071,8 @@ def simulate_futures_contract_portfolio(
                     elif "timestamp_utc" in old_bar.columns:
                         matched_utc = pd.to_datetime(old_bar["timestamp_utc"], utc=True).dt.as_unit("ns")
                         old_bar = old_bar.loc[matched_utc == bar_utc_index[pos]]
-                if old_bar is not None and not old_bar.empty:
-                    field = "open" if use_open else "close"
-                    if field in old_bar.columns:
-                        price_val = _valid_positive(old_bar[field].iloc[-1])
+                if old_bar is not None and not old_bar.empty and field in old_bar.columns:
+                    price_val = _valid_positive(old_bar[field].iloc[-1])
             except Exception as exc:
                 roll_close_errors[key] = exc
                 log.debug(
@@ -890,23 +1091,102 @@ def simulate_futures_contract_portfolio(
     margin_util_vals = np.zeros(len(all_dates), dtype=float)
     asset_val_df = pd.DataFrame(0.0, index=all_dates, columns=instruments, dtype=float)
     lots_df = pd.DataFrame(0, index=all_dates, columns=instruments, dtype=int)
+    target_weights_out = pd.DataFrame(np.nan, index=all_dates, columns=instruments, dtype=float)
 
     order_rows: List[Dict[str, Any]] = []
     trade_rows: List[Dict[str, Any]] = []
     log_rows: List[Dict[str, Any]] = []
     roll_events: List[Dict[str, Any]] = []
     liquidation_events: List[Dict[str, Any]] = []
+    blocked_order_events: List[Dict[str, Any]] = []
+
+    pending_sells: Set[str] = set()
+    pending_sell_since: Dict[str, pd.Timestamp] = {}
+    pending_rolls: Dict[str, Dict[str, Any]] = {}
+    pending_liquidations: Set[str] = set()
+    decision_portfolio_values: Dict[pd.Timestamp, float] = {}
 
     order_counter = 0
     margin_clipped_events = 0
     lot_floored_to_zero_events = 0
     missing_execution_bar_count = 0
     roll_close_fallback_count = 0
+    roll_close_blocked_count = 0
+    roll_open_blocked_count = 0
+    roll_deferred_count = 0
+    liquidation_blocked_count = 0
+    liquidation_deferred_executed_count = 0
+    blocked_exit_events = 0
+    blocked_exit_notional = 0.0
+    completed_exit_delays: List[int] = []
+    strict_position_buys_skipped = 0
     total_roll_cost = 0.0
     total_transaction_cost = 0.0
 
     def _exec_price(pos: int, inst: str) -> Optional[float]:
         return concrete_open[(pos, inst)] if use_open else concrete_close[(pos, inst)]
+
+    def _norm_ts(ts: Any) -> pd.Timestamp:
+        return pd.Timestamp(ts).normalize()
+
+    def _block_exit(dt_val: Any, inst: str, mark_px: Optional[float]) -> None:
+        nonlocal blocked_exit_events, blocked_exit_notional
+        if inst not in pending_sells:
+            blocked_exit_events += 1
+            pending_sell_since[inst] = _norm_ts(dt_val)
+            pos_obj = positions.get(inst)
+            if pos_obj is not None:
+                px_val = mark_px if mark_px is not None else pos_obj.last_mark_price
+                blocked_exit_notional += abs(pos_obj.lots) * float(px_val) * float(pos_obj.multiplier)
+        pending_sells.add(inst)
+
+    def _finish_exit(dt_val: Any, inst: str) -> None:
+        started = pending_sell_since.pop(inst, None)
+        if started is not None:
+            completed_exit_delays.append(max(0, int((_norm_ts(dt_val) - started).days)))
+        pending_sells.discard(inst)
+
+    def _cancel_exit(inst: str) -> None:
+        pending_sells.discard(inst)
+        pending_sell_since.pop(inst, None)
+
+    def _record_blocked_order(
+        *,
+        dt: Any,
+        inst: str,
+        contract: str,
+        order_type: str,
+        side: str,
+        requested_delta_lots: int,
+        multiplier: float,
+        price: Optional[float],
+        reason: str,
+        status: str,
+        current_lots: int,
+    ) -> None:
+        blocked_order_events.append(
+            {
+                "timestamp": dt,
+                "instrument_id": inst,
+                "contract": contract,
+                "order_type": order_type,
+                "side": side,
+                "requested_delta_lots": int(requested_delta_lots),
+                "reason": reason,
+                "status": status,
+            }
+        )
+        log_rows.append(
+            {
+                "Timestamp": dt,
+                "Column": inst,
+                "Result Status": "Rejected",
+                "Request Size": float(requested_delta_lots) * float(multiplier),
+                "Position": float(current_lots) * float(multiplier),
+                "Val Price": float(price) if price is not None else 0.0,
+                "Reason": f"{order_type}:{reason}",
+            }
+        )
 
     def _record_order(
         *,
@@ -1020,8 +1300,8 @@ def simulate_futures_contract_portfolio(
     # 4. Main bar-by-bar execution loop.
     prev_equity = float(init_cash)
     for bar_idx, dt in enumerate(all_dates):
-        w_row = signed_weights.loc[dt]
-        missing_bar_insts: set[str] = set()
+        w_row = signed_weights.loc[dt] if signed_weights is not None else None
+        missing_bar_insts: Set[str] = set()
         if slot is not None:
             for inst in instruments:
                 exec_px = _exec_price(bar_idx, inst)
@@ -1029,16 +1309,31 @@ def simulate_futures_contract_portfolio(
                 if exec_px is not None and close_px is not None:
                     continue
                 has_pos = inst in positions
-                raw_w = w_row[inst]
-                has_target = pd.notna(raw_w) and (abs(float(raw_w)) > 1e-12 or has_pos)
+                if w_row is not None:
+                    raw_w = w_row[inst]
+                    has_target = pd.notna(raw_w) and (abs(float(raw_w)) > 1e-12 or has_pos)
+                else:
+                    dt_norm = policy_ctx.norm_bar_fn(dt)
+                    has_target = (
+                        dt_norm in policy_ctx.rebalance_set
+                        or dt_norm in policy_ctx.skip_liquidation_bars
+                        or inst in pending_sells
+                    )
                 has_signal_bar = (
                     inst in price_aligned.columns
                     and _valid_positive(price_aligned.loc[dt, inst]) is not None
                 )
                 if not (has_pos or has_target or has_signal_bar):
                     continue
-                missing_execution_bar_count += 1
                 c_id = active_contract[(bar_idx, inst)]
+                # If microstructure explicitly marks the bar non-tradable, do not fail
+                # missing-execution-bar validation; let order validation block/defer it.
+                if not validator.is_mask_tradable(
+                    bar_idx=bar_idx, inst=inst, contract=c_id, side="hold", price=exec_px
+                ):
+                    missing_bar_insts.add(inst)
+                    continue
+                missing_execution_bar_count += 1
                 if config.missing_execution_bar_policy == "raise":
                     raise FuturesExecutionError(
                         f"Missing physical execution bar for instrument={inst!r}, "
@@ -1047,7 +1342,7 @@ def simulate_futures_contract_portfolio(
                 missing_bar_insts.add(inst)
 
         # Step 4.1: Mark open positions to bar execution prices (or roll exit prices).
-        roll_exit_prices: Dict[str, Tuple[float, bool]] = {}
+        roll_exit_prices: Dict[str, Tuple[Optional[float], bool]] = {}
         for inst in sorted(positions):
             pos_obj = positions[inst]
             c_cur = active_contract[(bar_idx, inst)]
@@ -1059,146 +1354,521 @@ def simulate_futures_contract_portfolio(
                     equity += float(pos_obj.lots) * (px - pos_obj.last_mark_price) * pos_obj.multiplier
                     pos_obj.last_mark_price = px
             else:
-                roll_px = _resolve_roll_close_price(bar_idx, pos_obj.concrete_instrument_id)
+                c_old = pos_obj.concrete_instrument_id
+                close_side = "sell" if pos_obj.lots > 0 else "buy"
+                roll_px = _resolve_roll_close_price(bar_idx, c_old)
+                old_mask_ok = validator.is_mask_tradable(
+                    bar_idx=bar_idx,
+                    inst=inst,
+                    contract=c_old,
+                    side=close_side,
+                    price=roll_px,
+                )
                 used_fallback = False
                 if roll_px is None:
-                    if config.roll_close_fallback_policy == "raise":
-                        err = roll_close_errors.get((bar_idx, pos_obj.concrete_instrument_id))
+                    if old_mask_ok and config.roll_close_fallback_policy == "raise":
+                        field = "open" if use_open else "close"
+                        err = roll_close_errors.get((bar_idx, c_old, field))
                         msg = (
                             f"Missing physical roll exit bar for instrument={inst!r}, "
-                            f"from_contract={pos_obj.concrete_instrument_id!r}, "
-                            f"to_contract={c_cur!r}, bar={dt}"
+                            f"from_contract={c_old!r}, to_contract={c_cur!r}, bar={dt}"
                         )
                         if err is not None:
                             raise FuturesExecutionError(msg) from err
                         raise FuturesExecutionError(msg)
-                    roll_px = last_contract_close.get(
-                        pos_obj.concrete_instrument_id, pos_obj.last_mark_price
-                    )
-                    used_fallback = True
-                    roll_close_fallback_count += 1
+                    if old_mask_ok or config.roll_close_fallback_policy == "last_close":
+                        roll_px = last_contract_close.get(c_old, pos_obj.last_mark_price)
+                        used_fallback = True
+                        roll_close_fallback_count += 1
+                    else:
+                        roll_px = last_contract_close.get(c_old, pos_obj.last_mark_price)
+                        used_fallback = True
                 roll_exit_prices[inst] = (roll_px, used_fallback)
-                equity += float(pos_obj.lots) * (roll_px - pos_obj.last_mark_price) * pos_obj.multiplier
-                pos_obj.last_mark_price = roll_px
+                if roll_px is not None:
+                    equity += float(pos_obj.lots) * (roll_px - pos_obj.last_mark_price) * pos_obj.multiplier
+                    pos_obj.last_mark_price = roll_px
 
-        # Step 4.2: Execute rolls (close C_old first so jump gaps never pollute PnL).
+        # Step 4.1b: Retry deferred maintenance liquidations before any roll/rebalance.
+        liq_attempted_this_bar: Set[str] = set()
+        for inst in sorted(list(pending_liquidations)):
+            if inst not in positions:
+                pending_liquidations.discard(inst)
+                continue
+            liq_attempted_this_bar.add(inst)
+            pos_obj = positions[inst]
+            c_cur = active_contract[(bar_idx, inst)]
+            liq_side = "sell" if pos_obj.lots > 0 else "buy"
+            if pos_obj.concrete_instrument_id != c_cur:
+                liq_px = roll_exit_prices.get(inst, (None, False))[0]
+            else:
+                liq_px = None if inst in missing_bar_insts else _exec_price(bar_idx, inst)
+            liq_ok, liq_reason = validator.validate_order(
+                bar_idx=bar_idx,
+                inst=inst,
+                contract=pos_obj.concrete_instrument_id,
+                side=liq_side,
+                price=liq_px,
+            )
+            if liq_ok and liq_px is not None:
+                eq_before = float(equity)
+                closed_lots = pos_obj.lots
+                c_closed = pos_obj.concrete_instrument_id
+                _close_open_position(
+                    dt=dt,
+                    pos_obj=pos_obj,
+                    close_lots=closed_lots,
+                    exit_price=liq_px,
+                    order_type="LIQUIDATION",
+                )
+                del positions[inst]
+                pending_liquidations.discard(inst)
+                pending_rolls.pop(inst, None)
+                _finish_exit(dt, inst)
+                liquidation_deferred_executed_count += 1
+                liquidation_events.append(
+                    {
+                        "timestamp": dt,
+                        "equity_before_action": eq_before,
+                        "maintenance_margin_required": None,
+                        "action": "liquidate",
+                        "status": "deferred_executed",
+                        "positions": {
+                            inst: {
+                                "contract": c_closed,
+                                "lots": int(closed_lots),
+                                "mark_price": float(liq_px),
+                            }
+                        },
+                        "equity_after_action": float(equity),
+                    }
+                )
+            else:
+                liquidation_blocked_count += 1
+                _record_blocked_order(
+                    dt=dt,
+                    inst=inst,
+                    contract=pos_obj.concrete_instrument_id,
+                    order_type="LIQUIDATION",
+                    side=liq_side,
+                    requested_delta_lots=-pos_obj.lots,
+                    multiplier=pos_obj.multiplier,
+                    price=liq_px,
+                    reason=liq_reason,
+                    status="deferred",
+                    current_lots=pos_obj.lots,
+                )
+
+        # Step 4.2: Execute eligible rolls (close C_old first so jump gaps never pollute PnL).
         rolled_from: Dict[str, Dict[str, Any]] = {}
+        roll_completed_exits: Set[str] = set()
         for inst in sorted(list(positions.keys())):
             pos_obj = positions[inst]
             c_new = active_contract[(bar_idx, inst)]
-            if pos_obj.concrete_instrument_id != c_new:
-                c_old = pos_obj.concrete_instrument_id
-                old_lots = pos_obj.lots
-                old_mult = pos_obj.multiplier
-                p_old_exec, used_fallback = roll_exit_prices[inst]
-                close_cost = _close_open_position(
-                    dt=dt,
-                    pos_obj=pos_obj,
-                    close_lots=old_lots,
-                    exit_price=p_old_exec,
-                    order_type="ROLL_CLOSE",
-                )
-                total_roll_cost += close_cost
-                del positions[inst]
-                roll_rec: Dict[str, Any] = {
-                    "timestamp": dt,
-                    "instrument_id": inst,
-                    "from_contract": c_old,
-                    "to_contract": c_new,
-                    "closed_lots": int(old_lots),
-                    "close_price": float(p_old_exec),
-                    "close_cost": float(close_cost),
-                    "close_price_fallback": bool(used_fallback),
-                    "opened_lots": 0,
-                    "open_price": None,
-                    "open_cost": 0.0,
-                    "price_gap": None,
-                }
-                rolled_from[inst] = roll_rec
-                roll_events.append(roll_rec)
-
-        # Step 4.3: Compute desired target lots for each instrument on this bar.
-        desired_lots: Dict[str, int] = {}
-        for inst in instruments:
-            if inst in missing_bar_insts:
-                desired_lots[inst] = positions[inst].lots if inst in positions else 0
+            if pos_obj.concrete_instrument_id == c_new or inst in pending_liquidations:
                 continue
-            raw_w = w_row[inst]
-            if pd.notna(raw_w):
-                w = float(raw_w)
-                if not allow_short and w < 0.0:
-                    w = 0.0
-                if abs(w) <= 1e-12:
-                    desired_lots[inst] = 0
-                    continue
-                c_cur = active_contract[(bar_idx, inst)]
-                px = _exec_price(bar_idx, inst)
-                if px is None:
-                    desired_lots[inst] = positions[inst].lots if inst in positions else 0
-                    continue
-                spec = _get_spec(c_cur)
-                mr = config.margin_rate_for(inst, c_cur)
-                if target_value_mode == "target_notional":
-                    target_notional = w * config.leverage
-                elif config.target_weight_basis == "margin":
-                    target_notional = (w * max(equity, 0.0) / mr) * config.leverage
+            c_old = pos_obj.concrete_instrument_id
+            old_lots = pos_obj.lots
+            p_old_exec, used_fallback = roll_exit_prices[inst]
+            close_side = "sell" if old_lots > 0 else "buy"
+            roll_close_ok, roll_close_reason = validator.validate_order(
+                bar_idx=bar_idx,
+                inst=inst,
+                contract=c_old,
+                side=close_side,
+                price=p_old_exec,
+            )
+            if not roll_close_ok or p_old_exec is None:
+                roll_close_blocked_count += 1
+                if inst not in pending_rolls:
+                    roll_deferred_count += 1
+                    pending_rolls[inst] = {
+                        "from_contract": c_old,
+                        "to_contract": c_new,
+                        "since": dt,
+                        "deferred_bars": 1,
+                    }
                 else:
-                    target_notional = w * max(equity, 0.0) * config.leverage
-                lots = round_contract_lots(
-                    target_notional,
-                    px,
-                    spec.contract_multiplier,
-                    spec.lot_size,
-                    config.lot_rounding,
+                    pending_rolls[inst]["to_contract"] = c_new
+                    pending_rolls[inst]["deferred_bars"] = int(
+                        pending_rolls[inst].get("deferred_bars", 0)
+                    ) + 1
+                _record_blocked_order(
+                    dt=dt,
+                    inst=inst,
+                    contract=c_old,
+                    order_type="ROLL_CLOSE",
+                    side=close_side,
+                    requested_delta_lots=-old_lots,
+                    multiplier=pos_obj.multiplier,
+                    price=p_old_exec,
+                    reason=roll_close_reason,
+                    status="deferred",
+                    current_lots=old_lots,
                 )
-                if lots == 0 and abs(target_notional) > 1e-12:
-                    lot_floored_to_zero_events += 1
-                desired_lots[inst] = lots
+                continue
+
+            was_pending_sell = inst in pending_sells
+            deferred_info = pending_rolls.pop(inst, None)
+            close_cost = _close_open_position(
+                dt=dt,
+                pos_obj=pos_obj,
+                close_lots=old_lots,
+                exit_price=p_old_exec,
+                order_type="ROLL_CLOSE",
+            )
+            total_roll_cost += close_cost
+            del positions[inst]
+            _finish_exit(dt, inst)
+            roll_rec: Dict[str, Any] = {
+                "timestamp": dt,
+                "instrument_id": inst,
+                "from_contract": c_old,
+                "to_contract": c_new,
+                "closed_lots": int(old_lots),
+                "close_price": float(p_old_exec),
+                "close_cost": float(close_cost),
+                "close_price_fallback": bool(used_fallback),
+                "opened_lots": 0,
+                "open_price": None,
+                "open_cost": 0.0,
+                "price_gap": None,
+                "open_blocked": False,
+                "open_block_reason": None,
+                "deferred_from": deferred_info["since"] if deferred_info else None,
+                "deferred_bars": int(deferred_info["deferred_bars"]) if deferred_info else 0,
+            }
+            if was_pending_sell:
+                # Pending exit intent supersedes rolling into C_new; never size or open ROLL_OPEN.
+                roll_rec["pending_exit_completed"] = True
+                roll_completed_exits.add(inst)
             else:
-                if inst in rolled_from:
-                    c_new = active_contract[(bar_idx, inst)]
+                rolled_from[inst] = roll_rec
+            roll_events.append(roll_rec)
+
+        # Step 4.3: Evaluate portfolio policy (if policy-driven) or decode matrix row.
+        desired_lots: Dict[str, int] = {}
+        decision: Any = None
+        if policy_driven:
+            dt_norm = policy_ctx.norm_bar_fn(dt)
+            if policy_ctx.capture_decisions and (
+                dt_norm in policy_ctx.rebalance_set
+                or dt_norm in policy_ctx.skip_liquidation_bars
+                or pending_sells
+                or not positions
+            ):
+                decision_portfolio_values[dt] = float(equity)
+
+            account_view = _FuturesAccountView(
+                bar_idx=bar_idx,
+                equity=equity,
+                positions=positions,
+                pending_rolls=pending_rolls,
+                pending_liquidations=pending_liquidations,
+                active_contract=active_contract,
+                missing_bar_insts=missing_bar_insts,
+                exec_price_fn=_exec_price,
+                last_contract_close=last_contract_close,
+                validator=validator,
+                config=config,
+                get_spec_fn=_get_spec,
+                buy_cost_rate=buy_cost_rate,
+                sell_cost_rate=sell_cost_rate,
+                slippage=slippage,
+            )
+            decision = policy.evaluate_bar(
+                ctx=policy_ctx,
+                date=dt,
+                account=account_view,
+                exposure_by_date=exposure_by_date,
+            )
+            strict_position_buys_skipped += int(decision.strict_buys_skipped)
+            for s in decision.cancelled_exits:
+                _cancel_exit(s)
+            for s in sorted(decision.blocked_exits):
+                _block_exit(dt, s, account_view.mark_price(s))
+                pos_blk = positions.get(s)
+                if pos_blk is not None:
+                    _record_blocked_order(
+                        dt=dt,
+                        inst=s,
+                        contract=pos_blk.concrete_instrument_id,
+                        order_type="REBALANCE",
+                        side="sell" if pos_blk.lots > 0 else "buy",
+                        requested_delta_lots=-pos_blk.lots,
+                        multiplier=pos_blk.multiplier,
+                        price=account_view.execution_price(s),
+                        reason="tradability_mask_blocked",
+                        status="deferred",
+                        current_lots=pos_blk.lots,
+                    )
+
+            if decision.kind == "noop":
+                for inst in instruments:
+                    if (
+                        inst in pending_sells
+                        and inst in positions
+                        and inst not in missing_bar_insts
+                        and inst not in pending_rolls
+                        and inst not in pending_liquidations
+                    ):
+                        desired_lots[inst] = 0
+                    elif inst in rolled_from:
+                        c_new = active_contract[(bar_idx, inst)]
+                        px = None if inst in missing_bar_insts else _exec_price(bar_idx, inst)
+                        if px is None:
+                            desired_lots[inst] = 0
+                        else:
+                            spec = _get_spec(c_new)
+                            roll_rec = rolled_from[inst]
+                            old_lots = int(roll_rec["closed_lots"])
+                            if config.roll_sizing == "same_lots":
+                                sign = 1 if old_lots >= 0 else -1
+                                aligned_lots = (abs(old_lots) // spec.lot_size) * spec.lot_size
+                                desired_lots[inst] = sign * aligned_lots
+                            else:
+                                old_notional = (
+                                    float(old_lots)
+                                    * float(roll_rec["close_price"])
+                                    * _get_spec(roll_rec["from_contract"]).contract_multiplier
+                                )
+                                desired_lots[inst] = round_contract_lots(
+                                    old_notional,
+                                    px,
+                                    spec.contract_multiplier,
+                                    spec.lot_size,
+                                    config.lot_rounding,
+                                )
+                    elif inst in positions:
+                        desired_lots[inst] = positions[inst].lots
+                    else:
+                        desired_lots[inst] = 0
+                for inst in roll_completed_exits:
+                    target_weights_out.loc[dt, inst] = 0.0
+            elif decision.kind in ("skip_liquidate", "liquidate_targetless"):
+                for inst in instruments:
+                    if (
+                        inst in positions
+                        and inst not in missing_bar_insts
+                        and inst not in pending_rolls
+                        and inst not in pending_liquidations
+                    ):
+                        desired_lots[inst] = 0
+                    elif inst in positions:
+                        desired_lots[inst] = positions[inst].lots
+                        if inst not in pending_liquidations and (
+                            inst in pending_rolls or inst in missing_bar_insts
+                        ):
+                            _block_exit(dt, inst, account_view.mark_price(inst))
+                    else:
+                        desired_lots[inst] = 0
+                for inst in roll_completed_exits:
+                    target_weights_out.loc[dt, inst] = 0.0
+            elif decision.kind == "no_signal":
+                target_weights_out.loc[dt, :] = 0.0
+                for inst in instruments:
+                    desired_lots[inst] = positions[inst].lots if inst in positions else 0
+            else:
+                for inst in instruments:
+                    if inst in decision.hold_instruments or inst in decision.forced_instruments:
+                        target_weights_out.loc[dt, inst] = np.nan
+                    elif inst in decision.target_values:
+                        target_weights_out.loc[dt, inst] = float(decision.target_values[inst])
+                    elif inst in roll_completed_exits:
+                        target_weights_out.loc[dt, inst] = 0.0
+
+                    if inst in missing_bar_insts or inst in pending_rolls or inst in pending_liquidations:
+                        desired_lots[inst] = positions[inst].lots if inst in positions else 0
+                        continue
+                    if inst in decision.sell_instruments:
+                        desired_lots[inst] = 0
+                        continue
+                    if inst in decision.hold_instruments or inst in decision.forced_instruments:
+                        if inst in rolled_from:
+                            c_new = active_contract[(bar_idx, inst)]
+                            px = _exec_price(bar_idx, inst)
+                            if px is None:
+                                desired_lots[inst] = 0
+                            else:
+                                spec = _get_spec(c_new)
+                                roll_rec = rolled_from[inst]
+                                old_lots = int(roll_rec["closed_lots"])
+                                if config.roll_sizing == "same_lots":
+                                    sign = 1 if old_lots >= 0 else -1
+                                    aligned_lots = (abs(old_lots) // spec.lot_size) * spec.lot_size
+                                    desired_lots[inst] = sign * aligned_lots
+                                else:
+                                    old_notional = (
+                                        float(old_lots)
+                                        * float(roll_rec["close_price"])
+                                        * _get_spec(roll_rec["from_contract"]).contract_multiplier
+                                    )
+                                    desired_lots[inst] = round_contract_lots(
+                                        old_notional,
+                                        px,
+                                        spec.contract_multiplier,
+                                        spec.lot_size,
+                                        config.lot_rounding,
+                                    )
+                        elif inst in positions:
+                            desired_lots[inst] = positions[inst].lots
+                        else:
+                            desired_lots[inst] = 0
+                        continue
+
+                    c_cur = active_contract[(bar_idx, inst)]
                     px = _exec_price(bar_idx, inst)
                     if px is None:
-                        desired_lots[inst] = 0
-                    else:
-                        spec = _get_spec(c_new)
-                        roll_rec = rolled_from[inst]
-                        old_lots = int(roll_rec["closed_lots"])
-                        if config.roll_sizing == "same_lots":
-                            sign = 1 if old_lots >= 0 else -1
-                            aligned_lots = (abs(old_lots) // spec.lot_size) * spec.lot_size
-                            desired_lots[inst] = sign * aligned_lots
+                        desired_lots[inst] = positions[inst].lots if inst in positions else 0
+                        continue
+                    spec = _get_spec(c_cur)
+                    mr = config.margin_rate_for(inst, c_cur)
+                    target_notional: Optional[float] = None
+                    if (
+                        decision.use_direct_notional_targets
+                        and inst in decision.target_values
+                        and not (
+                            decision.kind == "branch_overlay"
+                            and config.target_weight_basis == "margin"
+                            and inst in decision.target_weights
+                        )
+                    ):
+                        target_notional = float(decision.target_values[inst])
+                    elif inst in decision.target_weights:
+                        w = float(decision.target_weights[inst])
+                        if not allow_short and w < 0.0:
+                            w = 0.0
+                        if config.target_weight_basis == "margin":
+                            target_notional = (w * max(equity, 0.0) / mr) * config.leverage
                         else:
-                            old_notional = (
-                                float(old_lots)
-                                * float(roll_rec["close_price"])
-                                * _get_spec(roll_rec["from_contract"]).contract_multiplier
-                            )
-                            desired_lots[inst] = round_contract_lots(
-                                old_notional,
-                                px,
-                                spec.contract_multiplier,
-                                spec.lot_size,
-                                config.lot_rounding,
-                            )
-                elif inst in positions:
-                    desired_lots[inst] = positions[inst].lots
-                else:
-                    desired_lots[inst] = 0
+                            target_notional = w * max(equity, 0.0) * config.leverage
 
-        # Step 4.4: Execute reductions / closes / sign-flips first (frees margin).
+                    if target_notional is None:
+                        desired_lots[inst] = positions[inst].lots if inst in positions else 0
+                        continue
+                    if abs(target_notional) <= 1e-12:
+                        desired_lots[inst] = 0
+                        continue
+                    lots = round_contract_lots(
+                        target_notional,
+                        px,
+                        spec.contract_multiplier,
+                        spec.lot_size,
+                        config.lot_rounding,
+                    )
+                    if lots == 0:
+                        lot_floored_to_zero_events += 1
+                    desired_lots[inst] = lots
+        else:
+            for inst in instruments:
+                if inst in missing_bar_insts or inst in pending_rolls or inst in pending_liquidations:
+                    desired_lots[inst] = positions[inst].lots if inst in positions else 0
+                    continue
+                raw_w = w_row[inst]
+                if pd.notna(raw_w):
+                    w = float(raw_w)
+                    if not allow_short and w < 0.0:
+                        w = 0.0
+                    if abs(w) <= 1e-12:
+                        desired_lots[inst] = 0
+                        continue
+                    _cancel_exit(inst)
+                    c_cur = active_contract[(bar_idx, inst)]
+                    px = _exec_price(bar_idx, inst)
+                    if px is None:
+                        desired_lots[inst] = positions[inst].lots if inst in positions else 0
+                        continue
+                    spec = _get_spec(c_cur)
+                    mr = config.margin_rate_for(inst, c_cur)
+                    if target_value_mode == "target_notional":
+                        target_notional = w * config.leverage
+                    elif config.target_weight_basis == "margin":
+                        target_notional = (w * max(equity, 0.0) / mr) * config.leverage
+                    else:
+                        target_notional = w * max(equity, 0.0) * config.leverage
+                    lots = round_contract_lots(
+                        target_notional,
+                        px,
+                        spec.contract_multiplier,
+                        spec.lot_size,
+                        config.lot_rounding,
+                    )
+                    if lots == 0 and abs(target_notional) > 1e-12:
+                        lot_floored_to_zero_events += 1
+                    desired_lots[inst] = lots
+                else:
+                    if inst in pending_sells and inst in positions:
+                        desired_lots[inst] = 0
+                    elif inst in rolled_from:
+                        c_new = active_contract[(bar_idx, inst)]
+                        px = _exec_price(bar_idx, inst)
+                        if px is None:
+                            desired_lots[inst] = 0
+                        else:
+                            spec = _get_spec(c_new)
+                            roll_rec = rolled_from[inst]
+                            old_lots = int(roll_rec["closed_lots"])
+                            if config.roll_sizing == "same_lots":
+                                sign = 1 if old_lots >= 0 else -1
+                                aligned_lots = (abs(old_lots) // spec.lot_size) * spec.lot_size
+                                desired_lots[inst] = sign * aligned_lots
+                            else:
+                                old_notional = (
+                                    float(old_lots)
+                                    * float(roll_rec["close_price"])
+                                    * _get_spec(roll_rec["from_contract"]).contract_multiplier
+                                )
+                                desired_lots[inst] = round_contract_lots(
+                                    old_notional,
+                                    px,
+                                    spec.contract_multiplier,
+                                    spec.lot_size,
+                                    config.lot_rounding,
+                                )
+                    elif inst in positions:
+                        desired_lots[inst] = positions[inst].lots
+                    else:
+                        desired_lots[inst] = 0
+
+        # Step 4.4: Execute reductions / closes / sign-flips first (frees margin),
+        # enforcing the unified order tradability check layer.
         for inst in instruments:
-            if inst not in positions:
+            if inst not in positions or inst in pending_rolls or inst in pending_liquidations:
                 continue
             pos_obj = positions[inst]
             tgt = desired_lots[inst]
             cur = pos_obj.lots
             if tgt == cur:
                 continue
-            px = _exec_price(bar_idx, inst)
-            if px is None:
-                continue
+            px = None if inst in missing_bar_insts else _exec_price(bar_idx, inst)
+            close_side = "sell" if cur > 0 else "buy"
             if tgt == 0 or (tgt * cur < 0):
+                ok, reason = validator.validate_order(
+                    bar_idx=bar_idx,
+                    inst=inst,
+                    contract=pos_obj.concrete_instrument_id,
+                    side=close_side,
+                    price=px,
+                )
+                if not ok or px is None:
+                    _block_exit(dt, inst, px)
+                    if tgt * cur < 0:
+                        desired_lots[inst] = cur
+                    if policy_driven:
+                        target_weights_out.loc[dt, inst] = np.nan
+                    _record_blocked_order(
+                        dt=dt,
+                        inst=inst,
+                        contract=pos_obj.concrete_instrument_id,
+                        order_type="REBALANCE",
+                        side=close_side,
+                        requested_delta_lots=-cur,
+                        multiplier=pos_obj.multiplier,
+                        price=px,
+                        reason=reason,
+                        status="deferred",
+                        current_lots=cur,
+                    )
+                    continue
                 _close_open_position(
                     dt=dt,
                     pos_obj=pos_obj,
@@ -1207,33 +1877,94 @@ def simulate_futures_contract_portfolio(
                     order_type="REBALANCE",
                 )
                 del positions[inst]
+                _finish_exit(dt, inst)
+                if policy_driven and (
+                    decision.kind in ("noop", "skip_liquidate", "liquidate_targetless")
+                ):
+                    target_weights_out.loc[dt, inst] = 0.0
             elif abs(tgt) < abs(cur):
+                reduce_abs = abs(cur) - abs(tgt)
+                ok, reason = validator.validate_order(
+                    bar_idx=bar_idx,
+                    inst=inst,
+                    contract=pos_obj.concrete_instrument_id,
+                    side=close_side,
+                    price=px,
+                )
+                if not ok or px is None:
+                    if policy_driven:
+                        target_weights_out.loc[dt, inst] = np.nan
+                    _record_blocked_order(
+                        dt=dt,
+                        inst=inst,
+                        contract=pos_obj.concrete_instrument_id,
+                        order_type="REBALANCE",
+                        side=close_side,
+                        requested_delta_lots=(-reduce_abs if cur > 0 else reduce_abs),
+                        multiplier=pos_obj.multiplier,
+                        price=px,
+                        reason=reason,
+                        status="blocked",
+                        current_lots=cur,
+                    )
+                    continue
                 _close_open_position(
                     dt=dt,
                     pos_obj=pos_obj,
-                    close_lots=abs(cur) - abs(tgt),
+                    close_lots=reduce_abs,
                     exit_price=px,
                     order_type="REBALANCE",
                 )
 
-        # Step 4.5: Margin validation & clipping for new openings / position increases.
+        # Step 4.5: Unified tradability validation + margin clipping for new openings / increases.
         used_margin = sum(
             abs(p.lots) * p.last_mark_price * p.multiplier * p.margin_rate
             for p in positions.values()
         )
         increases: List[Dict[str, Any]] = []
         for inst in instruments:
+            if inst in pending_rolls or inst in pending_liquidations:
+                continue
             cur_lots = positions[inst].lots if inst in positions else 0
             tgt_lots = desired_lots[inst]
             if abs(tgt_lots) <= abs(cur_lots):
                 continue
             c_cur = active_contract[(bar_idx, inst)]
-            px = _exec_price(bar_idx, inst)
-            if px is None:
-                continue
+            px = None if inst in missing_bar_insts else _exec_price(bar_idx, inst)
             spec = _get_spec(c_cur)
-            mr = config.margin_rate_for(inst, c_cur)
             delta_lots = tgt_lots - cur_lots
+            open_side = "buy" if delta_lots > 0 else "sell"
+            order_type = "ROLL_OPEN" if inst in rolled_from else "REBALANCE"
+            ok, reason = validator.validate_order(
+                bar_idx=bar_idx,
+                inst=inst,
+                contract=c_cur,
+                side=open_side,
+                price=px,
+            )
+            if not ok or px is None:
+                if order_type == "ROLL_OPEN":
+                    roll_open_blocked_count += 1
+                    rolled_from[inst]["open_blocked"] = True
+                    rolled_from[inst]["open_block_reason"] = reason
+                elif policy_driven:
+                    target_weights_out.loc[dt, inst] = np.nan
+                _record_blocked_order(
+                    dt=dt,
+                    inst=inst,
+                    contract=c_cur,
+                    order_type=order_type,
+                    side=open_side,
+                    requested_delta_lots=delta_lots,
+                    multiplier=float(spec.contract_multiplier),
+                    price=px,
+                    reason=reason,
+                    status="rejected",
+                    current_lots=cur_lots,
+                )
+                continue
+
+            mr = config.margin_rate_for(inst, c_cur)
             fee_rate = (
                 max(float(buy_cost_rate), 0.0)
                 if delta_lots > 0
@@ -1371,11 +2102,60 @@ def simulate_futures_contract_portfolio(
                         entry_timestamp=dt,
                     )
 
+        # Record alignment snapshot using REAL post-rebalance futures equity and positions.
+        if (
+            policy_driven
+            and decision is not None
+            and decision.snapshot_payload is not None
+            and policy.runner._alignment_writer is not None
+        ):
+            snap = decision.snapshot_payload
+            if snap.get("is_topk_branch"):
+                snap_targets: Dict[str, float] = {}
+                buy_set = set(snap["buy_stocks"])
+                for s in snap["target_holdings"]:
+                    if s in buy_set and s in positions:
+                        snap_targets[s] = abs(positions[s].lots) * positions[s].last_mark_price * positions[s].multiplier
+                    elif s in positions:
+                        snap_targets[s] = abs(positions[s].lots) * positions[s].last_mark_price * positions[s].multiplier
+                policy.runner._alignment_writer.add_rebalance_snapshot(
+                    rebalance_date=snap["rebalance_date"],
+                    factor_date=snap["factor_date"],
+                    stock_pool=snap["stock_pool"],
+                    raw_factors=snap["raw_factors"],
+                    processed_factors=snap["processed_factors"],
+                    composite_scores=snap["composite_scores"],
+                    target_holdings=snap["target_holdings"],
+                    target_values=snap_targets,
+                    actions=snap["actions"],
+                    pool_size=snap["pool_size"],
+                    nav=equity / float(init_cash),
+                )
+            else:
+                policy.runner._alignment_writer.add_rebalance_snapshot(
+                    rebalance_date=snap["rebalance_date"],
+                    factor_date=snap["factor_date"],
+                    stock_pool=snap["stock_pool"],
+                    raw_factors=snap["raw_factors"],
+                    processed_factors=snap["processed_factors"],
+                    composite_scores=snap["composite_scores"],
+                    target_holdings=snap["target_holdings"],
+                    target_values=snap["target_values"],
+                    pool_size=snap["pool_size"],
+                    nav=equity / float(init_cash),
+                )
+
         # Step 4.7: Mark open positions to bar close price & check maintenance margin.
         bar_margin_used = 0.0
         for inst in sorted(positions):
             pos_obj = positions[inst]
-            close_px = None if inst in missing_bar_insts else concrete_close[(bar_idx, inst)]
+            c_cur = active_contract[(bar_idx, inst)]
+            if pos_obj.concrete_instrument_id != c_cur:
+                close_px = _resolve_roll_close_price(
+                    bar_idx, pos_obj.concrete_instrument_id, field_override="close"
+                )
+            else:
+                close_px = None if inst in missing_bar_insts else concrete_close[(bar_idx, inst)]
             if close_px is not None:
                 equity += float(pos_obj.lots) * (close_px - pos_obj.last_mark_price) * pos_obj.multiplier
                 pos_obj.last_mark_price = close_px
@@ -1403,6 +2183,8 @@ def simulate_futures_contract_portfolio(
                     "equity_before_action": float(equity),
                     "maintenance_margin_required": float(maint_req),
                     "action": config.liquidation_policy,
+                    "status": config.liquidation_policy,
+                    "blocked_instruments": [],
                     "positions": {
                         inst: {
                             "contract": p.concrete_instrument_id,
@@ -1418,21 +2200,85 @@ def simulate_futures_contract_portfolio(
                         f"maintenance_required={maint_req:.2f}"
                     )
                 if config.liquidation_policy == "liquidate":
+                    blocked_insts: List[str] = []
+                    liquidated_insts: List[str] = []
+                    attempted_new = False
                     for inst in sorted(list(positions.keys())):
+                        if inst in liq_attempted_this_bar:
+                            # Already attempted & deferred in Step 4.1b on this bar.
+                            continue
+                        attempted_new = True
                         pos_obj = positions[inst]
+                        liq_side = "sell" if pos_obj.lots > 0 else "buy"
+                        c_cur = active_contract[(bar_idx, inst)]
+                        if pos_obj.concrete_instrument_id != c_cur:
+                            liq_close_px = _resolve_roll_close_price(
+                                bar_idx, pos_obj.concrete_instrument_id, field_override="close"
+                            )
+                            if liq_close_px is None:
+                                liq_close_px = pos_obj.last_mark_price
+                        else:
+                            liq_close_px = (
+                                None
+                                if inst in missing_bar_insts
+                                else concrete_close[(bar_idx, inst)]
+                            )
+                        liq_ok, liq_reason = validator.validate_order(
+                            bar_idx=bar_idx,
+                            inst=inst,
+                            contract=pos_obj.concrete_instrument_id,
+                            side=liq_side,
+                            price=liq_close_px,
+                        )
+                        if not liq_ok or liq_close_px is None:
+                            liquidation_blocked_count += 1
+                            pending_liquidations.add(inst)
+                            blocked_insts.append(inst)
+                            _record_blocked_order(
+                                dt=dt,
+                                inst=inst,
+                                contract=pos_obj.concrete_instrument_id,
+                                order_type="LIQUIDATION",
+                                side=liq_side,
+                                requested_delta_lots=-pos_obj.lots,
+                                multiplier=pos_obj.multiplier,
+                                price=liq_close_px,
+                                reason=liq_reason,
+                                status="deferred",
+                                current_lots=pos_obj.lots,
+                            )
+                            continue
                         _close_open_position(
                             dt=dt,
                             pos_obj=pos_obj,
                             close_lots=pos_obj.lots,
-                            exit_price=pos_obj.last_mark_price,
+                            exit_price=liq_close_px,
                             order_type="LIQUIDATION",
                         )
                         del positions[inst]
+                        pending_liquidations.discard(inst)
+                        pending_rolls.pop(inst, None)
+                        _finish_exit(dt, inst)
                         asset_val_df.loc[dt, inst] = 0.0
                         lots_df.loc[dt, inst] = 0
-                    bar_margin_used = 0.0
-                event["equity_after_action"] = float(equity)
-                liquidation_events.append(event)
+                        liquidated_insts.append(inst)
+                    bar_margin_used = sum(
+                        abs(float(p.lots) * p.last_mark_price * p.multiplier) * p.margin_rate
+                        for p in positions.values()
+                    )
+                    if not attempted_new:
+                        event = None
+                    else:
+                        if blocked_insts and liquidated_insts:
+                            event["status"] = "partial_deferred"
+                        elif blocked_insts:
+                            event["status"] = "deferred"
+                        else:
+                            event["status"] = "liquidated"
+                        event["blocked_instruments"] = blocked_insts
+                if event is not None:
+                    event["equity_after_action"] = float(equity)
+                    liquidation_events.append(event)
 
         equity_vals[bar_idx] = equity
         if prev_equity > 0.0:
@@ -1467,6 +2313,15 @@ def simulate_futures_contract_portfolio(
                 "Reason": "MARK_TO_MARKET",
             }
         )
+
+    if policy_driven:
+        has_values = target_weights_out.notna().any(axis=1)
+        if has_values.any():
+            first_valid_idx = has_values.idxmax()
+            before_first = target_weights_out.index < first_valid_idx
+            target_weights_out.loc[before_first] = 0.0
+        if policy_ctx.capture_decisions:
+            target_weights_out.attrs["decision_portfolio_values"] = decision_portfolio_values
 
     equity_series = pd.Series(equity_vals, index=all_dates, name="equity", dtype=float)
     returns_series = pd.Series(returns_vals, index=all_dates, name="returns", dtype=float)
@@ -1531,6 +2386,8 @@ def simulate_futures_contract_portfolio(
 
     diagnostics: Dict[str, Any] = {
         "execution_mode": "futures_contract",
+        "single_account_closed_loop": bool(policy_driven),
+        "tradability_checks_enabled": bool(slot is not None),
         "margin_rate": float(config.margin_rate),
         "margin_rates": dict(config.margin_rates),
         "maintenance_margin_rate": config.maintenance_margin_rate,
@@ -1548,6 +2405,11 @@ def simulate_futures_contract_portfolio(
         "roll_cost_total": float(total_roll_cost),
         "missing_execution_bar_count": int(missing_execution_bar_count),
         "roll_close_fallback_count": int(roll_close_fallback_count),
+        "roll_close_blocked_count": int(roll_close_blocked_count),
+        "roll_open_blocked_count": int(roll_open_blocked_count),
+        "roll_blocked_count": int(roll_close_blocked_count + roll_open_blocked_count),
+        "roll_deferred_count": int(roll_deferred_count),
+        "open_deferred_rolls_at_end": len(pending_rolls),
         "roll_events": roll_events,
         "total_transaction_cost": float(total_transaction_cost),
         "max_margin_used": float(np.max(margin_used_vals)) if len(margin_used_vals) else 0.0,
@@ -1557,10 +2419,33 @@ def simulate_futures_contract_portfolio(
         "min_equity": float(np.min(equity_vals)) if len(equity_vals) else float(init_cash),
         "margin_clipped_events": int(margin_clipped_events),
         "lot_floored_to_zero_events": int(lot_floored_to_zero_events),
-        "liquidation_count": len(liquidation_events),
+        "liquidation_count": sum(
+            1 for evt in liquidation_events if evt.get("status") != "deferred"
+        ),
+        "liquidation_blocked_count": int(liquidation_blocked_count),
+        "liquidation_deferred_executed_count": int(liquidation_deferred_executed_count),
+        "open_pending_liquidations_at_end": len(pending_liquidations),
         "liquidation_events": liquidation_events,
+        "blocked_order_count": len(blocked_order_events),
+        "blocked_order_events": blocked_order_events,
         "max_abs_lots": int(lots_df.abs().to_numpy().max()) if not lots_df.empty else 0,
     }
+    if policy_driven:
+        diagnostics["policy_execution_diagnostics"] = {
+            "strict_max_actual_holdings": bool(policy.runner.strict_max_actual_holdings),
+            "strict_position_buys_skipped": int(strict_position_buys_skipped),
+            "blocked_exit_events": int(blocked_exit_events),
+            "blocked_exit_notional": float(blocked_exit_notional),
+            "completed_blocked_exits": len(completed_exit_delays),
+            "open_blocked_exits_at_end": len(pending_sells),
+            "average_calendar_days_to_exit": (
+                float(np.mean(completed_exit_delays)) if completed_exit_delays else None
+            ),
+            "max_calendar_days_to_exit": (
+                int(max(completed_exit_delays)) if completed_exit_delays else None
+            ),
+        }
+        diagnostics["target_weights"] = target_weights_out
 
     portfolio = FuturesPortfolio(
         equity=equity_series,
@@ -1588,7 +2473,7 @@ def execute_portfolio_simulation(
     *,
     execution_mode: str,
     futures_config: FuturesExecutionConfig,
-    target_weights: pd.DataFrame,
+    target_weights: Optional[pd.DataFrame],
     price_aligned: pd.DataFrame,
     open_aligned: Optional[pd.DataFrame],
     use_open: bool,
@@ -1605,6 +2490,9 @@ def execute_portfolio_simulation(
     portfolio_audit_enabled: bool,
     sanitize_prices_fn: Any,
     logger: Optional[logging.Logger] = None,
+    policy: Optional[Any] = None,
+    policy_ctx: Optional[Any] = None,
+    exposure_by_date: Optional[Dict[Any, float]] = None,
 ) -> Tuple[Any, Dict[str, Any]]:
     """Dispatch simulation between VectorBT nominal target-value and futures contract mode."""
     validate_nominal_execution_mode(
@@ -1631,7 +2519,13 @@ def execute_portfolio_simulation(
             vbt_freq=vbt_freq,
             year_freq=year_freq,
             logger=logger,
+            policy=policy,
+            policy_ctx=policy_ctx,
+            exposure_by_date=exposure_by_date,
         )
+
+    if target_weights is None:
+        raise ValueError("target_weights is required for nominal_weight execution")
 
     fees_arg: Any = buy_cost_rate
     if (

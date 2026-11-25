@@ -71,6 +71,8 @@ def _handle_single_factor_analysis(args: argparse.Namespace) -> HarnessResult:
         command.extend(["--config", args.config])
     if args.factor:
         command.extend(["--factor", args.factor])
+    if getattr(args, "causal_gate_policy", None) is not None:
+        command.extend(["--causal-gate-policy", args.causal_gate_policy])
     if args.use_dynamic:
         command.append("--use-dynamic")
     if args.materialize_only:
@@ -134,6 +136,12 @@ def _handle_single_factor_analysis(args: argparse.Namespace) -> HarnessResult:
             manifest = json.loads(Path(artifact["path"]).read_text(encoding="utf-8"))
             metrics["results_db"] = manifest["results_db"]
             metrics["_artifacts"].extend(manifest["artifacts"])
+        gate_report = metrics.get("causal_gate")
+        if isinstance(gate_report, dict) and gate_report.get("status") == "failed_fallback":
+            metrics.setdefault("_warnings", []).append(
+                f"Causal fast-path gate fell back to pit_replay for {gate_report.get('factor_name')}: "
+                f"{gate_report.get('failure_reason')}"
+            )
         return metrics
 
     return cli._run_subprocess(

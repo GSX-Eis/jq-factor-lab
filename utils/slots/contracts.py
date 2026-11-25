@@ -92,6 +92,44 @@ class ExecutionProfile:
             _name(self.benchmark_instrument, 'benchmark_instrument')
 
 
+LabelExecutionProfile = ExecutionProfile
+
+
+@dataclass(frozen=True)
+class PortfolioExecutionProfile(ExecutionProfile):
+    """Continuous portfolio rebalancing execution contract.
+
+    Unlike label evaluation profiles (``LabelExecutionProfile``), continuous
+    portfolio backtest engines execute both entries and exits at a single bar
+    price field (``open -> open`` or ``close -> close``) on rebalance bars
+    (``exit_adjustment == 0``, ``min_entry_offset_bars >= 1``,
+    ``boundary_policy == 'cross_session'``).
+    """
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if self.exit_price_field != self.entry_price_field:
+            raise ValueError(
+                'PortfolioExecutionProfile requires exit_price_field == entry_price_field '
+                f'(got entry_price_field={self.entry_price_field!r}, '
+                f'exit_price_field={self.exit_price_field!r})'
+            )
+        if self.exit_adjustment != 0:
+            raise ValueError(
+                f'PortfolioExecutionProfile requires exit_adjustment == 0 (got {self.exit_adjustment})'
+            )
+        if self.min_entry_offset_bars < 1:
+            raise ValueError(
+                'PortfolioExecutionProfile requires min_entry_offset_bars >= 1 '
+                f'(got {self.min_entry_offset_bars})'
+            )
+        if self.boundary_policy != 'cross_session':
+            raise ValueError(
+                'PortfolioExecutionProfile requires boundary_policy == \'cross_session\' '
+                f'(got {self.boundary_policy!r})'
+            )
+
+
 @runtime_checkable
 class CalendarSlot(Protocol):
     @property

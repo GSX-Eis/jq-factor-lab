@@ -541,6 +541,12 @@ def _classify_subprocess_failure(
             extra_metrics.get("failure_reason") or "symbolic_quality_gate_failed"
         )
         return "symbolic_quality_gate_failed", cli.EXIT_QUALITY_GATE, detail
+    if (
+        action == "single-factor-analysis"
+        and subprocess_exit_code == cli.EXIT_QUALITY_GATE
+        and str(extra_metrics.get("failure_reason") or "") == "causal_fast_path_gate_failed"
+    ):
+        return "causal_fast_path_gate_failed", cli.EXIT_QUALITY_GATE, "causal_fast_path_gate_failed"
     return "command_failed", cli.EXIT_EXECUTION, ""
 
 

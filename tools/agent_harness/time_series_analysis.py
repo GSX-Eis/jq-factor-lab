@@ -87,18 +87,41 @@ def resolve_slot_request(config: dict[str, Any]):
     )
 
 
+def _default_slot_instruments(slot) -> list[str]:
+    static = getattr(slot.universe, 'static', None)
+    if isinstance(static, dict) and static:
+        first_pool = next(iter(static.values()))
+        if first_pool:
+            return list(first_pool)
+    specs = getattr(slot.universe, 'specs', None)
+    if isinstance(specs, dict) and specs:
+        return sorted(specs.keys())
+    root = getattr(slot.bar_feed, 'root', None)
+    if isinstance(root, str) and root:
+        return [root]
+    raise ValueError('instruments must be provided when the Slot has no static instruments')
+
+
 def _evaluate_slot(config: dict[str, Any], options: dict[str, Any]):
+    import pandas as pd
+
+    from backtest_and_analysis.factor_loader import FactorLoader
     from backtest_and_analysis.time_series.evaluator import evaluate_slot
-    from backtest_and_analysis.time_series.factor_bridge import read_slot_factor_values
+    from backtest_and_analysis.time_series.factor_bridge import bar_factor_frame, read_slot_factor_values
     from slots import build_slot_from_config
+    from tools.agent_harness.causal_gate import CausalFastPathGateError, verify_factor_causality
+    from utils.data_revision import frame_digest
     from utils.duckdb_results_writer import connect_read_only_with_retry
+    from utils.factor_core.bar_bridge import _session_rollup
     from utils.market_db.identity import slot_market_db_identity
     from utils.market_db.research import open_research_slot
     from utils.time_axis import Frequency
 
     frozen, base_dir = resolve_slot_request(config)
+    factor_file = config.get('factor_file')
 
-    for name in ('start_date', 'end_date', 'factor_store_root', 'factor_id'):
+    required_fields = ('start_date', 'end_date') if factor_file else ('start_date', 'end_date', 'factor_store_root', 'factor_id')
+    for name in required_fields:
         if not isinstance(config.get(name), str) or not config[name].strip():
             raise ValueError(f'{name} must be a nonempty string for Slot evaluation')
     frequency = Frequency.parse(config.get('frequency', '1d'))
@@ -110,6 +133,7 @@ def _evaluate_slot(config: dict[str, Any], options: dict[str, Any]):
             len(set(instruments)) != len(instruments)):
         raise ValueError('instruments must contain distinct nonempty instrument IDs')
 
+    causal_gate_report: dict[str, Any] | None = None
     with ExitStack() as stack:
         connection = None
         database = config.get('slot_db', config.get('duckdb_path'))
@@ -139,33 +163,92 @@ def _evaluate_slot(config: dict[str, Any], options: dict[str, Any]):
                 raise ValueError('Conflicting boundary_policy overrides')
             overrides = {**overrides, 'boundary_policy': config['boundary_policy']}
         profile = replace(profile, **overrides)
-        values, identity = read_slot_factor_values(
-            config['factor_store_root'], slot, factor_id=config['factor_id'], frequency=frequency.canonical,
-            start_date=config['start_date'], end_date=config['end_date'],
-            factor_identity_hash=config.get('factor_identity_hash'), instruments=instruments,
-        )
-        slot = replace(slot, slot_data_fingerprint={
-            **selected_db,
-            'factor_identity_hash': identity.factor_identity_hash,
-            'factor_input': identity.slot_data_fingerprint,
-            'factor_source_build_ids': sorted(values.source_build_id.dropna().unique().tolist()),
-        })
+
+        if factor_file:
+            factor_path = Path(factor_file).expanduser().resolve()
+            classes = FactorLoader.load_factor_class_from_file(str(factor_path), config.get('factor_class'))
+            if len(classes) != 1:
+                raise ValueError(f'Expected one factor class in {factor_path}; pass factor_class to disambiguate')
+            factor_cls = classes[0]
+            factor_instruments = instruments or _default_slot_instruments(slot)
+            factor_id = config.get('factor_id') or factor_cls.__name__
+            factor = factor_cls(
+                None,
+                factor_id,
+                config['start_date'],
+                config['end_date'],
+                stock_pool=factor_instruments,
+                slot=slot,
+                data_frequency=frequency.canonical,
+                analysis_mode=options['analysis_mode'],
+                session_view=getattr(slot.bar_feed, 'view', 'ETH'),
+                slot_execution_mode=config.get('slot_execution_mode'),
+            )
+            factor._require_causal_verification = True
+            gate = verify_factor_causality(
+                factor,
+                on_failure=config.get('causal_gate_policy', 'reject'),
+                apply_to_factor=True,
+            )
+            causal_gate_report = gate.to_dict()
+            if not gate.ok:
+                raise CausalFastPathGateError(
+                    f'Causal fast-path gate rejected {gate.factor_name}: {gate.failure_reason}',
+                    gate_result=causal_gate_report,
+                )
+            if factor._frequency_route.bar_grid and not _session_rollup(factor):
+                values = bar_factor_frame(factor.get_bar_factor_frame())
+            else:
+                panel = factor.get_factor_values()
+                if getattr(panel.index, 'tz', None) is None and not panel.empty:
+                    grid = slot.calendar.bar_grid(
+                        frequency, config['start_date'], config['end_date'], view=getattr(slot.bar_feed, 'view', 'ETH')
+                    )
+                    keys = grid.groupby(pd.to_datetime(grid.session_id))['timestamp_utc'].max()
+                    mapped = pd.to_datetime(panel.index).map(keys)
+                    if mapped.isna().any():
+                        raise ValueError('Factor panel dates could not be mapped to Slot session timestamps')
+                    panel = panel.set_axis(pd.DatetimeIndex(mapped))
+                values = bar_factor_frame(panel)
+            factor_identity_hash = hashlib.sha256(factor_path.read_bytes()).hexdigest()
+            slot = replace(slot, slot_data_fingerprint={
+                **selected_db,
+                'factor_identity_hash': factor_identity_hash,
+                'factor_values_sha256': frame_digest(values),
+            })
+            eval_instruments = instruments or sorted(values.instrument_id.unique())
+        else:
+            values, identity = read_slot_factor_values(
+                config['factor_store_root'], slot, factor_id=config['factor_id'], frequency=frequency.canonical,
+                start_date=config['start_date'], end_date=config['end_date'],
+                factor_identity_hash=config.get('factor_identity_hash'), instruments=instruments,
+            )
+            factor_identity_hash = identity.factor_identity_hash
+            slot = replace(slot, slot_data_fingerprint={
+                **selected_db,
+                'factor_identity_hash': factor_identity_hash,
+                'factor_input': identity.slot_data_fingerprint,
+                'factor_source_build_ids': sorted(values.source_build_id.dropna().unique().tolist()),
+            })
+            eval_instruments = instruments or sorted(values.instrument_id.unique())
         result = evaluate_slot(
             slot, values[['timestamp_utc', 'instrument_id', 'factor_value']], frequency=frequency.canonical,
             start_date=config['start_date'], end_date=config['end_date'],
-            instruments=instruments or sorted(values.instrument_id.unique()),
+            instruments=eval_instruments,
             horizons=config.get('horizons', [1, 5, 15, 60]), entry_offset_bars=config.get('entry_offset_bars'),
             bucket_strategy=config.get('bucket_strategy'), profile=profile,
             apply_tradability_mask=config.get('apply_tradability_mask', False), **options,
         )
     resolved = {key: value for key, value in config.items() if key != 'slot'}
     resolved.update(slot_config=frozen.as_dict(), slot_id=slot.slot_id, frequency=frequency.canonical,
-                    factor_identity_hash=identity.factor_identity_hash, slot_base_dir=str(base_dir))
+                    factor_identity_hash=factor_identity_hash, slot_base_dir=str(base_dir))
+    if causal_gate_report is not None:
+        resolved['causal_gate'] = causal_gate_report
     if overrides:
         resolved['execution_profile'] = overrides
     fingerprints = result.data_identity['slot_data_fingerprint']
     hashes = {name: fingerprints[name] for name in ('execution_bars_sha256', 'factor_values_sha256')}
-    return result, resolved, hashes
+    return result, resolved, hashes, causal_gate_report
 
 
 def evaluate(config: dict[str, Any], destination: Path | None) -> dict[str, Any]:
@@ -189,8 +272,9 @@ def evaluate(config: dict[str, Any], destination: Path | None) -> dict[str, Any]
         factor_id=config.get('factor_id', 'factor_value'), diagnostics=diagnostics_requested,
         **{key: config[key] for key in _INFERENCE_OPTIONS if key in config},
     )
+    causal_gate_report = None
     if any(config.get(key) is not None for key in ('slot', 'slot_id', 'slot_config', 'factor_store_root', 'market_db')):
-        result, config, hashes = _evaluate_slot(config, options)
+        result, config, hashes, causal_gate_report = _evaluate_slot(config, options)
     else:
         result, hashes = _evaluate_csv(config, options, destination=destination)
         if destination is None:
@@ -199,7 +283,10 @@ def evaluate(config: dict[str, Any], destination: Path | None) -> dict[str, Any]
     if diagnostics_requested:
         from backtest_and_analysis.time_series.diagnostics_report import evaluate_diagnostics
         diagnostics_report = evaluate_diagnostics(result)
-    return publish_evaluation(result, config, hashes, destination, diagnostics_report=diagnostics_report)
+    published = publish_evaluation(result, config, hashes, destination, diagnostics_report=diagnostics_report)
+    if causal_gate_report is not None:
+        published['metrics']['causal_gate'] = causal_gate_report
+    return published
 
 
 def publish_evaluation(result: EvaluationResult, config: dict[str, Any], hashes: dict[str, str], destination: Path, *,
@@ -402,10 +489,12 @@ def main() -> int:
         if not isinstance(exc, LegacyEvaluationOutputError):
             destination.joinpath('summary.json').unlink(missing_ok=True)
         precondition = isinstance(exc, (ValueError, TypeError, KeyError, FileNotFoundError))
-        payload = dict(ok=False, exit_code=2 if precondition else 3,
+        exit_code = getattr(exc, 'exit_code', 2 if precondition else 3)
+        details = {'exception_type': type(exc).__name__, **getattr(exc, 'details', {})}
+        payload = dict(ok=False, exit_code=exit_code,
             error=dict(code=getattr(exc, 'code', 'time_series_precondition_failed' if precondition
                                     else 'time_series_execution_failed'), message=str(exc),
-                       details={'exception_type': type(exc).__name__}))
+                       details=details))
     print(json.dumps(payload, ensure_ascii=False, allow_nan=False))
     return payload['exit_code']
 

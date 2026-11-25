@@ -19,7 +19,12 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Set, Tuple, Uni
 import numpy as np
 import pandas as pd
 
-from utils.execution_schedule import ExecutionScheduler, resolve_calendar_signal_bar, resolve_runner_execution
+from utils.execution_schedule import (
+    ExecutionScheduler,
+    resolve_calendar_signal_bar,
+    resolve_runner_execution,
+    resolve_slot_backtest_profile,
+)
 from utils.market_factor import MarketFactorValueStore
 from utils.slots.contracts import ExecutionProfile, MarketSlot
 from utils.time_axis import Frequency
@@ -53,6 +58,7 @@ from .alignment_data_writer import AlignmentDataWriter
 from .futures_execution import (
     FuturesExecutionConfig, FuturesExecutionError, execute_portfolio_simulation, parse_futures_execution_config, validate_nominal_execution_mode,
 )
+from .portfolio_policy import SharedPortfolioPolicy
 from .quality_filter import QualityFilterError, apply_pit_quality_filter
 from .slot_provider import (
     SlotDataProvider,
@@ -459,7 +465,7 @@ class VectorBTBacktestRunner:
         )
 
         # Align open prices if provided, or read from Slot execution bars if configured
-        profile = self.slot.microstructure.execution_profile if self.slot is not None else None
+        profile = resolve_slot_backtest_profile(self.slot)
         explicit_close_slot = bool(self.slot is not None and self.slot.slot_id != "jq_ashare_local" and profile is not None and profile.entry_price_field == "close")
         explicit_open_slot = bool(profile is not None and profile.entry_price_field == "open")
         open_aligned = None
@@ -629,95 +635,195 @@ class VectorBTBacktestRunner:
         except Exception:
             pass
 
-        # Build target values matrix (size_type='targetvalue')
-        # Pass open_aligned for pre-simulation execution price
-        target_weights = self._compute_target_weights(
-            factor_aligned,
-            price_aligned,
-            dynamic_pools or {},
-            rebalance_dates,
-            open_df=open_aligned,  # [V4] For pre-simulation
-            factor_ratio_df=factor_ratio_df,  # For corporate action share adjustment
-        )
-
-        selection_summary = self._selection_diagnostics_summary()
-        selection_artifact = self._write_selection_diagnostics_artifact(
-            selection_summary
-        )
-        selection_failure = self._selection_quality_failure(selection_summary)
-        if selection_failure:
-            return {
-                "error": "selection_quality_gate_failed",
-                "selection_quality_failure": selection_failure,
-                "selection_diagnostics": selection_summary,
-                "selection_diagnostics_artifact": selection_artifact,
-            }
-
-        if target_weights.isna().all().all():
-            self.logger.warning("All target weights are NaN")
-            return {"error": "All weights NaN"}
-
-        # Run VectorBT portfolio simulation
-        # JoinQuant alignment: use open prices for order execution, close prices for valuation
         use_open = open_aligned is not None
         self.effective_entry_price_field = "open" if use_open else "close"
         self._execution_scheduler, eff_profile = resolve_runner_execution(self, self.effective_entry_price_field)
         self.effective_execution_profile = eff_profile
-        self._execution_diagnostics.update({
-            "effective_entry_price_field": self.effective_entry_price_field, "effective_use_open": bool(use_open), "effective_execution_mode": self.execution_mode,
-            "effective_min_entry_offset_bars": eff_profile.min_entry_offset_bars,
-            "effective_exit_adjustment": eff_profile.exit_adjustment, "effective_boundary_policy": eff_profile.boundary_policy,
-            "effective_execution_profile": asdict(eff_profile),
-            "effective_quality_filter": dict(self.quality_filter), "effective_enable_tday_filter": bool(self.enable_tday_filter),
-            "effective_allow_short": bool(self.allow_short), "effective_benchmark_instrument": self.benchmark_instrument,
-            "effective_buy_cost_rate": float(self.buy_cost_rate), "effective_sell_cost_rate": float(self.sell_cost_rate),
-            "effective_slippage": float(self.slippage),
-        })
-        self.logger.info(
-            f"[VectorBT] Running simulation with top_k={self.top_k}, cost={self.cost_rate}, use_open={use_open}"
-        )
+
+        def _populate_effective_execution_diagnostics() -> None:
+            self._execution_diagnostics.update({
+                "effective_entry_price_field": self.effective_entry_price_field,
+                "effective_exit_price_field": eff_profile.exit_price_field,
+                "effective_use_open": bool(use_open), "effective_execution_mode": self.execution_mode,
+                "effective_min_entry_offset_bars": eff_profile.min_entry_offset_bars,
+                "effective_exit_adjustment": eff_profile.exit_adjustment, "effective_boundary_policy": eff_profile.boundary_policy,
+                "effective_execution_profile": asdict(eff_profile),
+                "effective_quality_filter": dict(self.quality_filter), "effective_enable_tday_filter": bool(self.enable_tday_filter),
+                "effective_allow_short": bool(self.allow_short), "effective_benchmark_instrument": self.benchmark_instrument,
+                "effective_buy_cost_rate": float(self.buy_cost_rate), "effective_sell_cost_rate": float(self.sell_cost_rate),
+                "effective_slippage": float(self.slippage),
+            })
 
         try:
-            portfolio = self._simulate_portfolio(
-                target_weights, price_aligned, open_aligned, use_open
-            )
-
-            # [OVERLAY] Endogenous tail-risk overlay is a two-pass procedure: pass 1
-            # produces the unscaled equity curve, then exposure is derived from
-            # information up to the prior day and applied in pass 2 (no look-ahead).
             exposure_by_date: Optional[Dict[Any, float]] = None
-            if self.overlay_active and self._risk_overlay_active(self.overlay):
-                try:
-                    pass1_returns = portfolio.returns()
-                    if isinstance(pass1_returns, pd.DataFrame):
-                        pass1_returns = (
-                            pass1_returns.mean(axis=1)
-                            if pass1_returns.shape[1] > 1
-                            else pass1_returns.iloc[:, 0]
-                        )
-                    exposure_by_date = self._compute_exposure_by_date(
-                        pass1_returns,
-                        rebalance_dates,
-                        price_aligned,
-                        list(price_aligned.columns),
-                    )
-                    target_weights = self._compute_target_weights(
-                        factor_aligned,
-                        price_aligned,
-                        dynamic_pools or {},
-                        rebalance_dates,
+            if self.execution_mode == "futures_contract":
+                # Single-account closed-loop futures path: no nominal equity pre-simulation.
+                def _run_futures_pass(
+                    exp_map: Optional[Dict[Any, float]] = None,
+                ) -> Tuple[Any, pd.DataFrame]:
+                    self._selection_diagnostics = []
+                    self._futures_diagnostics = {}
+                    policy = SharedPortfolioPolicy(self)
+                    policy_ctx = policy.prepare(
+                        factor_df=factor_aligned,
+                        price_df=price_aligned,
+                        dynamic_pools=dynamic_pools or {},
+                        rebalance_dates=rebalance_dates,
                         open_df=open_aligned,
-                        factor_ratio_df=factor_ratio_df,
-                        exposure_by_date=exposure_by_date,
                     )
-                    portfolio = self._simulate_portfolio(
-                        target_weights, price_aligned, open_aligned, use_open
+                    vbt_freq, year_freq = self._vbt_freq_and_year_freq(
+                        pd.DatetimeIndex(price_aligned.index)
                     )
-                except Exception as e:
-                    self.logger.warning(
-                        f"[Overlay] Risk-overlay pass-2 failed, using pass-1 result: {e}"
+                    pf, fut_diag = execute_portfolio_simulation(
+                        execution_mode=self.execution_mode,
+                        futures_config=self.futures_execution_config,
+                        target_weights=None,
+                        price_aligned=price_aligned,
+                        open_aligned=open_aligned,
+                        use_open=use_open,
+                        slot=self.slot,
+                        frequency=self.frequency,
+                        init_cash=float(self.init_cash),
+                        buy_cost_rate=float(self.buy_cost_rate),
+                        sell_cost_rate=float(self.sell_cost_rate),
+                        slippage=float(self.slippage),
+                        allow_short=bool(self.allow_short),
+                        vbt_freq=vbt_freq,
+                        year_freq=year_freq,
+                        last_order_fees=None,
+                        portfolio_audit_enabled=self.portfolio_audit_enabled,
+                        sanitize_prices_fn=sanitize_execution_prices,
+                        logger=self.logger,
+                        policy=policy,
+                        policy_ctx=policy_ctx,
+                        exposure_by_date=exp_map,
                     )
-                    exposure_by_date = None
+                    tw_out = fut_diag.pop(
+                        "target_weights",
+                        pd.DataFrame(np.nan, index=price_aligned.index, columns=price_aligned.columns),
+                    )
+                    policy_exec_diag = fut_diag.pop("policy_execution_diagnostics", {})
+                    self._futures_diagnostics = fut_diag
+                    self._execution_diagnostics = dict(policy_exec_diag)
+                    _populate_effective_execution_diagnostics()
+                    return pf, tw_out
+
+                self.logger.info(
+                    f"[VectorBT] Running futures single-account simulation with top_k={self.top_k}, "
+                    f"cost={self.cost_rate}, use_open={use_open}"
+                )
+                portfolio, target_weights = _run_futures_pass(None)
+                selection_summary = self._selection_diagnostics_summary()
+                selection_artifact = self._write_selection_diagnostics_artifact(selection_summary)
+                selection_failure = self._selection_quality_failure(selection_summary)
+                if selection_failure:
+                    self.close()
+                    return {
+                        "error": "selection_quality_gate_failed",
+                        "selection_quality_failure": selection_failure,
+                        "selection_diagnostics": selection_summary,
+                        "selection_diagnostics_artifact": selection_artifact,
+                    }
+                if target_weights.isna().all().all():
+                    self.logger.warning("All target weights are NaN")
+                    self.close()
+                    return {"error": "All weights NaN"}
+
+                if self.overlay_active and self._risk_overlay_active(self.overlay):
+                    try:
+                        pass1_returns = portfolio.returns()
+                        if isinstance(pass1_returns, pd.DataFrame):
+                            pass1_returns = (
+                                pass1_returns.mean(axis=1)
+                                if pass1_returns.shape[1] > 1
+                                else pass1_returns.iloc[:, 0]
+                            )
+                        exposure_by_date = self._compute_exposure_by_date(
+                            pass1_returns,
+                            rebalance_dates,
+                            price_aligned,
+                            list(price_aligned.columns),
+                        )
+                        portfolio, target_weights = _run_futures_pass(exposure_by_date)
+                    except FuturesExecutionError:
+                        raise
+                    except Exception as e:
+                        self.logger.warning(
+                            f"[Overlay] Risk-overlay pass-2 failed, using pass-1 result: {e}"
+                        )
+                        exposure_by_date = None
+            else:
+                # Nominal equity path: pre-compute target values matrix then simulate in VectorBT.
+                target_weights = self._compute_target_weights(
+                    factor_aligned,
+                    price_aligned,
+                    dynamic_pools or {},
+                    rebalance_dates,
+                    open_df=open_aligned,
+                    factor_ratio_df=factor_ratio_df,
+                )
+
+                selection_summary = self._selection_diagnostics_summary()
+                selection_artifact = self._write_selection_diagnostics_artifact(
+                    selection_summary
+                )
+                selection_failure = self._selection_quality_failure(selection_summary)
+                if selection_failure:
+                    return {
+                        "error": "selection_quality_gate_failed",
+                        "selection_quality_failure": selection_failure,
+                        "selection_diagnostics": selection_summary,
+                        "selection_diagnostics_artifact": selection_artifact,
+                    }
+
+                if target_weights.isna().all().all():
+                    self.logger.warning("All target weights are NaN")
+                    return {"error": "All weights NaN"}
+
+                _populate_effective_execution_diagnostics()
+                self.logger.info(
+                    f"[VectorBT] Running simulation with top_k={self.top_k}, cost={self.cost_rate}, use_open={use_open}"
+                )
+                portfolio = self._simulate_portfolio(
+                    target_weights, price_aligned, open_aligned, use_open
+                )
+
+                # [OVERLAY] Endogenous tail-risk overlay is a two-pass procedure: pass 1
+                # produces the unscaled equity curve, then exposure is derived from
+                # information up to the prior day and applied in pass 2 (no look-ahead).
+                if self.overlay_active and self._risk_overlay_active(self.overlay):
+                    try:
+                        pass1_returns = portfolio.returns()
+                        if isinstance(pass1_returns, pd.DataFrame):
+                            pass1_returns = (
+                                pass1_returns.mean(axis=1)
+                                if pass1_returns.shape[1] > 1
+                                else pass1_returns.iloc[:, 0]
+                            )
+                        exposure_by_date = self._compute_exposure_by_date(
+                            pass1_returns,
+                            rebalance_dates,
+                            price_aligned,
+                            list(price_aligned.columns),
+                        )
+                        target_weights = self._compute_target_weights(
+                            factor_aligned,
+                            price_aligned,
+                            dynamic_pools or {},
+                            rebalance_dates,
+                            open_df=open_aligned,
+                            factor_ratio_df=factor_ratio_df,
+                            exposure_by_date=exposure_by_date,
+                        )
+                        _populate_effective_execution_diagnostics()
+                        portfolio = self._simulate_portfolio(
+                            target_weights, price_aligned, open_aligned, use_open
+                        )
+                    except Exception as e:
+                        self.logger.warning(
+                            f"[Overlay] Risk-overlay pass-2 failed, using pass-1 result: {e}"
+                        )
+                        exposure_by_date = None
             self._last_exposure_by_date = exposure_by_date
             self._last_target_weights = target_weights
 
@@ -2650,92 +2756,32 @@ class VectorBTBacktestRunner:
         Returns:
             DataFrame with same shape as factor_df, containing TARGET VALUES (not percentages)
         """
-        all_dates = factor_df.index
-        all_dates_idx = pd.DatetimeIndex(all_dates)
-        is_daily_naive = self._slot_provider.is_daily_naive_index(all_dates_idx)
-        try:
-            market_cal = self._trading_calendar()
-        except Exception:
-            market_cal = None
-
-        def _bar_key(ts: Any) -> str:
-            return self._slot_provider.bar_key(ts, daily_naive=is_daily_naive)
-
-        def _norm_bar(ts: Any) -> pd.Timestamp:
-            return self._slot_provider.norm_bar_ts(ts, daily_naive=is_daily_naive)
-
-        self._score_decay_state = pd.Series(dtype=float)
-        self._score_decay_date = None
-        self._input_factor_df = factor_df
-        all_stocks = factor_df.columns.tolist()
-        if open_df is None and self.slot is not None:
-            open_df = self._slot_provider.read_execution_price_frame(
-                all_dates_idx, all_stocks
-            )
-        elif open_df is not None:
-            open_df = sanitize_execution_prices(open_df)
-        if self._execution_scheduler is None:
-            self._execution_scheduler, self.effective_execution_profile = resolve_runner_execution(self, "open" if open_df is not None else "close")
-        scheduler = self._execution_scheduler
-        entry_offset = scheduler.resolved_entry_offset_bars
-        self._backtest_previous_dates = scheduler.signal_timestamp_map(all_dates, key_fn=_bar_key)
-        self._factor_replay_dates = sorted({
-            self._backtest_previous_dates[_bar_key(date)]
-            for date in rebalance_dates
-            if _bar_key(date) in self._backtest_previous_dates
-        })
-        all_stocks_set = set(all_stocks)
-        sorted_pool_dates, normalized_pools = self._slot_provider.resolve_dynamic_pools(
-            all_dates_idx,
-            dynamic_pools,
-            self.price_db_conn,
-            self.price_db_path,
+        policy = SharedPortfolioPolicy(self)
+        ctx = policy.prepare(
+            factor_df=factor_df,
+            price_df=price_df,
+            dynamic_pools=dynamic_pools,
+            rebalance_dates=rebalance_dates,
+            open_df=open_df,
         )
 
         # Initialize with NaN (means "no action" in VectorBT)
         weights = pd.DataFrame(
             np.nan,
-            index=all_dates,
-            columns=all_stocks,
+            index=ctx.all_dates,
+            columns=ctx.all_stocks,
             dtype=np.float64,
         )
         order_fees = pd.DataFrame(
             float(self.buy_cost_rate),
-            index=all_dates,
-            columns=all_stocks,
+            index=ctx.all_dates,
+            columns=ctx.all_stocks,
             dtype=np.float64,
         )
 
-        # Convert rebalance dates to set for fast lookup
-        rebalance_set = {_norm_bar(d) for d in rebalance_dates}
-
-        # [JQ-ALIGNED V5] 构建 Skip 清仓日期集合（支持整月与 MM-DD:MM-DD 窗口）
-        # 逻辑：先按 Slot 交易日识别跳过区间，再用该区间首根 Bar 的统一时间键触发清仓
-        skip_liquidation_bars: set[pd.Timestamp] = set()
-        if self.skip_months:
-            session_days = pd.DatetimeIndex(
-                [
-                    self._slot_provider.session_date_for_bar(
-                        d, daily_naive=is_daily_naive, cal=market_cal
-                    )
-                    for d in all_dates
-                ]
-            )
-            in_skip = skip_mask(session_days, self.skip_months)
-            if in_skip.any():
-                prev_in_skip = np.concatenate(([False], in_skip[:-1]))
-                entry_bars = all_dates[in_skip & ~prev_in_skip]
-                skip_liquidation_bars = {_norm_bar(d) for d in entry_bars}
-                for d in entry_bars:
-                    self.logger.debug(
-                        f"[Skip] 识别清仓Bar: {_bar_key(d)}"
-                    )
-
         # [JQ-ALIGNED V4] 预模拟：追踪持仓和现金
-        # 使用与 JQ 相同的逻辑计算每个调仓日的买入金额
-        sim_cash = float(self.init_cash)  # 模拟现金
-        sim_positions = {}  # {stock_code: shares}  股数
-        capture_decisions = bool(self.diagnostics_output_dir and self.return_series_trial_id)
+        sim_cash = float(self.init_cash)
+        sim_positions: Dict[str, float] = {}
         decision_portfolio_values: dict[pd.Timestamp, float] = {}
         pending_sells: set[str] = set()
         pending_sell_since: Dict[str, pd.Timestamp] = {}
@@ -2743,16 +2789,9 @@ class VectorBTBacktestRunner:
         completed_exit_delays: List[int] = []
         blocked_exit_events = 0
         strict_position_buys_skipped = 0
-        buy_cost_multiplier = (
-            1.0 + max(float(self.buy_cost_rate), 0.0) + max(float(self.slippage), 0.0)
-        )
-        sell_proceeds_multiplier = max(
-            0.0, 1.0 - max(float(self.sell_cost_rate), 0.0) - max(float(self.slippage), 0.0)
-        )
-
-        # 使用开盘价进行模拟（如果提供了开盘价数据）
-        exec_price_df = open_df if open_df is not None else price_df
-        self._active_exec_price_df = exec_price_df
+        buy_cost_multiplier = ctx.buy_cost_multiplier
+        sell_proceeds_multiplier = ctx.sell_proceeds_multiplier
+        exec_price_df = ctx.exec_price_df
 
         def _valid_positive_price(value: Any) -> Optional[float]:
             if pd.isna(value):
@@ -2854,26 +2893,105 @@ class VectorBTBacktestRunner:
                     order_fees.loc[current_date, stock] = float(self.buy_cost_rate)
                 finish_exit(current_date, stock)
 
-        def liquidate_targetless(current_date: Any, date_str: str) -> None:
-            """Attempt an empty-target liquidation without inventing fills."""
-            _close_positions(current_date, date_str, sim_positions.keys())
+        class _EquityAccountView:
+            def __init__(self, current_date: Any) -> None:
+                self._date = current_date
 
-        for date in all_dates:
-            date_normalized = _norm_bar(date)
-            skip_lookup_day = self._slot_provider.session_date_for_bar(
-                date, daily_naive=is_daily_naive, cal=market_cal
-            )
-            date_key = _bar_key(date)
+            def held_instruments(self) -> Set[str]:
+                return set(sim_positions.keys())
 
-            if capture_decisions and (
-                date_normalized in rebalance_set
-                or date_normalized in skip_liquidation_bars
+            def held_notional(self, instrument: str) -> float:
+                shares = sim_positions.get(instrument, 0.0)
+                if shares == 0.0:
+                    return 0.0
+                if self.allow_short_only_exec():
+                    px = execution_price(self._date, instrument)
+                else:
+                    px = mark_price(self._date, instrument)
+                return float(shares * px) if px is not None else 0.0
+
+            def allow_short_only_exec(self) -> bool:
+                return bool(runner_ref.allow_short and not runner_ref.overlay_active)
+
+            def nav(self) -> float:
+                val = sim_cash
+                for s, shares in sorted(sim_positions.items(), key=lambda x: x[0]):
+                    px = mark_price(self._date, s)
+                    if px is not None:
+                        val += shares * px
+                return val
+
+            def prev_weight_map(self) -> Dict[str, float]:
+                nav_val = self.nav()
+                out: Dict[str, float] = {}
+                if nav_val > 0:
+                    for s, shares in sorted(sim_positions.items(), key=lambda x: x[0]):
+                        px = mark_price(self._date, s)
+                        if px is not None:
+                            out[s] = shares * px / nav_val
+                return out
+
+            def execution_price(self, instrument: str) -> Optional[float]:
+                return execution_price(self._date, instrument)
+
+            def mark_price(self, instrument: str) -> Optional[float]:
+                return mark_price(self._date, instrument)
+
+            def filter_tradeable(
+                self,
+                date_str: str,
+                instruments: List[str],
+                *,
+                side: str,
+                require_non_st: bool,
+            ) -> List[str]:
+                return runner_ref._filter_tradeable_stocks(
+                    date_str, list(instruments), side=side, require_non_st=require_non_st
+                )
+
+            def deployed_capital_for_liquidity(self, exposure: float) -> float:
+                return self.nav() * float(exposure)
+
+            def base_capital(self, exposure: float) -> float:
+                return self.nav() * float(exposure) / buy_cost_multiplier
+
+            def branch3_buy_target_value(
+                self,
+                *,
+                executed_sells: Set[str],
+                remaining_held: Set[str],
+                effective_top_k: int,
+                buy_count: int,
+                exposure: float,
+            ) -> float:
+                del remaining_held, exposure
+                if not sim_positions:
+                    return (
+                        sim_cash / effective_top_k / buy_cost_multiplier
+                        if effective_top_k > 0
+                        else 0.0
+                    )
+                if buy_count <= 0:
+                    return 0.0
+                projected_cash = sim_cash
+                for stock in sorted(executed_sells):
+                    shares = sim_positions.get(stock, 0.0)
+                    px = execution_price(self._date, stock)
+                    if shares > 0 and px is not None:
+                        projected_cash += shares * px * sell_proceeds_multiplier
+                return projected_cash / buy_count / buy_cost_multiplier
+
+        runner_ref = self
+        for date in ctx.all_dates:
+            date_normalized = ctx.norm_bar_fn(date)
+            date_key = ctx.bar_key_fn(date)
+
+            if ctx.capture_decisions and (
+                date_normalized in ctx.rebalance_set
+                or date_normalized in ctx.skip_liquidation_bars
                 or pending_sells
-                or not sim_positions  # Includes the leading flat rows written below.
+                or not sim_positions
             ):
-                # The same pre-order book that sizes the instructions, marked at
-                # executable prices. If a held mark is unavailable, the weight
-                # stays unknown instead of using a later close.
                 decision_nav = sim_cash
                 for stock, shares in sorted(sim_positions.items()):
                     price = execution_price(date, stock)
@@ -2883,327 +3001,55 @@ class VectorBTBacktestRunner:
                     decision_nav += shares * price
                 decision_portfolio_values[date] = decision_nav
 
-            # A failed exit remains a real holding and consumes NAV.  Retry it
-            # on every non-rebalance trading day; rebalance days reconsider the
-            # T-1 target before deciding whether the exit is still desired.
-            if pending_sells and date_normalized not in rebalance_set:
+            if pending_sells and date_normalized not in ctx.rebalance_set:
                 _close_positions(date, date_key, pending_sells, retry_only=True)
 
-            # [JQ-ALIGNED V4] 先检查 Skip Month 清仓 Bar
-            if date_normalized in skip_liquidation_bars:
+            decision = policy.evaluate_bar(
+                ctx=ctx,
+                date=date,
+                account=_EquityAccountView(date),
+                exposure_by_date=exposure_by_date,
+            )
+            strict_position_buys_skipped += int(decision.strict_buys_skipped)
+
+            if decision.kind == "noop":
+                continue
+
+            if decision.kind == "skip_liquidate":
                 held = set(sim_positions)
                 weights.loc[date, :] = 0.0
                 _close_positions(date, date_key, held)
                 continue
 
-            # Check if this is a rebalance date
-            if date_normalized not in rebalance_set:
+            if decision.kind == "liquidate_targetless":
+                _close_positions(date, date_key, sim_positions.keys())
                 continue
 
-            # Check skip rules (fallback, should not reach here if skip_month_liquidation_dates works)
-            if self.skip_months and date_in_skip(skip_lookup_day, self.skip_months):
-                held = set(sim_positions)
-                weights.loc[date, :] = 0.0
-                _close_positions(date, date_key, held)
-                continue
-
-            # Get valid stocks from dynamic pool
-            if not sorted_pool_dates:
-                valid_stocks = all_stocks_set
-            else:
-                pool_pos = bisect_right(sorted_pool_dates, date_normalized) - 1
-                valid_stocks = (
-                    normalized_pools[sorted_pool_dates[pool_pos]] & all_stocks_set
-                    if pool_pos >= 0
-                    else set()
-                )
-
-            # [ALIGNMENT] Enhanced pool logging - save pre-filter pool and per-filter removals
-            date_str_log = date_key
-            try:
-
-                with open_diagnostic("local_pools.txt", "a", directory=self.diagnostics_output_dir, enabled=self.verbose_alignment or bool(self.diagnostics_output_dir)) as f:
-                    f.write(f"\n{'=' * 60}\n")
-                    f.write(f"DATE: {date_str_log}\n")
-                    f.write(f"POOL_PRE_FILTER: {len(valid_stocks)}\n")
-                    f.write(f"POOL_STOCKS: {','.join(sorted(valid_stocks))}\n")
-            except Exception as e:
-                self.logger.warning(f"Failed to dump pool: {e}")
-
-            if not valid_stocks:
-                liquidate_targetless(date, date_key)
-                continue
-
-            # Resolve signal bar via ExecutionScheduler (strictly respecting min_entry_offset_bars)
-            date_str = date_key
-            if self.score_source == "input_factor":
-                position = all_dates.get_loc(date)
-                if isinstance(position, slice):
-                    position = position.start
-                sig_ts = scheduler.signal_timestamp_for_position(all_dates, int(position))
-                prev_date = _bar_key(sig_ts) if sig_ts is not None else None
-            else:
-                prev_date = self._backtest_previous_dates.get(date_str)
-                if prev_date is None and is_daily_naive:
-                    prev_date = (self._get_previous_trading_day(date_str) if entry_offset == 1 else resolve_calendar_signal_bar(
-                        market_cal if market_cal is not None else self._trading_calendar(), date_str, frequency=self.frequency, entry_offset_bars=entry_offset))
-
-            if prev_date is None:
-                self.logger.debug(f"[VectorBT] No signal bar (offset={entry_offset}) for {date_str}, skipping")
+            if decision.kind == "no_signal":
                 weights.loc[date, :] = 0.0
                 continue
-            prev_date_str = prev_date
 
-            # [CLOUD-ALIGNED] Always use bundle-based synthesis when bundle is available
-            raw_factors_df = None  # For logging
-
-            self.logger.debug(
-                f"[DEBUG SCORE] Date={date_str}, T-1={prev_date_str}, "
-                f"Mode=BUNDLE_SYNTHESIS, bundle_path={self.bundle_path}"
-            )
-
-            score_series, processed_factors_df, raw_factors_df = (
-                self._get_synthesis_score(prev_date_str, list(valid_stocks))
-            )
-            score_series = self._apply_score_decay(score_series, prev_date_str)
-
-            # [DEBUG] Log score statistics for verification
-            if len(score_series) > 0:
-                self.logger.debug(
-                    f"[DEBUG SCORE] Computed {len(score_series)} scores, "
-                    f"mean={score_series.mean():.4f}, std={score_series.std():.4f}, "
-                    f"top3={score_series.nlargest(3).to_dict()}"
-                )
-
-                # [DIAG] FACTOR_ALIGNMENT: 输出 Top10 composite scores 用于云端-本地对齐验证
-                if self.verbose_alignment and len(score_series) > 0:
-                    ranked_scores = score_series.sort_values(ascending=False)
-                    top10 = ranked_scores.head(10)
-                    top10_str = "|".join([f"{s}:{v:.6f}" for s, v in top10.items()])
-                    self.logger.info(
-                        f"FACTOR_ALIGNMENT|{date_str}|TOP10|n={len(score_series)}|{top10_str}"
-                    )
-
-            # Calculate effective top_k for early validation
-            min_required = self._get_effective_top_k(len(score_series))
-
-            if len(score_series) < min_required:
-                # Not enough stocks with valid factor values
-                self.logger.debug(
-                    f"[VectorBT] {date}: Only {len(score_series)} valid stocks (T-1={prev_date}), need ~{min_required}"
-                )
-                if len(score_series) == 0:
-                    liquidate_targetless(date, date_str)
-                    continue
-
-            # Rank stocks (ascending=False: higher factor value is better)
-            ranked = score_series.reindex(rank_scores(score_series))
-
-            # [DIAG] TOP10_FINAL 日志 (与云端对齐)
-            if self.verbose_alignment:
-                self.logger.info(
-                    f"TOP10_FINAL|{date_str}|"
-                    + "|".join(
-                        [
-                            f"{i + 1}:{s}:{score_series[s]:.6f}"
-                            for i, s in enumerate(ranked.index[:10])
-                        ]
-                    )
-                )
-
-            # Track stocks removed by score filter (for alignment debugging)
-            stocks_removed_by_score = set(valid_stocks) - set(score_series.index)
-
-            # =====================================================
-            # [REBALANCE DEBUG] 调仓日因子诊断日志
-            # 输出每个调仓日的因子rank和raw值用于云端-本地对齐验证
-            # =====================================================
-            self._log_rebalance_debug(
-                date_str=date_str,
-                prev_date_str=prev_date_str,
-                ranked=ranked,
-                raw_factors_df=raw_factors_df,
-                score_series=score_series,
-            )
-
-            # [T-DAY FILTER] A held name may remain selected while trading is
-            # blocked.  A new name must be buyable.  Directional order checks
-            # below decide whether an existing position can be resized/exited.
-            # Controlled by config: enable_tday_filter (default: true)
-            if self.enable_tday_filter:
-                ranked_names = ranked.index.tolist()
-                buyable = set(
-                    self._filter_tradeable_stocks(
-                        date_str, ranked_names, side="buy", require_non_st=True
-                    )
-                )
-                sellable_open = (
-                    set(
-                        self._filter_tradeable_stocks(
-                            date_str, ranked_names, side="sell", require_non_st=True
-                        )
-                    )
-                    if self.allow_short
-                    else set()
-                )
-                held_eligible = set(
-                    self._filter_tradeable_stocks(
-                        date_str,
-                        [s for s in ranked_names if s in sim_positions],
-                        side="hold",
-                        require_non_st=True,
-                    )
-                )
-                tradeable_stocks = [
-                    s
-                    for s in ranked_names
-                    if s in buyable or s in sellable_open or s in held_eligible
-                ]
-                stocks_removed_by_tday = set(ranked.index) - set(tradeable_stocks)
-                if not self.pretrade_fixed_targets:
-                    ranked = ranked.loc[
-                        [s for s in ranked.index if s in tradeable_stocks]
-                    ]
-            else:
-                # Skip T-day filter for alignment debugging
-                tradeable_stocks = ranked.index.tolist()
-                stocks_removed_by_tday = set()
-
-            # Calculate effective top_k based on pool size (supports both top_k and top_pct)
-            effective_top_k = self._get_effective_top_k(len(ranked))
-
-            if len(ranked) < effective_top_k:
-                self.logger.debug(
-                    f"[VectorBT] {date_str}: Only {len(ranked)} tradeable stocks after T-day filter, "
-                    f"effective_top_k={effective_top_k}"
-                )
-
-            strategy_weight_map: Optional[Dict[Any, float]] = None
-            if self._strategy_plugin is not None:
-                strategy_weight_map = self._strategy_plugin(ranked, effective_top_k)
-                top_k_stocks = list(strategy_weight_map)
-            elif self.allow_short:
-                strategy_weight_map = compute_long_short_target_weights(
-                    ranked, effective_top_k
-                )
-                top_k_stocks = list(strategy_weight_map)
-            elif self.all_equal_weight:
-                top_k_stocks = ranked.index.tolist()
-                effective_top_k = len(top_k_stocks)
-            elif self.overlay_active:
-                # [OVERLAY] Banding hysteresis + tranche turnover throttle on selection.
-                top_k_stocks = self._select_with_overlays(
-                    ranked, effective_top_k, set(sim_positions.keys())
-                )
-            else:
-                top_k_stocks = ranked.head(effective_top_k).index.tolist()
-
-            self._record_selection_diagnostic(
-                date=date_normalized,
-                pool_count=len(valid_stocks),
-                valid_score_count=len(score_series),
-                tradeable_count=len(tradeable_stocks),
-                ranked=ranked,
-                selected=top_k_stocks,
-                previous_holdings=set(sim_positions),
-            )
-
-            # [ALIGNMENT] Append per-filter removal info to file
-            try:
-                with open_diagnostic("local_pools.txt", "a", directory=self.diagnostics_output_dir, enabled=self.verbose_alignment or bool(self.diagnostics_output_dir)) as f:
-                    f.write(
-                        f"FILTER_SCORE_REMOVED: {len(stocks_removed_by_score)} ({','.join(sorted(stocks_removed_by_score)) if stocks_removed_by_score else 'none'})\n"
-                    )
-                    f.write(
-                        f"FILTER_TDAY_REMOVED: {len(stocks_removed_by_tday)} ({','.join(sorted(stocks_removed_by_tday)) if stocks_removed_by_tday else 'none'})\n"
-                    )
-                    f.write(f"FINAL_POOL: {len(ranked)}\n")
-                    f.write(
-                        f"EFFECTIVE_TOP_K: {effective_top_k} (top_k={self.top_k}, top_pct={self.top_pct})\n"
-                    )
-                    f.write(f"TOP_K_SELECTED: {','.join(top_k_stocks)}\n")
-            except Exception:
-                pass
-
-            if self.allow_short and not self.overlay_active:
-                target_map = strategy_weight_map or {}
-                target_set = set(target_map)
-                prev_holdings_set = set(sim_positions.keys())
-                for stock in target_set:
+            if decision.kind == "branch_long_short":
+                for stock in decision.cancelled_exits:
                     cancel_exit(stock)
-                nav = sim_cash
-                for s, shares in sorted(sim_positions.items(), key=lambda x: x[0]):
-                    px = mark_price(date, s)
-                    if px is not None:
-                        nav += shares * px
-                exposure = 1.0
-                if exposure_by_date:
-                    exposure = float(exposure_by_date.get(date_normalized, 1.0))
-                base_capital = nav * exposure / buy_cost_multiplier
-                buy_fee_rate = max(float(self.buy_cost_rate), 0.0) + max(float(self.slippage), 0.0)
-                sell_fee_rate = max(float(self.sell_cost_rate), 0.0) + max(float(self.slippage), 0.0)
-                order_names = sorted(prev_holdings_set | target_set)
-                held_list = sorted(prev_holdings_set)
-                buyable_close = (
-                    set(self._filter_tradeable_stocks(date_str, held_list, side="buy", require_non_st=False))
-                    if held_list
-                    else set()
-                )
-                sellable_close = (
-                    set(self._filter_tradeable_stocks(date_str, held_list, side="sell", require_non_st=False))
-                    if held_list
-                    else set()
-                )
-                if self.enable_tday_filter:
-                    buyable_open = set(
-                        self._filter_tradeable_stocks(date_str, order_names, side="buy", require_non_st=True)
-                    )
-                    sellable_open = set(
-                        self._filter_tradeable_stocks(date_str, order_names, side="sell", require_non_st=True)
-                    )
-                else:
-                    buyable_open = set(order_names)
-                    sellable_open = set(order_names)
-
-                for stock in order_names:
+                for stock in decision.blocked_exits:
+                    weights.loc[date, stock] = np.nan
+                    block_exit(date, stock)
+                for stock in decision.hold_instruments:
+                    weights.loc[date, stock] = np.nan
+                for stock, tgt_val in decision.target_values.items():
                     px = execution_price(date, stock)
-                    old_shares = sim_positions.get(stock, 0.0)
-                    tgt_val = float(target_map.get(stock, 0.0)) * base_capital
                     if px is None:
-                        if stock not in target_set and stock in sim_positions:
-                            weights.loc[date, stock] = np.nan
-                            block_exit(date, stock)
                         continue
+                    old_shares = sim_positions.get(stock, 0.0)
                     cur_val = old_shares * px
                     delta = tgt_val - cur_val
-                    if abs(delta) <= 1e-12:
-                        if abs(tgt_val) > 1e-12:
-                            weights.loc[date, stock] = tgt_val
-                        elif stock in sim_positions:
-                            weights.loc[date, stock] = 0.0
-                            sim_positions.pop(stock, None)
-                            finish_exit(date, stock)
-                        continue
-                    if delta > 0:
-                        closing_short = old_shares < 0 and tgt_val <= 1e-12
-                        side_allowed = (stock in buyable_close) if closing_short else (stock in buyable_open)
-                        fee_rate = buy_fee_rate
-                        order_fee = float(self.buy_cost_rate)
-                    else:
-                        closing_long = old_shares > 0 and tgt_val >= -1e-12
-                        side_allowed = (stock in sellable_close) if closing_long else (stock in sellable_open)
-                        fee_rate = sell_fee_rate
-                        order_fee = float(self.sell_cost_rate)
-
-                    if not side_allowed:
-                        weights.loc[date, stock] = np.nan
-                        if stock not in target_set and stock in sim_positions:
-                            block_exit(date, stock)
-                        continue
-
-                    sim_cash -= delta + abs(delta) * fee_rate
+                    if abs(delta) > 1e-12:
+                        fee_r = ctx.buy_fee_rate if delta > 0.0 else ctx.sell_fee_rate
+                        sim_cash -= delta + abs(delta) * fee_r
                     weights.loc[date, stock] = tgt_val
-                    order_fees.loc[date, stock] = order_fee
+                    if stock in decision.order_fees:
+                        order_fees.loc[date, stock] = decision.order_fees[stock]
                     if abs(tgt_val) > 1e-12:
                         sim_positions[stock] = tgt_val / px
                     else:
@@ -3211,449 +3057,119 @@ class VectorBTBacktestRunner:
                         finish_exit(date, stock)
                 continue
 
-            if self.overlay_active:
-                # =====================================================
-                # [OVERLAY] Full target-value rebalance with risk-aware
-                # weights + per-rebalance exposure multiplier.
-                # Every selected name is assigned an absolute target value so
-                # VectorBT rebalances exactly to the desired weights each period.
-                # =====================================================
-                target_set = set(top_k_stocks)
-                prev_holdings_set = set(sim_positions.keys())
-                pending_sells.difference_update(target_set)
-                for stock in target_set:
+            if decision.kind == "branch_overlay":
+                pending_sells.difference_update(decision.cancelled_exits)
+                for stock in decision.cancelled_exits:
                     cancel_exit(stock)
-                # Mark current book to market at the execution price.
-                nav = sim_cash
-                for s, shares in sorted(sim_positions.items(), key=lambda x: x[0]):
-                    px = mark_price(date, s)
-                    if px is not None:
-                        nav += shares * px
-                exposure = 1.0
-                if exposure_by_date:
-                    exposure = float(exposure_by_date.get(date_normalized, 1.0))
-                # Current holdings as weight fractions (for the MVO turnover penalty).
-                prev_weight_map: Dict[str, float] = {}
-                if nav > 0:
-                    for s, shares in sorted(sim_positions.items(), key=lambda x: x[0]):
-                        px = mark_price(date, s)
-                        if px is not None:
-                            prev_weight_map[s] = shares * px / nav
-                weight_map = (
-                    strategy_weight_map
-                    if strategy_weight_map is not None
-                    else self._compute_overlay_weights(
-                        top_k_stocks,
-                        score_series,
-                        price_df,
-                        prev_date_str,
-                        prev_weight_map,
-                    )
-                )
-                if self.overlay["partial_rebalance"]["enabled"]:
-                    # [OVERLAY] G-P partial adjustment: only move trade_rate of
-                    # the way toward the fresh target. The traded book becomes
-                    # the blended union of current holdings and targets.
-                    weight_map = self._blend_partial_rebalance(
-                        weight_map, prev_weight_map
-                    )
-                    target_set = set(weight_map)
-                if self.overlay["liquidity_cap"]["enabled"]:
-                    # Cap weights at the ADV participation limit against the
-                    # capital actually deployed at this rebalance (nav * exposure)
-                    # unless an explicit capital_base is configured.
-                    weight_map = self._apply_liquidity_cap(
-                        weight_map, prev_date_str, nav * exposure
-                    )
-                order_names = sorted(prev_holdings_set | target_set)
-                held_list = sorted(prev_holdings_set)
-                buyable = set(
-                    self._filter_tradeable_stocks(
-                        date_str, order_names, side="buy", require_non_st=True
-                    )
-                )
-                buyable = {
-                    stock
-                    for stock in buyable
-                    if execution_price(date, stock) is not None
-                }
-                buyable_close = (
-                    {
-                        stock
-                        for stock in self._filter_tradeable_stocks(
-                            date_str, held_list, side="buy", require_non_st=False
-                        )
-                        if execution_price(date, stock) is not None
-                    }
-                    if held_list
-                    else set()
-                )
-                sellable = set(
-                    self._filter_tradeable_stocks(
-                        date_str, order_names, side="sell", require_non_st=False
-                    )
-                )
-                sellable = {
-                    stock
-                    for stock in sellable
-                    if execution_price(date, stock) is not None
-                }
-                sellable_open = (
-                    {
-                        stock
-                        for stock in self._filter_tradeable_stocks(
-                            date_str, order_names, side="sell", require_non_st=True
-                        )
-                        if execution_price(date, stock) is not None
-                    }
-                    if self.allow_short
-                    else sellable
-                )
-                if self.strict_max_actual_holdings:
-                    executable_exits = (prev_holdings_set - target_set) & sellable
-                    surviving_holdings = prev_holdings_set - executable_exits
-                    ranked_new_targets = [
-                        stock
-                        for stock in top_k_stocks
-                        if stock in target_set and stock not in prev_holdings_set
-                    ]
-                    available_slots = max(
-                        0, effective_top_k - len(surviving_holdings)
-                    )
-                    allowed_new = set(ranked_new_targets[:available_slots])
-                    skipped_new = set(ranked_new_targets) - allowed_new
-                    strict_position_buys_skipped += len(skipped_new)
-                    target_set.difference_update(skipped_new)
-                    weight_map = {
-                        stock: weight
-                        for stock, weight in weight_map.items()
-                        if stock in target_set
-                    }
-                    order_names = sorted(prev_holdings_set | target_set)
-                current_values: Dict[str, float] = {}
-                for stock in prev_holdings_set:
-                    px = mark_price(date, stock)
-                    if px is not None:
-                        current_values[stock] = sim_positions[stock] * px
-                base_capital = nav * exposure / buy_cost_multiplier
-                dollar_caps: Dict[str, float] = {}
-                if self.overlay["liquidity_cap"]["enabled"]:
-                    liq_caps = self._liquidity_weight_caps(
-                        target_set, prev_date_str, nav * exposure
-                    )
-                    dollar_caps = {
-                        stock: cap * base_capital for stock, cap in liq_caps.items()
-                    }
-                desired = {
-                    stock: weight_map.get(stock, 0.0) * base_capital
-                    for stock in target_set
-                }
-                initial_gross = sum(abs(v) for v in desired.values())
-                forced: Dict[str, float] = {}
-                for _ in range(len(order_names) + 1):
-                    newly_forced = False
-                    for stock in order_names:
-                        if stock in forced:
-                            continue
-                        current = current_values.get(stock, 0.0)
-                        target = desired.get(stock, 0.0)
-                        old_shares = sim_positions.get(stock, 0.0)
-                        if stock not in target_set:
-                            exit_ok = (stock in buyable_close) if old_shares < 0 else (stock in sellable)
-                            if not exit_ok:
-                                forced[stock] = current
-                                block_exit(date, stock)
-                                newly_forced = True
-                        elif target > current + 1e-12:
-                            allowed = (
-                                (stock in buyable_close)
-                                if (old_shares < 0 and target <= 1e-12)
-                                else (stock in buyable)
-                            )
-                            if not allowed:
-                                forced[stock] = current
-                                newly_forced = True
-                        elif target < current - 1e-12:
-                            allowed = (
-                                (stock in sellable)
-                                if (old_shares > 0 and target >= -1e-12)
-                                else (stock in sellable_open)
-                            )
-                            if not allowed:
-                                forced[stock] = current
-                                newly_forced = True
-                    if self.pretrade_fixed_targets or not forced:
-                        break
-                    flexible_targets = [s for s in target_set if s not in forced]
-                    gross_budget = min(base_capital, initial_gross)
-                    available = max(0.0, gross_budget - sum(abs(v) for v in forced.values()))
-                    flexible_weight = sum(
-                        abs(weight_map.get(s, 0.0)) for s in flexible_targets
-                    )
-                    if not (flexible_targets and flexible_weight > 0):
-                        break
-                    new_desired = {
-                        stock: available * weight_map.get(stock, 0.0) / flexible_weight
-                        for stock in flexible_targets
-                    }
-                    if dollar_caps:
-                        new_desired = apply_magnitude_caps(
-                            new_desired, dollar_caps, tol=1e-9
-                        )
-                    changed = any(
-                        abs(new_desired[stock] - desired.get(stock, 0.0)) > 1e-12
-                        for stock in flexible_targets
-                    )
-                    desired.update(new_desired)
-                    if not newly_forced and not changed:
-                        break
-
-                for stock in order_names:
-                    current = current_values.get(stock, 0.0)
-                    target = forced.get(stock, desired.get(stock, 0.0))
-                    if stock in forced:
-                        weights.loc[date, stock] = np.nan
-                        continue
+                for stock in decision.blocked_exits:
+                    block_exit(date, stock)
+                for stock in decision.hold_instruments:
+                    weights.loc[date, stock] = np.nan
+                nav_before = sim_cash
+                current_vals: Dict[str, float] = {}
+                for s, shares in sorted(sim_positions.items()):
+                    px_m = mark_price(date, s)
+                    if px_m is not None:
+                        current_vals[s] = shares * px_m
+                        nav_before += shares * px_m
+                for stock, target in decision.target_values.items():
                     px = mark_price(date, stock)
                     if px is None:
-                        if stock not in target_set:
-                            block_exit(date, stock)
                         continue
+                    current = current_vals.get(stock, 0.0)
                     if target < current - 1e-12:
                         sim_cash += (current - target) * sell_proceeds_multiplier
-                        order_fees.loc[date, stock] = float(self.sell_cost_rate)
                     elif target > current + 1e-12:
                         sim_cash -= (target - current) * buy_cost_multiplier
-                        order_fees.loc[date, stock] = float(self.buy_cost_rate)
                     weights.loc[date, stock] = target
+                    if stock in decision.order_fees:
+                        order_fees.loc[date, stock] = decision.order_fees[stock]
                     if abs(target) > 1e-12:
                         sim_positions[stock] = target / px
                     else:
                         sim_positions.pop(stock, None)
                         finish_exit(date, stock)
                 sim_cash = max(0.0, sim_cash)
-                if self._alignment_writer is not None:
+                if self._alignment_writer is not None and decision.snapshot_payload is not None:
+                    snap = decision.snapshot_payload
                     self._alignment_writer.add_rebalance_snapshot(
-                        rebalance_date=date_str,
-                        factor_date=prev_date_str,
-                        stock_pool=valid_stocks,
-                        raw_factors=raw_factors_df,
-                        processed_factors=processed_factors_df,
-                        composite_scores=score_series,
-                        target_holdings=[s for s in top_k_stocks if s in target_set],
-                        target_values={s: forced.get(s, desired.get(s, 0.0))
-                                       for s in sorted(target_set | set(forced))},
-                        pool_size=len(valid_stocks),
-                        nav=nav / self.init_cash,
+                        rebalance_date=snap["rebalance_date"],
+                        factor_date=snap["factor_date"],
+                        stock_pool=snap["stock_pool"],
+                        raw_factors=snap["raw_factors"],
+                        processed_factors=snap["processed_factors"],
+                        composite_scores=snap["composite_scores"],
+                        target_holdings=snap["target_holdings"],
+                        target_values=snap["target_values"],
+                        pool_size=snap["pool_size"],
+                        nav=nav_before / self.init_cash,
                     )
                 continue
 
-            # =====================================================
-            # [JQ-ALIGNED V4] 预模拟 + targetvalue 逻辑
-            #
-            # 关键改动：
-            # - 使用预模拟追踪持仓和现金
-            # - 卖出股票：按开盘价计算释放的现金
-            # - 买入股票：value = cash / num_to_buy (JQ 精确逻辑)
-            # - 保持股票：NaN（VectorBT 保持当前股数）
-            # =====================================================
-            target_set = set(top_k_stocks)
-            prev_holdings_set = set(sim_positions.keys())
-            pending_sells.difference_update(target_set)
-            for stock in target_set:
+            # branch_topk
+            pending_sells.difference_update(decision.cancelled_exits)
+            for stock in decision.cancelled_exits:
                 cancel_exit(stock)
-
-            # [FIX] 分类股票 - 排序以确保可重复性
-            stocks_to_sell = sorted(list(prev_holdings_set - target_set))  # 需要卖出
-            stocks_to_keep = sorted(list(prev_holdings_set & target_set))  # 继续持有
-            stocks_to_buy = sorted(list(target_set - prev_holdings_set))  # 需要买入
-            sellable = set(
-                self._filter_tradeable_stocks(
-                    date_str, stocks_to_sell, side="sell", require_non_st=False
-                )
-            )
-            blocked_sells = set(stocks_to_sell) - sellable
-            for stock in blocked_sells:
+            for stock in decision.blocked_exits:
                 block_exit(date, stock)
-
-            # [JQ-ALIGNED V4] 模拟卖出：计算释放的现金。A tradeability
-            # lookup alone is insufficient: VectorBT executes at open_df, so a
-            # missing/non-positive next-open price must remain a blocked exit.
-            released_cash = 0.0
-            executed_sells: set[str] = set()
-            for stock in stocks_to_sell:
-                if stock not in sellable:
-                    continue
+            for stock in sorted(decision.sell_instruments):
                 if stock in sim_positions and sim_positions[stock] > 0:
                     sell_price = execution_price(date, stock)
                     if sell_price is None:
                         block_exit(date, stock)
+                        weights.loc[date, stock] = np.nan
                         continue
-                    sell_value = sim_positions[stock] * sell_price
-                    net_sell_value = sell_value * sell_proceeds_multiplier
-                    released_cash += net_sell_value
+                    net_sell_value = sim_positions.pop(stock) * sell_price * sell_proceeds_multiplier
                     sim_cash += net_sell_value
-                    del sim_positions[stock]
-                    executed_sells.add(stock)
-                    finish_exit(date, stock)
-
-            # A blocked exit remains an actual holding and therefore consumes
-            # one of the effective_top_k slots.  Under the strict contract,
-            # buy only the highest-ranked new targets that fit after completed
-            # sells; a later successful exit releases its slot for a future
-            # rebalance rather than triggering an unscheduled replacement.
-            if self.strict_max_actual_holdings and stocks_to_buy:
-                ranked_new_targets = [
-                    stock for stock in top_k_stocks if stock in stocks_to_buy
-                ]
-                available_slots = max(0, effective_top_k - len(sim_positions))
-                skipped_count = max(0, len(ranked_new_targets) - available_slots)
-                strict_position_buys_skipped += skipped_count
-                stocks_to_buy = ranked_new_targets[:available_slots]
-
-            intended_buy_count = len(stocks_to_buy)
-            if (
-                self.pretrade_fixed_targets
-                and self.enable_tday_filter
-                and stocks_to_buy
-            ):
-                buyable = set(
-                    self._filter_tradeable_stocks(
-                        date_str, stocks_to_buy, side="buy", require_non_st=True
-                    )
-                )
-                stocks_to_buy = [
-                    stock
-                    for stock in stocks_to_buy
-                    if stock in buyable and execution_price(date, stock) is not None
-                ]
-            elif exec_price_df is not price_df and stocks_to_buy:
-                stocks_to_buy = [
-                    stock
-                    for stock in stocks_to_buy
-                    if execution_price(date, stock) is not None
-                ]
-
-            # [JQ-ALIGNED V4] 计算每只新股的买入金额
-            # JQ 逻辑: value = context.portfolio.cash / (target_num - position_count)
-            if not prev_holdings_set:
-                # 第一次建仓: 用全部现金均分
-                value_per_new_stock = (
-                    sim_cash / effective_top_k / buy_cost_multiplier
-                    if effective_top_k > 0
-                    else 0.0
-                )
-            elif stocks_to_buy:
-                # 后续换仓: 用当前现金（释放的+剩余的）均分给新股
-                # JQ: value = cash / num_to_buy
-                value_per_new_stock = (
-                    sim_cash
-                    / (
-                        intended_buy_count
-                        if self.pretrade_fixed_targets
-                        else len(stocks_to_buy)
-                    )
-                    / buy_cost_multiplier
-                )
-            else:
-                value_per_new_stock = 0.0
-
-            # 构建目标市值矩阵 (size_type='targetvalue')
-
-            # 1. 只有按 next-open 成功预模拟的卖出设为 0；其余保持。
-            for stock in stocks_to_sell:
-                if stock in executed_sells:
                     weights.loc[date, stock] = 0.0
                     order_fees.loc[date, stock] = float(self.sell_cost_rate)
-                else:
-                    weights.loc[date, stock] = np.nan
-
-            # 2. 保持的股票：设为 NaN（不操作）
-            for stock in stocks_to_keep:
+                    finish_exit(date, stock)
+            for stock in decision.hold_instruments:
                 weights.loc[date, stock] = np.nan
-
-            # 3. 新买入的股票：设置目标市值
-            for stock in stocks_to_buy:
-                weights.loc[date, stock] = value_per_new_stock
+            for stock, target_val in decision.target_values.items():
+                if stock in decision.sell_instruments:
+                    continue
+                weights.loc[date, stock] = target_val
                 order_fees.loc[date, stock] = float(self.buy_cost_rate)
-                # 模拟买入：扣除现金，增加持仓
                 buy_price = execution_price(date, stock)
                 if buy_price is not None:
-                    shares = value_per_new_stock / buy_price
-                    sim_positions[stock] = shares
-                    sim_cash -= value_per_new_stock * buy_cost_multiplier
+                    sim_positions[stock] = target_val / buy_price
+                    sim_cash -= target_val * buy_cost_multiplier
 
-            # [ALIGNMENT] 记录持仓变动到日志文件
-            try:
-                with open_diagnostic("local_pools.txt", "a", directory=self.diagnostics_output_dir, enabled=self.verbose_alignment or bool(self.diagnostics_output_dir)) as f:
-                    f.write(
-                        f"JQ_ALIGNED_V4_SELL: {','.join(sorted(stocks_to_sell)) if stocks_to_sell else 'none'} (释放现金={released_cash:,.0f})\n"
-                    )
-                    f.write(
-                        f"JQ_ALIGNED_V4_KEEP: {','.join(sorted(stocks_to_keep)) if stocks_to_keep else 'none'} (NaN)\n"
-                    )
-                    f.write(
-                        f"JQ_ALIGNED_V4_BUY: {','.join(sorted(stocks_to_buy)) if stocks_to_buy else 'none'} (每只={value_per_new_stock:,.0f}元)\n"
-                    )
-            except Exception:
-                pass
-
-            # [ALIGNMENT DATA COLLECTION] Collect snapshot for alignment analysis
-            if self._alignment_writer is not None:
-                # Build actions dict
-                actions = {}
-                for s in stocks_to_sell:
-                    actions[s] = "SELL"
-                for s in stocks_to_keep:
-                    actions[s] = "HOLD"
-                for s in stocks_to_buy:
-                    actions[s] = "BUY"
-
-                # Build target values dict
-                target_values = {}
-                for s in top_k_stocks:
-                    if s in stocks_to_buy:
-                        target_values[s] = value_per_new_stock
-                    else:
-                        # For HOLD stocks, estimate current value
-                        if s in sim_positions:
-                            price = execution_price(date, s)
-                            if price is not None:
-                                target_values[s] = sim_positions[s] * price
-
-                # Calculate current NAV
-                # [FIX] 排序sim_positions以确保可重复性
+            if self._alignment_writer is not None and decision.snapshot_payload is not None:
+                snap = decision.snapshot_payload
+                snap_target_values: Dict[str, float] = {}
+                buy_set = set(snap["buy_stocks"])
+                for s in snap["target_holdings"]:
+                    if s in buy_set:
+                        snap_target_values[s] = snap["value_per_new_stock"]
+                    elif s in sim_positions:
+                        price = execution_price(date, s)
+                        if price is not None:
+                            snap_target_values[s] = sim_positions[s] * price
                 current_nav = sim_cash
                 for s, shares in sorted(sim_positions.items(), key=lambda x: x[0]):
                     price = execution_price(date, s)
                     if price is not None:
                         current_nav += shares * price
-
                 self._alignment_writer.add_rebalance_snapshot(
-                    rebalance_date=date_str,
-                    factor_date=prev_date_str,
-                    stock_pool=valid_stocks,
-                    raw_factors=raw_factors_df,
-                    processed_factors=processed_factors_df.fillna(0.0)
-                    if processed_factors_df is not None
-                    else None,
-                    composite_scores=score_series,
-                    target_holdings=top_k_stocks,
-                    target_values=target_values,
-                    actions=actions,
-                    pool_size=len(valid_stocks),
-                    nav=current_nav / self.init_cash,  # Normalized NAV
+                    rebalance_date=snap["rebalance_date"],
+                    factor_date=snap["factor_date"],
+                    stock_pool=snap["stock_pool"],
+                    raw_factors=snap["raw_factors"],
+                    processed_factors=snap["processed_factors"],
+                    composite_scores=snap["composite_scores"],
+                    target_holdings=snap["target_holdings"],
+                    target_values=snap_target_values,
+                    actions=snap["actions"],
+                    pool_size=snap["pool_size"],
+                    nav=current_nav / self.init_cash,
                 )
 
         # [JQ-ALIGNED V2] 不使用 ffill！
-        # 非调仓日保持 NaN，VectorBT 会保持当前持仓不变
-        # 只填充第一个调仓日之前的 NaN 为 0（初始无持仓）
-
-        # 找到第一个有非 NaN 值的行
         has_values = weights.notna().any(axis=1)
         if has_values.any():
             first_valid_idx = has_values.idxmax()
-            # 只填充第一个有效行之前的行（不包括第一个有效行本身）
             before_first = weights.index < first_valid_idx
             weights.loc[before_first] = 0.0
 
@@ -3672,7 +3188,7 @@ class VectorBTBacktestRunner:
                 int(max(completed_exit_delays)) if completed_exit_delays else None
             ),
         }
-        if capture_decisions:
+        if ctx.capture_decisions:
             weights.attrs["decision_portfolio_values"] = decision_portfolio_values
         return weights
 

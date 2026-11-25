@@ -5262,16 +5262,13 @@ class FactorSynthesizer:
     ) -> Dict[str, Any]:
         from utils.execution_schedule import (
             ExecutionScheduler,
+            resolve_slot_backtest_profile,
             validate_effective_execution_profile,
         )
         from utils.slots.contracts import ExecutionProfile
 
-        base = (
-            slot.microstructure.execution_profile
-            if slot is not None
-            else ExecutionProfile(
-                "close", "close", 0, 0, "decimal", "endpoints_only", "cross_session"
-            )
+        base = resolve_slot_backtest_profile(slot) or ExecutionProfile(
+            "close", "close", 0, 0, "decimal", "endpoints_only", "cross_session"
         )
         allow_entry_override = slot is None or slot.slot_id == "jq_ashare_local"
         effective_entry = (
@@ -5311,8 +5308,10 @@ class FactorSynthesizer:
                 allow_entry_field_override=allow_entry_override,
                 holding_period=getattr(runner, "holding_period", 1),
             )
+            effective_exit = effective_entry if allow_entry_override else base.exit_price_field
             effective = scheduler.effective_profile(
                 entry_price_field=effective_entry,
+                exit_price_field=effective_exit,
                 allow_short=bool(runner.allow_short),
                 benchmark_instrument=runner.benchmark_instrument,
                 update_benchmark=True,

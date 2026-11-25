@@ -30,7 +30,7 @@ from utils.market_db.validation import market_db_calendar_bounds, validate_marke
 from utils.market_factor import MarketFactorValueStore
 from utils.market_db.identity import slot_market_db_identity
 from utils.slots.contracts import ExecutionProfile, MarketSlot
-from utils.time_axis import Frequency
+from utils.time_axis import BarSchedule, Frequency
 
 from .factor_loader import FactorLoader
 
@@ -80,6 +80,7 @@ class SlotDataProvider:
         self._auto_slot_key: Optional[int] = None
         self._auto_slot: Optional[MarketSlot] = None
         self._session_ts_cache: Dict[tuple[int, str], pd.Timestamp] = {}
+        self._bar_schedule_cache: Dict[tuple[int, int, str], BarSchedule] = {}
         self._adv_cache: Dict[tuple[str, int, bool], Dict[str, Optional[float]]] = {}
         self._abv_cache: Dict[tuple[str, int], Dict[str, Optional[float]]] = {}
         self._style_exposure_cache: Dict[str, Optional[pd.DataFrame]] = {}
@@ -1014,6 +1015,120 @@ class SlotDataProvider:
             row_cache[cache_key] = list(allowed)
         return allowed
 
+    def _bar_schedule_for_slot(self, slot: MarketSlot) -> Optional[BarSchedule]:
+        """Resolve a ``BarSchedule`` matching ``slot.calendar`` and ``self._freq_obj``."""
+        feed_schedule = getattr(slot.bar_feed, "schedule", None)
+        if (
+            isinstance(feed_schedule, BarSchedule)
+            and feed_schedule.frequency.canonical == self._freq_obj.canonical
+        ):
+            return feed_schedule
+        cal = slot.calendar
+        if cal is None or not hasattr(cal, "_intervals"):
+            return None
+        cache_key = (id(slot.bar_feed), id(cal), str(self.frequency))
+        cached = self._bar_schedule_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        bucket_strategy = getattr(slot.bar_feed, "bucket_strategy", None)
+        if (
+            getattr(cal, "is_domestic_futures", False)
+            and self._freq_obj.kind != "week"
+            and bucket_strategy is None
+        ):
+            return None
+        view = getattr(slot.bar_feed, "view", "ETH")
+        schedule = BarSchedule(
+            cal, self._freq_obj, view=view, bucket_strategy=bucket_strategy
+        )
+        self._bar_schedule_cache[cache_key] = schedule
+        return schedule
+
+    def _session_completed_at(
+        self,
+        slot: MarketSlot,
+        session_id: str,
+        schedule: Optional[BarSchedule],
+    ) -> Optional[pd.Timestamp]:
+        """Return the UTC completion timestamp (``available_at``) of ``session_id``."""
+        if schedule is not None:
+            slots = schedule.for_session(session_id)
+            if not slots.empty:
+                last_start = (
+                    pd.Timestamp(slots["start_utc"].iloc[-1])
+                    .tz_convert("UTC")
+                    .as_unit("ns")
+                )
+                return schedule.available_at(last_start).tz_convert("UTC")
+        cal = slot.calendar
+        if cal is not None and hasattr(cal, "session_on") and hasattr(cal, "_intervals"):
+            view = getattr(slot.bar_feed, "view", "ETH")
+            sess = cal.session_on(session_id, view)
+            if sess is not None and sess.segments:
+                return pd.Timestamp(sess.segments[-1][1]).tz_convert("UTC")
+        return None
+
+    def _latest_started_session_day(
+        self,
+        slot: MarketSlot,
+        as_of_utc: pd.Timestamp,
+    ) -> Optional[pd.Timestamp]:
+        """Return the latest session date in ``slot.calendar`` opened strictly before ``as_of_utc``."""
+        cal = slot.calendar
+        view = getattr(slot.bar_feed, "view", "ETH")
+        opens = getattr(cal, "_opens", None)
+        intervals = getattr(cal, "_intervals", None)
+        if isinstance(opens, Mapping) and isinstance(intervals, Mapping) and view in opens:
+            view_opens = opens[view]
+            view_intervals = intervals[view]
+            if not view_opens:
+                return None
+            pos = bisect_left(view_opens, as_of_utc) - 1
+            if pos < 0:
+                return None
+            day = pd.Timestamp(view_intervals[pos][2].session_date).normalize()
+            day = min(day, cal.end)
+            return day if day >= cal.start else None
+        return self.session_date_for_bar(as_of_utc, daily_naive=False, cal=cal)
+
+    def liquidity_as_of_key(
+        self,
+        bar_key: str,
+        price_db_conn: Optional[Any] = None,
+        price_db_path: Optional[str] = None,
+    ) -> str:
+        """Resolve a signal bar key to its ``BarSchedule.available_at()`` publication key."""
+        if self._is_date_only_key(bar_key):
+            return bar_key
+        slot, _, _ = self._resolve_slot_and_conn(price_db_conn, price_db_path)
+        if slot is None:
+            return bar_key
+        ts = pd.Timestamp(bar_key)
+        ts_utc = (
+            ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC")
+        ).as_unit("ns")
+        schedule = self._bar_schedule_for_slot(slot)
+        if schedule is not None:
+            try:
+                return schedule.available_at(ts_utc).isoformat()
+            except Exception:
+                return bar_key
+        cal = slot.calendar
+        if (
+            self._freq_obj.kind in ("session", "week")
+            and cal is not None
+            and hasattr(cal, "session_at")
+            and hasattr(cal, "_intervals")
+        ):
+            view = getattr(slot.bar_feed, "view", "ETH")
+            try:
+                sess = cal.session_at(ts_utc, view, frequency=self._freq_obj)
+                if sess is not None and sess.segments:
+                    return pd.Timestamp(sess.segments[-1][1]).tz_convert("UTC").isoformat()
+            except Exception:
+                return bar_key
+        return bar_key
+
     def _read_traded_value_bars(
         self,
         stocks: List[str],
@@ -1033,7 +1148,9 @@ class SlotDataProvider:
                 if as_of_ts.tzinfo is None
                 else as_of_ts.tz_convert("UTC")
             )
-            end_day = self.session_date_for_bar(as_of_utc, daily_naive=False, cal=slot.calendar)
+            end_day = self._latest_started_session_day(slot, as_of_utc)
+            if end_day is None:
+                return pd.DataFrame(), slot, as_of_utc, None
         else:
             as_of_utc = None
             end_day = as_of_ts.normalize()
@@ -1051,8 +1168,25 @@ class SlotDataProvider:
         bars = slot.bar_feed.read_execution_bars(
             stocks, self._freq_obj, start_utc=bounds[0], end_utc=bounds[1]
         )
-        if as_of_utc is not None and not bars.empty and "timestamp_utc" in bars.columns:
-            bars = bars.loc[pd.to_datetime(bars["timestamp_utc"], utc=True) <= as_of_utc]
+        schedule = self._bar_schedule_for_slot(slot)
+        if as_of_utc is not None and not bars.empty:
+            if "available_at_utc" in bars.columns and bars["available_at_utc"].notna().all():
+                avail_utc = pd.to_datetime(bars["available_at_utc"], utc=True)
+            elif schedule is not None and "timestamp_utc" in bars.columns:
+                ts_utc = pd.to_datetime(bars["timestamp_utc"], utc=True)
+                avail_map = {
+                    ts: schedule.available_at(
+                        pd.Timestamp(ts).tz_convert("UTC").as_unit("ns")
+                    )
+                    for ts in ts_utc.unique()
+                }
+                avail_utc = pd.to_datetime(ts_utc.map(avail_map), utc=True)
+            elif "timestamp_utc" in bars.columns:
+                avail_utc = pd.to_datetime(bars["timestamp_utc"], utc=True)
+            else:
+                avail_utc = None
+            if avail_utc is not None:
+                bars = bars.loc[avail_utc <= as_of_utc]
         if bars.empty:
             return pd.DataFrame(), slot, as_of_utc, end_day
         if "money" in bars.columns and bars["money"].notna().any():
@@ -1135,21 +1269,28 @@ class SlotDataProvider:
                     if (
                         not include_incomplete_session
                         and as_of_utc is not None
-                        and end_day is not None
                         and self._freq_obj.kind == "intraday"
                     ):
-                        end_day_str = end_day.strftime("%Y-%m-%d")
-                        day_grid = slot.calendar.bar_grid(
-                            self.frequency, end_day_str, end_day_str
-                        )
-                        if not day_grid.empty:
-                            last_bar_utc = pd.to_datetime(
-                                day_grid["timestamp_utc"], utc=True
-                            ).max()
-                            if as_of_utc < last_bar_utc:
-                                # Exclude the unfinished current session so partial-day
-                                # sums are never averaged on the same footing as full days.
-                                valid = valid.loc[valid["_session_id"] < end_day_str]
+                        schedule = self._bar_schedule_for_slot(slot)
+                        incomplete_sessions = {
+                            str(sid)
+                            for sid in valid["_session_id"].unique()
+                            if (
+                                (
+                                    completed_at := self._session_completed_at(
+                                        slot, str(sid), schedule
+                                    )
+                                )
+                                is not None
+                                and as_of_utc < completed_at
+                            )
+                        }
+                        if incomplete_sessions:
+                            # Exclude unfinished sessions so partial-day sums are
+                            # never averaged on the same footing as full days.
+                            valid = valid.loc[
+                                ~valid["_session_id"].astype(str).isin(incomplete_sessions)
+                            ]
                     if not valid.empty:
                         daily_totals = (
                             valid.groupby(["instrument_id", "_session_id"], sort=False)[

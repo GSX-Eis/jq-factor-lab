@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from numbers import Integral
 import re
 from typing import TYPE_CHECKING, Any, TypeVar
@@ -11,7 +11,7 @@ import numpy as np
 import pandas as pd
 
 if TYPE_CHECKING:
-    from utils.slots.contracts import ExecutionProfile
+    from utils.slots.contracts import ExecutionProfile, PortfolioExecutionProfile
 
 _Rows = TypeVar("_Rows", int, np.ndarray)
 _SESSION_DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
@@ -21,6 +21,25 @@ def _execution_profile_cls() -> type[ExecutionProfile]:
     from utils.slots.contracts import ExecutionProfile
 
     return ExecutionProfile
+
+
+def _portfolio_execution_profile_cls() -> type[PortfolioExecutionProfile]:
+    from utils.slots.contracts import PortfolioExecutionProfile
+
+    return PortfolioExecutionProfile
+
+
+def resolve_slot_backtest_profile(slot: Any) -> ExecutionProfile | None:
+    """Return the portfolio backtest ``ExecutionProfile`` declared by ``slot``."""
+    if slot is None:
+        return None
+    micro = getattr(slot, "microstructure", None)
+    if micro is None:
+        return None
+    portfolio_profile = getattr(micro, "portfolio_execution_profile", None)
+    if portfolio_profile is not None:
+        return portfolio_profile
+    return getattr(micro, "execution_profile", None)
 
 
 def validate_non_bool_int(
@@ -113,19 +132,26 @@ class ExecutionScheduler:
                 "continuous portfolio simulation requires 'cross_session'"
             )
 
-        if profile.exit_adjustment == 0:
-            pass
-        elif profile.exit_adjustment == -1:
-            if not (entry_field == "open" and profile.exit_price_field == "close"):
-                raise ValueError(
-                    "VectorBTBacktestRunner supports exit_adjustment=-1 only for open-to-close "
-                    f"execution (got entry_price_field={entry_field!r}, "
-                    f"exit_price_field={profile.exit_price_field!r})"
-                )
-        else:
+        if profile.exit_adjustment != 0:
             raise ValueError(
                 f"VectorBTBacktestRunner does not support exit_adjustment={profile.exit_adjustment}; "
-                "supported values are 0 or -1 (with open->close)"
+                "continuous portfolio simulation only supports exit_adjustment=0"
+            )
+
+        if allow_entry_field_override:
+            if profile.exit_price_field != profile.entry_price_field:
+                raise ValueError(
+                    "VectorBTBacktestRunner does not support mismatched entry/exit price fields "
+                    f"(entry_price_field={profile.entry_price_field!r}, "
+                    f"exit_price_field={profile.exit_price_field!r}); "
+                    "continuous portfolio simulation requires exit_price_field == entry_price_field"
+                )
+        elif profile.exit_price_field != entry_field:
+            raise ValueError(
+                "VectorBTBacktestRunner does not support mismatched entry/exit price fields "
+                f"(entry_price_field={entry_field!r}, "
+                f"exit_price_field={profile.exit_price_field!r}); "
+                "continuous portfolio simulation requires exit_price_field == entry_price_field"
             )
 
         if entry_offset_bars is None:
@@ -148,6 +174,7 @@ class ExecutionScheduler:
         self,
         *,
         entry_price_field: str | None = None,
+        exit_price_field: str | None = None,
         allow_short: bool | None = None,
         benchmark_instrument: str | None = None,
         update_benchmark: bool = False,
@@ -161,6 +188,8 @@ class ExecutionScheduler:
         }
         if entry_price_field is not None:
             overrides["entry_price_field"] = entry_price_field
+        if exit_price_field is not None:
+            overrides["exit_price_field"] = exit_price_field
         if allow_short is not None:
             overrides["allow_short"] = bool(allow_short)
         if update_benchmark:
@@ -293,14 +322,14 @@ def resolve_calendar_signal_bar(
 def resolve_runner_execution(
     runner: Any,
     effective_entry_field: str,
-) -> tuple[ExecutionScheduler, ExecutionProfile]:
-    """Build and validate ``(ExecutionScheduler, effective_ExecutionProfile)`` for a backtest runner."""
+) -> tuple[ExecutionScheduler, PortfolioExecutionProfile]:
+    """Build and validate ``(ExecutionScheduler, effective_PortfolioExecutionProfile)`` for a backtest runner."""
     slot = getattr(runner, "slot", None)
-    profile = slot.microstructure.execution_profile if slot is not None else None
+    profile = resolve_slot_backtest_profile(slot)
     allow_override = slot is not None and slot.slot_id == "jq_ashare_local"
     if profile is None:
-        profile = _execution_profile_cls()(
-            effective_entry_field, "close", 1, 0, "decimal", "endpoints_only", "cross_session"
+        profile = _portfolio_execution_profile_cls()(
+            effective_entry_field, effective_entry_field, 1, 0, "decimal", "endpoints_only", "cross_session"
         )
         allow_override = True
     scheduler = ExecutionScheduler.for_backtest(
@@ -313,14 +342,22 @@ def resolve_runner_execution(
     buy_rate = float(getattr(runner, "buy_cost_rate", 0.0))
     sell_rate = float(getattr(runner, "sell_cost_rate", 0.0))
     slippage = float(getattr(runner, "slippage", 0.0))
-    effective = scheduler.effective_profile(
+    effective_exit_field = effective_entry_field if allow_override else profile.exit_price_field
+    effective_raw = scheduler.effective_profile(
         entry_price_field=effective_entry_field,
+        exit_price_field=effective_exit_field,
         allow_short=bool(getattr(runner, "allow_short", False)),
         benchmark_instrument=getattr(runner, "benchmark_instrument", None),
         update_benchmark=True,
         commission_bps=round(buy_rate * 10_000.0, 12),
         sell_tax_bps=round(max(0.0, sell_rate - buy_rate) * 10_000.0, 12),
         slippage_bps=round(slippage * 10_000.0, 12),
+    )
+    effective = _portfolio_execution_profile_cls()(**asdict(effective_raw))
+    validate_effective_execution_profile(
+        profile,
+        effective,
+        allow_entry_field_override=allow_override,
     )
     return scheduler, effective
 
@@ -345,12 +382,22 @@ def validate_effective_execution_profile(
             f"Effective exit_adjustment={effective.exit_adjustment} disagrees with "
             f"declared exit_adjustment={declared.exit_adjustment}"
         )
+    if effective.exit_adjustment != 0:
+        raise ValueError(
+            f"Effective exit_adjustment={effective.exit_adjustment} is unsupported; "
+            "continuous portfolio simulation only supports exit_adjustment=0"
+        )
     if effective.boundary_policy != declared.boundary_policy:
         raise ValueError(
             f"Effective boundary_policy={effective.boundary_policy!r} disagrees with "
             f"declared boundary_policy={declared.boundary_policy!r}"
         )
-    if effective.exit_price_field != declared.exit_price_field:
+    if effective.exit_price_field != effective.entry_price_field:
+        raise ValueError(
+            f"Effective exit_price_field={effective.exit_price_field!r} disagrees with "
+            f"effective entry_price_field={effective.entry_price_field!r}"
+        )
+    if not allow_entry_field_override and effective.exit_price_field != declared.exit_price_field:
         raise ValueError(
             f"Effective exit_price_field={effective.exit_price_field!r} disagrees with "
             f"declared exit_price_field={declared.exit_price_field!r}"

@@ -25,6 +25,7 @@ def test_cli_legacy_imports() -> None:
         "_extract_symbolic_factor_mining_metrics "
         "_bar_artifact_paths _validate_bar_output_paths _parse_strict_utc_csv_column _duckdb_count_tables "
         "_handle_time_series_analysis _handle_read_bar_evaluations _handle_single_factor_analysis "
+        "_handle_verify_factor_causality "
         "_handle_symbolic_factor_mining _handle_quanta_alpha_realize _handle_factor_synthesis "
         "_handle_parent_factor_screen _handle_monitor_refresh _handle_alignment_run _handle_bar_storage _handle_factor_values_store "
         "config_sha256 read_execution_result D9CapacityAuditError build_capacity_audit "
@@ -56,7 +57,7 @@ def test_cli_subcommand_inventory() -> None:
         "outputs-gc", "market-db", "build-bars", "audit-bars", "import-bars", "build-roll-schedule",
         "write-factor-values", "read-factor-values", "verify-factor-values",
         "export-strategy", "verify-target-alignment", "alignment-run",
-        "single-factor-analysis", "time-series-analysis", "read-bar-evaluations",
+        "single-factor-analysis", "time-series-analysis", "verify-factor-causality", "read-bar-evaluations",
         "symbolic-factor-mining", "quanta-alpha-realize", "factor-synthesis", "parent-factor-screen",
         "monitor-refresh",
     ]

@@ -24,7 +24,7 @@ from utils.market_db.validation import (
     validate_market_db_execution_rules, validate_market_db_metadata, validate_market_db_provider,
 )
 from utils.session_calendar import Session, View
-from utils.slots.contracts import ExecutionProfile, InstrumentSpec, MarketSlot
+from utils.slots.contracts import ExecutionProfile, InstrumentSpec, MarketSlot, PortfolioExecutionProfile
 from utils.time_axis import BarSchedule, Frequency
 
 from .policy import DaysBeforeExpiry, RollPolicy, expiry_date, resolve_roll_policy
@@ -91,6 +91,11 @@ class _FuturesData:
         self.execution_profile = ExecutionProfile(
             rules.entry_price_field, rules.exit_price_field, rules.min_entry_offset,
             rules.exit_adjustment, rules.unit, rules.gap_rule, 'cross_session', allow_short=True,
+            commission_bps=commission_bps, slippage_bps=slippage_bps,
+        )
+        self.portfolio_execution_profile = PortfolioExecutionProfile(
+            rules.entry_price_field, rules.entry_price_field, rules.min_entry_offset,
+            0, rules.unit, rules.gap_rule, 'cross_session', allow_short=True,
             commission_bps=commission_bps, slippage_bps=slippage_bps,
         )
         days = self.calendar.sessions().strftime('%Y-%m-%d')

@@ -494,7 +494,7 @@ def test_declarative_24x7_long_short_end_to_end_with_scheme_b(tmp_path: Path) ->
         "microstructure": {"provider": "open"},
         "execution_profile": {
             "entry_price_field": "open",
-            "exit_price_field": "close",
+            "exit_price_field": "open",
             "min_entry_offset_bars": 1,
             "exit_adjustment": 0,
             "return_unit": "decimal",
@@ -696,7 +696,7 @@ def _make_24x7_hourly_slot(
         "microstructure": {"provider": "open"},
         "execution_profile": {
             "entry_price_field": entry_price_field,
-            "exit_price_field": "close",
+            "exit_price_field": entry_price_field,
             "min_entry_offset_bars": 1,
             "exit_adjustment": 0,
             "return_unit": "decimal",
@@ -785,7 +785,7 @@ def test_intraday_dynamic_pool_respects_bar_timestamps_and_session_dates(tmp_pat
         "universe": {"provider": "static", "options": {"instruments": {s: {"asset_class": "equity", "currency": "CNY"} for s in ("A", "B")}, "universes": {"all": ["A", "B"]}}},
         "aux_features": {"provider": "none"},
         "microstructure": {"provider": "open"},
-        "execution_profile": {"entry_price_field": "open", "exit_price_field": "close", "min_entry_offset_bars": 1, "exit_adjustment": 0, "return_unit": "decimal", "gap_rule": "endpoints_only", "boundary_policy": "cross_session", "allow_short": False, "commission_bps": 0.0, "sell_tax_bps": 0.0, "slippage_bps": 0.0, "benchmark_instrument": None},
+        "execution_profile": {"entry_price_field": "open", "exit_price_field": "open", "min_entry_offset_bars": 1, "exit_adjustment": 0, "return_unit": "decimal", "gap_rule": "endpoints_only", "boundary_policy": "cross_session", "allow_short": False, "commission_bps": 0.0, "sell_tax_bps": 0.0, "slippage_bps": 0.0, "benchmark_instrument": None},
     }
     sh_slot = build_declarative_slot(SlotConfig.from_mapping(sh_cfg), base_dir=tmp_path)
     from utils.time_axis import Frequency
@@ -1708,7 +1708,7 @@ def test_overlay_liquidity_cap_preserves_capped_weights_and_enforces_caps_on_rea
             "microstructure": {"provider": "open"},
             "execution_profile": {
                 "entry_price_field": "open",
-                "exit_price_field": "close",
+                "exit_price_field": "open",
                 "min_entry_offset_bars": 1,
                 "exit_adjustment": 0,
                 "return_unit": "decimal",
@@ -2051,11 +2051,11 @@ def test_overlay_liquidity_cap_reallocation_caps_total_gross_including_blocked_h
             slot=slot,
             frequency="1h",
         )
-        # Round 1 (t1, pool A/D): A cap=30k, D cap=20k (daily ADV * 24 for 1h holding_period=1) -> holds A=30k, D=20k
-        # Round 2 (t2, pool A/C): A cap=30k, C cap=30k -> initial_gross=60k
+        # Round 1 (t1=01:00Z, signal bar t0=00:00Z available_at=t1): D cap=20k -> holds A=30k, D=20k
+        # Round 2 (t2=02:00Z, signal bar t1=01:00Z available_at=t2): A cap=30k, C cap=30k -> initial_gross=60k
         def _adv(stocks, as_of, lookback):
             ts = pd.Timestamp(as_of).tz_convert("UTC") if pd.Timestamp(as_of).tzinfo else pd.Timestamp(as_of, tz="UTC")
-            if ts < t1:
+            if ts <= t1:
                 return {"A": 2_400_000.0, "C": 2_400_000.0, "D": 24.0 * 20_000.0 / 0.30}
             return {"A": 2_400_000.0, "C": 2_400_000.0, "D": 2_400_000.0}
 

@@ -210,12 +210,49 @@ def build_parser(*, public_bar_cli: bool = False, parser_class: type[argparse.Ar
     analyze.add_argument(
         "--pool", action="append", default=[], help="Append a dynamic pool name"
     )
+    analyze.add_argument(
+        "--causal-gate-policy",
+        choices=("reject", "fallback"),
+        default=None,
+        help="Policy when CAUSAL_VECTORIZED fast-path verification fails",
+    )
 
     bar_analysis = subparsers.add_parser("time-series-analysis", help="Evaluate CSV or MarketSlot factors in an explicit mode")
     add_common(bar_analysis)
     bar_analysis.add_argument("--config", default="", help="Bar analysis JSON config")
     bar_analysis.add_argument("--diagnostics-report", action=argparse.BooleanOptionalAction,
                               help="Publish time-series diagnostics in JSON, CSV and Markdown")
+    bar_analysis.add_argument("--factor", default="", help="Optional factor module path for Slot evaluation")
+    bar_analysis.add_argument("--factor-class", default=None, help="Optional factor class name in --factor")
+    bar_analysis.add_argument(
+        "--causal-gate-policy",
+        choices=("reject", "fallback"),
+        default=None,
+        help="Policy when CAUSAL_VECTORIZED fast-path verification fails",
+    )
+
+    verify_causal = subparsers.add_parser(
+        "verify-factor-causality",
+        help="Run automatic causal verification gate for fast-path Slot/FactorBase factors",
+    )
+    add_common(verify_causal)
+    verify_causal.add_argument("--factor", default="", help="Factor module .py path")
+    verify_causal.add_argument("--factor-class", default=None, help="Optional factor class name")
+    verify_causal.add_argument("--slot", "--slot-config", dest="slot", default=None, help="SlotConfig YAML/JSON path or jq_ashare_local")
+    verify_causal.add_argument("--slot-id", default=None, help="Configured MarketSlot identity")
+    verify_causal.add_argument("--slot-db", default=None, help="Read-only DuckDB path for native slots")
+    verify_causal.add_argument("--market-db", default=None, help="Database ID in QUANT_DATA_BINDINGS.market_dbs")
+    verify_causal.add_argument("--start-date", default=None, help="Evaluation start date YYYY-MM-DD")
+    verify_causal.add_argument("--end-date", default=None, help="Evaluation end date YYYY-MM-DD")
+    verify_causal.add_argument("--frequency", default=None, help="Slot frequency (e.g. 60min, 1d)")
+    verify_causal.add_argument("--analysis-mode", choices=("time_series", "cross_sectional"), default="time_series")
+    verify_causal.add_argument("--view", choices=("ETH", "RTH"), default="ETH")
+    verify_causal.add_argument("--instruments", default=None, help="Comma-separated instrument IDs")
+    verify_causal.add_argument("--slot-execution-mode", choices=("auto", "vectorized", "incremental", "pit_replay"), default=None)
+    verify_causal.add_argument("--n-truncations", type=int, default=3)
+    verify_causal.add_argument("--n-pit-samples", type=int, default=5)
+    verify_causal.add_argument("--seed", type=int, default=42)
+    verify_causal.add_argument("--on-failure", choices=("reject", "fallback"), default="reject")
     for subparser in (bar_analysis, analyze):
         subparser.add_argument("--slot", "--slot-config", dest="slot", help="SlotConfig YAML/JSON path or jq_ashare_local")
         subparser.add_argument("--market-db", help="Database ID in QUANT_DATA_BINDINGS.market_dbs")

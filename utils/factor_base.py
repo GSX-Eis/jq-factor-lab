@@ -313,6 +313,7 @@ class FactorBase:
         return _bar_bridge.session_rolling(self, data, column, window, **kwargs)
 
     def _get_market_factor_values(self, force_recalculate: bool = False) -> pd.DataFrame:
+        _slot_execution_mode.require_ashare_causal_gate(self)
         return _bar_bridge._get_market_factor_values(self, force_recalculate)
 
     @staticmethod
@@ -360,10 +361,12 @@ class FactorBase:
 
     def get_factor_values(self, force_recalculate: bool = False) -> pd.DataFrame:
         """Compute or load the factor values for the configured stock pools."""
+        _slot_execution_mode.require_ashare_causal_gate(self)
         return _execution.get_factor_values(self, FactorBase, force_recalculate)
 
     def get_factor_values_unfiltered(self, force_recalculate: bool = False) -> pd.DataFrame:
         """Compute over the current stock universe without period membership filtering."""
+        _slot_execution_mode.require_ashare_causal_gate(self)
         return _execution.get_factor_values_unfiltered(self, FactorBase, force_recalculate)
 
     def get_factor_values_unfiltered_chunked(self, chunk_size: int) -> pd.DataFrame:

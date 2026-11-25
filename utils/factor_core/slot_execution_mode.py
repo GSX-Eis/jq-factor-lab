@@ -286,7 +286,7 @@ def validate_slot_execution_mode(mode: str) -> str:
 
 
 def slot_has_historical_revision(factor) -> tuple[bool, str]:
-    """Conservatively decide whether a Slot's BarFeed/Universe can revise history."""
+    """Conservatively decide whether a Slot's BarFeed/Universe/AuxFeatures can revise history."""
     slot = getattr(factor, "slot", None)
     if slot is None:
         return True, "missing_slot"
@@ -297,14 +297,17 @@ def slot_has_historical_revision(factor) -> tuple[bool, str]:
 
     feed = slot.bar_feed
     universe = slot.universe
+    aux = getattr(slot, "aux_features", None)
     if getattr(slot, "has_historical_revision", None) is True:
         return True, "slot_has_historical_revision"
     if getattr(feed, "has_historical_revision", None) is True:
         return True, "feed_has_historical_revision"
     if getattr(universe, "has_historical_revision", None) is True:
         return True, "universe_has_historical_revision"
+    if getattr(aux, "has_historical_revision", None) is True:
+        return True, "aux_features_has_historical_revision"
 
-    from slots.declarative.slot import DeclarativeBarFeed, DeclarativeUniverse
+    from slots.declarative.slot import DeclarativeAuxFeatures, DeclarativeBarFeed, DeclarativeUniverse
     from slots.futures.slot import _FuturesData
 
     feed_static = (
@@ -323,6 +326,15 @@ def slot_has_historical_revision(factor) -> tuple[bool, str]:
     )
     if not universe_static:
         return True, "unverified_universe"
+
+    aux_static = (
+        aux is None
+        or getattr(aux, "has_historical_revision", None) is False
+        or isinstance(aux, DeclarativeAuxFeatures)
+        or (isinstance(aux, _FuturesData) and getattr(aux, "adjustment", None) == "none")
+    )
+    if not aux_static:
+        return True, "unverified_aux_features"
 
     return False, "immutable_no_revision"
 
@@ -345,14 +357,65 @@ def factor_supports_incremental(factor, factor_base_cls: type) -> bool:
     return has_init and has_step
 
 
+def fast_path_request_status(
+    factor,
+    factor_base_cls: type,
+    *,
+    requested_mode: str | None = None,
+    bar_grid: bool = True,
+) -> tuple[bool, str, str]:
+    """Report whether the factor requests a fast path (declaration only, not causal proof)."""
+    requested = validate_slot_execution_mode(
+        requested_mode if requested_mode is not None else getattr(factor, "slot_execution_mode", "auto")
+    )
+    if requested == "pit_replay":
+        return False, "pit_replay", "explicit_pit_replay"
+
+    supports_inc = bar_grid and factor_supports_incremental(factor, factor_base_cls)
+    causal_flag = getattr(factor, "CAUSAL_VECTORIZED", None)
+
+    if requested == "incremental":
+        if not supports_inc:
+            return False, "pit_replay", "fallback_pit_replay:incremental_not_implemented"
+        return True, "incremental", "explicit_incremental_requested"
+
+    if requested == "vectorized":
+        if causal_flag is not True:
+            reason = "non_causal_factor" if causal_flag is False else "unverified_factor_causality"
+            return False, "pit_replay", f"fallback_pit_replay:{reason}"
+        return True, "vectorized", "explicit_vectorized_requested"
+
+    # requested == "auto"
+    if supports_inc:
+        return True, "incremental", "auto_incremental_requested"
+    if causal_flag is True:
+        return True, "vectorized", "auto_vectorized_requested"
+    return False, "pit_replay", "fallback_pit_replay:unverified_factor_causality"
+
+
+def _causal_gate_block_reason(verified: bool | None, require_verified: bool) -> str | None:
+    if verified is False:
+        return "causal_gate_failed"
+    if require_verified and verified is not True:
+        return "causal_verification_required"
+    return None
+
+
 def resolve_slot_execution_mode(
     factor,
     factor_base_cls: type,
     *,
     requested_mode: str | None = None,
     bar_grid: bool = True,
+    causal_verified: bool | None = None,
+    require_causal_verification: bool = False,
 ) -> tuple[str, str]:
-    """Resolve safe non-A-share Slot execution mode and human-readable rationale."""
+    """Resolve safe non-A-share Slot execution mode and human-readable rationale.
+
+    ``CAUSAL_VECTORIZED = True`` is treated as a fast-path request declaration,
+    not proof of causality: any failed or missing (when required) gate check
+    blocks fast paths and falls back to ``pit_replay``.
+    """
     requested = validate_slot_execution_mode(
         requested_mode if requested_mode is not None else getattr(factor, "slot_execution_mode", "auto")
     )
@@ -371,6 +434,9 @@ def resolve_slot_execution_mode(
 
     supports_inc = bar_grid and factor_supports_incremental(factor, factor_base_cls)
     causal_flag = getattr(factor, "CAUSAL_VECTORIZED", None)
+    verified = causal_verified if causal_verified is not None else getattr(factor, "_causal_gate_passed", None)
+    require_verified = require_causal_verification or bool(getattr(factor, "_require_causal_verification", False))
+    gate_block = _causal_gate_block_reason(verified, require_verified)
 
     if requested == "incremental":
         if not supports_inc:
@@ -380,6 +446,9 @@ def resolve_slot_execution_mode(
                 bar_grid,
             )
             return "pit_replay", "fallback_pit_replay:incremental_not_implemented"
+        if gate_block is not None:
+            factor.logger.warning("Slot execution mode incremental blocked (%s); falling back to pit_replay", gate_block)
+            return "pit_replay", f"fallback_pit_replay:{gate_block}"
         return "incremental", "explicit_incremental"
 
     if requested == "vectorized":
@@ -391,11 +460,28 @@ def resolve_slot_execution_mode(
                 causal_flag,
             )
             return "pit_replay", f"fallback_pit_replay:{reason}"
+        if gate_block is not None:
+            factor.logger.warning("Slot execution mode vectorized blocked (%s); falling back to pit_replay", gate_block)
+            return "pit_replay", f"fallback_pit_replay:{gate_block}"
         return "vectorized", "explicit_vectorized"
 
     # requested == "auto"
     if supports_inc:
+        if gate_block is not None:
+            factor.logger.warning("Slot execution mode auto incremental blocked (%s); falling back to pit_replay", gate_block)
+            return "pit_replay", f"fallback_pit_replay:{gate_block}"
         return "incremental", "auto_incremental"
     if causal_flag is True:
+        if gate_block is not None:
+            factor.logger.warning("Slot execution mode auto vectorized blocked (%s); falling back to pit_replay", gate_block)
+            return "pit_replay", f"fallback_pit_replay:{gate_block}"
         return "vectorized", "auto_causal_vectorized"
     return "pit_replay", "fallback_pit_replay:unverified_factor_causality"
+
+
+def require_ashare_causal_gate(factor) -> None:
+    """Block direct factor evaluation when an A-share factor failed the causal gate."""
+    if getattr(factor, "_ashare_panel", True) and getattr(factor, "_causal_gate_passed", None) is False:
+        raise RuntimeError(
+            f"Causal fast-path gate rejected A-share factor {factor.factor_name}; no pit_replay fallback exists"
+        )

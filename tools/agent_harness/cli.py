@@ -36,6 +36,9 @@ from tools.agent_harness.handlers.analysis import (
     _handle_single_factor_analysis as _handle_single_factor_analysis,
     _handle_symbolic_factor_mining as _handle_symbolic_factor_mining,
 )
+from tools.agent_harness.handlers.causal_gate import (
+    _handle_verify_factor_causality as _handle_verify_factor_causality,
+)
 from tools.agent_harness.handlers.monitor import (
     _duckdb_count_tables as _duckdb_count_tables,
     _handle_alignment_run as _handle_alignment_run,
@@ -165,6 +168,8 @@ def main(argv: Sequence[str] | None = None, *, public_bar_cli: bool = False) -> 
         if args.materialize_only and not args.factor:
             parser.error("--materialize-only requires --factor")
         result = _handle_single_factor_analysis(args)
+    elif args.command == "verify-factor-causality":
+        result = _handle_verify_factor_causality(args)
     elif args.command == "symbolic-factor-mining":
         result = _handle_symbolic_factor_mining(args)
     elif args.command == "quanta-alpha-realize":

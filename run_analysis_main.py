@@ -500,6 +500,39 @@ def _publish_daily_bar_evaluation(config: Dict, *, factor_name: str, pool_name: 
         entry_offset_bars=runner.execution_lag, n_quantiles=runner.n_quantiles,
     )
 
+def _run_causal_gate_for_factor(factor: Any, config: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Run the automatic causal verification gate when a factor requests fast-path execution."""
+    from utils.factor_base import FactorBase
+    from utils.factor_core.slot_execution_mode import fast_path_request_status
+
+    if not isinstance(factor, FactorBase):
+        return None
+    bar_grid = bool(getattr(getattr(factor, "_frequency_route", None), "bar_grid", False))
+    requested, _, _ = fast_path_request_status(factor, FactorBase, bar_grid=bar_grid)
+    if not requested:
+        return None
+
+    from tools.agent_harness.causal_gate import CausalFastPathGateError, verify_factor_causality
+
+    policy = config.get("causal_gate_policy") or "reject"
+    gate = verify_factor_causality(factor, on_failure=policy, apply_to_factor=True)
+    report = gate.to_dict()
+    config.setdefault("_causal_gate_reports", []).append(report)
+    if not gate.ok:
+        config["_causal_gate_failure"] = report
+        raise CausalFastPathGateError(
+            f"Causal fast-path gate rejected {gate.factor_name}: {gate.failure_reason}",
+            gate_result=report,
+        )
+    if gate.status == "failed_fallback":
+        logger.warning(
+            "Causal fast-path gate fell back to pit_replay for %s: %s",
+            gate.factor_name,
+            gate.failure_reason,
+        )
+    return report
+
+
 def analyze_factor_static(factor, price_fetcher, runner, writer, monthly_writer, config, forward_returns=None):
     """
     对单个因子进行静态股票池分析（保持向后兼容）
@@ -516,6 +549,7 @@ def analyze_factor_static(factor, price_fetcher, runner, writer, monthly_writer,
     logger.info(f"Analyzing factor: {factor_name}")
     
     try:
+        causal_gate_report = _run_causal_gate_for_factor(factor, config)
         # 获取因子值
         factor_df = factor.get_factor_values()
         logger.info(f"Factor values shape: {factor_df.shape}")
@@ -575,6 +609,8 @@ def analyze_factor_static(factor, price_fetcher, runner, writer, monthly_writer,
                 'stock_count': len(code_list)
             }
         }
+        if causal_gate_report is not None:
+            combined_results['causal_gate'] = causal_gate_report
         
         # Flatten alphalens_results to fix KeyError 'ic' - Handle both dict and DataFrame cases
         if alphalens_results is not None:
@@ -694,6 +730,7 @@ def analyze_factor_dynamic(
             pit_enabled=pit_enabled,
             pit_factor_column=pit_factor_column,
         )
+        causal_gate_report = _run_causal_gate_for_factor(factor, config)
         
         # 🚀 优化：只获取一次数据，避免重复查询 23M+ 行
         # 先获取未过滤的因子值（包含所有股票），然后在内存中过滤
@@ -917,6 +954,8 @@ def analyze_factor_dynamic(
         
         performance['analysis_before_persist_seconds'] = time.perf_counter() - analysis_started
         combined_results['performance_metrics'] = performance.copy()
+        if causal_gate_report is not None:
+            combined_results['causal_gate'] = causal_gate_report
         persist_started = time.perf_counter()
         _publish_daily_bar_evaluation(
             config, factor_name=factor_name, pool_name=pool_name, factors=factor_df,
@@ -1397,6 +1436,12 @@ if __name__ == "__main__":
     parser.add_argument("--slot-config", help="SlotConfig YAML/JSON path or jq_ashare_local")
     parser.add_argument("--dry-run", action="store_true", help="Plan a --market-db Slot evaluation")
     parser.add_argument("--bar-results-db", type=Path)
+    parser.add_argument(
+        "--causal-gate-policy",
+        choices=("reject", "fallback"),
+        default="reject",
+        help="Policy when CAUSAL_VECTORIZED fast-path verification fails",
+    )
     parser.add_argument("--result-out", default="")
     parser.add_argument("--run-id", default="")
     parser.add_argument("--execution-id", default="")
@@ -1505,6 +1550,8 @@ if __name__ == "__main__":
             config['materialize_only'] = True
         if args.mining_only:
             config['mining_only'] = True
+        if getattr(args, 'causal_gate_policy', None):
+            config['causal_gate_policy'] = args.causal_gate_policy
     
         # 如果指定了特定的股票池
         if args.pools and config.get('dynamic_pools'):
@@ -1530,31 +1577,47 @@ if __name__ == "__main__":
     
         from tools.agent_harness.run_result import execution_result
 
-        with execution_result(args.result_out, command="single-factor-analysis",
-                              run_id=args.run_id, execution_id=args.execution_id,
-                              config_path=args.config or os.path.join(
-                                  os.path.dirname(__file__), "backtest_and_analysis", "config.py"
-                              )) as result:
-            main(config, execution=result["execution"])
-            if evaluation_db is not None:
-                from tools.agent_harness.time_series_analysis import (
-                    BarEvaluationStoreFailure, ingest_legacy_daily_evaluations,
-                )
-                from tools.agent_harness.run_result import config_sha256
-
+        causal_gate_rejected = False
+        try:
+            with execution_result(args.result_out, command="single-factor-analysis",
+                                  run_id=args.run_id, execution_id=args.execution_id,
+                                  config_path=args.config or os.path.join(
+                                      os.path.dirname(__file__), "backtest_and_analysis", "config.py"
+                                  )) as result:
                 try:
-                    manifest = ingest_legacy_daily_evaluations(
-                        config['_bar_evaluation_directory'], evaluation_db,
-                        expected_count=result["execution"]["completed"], run_id=args.run_id,
+                    main(config, execution=result["execution"])
+                finally:
+                    gate_reports = config.get("_causal_gate_reports") or []
+                    if gate_reports:
+                        result["metrics"]["causal_gates"] = gate_reports
+                        failed_gate = config.get("_causal_gate_failure")
+                        result["metrics"]["causal_gate"] = failed_gate or gate_reports[0]
+                    if config.get("_causal_gate_failure") is not None:
+                        result["metrics"]["failure_reason"] = "causal_fast_path_gate_failed"
+                        causal_gate_rejected = True
+                if evaluation_db is not None:
+                    from tools.agent_harness.time_series_analysis import (
+                        BarEvaluationStoreFailure, ingest_legacy_daily_evaluations,
                     )
-                except BarEvaluationStoreFailure as exc:
-                    result["metrics"]["_bar_store_failure"] = dict(
-                        code=exc.code, exit_code=exc.exit_code, details=exc.details, cleanup=exc.cleanup,
-                    )
-                    raise
-                manifest_path = directory / "bar_evaluations.json"
-                manifest_path.write_text(json.dumps(manifest, allow_nan=False), encoding="utf-8")
-                result["artifacts"].append(dict(
-                    artifact_type="bar_evaluation_manifest", path=str(manifest_path),
-                    sha256=config_sha256(manifest_path),
-                ))
+                    from tools.agent_harness.run_result import config_sha256
+
+                    try:
+                        manifest = ingest_legacy_daily_evaluations(
+                            config['_bar_evaluation_directory'], evaluation_db,
+                            expected_count=result["execution"]["completed"], run_id=args.run_id,
+                        )
+                    except BarEvaluationStoreFailure as exc:
+                        result["metrics"]["_bar_store_failure"] = dict(
+                            code=exc.code, exit_code=exc.exit_code, details=exc.details, cleanup=exc.cleanup,
+                        )
+                        raise
+                    manifest_path = directory / "bar_evaluations.json"
+                    manifest_path.write_text(json.dumps(manifest, allow_nan=False), encoding="utf-8")
+                    result["artifacts"].append(dict(
+                        artifact_type="bar_evaluation_manifest", path=str(manifest_path),
+                        sha256=config_sha256(manifest_path),
+                    ))
+        except Exception:
+            if causal_gate_rejected:
+                raise SystemExit(4)
+            raise

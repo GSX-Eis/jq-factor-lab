@@ -90,6 +90,12 @@ def _handle_time_series_analysis(
         value = getattr(args, name, None)
         if value is not None:
             config[name] = value
+    if getattr(args, "factor", None):
+        config["factor_file"] = str(cli._resolve_repo_relative_path(args.factor))
+    if getattr(args, "factor_class", None):
+        config["factor_class"] = args.factor_class
+    if getattr(args, "causal_gate_policy", None) is not None:
+        config["causal_gate_policy"] = args.causal_gate_policy
     cli_slot = getattr(args, "slot", None)
     if cli_slot is not None:
         config.pop("slot_config", None)
@@ -253,13 +259,26 @@ def _handle_time_series_analysis(
             raise RuntimeError(f"Bar evaluation worker returned invalid JSON (exit {proc.returncode}): "
                                f"{cli._tail(proc.stderr or proc.stdout)}") from exc
         if not payload["ok"]:
+            err_details = payload["error"].get("details") if isinstance(payload["error"], dict) else None
+            fail_metrics = (
+                {"causal_gate": err_details["causal_gate"]}
+                if isinstance(err_details, dict) and "causal_gate" in err_details
+                else {}
+            )
             result = cli._failure_result(**common, mode="subprocess", reason=payload["error"]["code"],
-                exit_code=payload["exit_code"], metrics={}, artifacts=cli._common_artifacts(output_dir))
+                exit_code=payload["exit_code"], metrics=fail_metrics, artifacts=cli._common_artifacts(output_dir))
             result.error = payload["error"]
         elif proc.returncode != 0:
             raise RuntimeError(f"Bar evaluation worker exited {proc.returncode}: {proc.stderr}")
         else:
             metrics_out = dict(payload["metrics"])
+            warnings_out: list[str] = []
+            gate_report = metrics_out.get("causal_gate")
+            if isinstance(gate_report, dict) and gate_report.get("status") == "failed_fallback":
+                warnings_out.append(
+                    f"Causal fast-path gate fell back to pit_replay for {gate_report.get('factor_name')}: "
+                    f"{gate_report.get('failure_reason')}"
+                )
             if results_db_path is not None:
                 phase = "results_db"
                 receipt = ingest_evaluation(
@@ -274,7 +293,7 @@ def _handle_time_series_analysis(
                     "status": receipt.status,
                 }
             result = cli._success_result(**common, mode="subprocess", metrics=metrics_out,
-                artifacts=cli._common_artifacts(output_dir) + payload["artifacts"])
+                artifacts=cli._common_artifacts(output_dir) + payload["artifacts"], warnings=warnings_out)
     except Exception as exc:
         if phase == "results_db":
             failure = BarEvaluationStoreFailure(exc, [destination])

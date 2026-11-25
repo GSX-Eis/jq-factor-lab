@@ -107,6 +107,7 @@ jobs:
         run: |
           python3 -m pip install '.[dev,synthesis,backtest]'
           python3 -m pip check
+          python3 -c 'import vectorbt as vbt; assert hasattr(vbt, "Portfolio")'
           python3 -m pytest -q -p no:cacheprovider
       - name: Exercise the MCP stdio protocol
         run: |

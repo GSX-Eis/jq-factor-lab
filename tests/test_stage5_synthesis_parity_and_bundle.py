@@ -707,7 +707,7 @@ def test_harness_factor_synthesis_declarative_24x7_long_short_end_to_end(tmp_pat
         "microstructure": {"provider": "open"},
         "execution_profile": {
             "entry_price_field": "open",
-            "exit_price_field": "close",
+            "exit_price_field": "open",
             "min_entry_offset_bars": 1,
             "exit_adjustment": 0,
             "return_unit": "decimal",
@@ -1036,7 +1036,7 @@ def test_explicit_slot_entry_price_field_and_effective_filter_manifest(tmp_path:
             "microstructure": {"provider": "open"},
             "execution_profile": {
                 "entry_price_field": entry_field,
-                "exit_price_field": "close",
+                "exit_price_field": entry_field,
                 "min_entry_offset_bars": 0,
                 "exit_adjustment": 0,
                 "return_unit": "decimal",
@@ -1245,7 +1245,7 @@ def test_bundle_records_blend_fallback_factors_and_data_version_digests(tmp_path
         "universe": {"provider": "static", "options": {"instruments": {s: {"asset_class": "crypto", "currency": "USD"} for s in syms}, "universes": {"spot": syms}}},
         "aux_features": {"provider": "none"},
         "microstructure": {"provider": "open"},
-        "execution_profile": {"entry_price_field": "open", "exit_price_field": "close", "min_entry_offset_bars": 1, "exit_adjustment": 0, "return_unit": "decimal", "gap_rule": "endpoints_only", "boundary_policy": "cross_session", "allow_short": True, "commission_bps": 0.0, "sell_tax_bps": 0.0, "slippage_bps": 0.0, "benchmark_instrument": None},
+        "execution_profile": {"entry_price_field": "open", "exit_price_field": "open", "min_entry_offset_bars": 1, "exit_adjustment": 0, "return_unit": "decimal", "gap_rule": "endpoints_only", "boundary_policy": "cross_session", "allow_short": True, "commission_bps": 0.0, "sell_tax_bps": 0.0, "slippage_bps": 0.0, "benchmark_instrument": None},
     }
     slot_path = tmp_path / "crypto_fp_slot.json"
     slot_path.write_text(json.dumps(slot_cfg), encoding="utf-8")
@@ -3200,7 +3200,7 @@ def test_explicit_null_top_k_uses_default_5_across_candidates_backtest_return_ar
         "microstructure": {"provider": "open"},
         "execution_profile": {
             "entry_price_field": "open",
-            "exit_price_field": "close",
+            "exit_price_field": "open",
             "min_entry_offset_bars": 1,
             "exit_adjustment": 0,
             "return_unit": "decimal",
@@ -3437,7 +3437,7 @@ def test_top_k_takes_priority_over_scalar_and_list_top_pct_across_entries_and_e2
         "microstructure": {"provider": "open"},
         "execution_profile": {
             "entry_price_field": "open",
-            "exit_price_field": "close",
+            "exit_price_field": "open",
             "min_entry_offset_bars": 1,
             "exit_adjustment": 0,
             "return_unit": "decimal",
