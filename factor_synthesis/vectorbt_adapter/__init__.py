@@ -7,6 +7,13 @@ Replaces removed Qlib backtest functionality.
 
 from .alignment_data_writer import AlignmentDataWriter
 from .backtest_runner import VectorBTBacktestRunner
+from .futures_execution import (
+    ContinuousFuturesNominalModeError,
+    FuturesExecutionConfig,
+    FuturesExecutionError,
+    FuturesMarginError,
+    FuturesPortfolio,
+)
 from .slot_provider import SlotDataProvider
 from .universe_filter import (
     UniverseFilterError,
@@ -17,6 +24,11 @@ from .universe_filter import (
 
 __all__ = [
     "AlignmentDataWriter",
+    "ContinuousFuturesNominalModeError",
+    "FuturesExecutionConfig",
+    "FuturesExecutionError",
+    "FuturesMarginError",
+    "FuturesPortfolio",
     "SlotDataProvider",
     "UniverseFilterError",
     "UniverseFilterPlugin",

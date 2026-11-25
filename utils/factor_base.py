@@ -16,6 +16,8 @@ from utils.factor_core import (
     execution as _execution,
     legacy_storage as _legacy_storage,
     slot_binding as _slot_binding,
+    slot_execution_mode as _slot_execution_mode,
+    slot_fast_path as _slot_fast_path,
     slot_replay as _slot_replay,
 )
 
@@ -73,6 +75,10 @@ def _get_pit_window_from_config(factor_name: str, data_frequency: str = "daily")
 class FactorBase:
     """Base lifecycle and calculation contract for daily and Bar factors."""
 
+    SLOT_EXECUTION_MODE: str = 'auto'
+    CAUSAL_VECTORIZED: Optional[bool] = None
+    INCREMENTAL_ENGINE = None
+
     def __init__(
         self,
         db_connection,
@@ -120,6 +126,7 @@ class FactorBase:
         slot_registry: _SlotRegistry | None = None,
         slot_config_hash: str | None = None,
         universe_id: str | None = None,
+        slot_execution_mode: Optional[str] = None,
     ):
         """Configure the factor, its input sources and stock universe."""
         if monthly_stock_pools is not None and stock_pools_by_period is not None:
@@ -148,6 +155,10 @@ class FactorBase:
         if slot_config_hash is not None and (not isinstance(slot_config_hash, str) or not slot_config_hash.strip()):
             raise ValueError('slot_config_hash must be a nonempty string')
         self.universe_id = universe_id
+        self.slot_execution_mode = _slot_execution_mode.validate_slot_execution_mode(
+            slot_execution_mode if slot_execution_mode is not None else type(self).SLOT_EXECUTION_MODE
+        )
+        self.last_slot_execution_mode: Optional[str] = None
         self.db_connection = db_connection
         self.factor_name = factor_name
         self.start_date = start_date
@@ -303,6 +314,22 @@ class FactorBase:
 
     def _get_market_factor_values(self, force_recalculate: bool = False) -> pd.DataFrame:
         return _bar_bridge._get_market_factor_values(self, force_recalculate)
+
+    @staticmethod
+    def _slot_execution_bindings() -> tuple:
+        return (FactorBase, StockFilter, apply_pit_adjustment, _cache, _slot_execution_mode, _slot_fast_path)
+
+    def get_incremental_engine(self):
+        """Return an optional built-in incremental engine spec for non-A-share Slots."""
+        return getattr(self, 'INCREMENTAL_ENGINE', None)
+
+    def init_incremental_state(self):
+        """Initialize causal incremental state for step-by-step Bar updates."""
+        raise NotImplementedError("增量执行因子需实现 init_incremental_state 和 step_incremental")
+
+    def step_incremental(self, state, bar_slice: pd.DataFrame):
+        """Advance causal state by one cutoff slice and return (new_state, step_values)."""
+        raise NotImplementedError("增量执行因子需实现 init_incremental_state 和 step_incremental")
 
     save_factor_values = _slot_binding.save_factor_values
     save_bar_factor_values = save_factor_values

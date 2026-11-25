@@ -105,9 +105,11 @@ jobs:
           PY
       - name: Run the public test suite
         run: |
-          python3 -m pip install '.[dev,synthesis]'
+          python3 -m pip install '.[dev,synthesis,backtest]'
+          python3 -m pip check
           python3 -m pytest -q -p no:cacheprovider
       - name: Exercise the MCP stdio protocol
         run: |
           python3 -m pip install '.[mcp]'
+          python3 -m pip check
           python3 -m pytest -q -p no:cacheprovider tests/test_public_mcp.py

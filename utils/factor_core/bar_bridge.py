@@ -10,18 +10,9 @@ from utils.data_revision import capture_factor_inputs, carry_factor_inputs, fram
 
 
 def initialize_frequency_route(
-    self,
-    data_frequency: str,
-    analysis_mode: Optional[str],
-    session_view: str,
-    output_frequency: Optional[str],
-    label_config: Optional[dict],
-    data_version: Optional[str],
-    session_calendar,
-    source_revision: Optional[str],
-    *,
-    slot=None,
-    legacy_panel: bool = False,
+    self, data_frequency: str, analysis_mode: Optional[str], session_view: str,
+    output_frequency: Optional[str], label_config: Optional[dict], data_version: Optional[str],
+    session_calendar, source_revision: Optional[str], *, slot=None, legacy_panel: bool = False,
 ) -> None:
     from utils.time_axis.frequency import FactorFrequencyRoute, Frequency
 
@@ -191,17 +182,14 @@ def _read_slot_bars(self, *, execution: bool = False, expected=None, as_of=None)
         grid = pd.concat(grids, ignore_index=True)
     else:
         grid = bars[keys].iloc[:0].assign(session_id=pd.Series(dtype=str))
-    bars = bars.drop(columns='session_id', errors='ignore').merge(
-        grid, on=keys, how='left', validate='one_to_one')
+    bars = bars.drop(columns='session_id', errors='ignore').merge(grid, on=keys, how='left', validate='one_to_one')
     if bars.session_id.isna().any():
         raise ValueError('bars contain timestamps outside the requested Session grid')
-    aligned = grid.merge(bars.drop(columns='session_id'), on=keys, how='left', validate='one_to_one',
-                         indicator=True)
+    aligned = grid.merge(bars.drop(columns='session_id'), on=keys, how='left', validate='one_to_one', indicator=True)
     aligned['observed'] = aligned.pop('_merge').eq('both')
     aligned['frequency'] = frequency.canonical
     hashes = {instrument: calendar.calendar_hash for instrument, calendar in calendars.items()}
-    bars.attrs = dict(_raw_coverage_attrs(coverage), session_view=view, calendar_hash=hashes,
-                      instrument_metadata=metadata)
+    bars.attrs = dict(_raw_coverage_attrs(coverage), session_view=view, calendar_hash=hashes, instrument_metadata=metadata)
     aligned.attrs = bars.attrs.copy()
     return bars, aligned.sort_values(['instrument_id', 'timestamp_utc']).reset_index(drop=True), calendars
 
@@ -352,12 +340,10 @@ def _calculate_panel_window(self, targets, force_recalculate, input_hash) -> pd.
     return carry_factor_inputs(result, declared)
 
 
-def causal_slot_values(self, clock, *, targets=None, force_recalculate=False,
-                       remember=False, calculate=True) -> pd.DataFrame:
-    """Re-read the history as known at each emitted Bar's availability."""
-    targets = clock if targets is None else targets
+def _pit_replay_slot_values(self, clock, targets, *, force_recalculate=False, remember=False, calculate=True) -> pd.DataFrame:
+    """Reference PIT Replay: re-read the history as known at each emitted Bar's availability."""
     bar = self._frequency_route.bar_grid
-    values, diagonals, coverage = [], [], {}
+    values, diagonals, coverage, window_bars = [], [], {}, None
     input_hash = hashlib.sha256() if calculate and self.slot.slot_data_fingerprint in (None, slot_market_db_identity(self.slot)) else None
     for cutoff, target in targets.groupby(_AVAILABLE, sort=True):
         window = clock.loc[clock[_AVAILABLE].le(cutoff)]
@@ -395,6 +381,19 @@ def causal_slot_values(self, clock, *, targets=None, force_recalculate=False,
         provenance['factor_input_sha256'] = input_hash.hexdigest()
     result.attrs['factor_input_fingerprint'] = provenance
     return result
+
+
+def causal_slot_values(self, clock, *, targets=None, force_recalculate=False,
+                       remember=False, calculate=True, execution_mode: str | None = None,
+                       bindings: tuple | None = None) -> pd.DataFrame:
+    """Compute causal Slot factor values using pre-read cache and tiered execution modes."""
+    resolved = bindings if bindings is not None else self._slot_execution_bindings()
+    return resolved[5].dispatch_causal_slot_values(
+        self, clock, clock if targets is None else targets, bindings=resolved,
+        read_slot_bars=_read_slot_bars, remember_market_bars=_remember_market_bars,
+        pool_mask_fn=_pool_mask, panel_dates_fn=_panel_dates, pit_replay_fn=_pit_replay_slot_values,
+        force_recalculate=force_recalculate, remember=remember, calculate=calculate, execution_mode=execution_mode,
+    )
 
 
 def _get_market_factor_values(self, force_recalculate: bool = False) -> pd.DataFrame:

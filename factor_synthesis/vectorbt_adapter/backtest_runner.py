@@ -11,6 +11,7 @@ import os
 import hashlib
 from utils.output_paths import open_diagnostic
 from bisect import bisect_right
+from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Set, Tuple, Union
@@ -18,8 +19,9 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Set, Tuple, Uni
 import numpy as np
 import pandas as pd
 
+from utils.execution_schedule import ExecutionScheduler, resolve_calendar_signal_bar, resolve_runner_execution
 from utils.market_factor import MarketFactorValueStore
-from utils.slots.contracts import MarketSlot
+from utils.slots.contracts import ExecutionProfile, MarketSlot
 from utils.time_axis import Frequency
 
 from ..portfolio_plugins import get_position_plugin, get_strategy_plugin
@@ -48,6 +50,9 @@ from .factor_loader import (
 )
 from utils.strategy_kernel import model_for_date, linear_signal, rank_scores, equal_target_weights, selection_count
 from .alignment_data_writer import AlignmentDataWriter
+from .futures_execution import (
+    FuturesExecutionConfig, FuturesExecutionError, execute_portfolio_simulation, parse_futures_execution_config, validate_nominal_execution_mode,
+)
 from .quality_filter import QualityFilterError, apply_pit_quality_filter
 from .slot_provider import (
     SlotDataProvider,
@@ -177,6 +182,7 @@ class VectorBTBacktestRunner:
         self.benchmark_instrument = self._slot_provider.resolve_benchmark_instrument(top_k_cfg)
         self._last_order_fees: Optional[pd.DataFrame] = None
         self.holding_period = top_k_cfg.get("holding_period", 5)
+        self.entry_offset_bars = top_k_cfg.get("entry_offset_bars")
         self.nth_trading_day = top_k_cfg.get(
             "nth_trading_day", 3
         )  # Default: 3rd trading day
@@ -268,8 +274,13 @@ class VectorBTBacktestRunner:
         self._quality_filter_diagnostics: Dict[str, Any] = {}
         self._selection_diagnostics: List[Dict[str, Any]] = []
         self._execution_diagnostics: Dict[str, Any] = {}
+        self._futures_diagnostics: Dict[str, Any] = {}
         self._mvo_diagnostics: List[Dict[str, Any]] = []
         self.effective_entry_price_field: str = "close"
+        self.effective_execution_profile: Optional[ExecutionProfile] = None
+        self._execution_scheduler: Optional[ExecutionScheduler] = None
+        self.futures_execution_config: FuturesExecutionConfig = parse_futures_execution_config(config)
+        self.execution_mode: str = self.futures_execution_config.execution_mode
 
         # Calendar filters: whole months (1-12) and/or "MM-DD:MM-DD" windows
         cal_cfg = config.get("calendar_filters", {})
@@ -439,12 +450,6 @@ class VectorBTBacktestRunner:
             factor_dates[skip_mask(factor_dates, self.skip_months)]
         )
 
-        # self.logger.info(f"[JQ-ALIGNED V5] 日期对齐:")
-        # self.logger.info(f"  - 价格数据日期: {len(all_price_dates)} 天")
-        # self.logger.info(f"  - 因子数据日期: {len(factor_dates)} 天")
-        # self.logger.info(f"  - 价格数据中 skip_month 日期: {len(skip_month_dates_in_price)} 天")
-        # self.logger.info(f"  - 因子数据中 skip_month 日期: {len(skip_month_dates_in_factor)} 天")
-
         # Align price data to common stocks only
         price_aligned = price_df[list(common_stocks)]
 
@@ -506,9 +511,16 @@ class VectorBTBacktestRunner:
             self.logger.warning(
                 "[VectorBT] Open price data alignment failed, falling back to close prices"
             )
+        self.effective_entry_price_field = "open" if open_aligned is not None else "close"
+        self._execution_scheduler, self.effective_execution_profile = resolve_runner_execution(self, self.effective_entry_price_field)
 
         # Use price dates as common_dates for subsequent logic
         common_dates = all_price_dates
+        self._futures_diagnostics = {}
+        validate_nominal_execution_mode(
+            execution_mode=self.execution_mode, slot=self.slot,
+            instruments=[str(s) for s in common_stocks], index=common_dates, frequency=self.frequency,
+        )
 
         self.logger.info(
             f"[VectorBT] Aligned data: {len(common_dates)} dates, {len(common_stocks)} stocks"
@@ -649,8 +661,13 @@ class VectorBTBacktestRunner:
         # JoinQuant alignment: use open prices for order execution, close prices for valuation
         use_open = open_aligned is not None
         self.effective_entry_price_field = "open" if use_open else "close"
+        self._execution_scheduler, eff_profile = resolve_runner_execution(self, self.effective_entry_price_field)
+        self.effective_execution_profile = eff_profile
         self._execution_diagnostics.update({
-            "effective_entry_price_field": self.effective_entry_price_field, "effective_use_open": bool(use_open),
+            "effective_entry_price_field": self.effective_entry_price_field, "effective_use_open": bool(use_open), "effective_execution_mode": self.execution_mode,
+            "effective_min_entry_offset_bars": eff_profile.min_entry_offset_bars,
+            "effective_exit_adjustment": eff_profile.exit_adjustment, "effective_boundary_policy": eff_profile.boundary_policy,
+            "effective_execution_profile": asdict(eff_profile),
             "effective_quality_filter": dict(self.quality_filter), "effective_enable_tday_filter": bool(self.enable_tday_filter),
             "effective_allow_short": bool(self.allow_short), "effective_benchmark_instrument": self.benchmark_instrument,
             "effective_buy_cost_rate": float(self.buy_cost_rate), "effective_sell_cost_rate": float(self.sell_cost_rate),
@@ -767,9 +784,13 @@ class VectorBTBacktestRunner:
             results["selection_diagnostics_artifact"] = selection_artifact
             if self._quality_filter_diagnostics:
                 results["quality_filter"] = self._quality_filter_diagnostics
+            if self._futures_diagnostics:
+                results["futures_execution"] = self._execution_diagnostics["futures_execution"] = dict(self._futures_diagnostics)
             results["execution_diagnostics"] = dict(self._execution_diagnostics)
             return results
 
+        except FuturesExecutionError:
+            raise
         except Exception as e:
             self.logger.error(f"[VectorBT] Simulation failed: {e}")
             import traceback
@@ -1468,20 +1489,19 @@ class VectorBTBacktestRunner:
         as_of_date_str: str,
         deployed_capital: float,
     ) -> Dict[str, float]:
-        """Compute per-name absolute weight caps implied by the ADV participation limit."""
+        """Compute per-name absolute weight caps implied by ADV/ABV participation limits."""
         liq = self.overlay["liquidity_cap"]
+        raw_liq = (self.config.get("top_k_strategy") or {}).get("liquidity_cap") or self.config.get("liquidity_cap")
         stock_list = sorted(set(stocks))
         capital_base = liq.get("capital_base")
         capital = float(capital_base) if capital_base else float(deployed_capital)
         if not stock_list or capital <= 0:
             return {}
-        adv = self._average_daily_value(stock_list, as_of_date_str, liq["adv_lookback_days"])
-        return compute_liquidity_weight_caps(
-            adv,
-            stock_list,
-            max_participation=float(liq["max_participation"]),
-            holding_period=max(1, int(self.holding_period or 1)),
-            capital=capital,
+        return self._slot_provider.liquidity_weight_caps(
+            stock_list, as_of_date_str, liq_config=liq, raw_liq_config=raw_liq,
+            holding_period=max(1, int(self.holding_period or 1)), capital=capital,
+            price_db_conn=self.price_db_conn, price_db_path=self.price_db_path,
+            adv_fetcher=self._average_daily_value,
         )
 
     def _apply_liquidity_cap(
@@ -2654,10 +2674,11 @@ class VectorBTBacktestRunner:
             )
         elif open_df is not None:
             open_df = sanitize_execution_prices(open_df)
-        self._backtest_previous_dates = {
-            _bar_key(all_dates[idx]): _bar_key(all_dates[idx - 1])
-            for idx in range(1, len(all_dates))
-        }
+        if self._execution_scheduler is None:
+            self._execution_scheduler, self.effective_execution_profile = resolve_runner_execution(self, "open" if open_df is not None else "close")
+        scheduler = self._execution_scheduler
+        entry_offset = scheduler.resolved_entry_offset_bars
+        self._backtest_previous_dates = scheduler.signal_timestamp_map(all_dates, key_fn=_bar_key)
         self._factor_replay_dates = sorted({
             self._backtest_previous_dates[_bar_key(date)]
             for date in rebalance_dates
@@ -2913,29 +2934,22 @@ class VectorBTBacktestRunner:
                 liquidate_targetless(date, date_key)
                 continue
 
-            # [HIGH PRIORITY 2] Get factor values for valid stocks using T-1 data (avoid look-ahead bias)
-            # Use database query to get previous trading day (align with JQ Local)
+            # Resolve signal bar via ExecutionScheduler (strictly respecting min_entry_offset_bars)
             date_str = date_key
             if self.score_source == "input_factor":
                 position = all_dates.get_loc(date)
                 if isinstance(position, slice):
                     position = position.start
-                prev_date = all_dates[int(position) - 1] if int(position) > 0 else None
-                prev_date = (
-                    _bar_key(prev_date)
-                    if prev_date is not None
-                    else None
-                )
+                sig_ts = scheduler.signal_timestamp_for_position(all_dates, int(position))
+                prev_date = _bar_key(sig_ts) if sig_ts is not None else None
             else:
                 prev_date = self._backtest_previous_dates.get(date_str)
-                if prev_date is None and (
-                    is_daily_naive or pd.Timestamp(date) != pd.Timestamp(all_dates[0])
-                ):
-                    prev_date = self._get_previous_trading_day(date_str)
+                if prev_date is None and is_daily_naive:
+                    prev_date = (self._get_previous_trading_day(date_str) if entry_offset == 1 else resolve_calendar_signal_bar(
+                        market_cal if market_cal is not None else self._trading_calendar(), date_str, frequency=self.frequency, entry_offset_bars=entry_offset))
 
             if prev_date is None:
-                # First date or no previous trading day found, skip
-                self.logger.debug(f"[VectorBT] No T-1 found for {date_str}, skipping")
+                self.logger.debug(f"[VectorBT] No signal bar (offset={entry_offset}) for {date_str}, skipping")
                 weights.loc[date, :] = 0.0
                 continue
             prev_date_str = prev_date
@@ -4013,34 +4027,19 @@ class VectorBTBacktestRunner:
         open_aligned: Optional[pd.DataFrame],
         use_open: bool,
     ):
-        """Run the VectorBT target-value simulation. Extracted for two-pass reuse."""
-        vbt_freq, _ = self._vbt_freq_and_year_freq(pd.DatetimeIndex(price_aligned.index))
-        fees_arg: Any = self.buy_cost_rate
-        if (
-            self.buy_cost_rate != self.sell_cost_rate
-            and self._last_order_fees is not None
-            and self._last_order_fees.shape == target_weights.shape
-            and self._last_order_fees.index.equals(target_weights.index)
-            and self._last_order_fees.columns.equals(target_weights.columns)
-        ):
-            fees_arg = self._last_order_fees
-        kwargs: Dict[str, Any] = {
-            "close": price_aligned,
-            "size": target_weights,
-            "size_type": "targetvalue",
-            "fees": fees_arg,
-            "slippage": self.slippage,
-            "cash_sharing": True,
-            "call_seq": "auto",
-            "freq": vbt_freq,
-            "init_cash": self.init_cash,
-            "log": self.portfolio_audit_enabled,
-        }
-        if use_open:
-            kwargs["price"] = sanitize_execution_prices(open_aligned)
-        if self.allow_short:
-            kwargs["direction"] = "both"
-        return vbt.Portfolio.from_orders(**kwargs)
+        """Run VectorBT target-value simulation or contract-level futures simulation."""
+        vbt_freq, year_freq = self._vbt_freq_and_year_freq(pd.DatetimeIndex(price_aligned.index))
+        portfolio, self._futures_diagnostics = execute_portfolio_simulation(
+            execution_mode=self.execution_mode, futures_config=self.futures_execution_config,
+            target_weights=target_weights, price_aligned=price_aligned, open_aligned=open_aligned,
+            use_open=use_open, slot=self.slot, frequency=self.frequency, init_cash=float(self.init_cash),
+            buy_cost_rate=float(self.buy_cost_rate), sell_cost_rate=float(self.sell_cost_rate),
+            slippage=float(self.slippage), allow_short=bool(self.allow_short), vbt_freq=vbt_freq,
+            year_freq=year_freq, last_order_fees=self._last_order_fees,
+            portfolio_audit_enabled=self.portfolio_audit_enabled,
+            sanitize_prices_fn=sanitize_execution_prices, logger=self.logger,
+        )
+        return portfolio
 
     def _compute_turnover_metrics(
         self,

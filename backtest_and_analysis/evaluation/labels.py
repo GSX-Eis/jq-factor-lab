@@ -13,6 +13,8 @@ from typing import TYPE_CHECKING, Literal, TypeVar
 import numpy as np
 import pandas as pd
 
+from utils.execution_schedule import ExecutionScheduler, compute_trade_rows
+
 if TYPE_CHECKING:
     from utils.continuous_bars import ContinuousBarSource
     from utils.session_calendar import SessionCalendar, View
@@ -63,8 +65,7 @@ def _price_returns(entry: _Prices, exit: _Prices, unit: str) -> _Prices:
 
 
 def _trade_rows(signal_rows: _Rows, lag: int, horizon: int, adjustment: int) -> tuple[_Rows, _Rows]:
-    entry_rows = signal_rows + lag
-    return entry_rows, entry_rows + (horizon + adjustment)
+    return compute_trade_rows(signal_rows, lag, horizon, adjustment)
 
 
 def _window_counts(flags: np.ndarray, starts: np.ndarray, stops: np.ndarray) -> np.ndarray:
@@ -391,12 +392,22 @@ class UnifiedReturnLabeler:
             rules.exit_adjustment, rules.unit, rules.gap_rule, boundary_policy,
         ))
 
+    def scheduler(self, entry_offset_bars: int | None = None) -> ExecutionScheduler:
+        """Build an ``ExecutionScheduler`` enforcing this labeler's ``ExecutionProfile``."""
+        from backtest_and_analysis.time_series.contracts import ContractValidationError
+
+        try:
+            return ExecutionScheduler(self.profile, entry_offset_bars=entry_offset_bars)
+        except ValueError as exc:
+            raise ContractValidationError(str(exc)) from exc
+
     def _label_daily(
         self, pricing: pd.Series, calendar: TradingCalendar | None,
         execution_lag: int, periods: Iterable[int],
     ) -> DailyReturnLabels:
         periods = validate_daily_horizons(periods, execution_lag)
         execution_lag = int(execution_lag)
+        sched = self.scheduler(execution_lag)
         logger.info("开始计算前瞻收益率，期间: %s, 执行滞后: %s天", periods, execution_lag)
         prices_df = _daily_close_panel(pricing)
         calendar = resolve_daily_calendar(pricing, calendar)
@@ -406,7 +417,7 @@ class UnifiedReturnLabeler:
         entry_prices = prices_df.shift(-execution_lag) if execution_lag else prices_df
         forward_returns = {}
         for period in periods:
-            _, exit_row = _trade_rows(0, execution_lag, period, self.profile.exit_adjustment)
+            _, exit_row = sched.trade_bar_indices(0, period)
             exit_prices = prices_df.shift(-exit_row)
             returns = _price_returns(entry_prices, exit_prices, self.profile.return_unit).replace(
                 [np.inf, -np.inf], np.nan,
@@ -437,7 +448,7 @@ class UnifiedReturnLabeler:
         and exit prices also record the unadjusted fills.
         """
         from backtest_and_analysis.time_series.contracts import _validate_aligned_factor_frame
-        from backtest_and_analysis.time_series.labels import LABEL_COLUMNS, _normalize_bar_horizons, _positive_integer
+        from backtest_and_analysis.time_series.labels import LABEL_COLUMNS, _normalize_bar_horizons
         from utils.time_axis import Frequency
 
         if self.slot is None:
@@ -447,10 +458,8 @@ class UnifiedReturnLabeler:
         ) or len(set(instruments)) != len(instruments):
             raise ValueError("instruments must be a nonempty sequence of distinct instrument IDs")
         periods = _normalize_bar_horizons(horizons)
-        minimum = self.profile.min_entry_offset_bars
-        lag = minimum if entry_offset_bars is None else _positive_integer(
-            entry_offset_bars, "entry_offset_bars", minimum,
-        )
+        sched = self.scheduler(entry_offset_bars)
+        lag = sched.resolved_entry_offset_bars
         factors = (None if factors is None else _validate_aligned_factor_frame(factors)
                    .set_index(["timestamp_utc", "instrument_id"]).factor_value)
         slot = self.slot
@@ -459,7 +468,7 @@ class UnifiedReturnLabeler:
         calendar = slot.calendar
         strategy = self.resolve_bucket_strategy(parsed, instruments, bucket_strategy)
         provenance = {}
-        _, lookahead = _trade_rows(0, lag, max(periods), self.profile.exit_adjustment)
+        lookahead = sched.lookahead_bars(max(periods))
         grid, requested_count = _slot_grid(
             calendar, parsed, start_date, end_date, view=view, bucket_strategy=strategy, lookahead_bars=lookahead,
         )
@@ -606,14 +615,15 @@ class UnifiedReturnLabeler:
             concrete = observed.concrete_instrument_id.ffill()
             changes = concrete.notna().to_numpy() & concrete.ne(concrete.shift()).to_numpy()
 
+        sched = self.scheduler(lag)
         tables = []
         for horizon in horizons:
-            entries, exits = _trade_rows(positions, lag, horizon, profile.exit_adjustment)
-            _, coverage_exits = _trade_rows(coverage_positions, lag, horizon, profile.exit_adjustment)
+            entries, exits = sched.trade_bar_indices(positions, horizon)
+            _, coverage_exits = sched.trade_bar_indices(coverage_positions, horizon)
             entry, exit = np.minimum(entries, last), np.minimum(exits, last)
-            boundary = exits > last
-            if profile.boundary_policy == "same_session":
-                boundary |= axis.owners[positions] != axis.owners[exit]
+            boundary = (exits > last) | sched.crosses_session_boundary(
+                axis.owners[positions], axis.owners[exit],
+            )
             insufficient = pd.isna(coverage_end) | np.where(
                 boundary,
                 (coverage_exits >= len(coverage_keys)) |

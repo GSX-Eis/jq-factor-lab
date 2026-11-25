@@ -1629,22 +1629,121 @@ def test_explicit_open_entry_field_resolves_slot_open_when_supplied_open_df_unal
 def test_overlay_liquidity_cap_preserves_capped_weights_and_enforces_caps_on_reallocation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    from utils.slots import SlotConfig
+    from slots.declarative.slot import build_declarative_slot
+    from utils.time_axis import Frequency
+
+    def _build_hourly_slot_with_volumes(
+        sub_dir: Path,
+        *,
+        symbols: tuple[str, ...],
+        volumes: dict[str, float],
+        allow_short: bool,
+        start: str = "2026-01-03",
+        end: str = "2026-01-05",
+    ) -> tuple[Any, pd.DataFrame, pd.DataFrame]:
+        sub_dir.mkdir(parents=True, exist_ok=True)
+        bars_csv = sub_dir / "bars.csv"
+        hours = pd.date_range(f"{start} 00:00:00Z", f"{end} 23:00:00Z", freq="1h")
+        rows = [
+            {
+                "symbol": sym,
+                "time": (ts + pd.Timedelta(hours=1)).isoformat(),
+                "open": 100.0,
+                "high": 101.0,
+                "low": 99.0,
+                "close": 100.0,
+                "volume": float(volumes[sym]),
+            }
+            for sym in symbols
+            for ts in hours
+        ]
+        pd.DataFrame(rows).to_csv(bars_csv, index=False)
+        cfg = {
+            "schema_version": 1,
+            "slot_id": "crypto_24x7_probe",
+            "calendar": {
+                "provider": "custom_sessions",
+                "options": {
+                    "calendar_id": "crypto_utc",
+                    "start": start,
+                    "end": end,
+                    "custom_sessions": {
+                        "timezone": "UTC",
+                        "weekdays": [0, 1, 2, 3, 4, 5, 6],
+                        "segments": [
+                            {"open": "00:00", "close": "00:00", "open_day_offset": 0, "close_day_offset": 1}
+                        ],
+                    },
+                },
+            },
+            "bar_feed": {
+                "provider": "csv_files",
+                "options": {
+                    "paths": [bars_csv.name],
+                    "frequency": "1h",
+                    "timestamp_anchor": "bar_end",
+                    "source_timezone": "UTC",
+                    "volume_mode": "interval",
+                    "data_version": "v1",
+                    "column_mapping": {
+                        "symbol": "instrument_id",
+                        "time": "timestamp",
+                        "open": "open",
+                        "high": "high",
+                        "low": "low",
+                        "close": "close",
+                        "volume": "volume",
+                    },
+                },
+            },
+            "universe": {
+                "provider": "static",
+                "options": {
+                    "instruments": {sym: {"asset_class": "crypto", "currency": "USD"} for sym in symbols},
+                    "universes": {"spot": list(symbols)},
+                },
+            },
+            "aux_features": {"provider": "none"},
+            "microstructure": {"provider": "open"},
+            "execution_profile": {
+                "entry_price_field": "open",
+                "exit_price_field": "close",
+                "min_entry_offset_bars": 1,
+                "exit_adjustment": 0,
+                "return_unit": "decimal",
+                "gap_rule": "endpoints_only",
+                "boundary_policy": "cross_session",
+                "allow_short": allow_short,
+                "commission_bps": 0.0,
+                "sell_tax_bps": 0.0,
+                "slippage_bps": 0.0,
+                "benchmark_instrument": None,
+            },
+        }
+        built = build_declarative_slot(SlotConfig.from_mapping(cfg), base_dir=sub_dir)
+        bars = built.bar_feed.read_execution_bars(
+            list(symbols), Frequency.parse("1h"), start_utc=hours[0], end_utc=hours[-1]
+        )
+        c_df = bars.pivot(index="timestamp_utc", columns="instrument_id", values="close").sort_index()
+        o_df = bars.pivot(index="timestamp_utc", columns="instrument_id", values="open").sort_index()
+        return built, c_df, o_df
+
     symbols = ("A", "B", "C")
-    slot, close_df, open_df = _make_24x7_hourly_slot(
-        tmp_path,
-        start="2026-01-05",
-        end="2026-01-05",
-        allow_short=True,
+    # Real multi-day hourly bars: A=100k/h (ADV=2.4M/day), B=200k/h (ADV=4.8M/day).
+    # With holding_period=1 bar (1/24 day) and max_participation=0.25: cap(A)=25k, cap(B)=50k.
+    slot, close_df, open_df = _build_hourly_slot_with_volumes(
+        tmp_path / "asym_ls",
         symbols=symbols,
-        open_price=100.0,
-        close_price=100.0,
+        volumes={"A": 1000.0, "B": 2000.0, "C": 1000.0},
+        allow_short=True,
     )
-    sub_close = close_df.iloc[:4, :2]
-    sub_open = open_df.iloc[:4, :2]
+    sub_close = close_df.loc["2026-01-05":].iloc[:4, :2]
+    sub_open = open_df.loc["2026-01-05":].iloc[:4, :2]
     t1 = sub_close.index[1]
     scores_ls = pd.DataFrame({"A": 2.0, "B": -2.0}, index=sub_close.index)
 
-    # 1. No blocked orders: +0.25 / -0.50 capped weights must NOT be scaled up to 100k gross
+    # 1. No blocked orders: real ADV caps (+25k / -50k) must NOT be scaled up to 100k gross
     runner_ls = VectorBTBacktestRunner(
         {
             "top_k_strategy": {
@@ -1656,17 +1755,12 @@ def test_overlay_liquidity_cap_preserves_capped_weights_and_enforces_caps_on_rea
                 "liquidity_cap": {
                     "enabled": True,
                     "max_participation": 0.25,
-                    "adv_lookback_days": 5,
+                    "adv_lookback_days": 2,
                 },
             }
         },
         slot=slot,
         frequency="1h",
-    )
-    monkeypatch.setattr(
-        runner_ls,
-        "_average_daily_value",
-        lambda stocks, as_of, lookback: {"A": 100_000.0, "B": 200_000.0},
     )
     res_ls = runner_ls.run_backtest(
         scores_ls,
@@ -1685,7 +1779,15 @@ def test_overlay_liquidity_cap_preserves_capped_weights_and_enforces_caps_on_rea
     assert float((a_ord["Size"] * a_ord["Price"]).abs().sum()) == pytest.approx(25_000.0)
     assert float((b_ord["Size"] * b_ord["Price"]).abs().sum()) == pytest.approx(50_000.0)
 
-    # 2. Signed caps also enforce ADV participation on short legs
+    # 2. Signed caps also enforce real ADV participation on short legs
+    slot_sym, close_sym, open_sym = _build_hourly_slot_with_volumes(
+        tmp_path / "sym_ls",
+        symbols=symbols,
+        volumes={"A": 1000.0, "B": 1000.0, "C": 1000.0},
+        allow_short=True,
+    )
+    sub_close_sym = close_sym.loc["2026-01-05":].iloc[:4, :2]
+    sub_open_sym = open_sym.loc["2026-01-05":].iloc[:4, :2]
     runner_ls_sym = VectorBTBacktestRunner(
         {
             "top_k_strategy": {
@@ -1697,40 +1799,31 @@ def test_overlay_liquidity_cap_preserves_capped_weights_and_enforces_caps_on_rea
                 "liquidity_cap": {
                     "enabled": True,
                     "max_participation": 0.25,
-                    "adv_lookback_days": 5,
+                    "adv_lookback_days": 2,
                 },
             }
         },
-        slot=slot,
+        slot=slot_sym,
         frequency="1h",
     )
-    monkeypatch.setattr(
-        runner_ls_sym,
-        "_average_daily_value",
-        lambda stocks, as_of, lookback: {"A": 100_000.0, "B": 100_000.0},
-    )
     tw_sym = runner_ls_sym._compute_target_weights(
-        scores_ls, sub_close, {}, [t1.to_pydatetime()], open_df=sub_open
+        scores_ls, sub_close_sym, {}, [t1.to_pydatetime()], open_df=sub_open_sym
     )
     runner_ls_sym.close()
     assert tw_sym.loc[t1, "A"] == pytest.approx(25_000.0)
     assert tw_sym.loc[t1, "B"] == pytest.approx(-25_000.0)
 
-    # 3. Blocked order reallocation must re-enforce BOTH ADV caps and directional masks
+    # 3. Blocked order reallocation must re-enforce BOTH real ADV caps and directional masks
     symbols_4 = ("A", "B", "C", "D")
-    long_dir = tmp_path / "long_sub"
-    long_dir.mkdir(parents=True, exist_ok=True)
-    slot_long, close_long, open_long = _make_24x7_hourly_slot(
-        long_dir,
-        start="2026-01-05",
-        end="2026-01-05",
-        allow_short=False,
+    # A/C/D=100k/h (2.4M/day -> cap 25k), B=240k/h (5.76M/day -> cap 60k)
+    slot_long, close_long, open_long = _build_hourly_slot_with_volumes(
+        tmp_path / "long_sub",
         symbols=symbols_4,
-        open_price=100.0,
-        close_price=100.0,
+        volumes={"A": 1000.0, "B": 2400.0, "C": 1000.0, "D": 1000.0},
+        allow_short=False,
     )
-    sub_c3 = close_long.iloc[:4]
-    sub_o3 = open_long.iloc[:4]
+    sub_c3 = close_long.loc["2026-01-05":].iloc[:4]
+    sub_o3 = open_long.loc["2026-01-05":].iloc[:4]
     t1_3 = sub_c3.index[1]
     t2_3 = sub_c3.index[2]
     scores_3 = pd.DataFrame(
@@ -1755,22 +1848,12 @@ def test_overlay_liquidity_cap_preserves_capped_weights_and_enforces_caps_on_rea
                 "liquidity_cap": {
                     "enabled": True,
                     "max_participation": 0.25,
-                    "adv_lookback_days": 5,
+                    "adv_lookback_days": 2,
                 },
             }
         },
         slot=slot_long,
         frequency="1h",
-    )
-    monkeypatch.setattr(
-        runner_3,
-        "_average_daily_value",
-        lambda stocks, as_of, lookback: {
-            "A": 100_000.0,   # cap 25,000
-            "B": 240_000.0,   # cap 60,000
-            "C": 100_000.0,   # cap 25,000
-            "D": 100_000.0,   # cap 25,000
-        },
     )
 
     def _mask_3(date_str: str, stocks: list[str], side: str = "both", require_non_st: bool = True) -> list[str]:
@@ -1800,11 +1883,15 @@ def test_overlay_liquidity_cap_preserves_capped_weights_and_enforces_caps_on_rea
     assert pd.isna(tw_3.loc[t2_3, "C"])
     assert tw_3.loc[t2_3, "D"] == pytest.approx(0.0)
 
-    # 4. Unpatched SlotDataProvider.average_daily_value accepts UTC ISO timestamps without tz mismatch
+    # 4. Unpatched SlotDataProvider distinguishes session-aggregated ADV from single-bar ABV under UTC ISO timestamps
     adv_real = runner_ls._slot_provider.average_daily_value(
         ["A", "B"], "2026-01-05T02:00:00+00:00", 2, None, None
     )
-    assert adv_real == {"A": pytest.approx(100_000.0), "B": pytest.approx(100_000.0)}
+    abv_real = runner_ls._slot_provider.average_bar_traded_value(
+        ["A", "B"], "2026-01-05T02:00:00+00:00", 2, None, None
+    )
+    assert adv_real == {"A": pytest.approx(2_400_000.0), "B": pytest.approx(4_800_000.0)}
+    assert abv_real == {"A": pytest.approx(100_000.0), "B": pytest.approx(200_000.0)}
 
 
 def test_explicit_open_entry_field_handles_nan_intersection_and_all_nan_barfeed(
@@ -1964,13 +2051,13 @@ def test_overlay_liquidity_cap_reallocation_caps_total_gross_including_blocked_h
             slot=slot,
             frequency="1h",
         )
-        # Round 1 (t1, pool A/D): A cap=30k, D cap=20k -> holds A=30k, D=20k
+        # Round 1 (t1, pool A/D): A cap=30k, D cap=20k (daily ADV * 24 for 1h holding_period=1) -> holds A=30k, D=20k
         # Round 2 (t2, pool A/C): A cap=30k, C cap=30k -> initial_gross=60k
         def _adv(stocks, as_of, lookback):
             ts = pd.Timestamp(as_of).tz_convert("UTC") if pd.Timestamp(as_of).tzinfo else pd.Timestamp(as_of, tz="UTC")
             if ts < t1:
-                return {"A": 100_000.0, "C": 100_000.0, "D": 20_000.0 / 0.30}
-            return {"A": 100_000.0, "C": 100_000.0, "D": 100_000.0}
+                return {"A": 2_400_000.0, "C": 2_400_000.0, "D": 24.0 * 20_000.0 / 0.30}
+            return {"A": 2_400_000.0, "C": 2_400_000.0, "D": 2_400_000.0}
 
         monkeypatch.setattr(runner, "_average_daily_value", _adv)
         return runner

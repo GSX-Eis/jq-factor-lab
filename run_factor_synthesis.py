@@ -5260,6 +5260,10 @@ class FactorSynthesizer:
     def _resolve_effective_execution_profile(
         self, *, runner: Any, slot: Any
     ) -> Dict[str, Any]:
+        from utils.execution_schedule import (
+            ExecutionScheduler,
+            validate_effective_execution_profile,
+        )
         from utils.slots.contracts import ExecutionProfile
 
         base = (
@@ -5269,6 +5273,7 @@ class FactorSynthesizer:
                 "close", "close", 0, 0, "decimal", "endpoints_only", "cross_session"
             )
         )
+        allow_entry_override = slot is None or slot.slot_id == "jq_ashare_local"
         effective_entry = (
             getattr(runner, "effective_entry_price_field", None)
             or base.entry_price_field
@@ -5279,14 +5284,54 @@ class FactorSynthesizer:
             12,
         )
         slippage_bps = round(float(runner.slippage) * 10_000.0, 12)
-        effective = replace(
+
+        runner_profile = getattr(runner, "effective_execution_profile", None)
+        if isinstance(runner_profile, ExecutionProfile):
+            if (
+                getattr(runner, "effective_entry_price_field", None) is not None
+                and runner.effective_entry_price_field != runner_profile.entry_price_field
+            ):
+                raise ValueError(
+                    f"Runner effective_entry_price_field={runner.effective_entry_price_field!r} "
+                    f"disagrees with effective_execution_profile.entry_price_field={runner_profile.entry_price_field!r}"
+                )
+            effective = replace(
+                runner_profile,
+                allow_short=bool(runner.allow_short),
+                benchmark_instrument=runner.benchmark_instrument,
+                commission_bps=commission_bps,
+                sell_tax_bps=sell_tax_bps,
+                slippage_bps=slippage_bps,
+            )
+        else:
+            scheduler = ExecutionScheduler.for_backtest(
+                base,
+                entry_offset_bars=getattr(runner, "entry_offset_bars", None),
+                effective_entry_price_field=effective_entry,
+                allow_entry_field_override=allow_entry_override,
+                holding_period=getattr(runner, "holding_period", 1),
+            )
+            effective = scheduler.effective_profile(
+                entry_price_field=effective_entry,
+                allow_short=bool(runner.allow_short),
+                benchmark_instrument=runner.benchmark_instrument,
+                update_benchmark=True,
+                commission_bps=commission_bps,
+                sell_tax_bps=sell_tax_bps,
+                slippage_bps=slippage_bps,
+            )
+
+        ExecutionScheduler.for_backtest(
+            effective,
+            entry_offset_bars=effective.min_entry_offset_bars,
+            effective_entry_price_field=effective.entry_price_field,
+            allow_entry_field_override=allow_entry_override,
+            holding_period=getattr(runner, "holding_period", 1),
+        )
+        validate_effective_execution_profile(
             base,
-            entry_price_field=effective_entry,
-            allow_short=bool(runner.allow_short),
-            benchmark_instrument=runner.benchmark_instrument,
-            commission_bps=commission_bps,
-            sell_tax_bps=sell_tax_bps,
-            slippage_bps=slippage_bps,
+            effective,
+            allow_entry_field_override=allow_entry_override,
         )
         return asdict(effective)
 

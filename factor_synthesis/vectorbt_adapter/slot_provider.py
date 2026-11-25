@@ -80,7 +80,8 @@ class SlotDataProvider:
         self._auto_slot_key: Optional[int] = None
         self._auto_slot: Optional[MarketSlot] = None
         self._session_ts_cache: Dict[tuple[int, str], pd.Timestamp] = {}
-        self._adv_cache: Dict[tuple[str, int], Dict[str, Optional[float]]] = {}
+        self._adv_cache: Dict[tuple[str, int, bool], Dict[str, Optional[float]]] = {}
+        self._abv_cache: Dict[tuple[str, int], Dict[str, Optional[float]]] = {}
         self._style_exposure_cache: Dict[str, Optional[pd.DataFrame]] = {}
         self._industry_cache: Dict[str, Dict[str, str]] = {}
         self._regime_z_cache: Optional[tuple[tuple[Any, ...], Optional[pd.Series]]] = None
@@ -537,6 +538,86 @@ class SlotDataProvider:
         if self._freq_obj.kind == "week":
             return vbt_freq, "52W", 52.0
 
+        bars_per_session = self.bars_per_session(
+            price_db_conn, price_db_path, calendar=cal
+        )
+        bars_per_year = float(sessions_per_year * bars_per_session)
+        total_minutes = max(1, int(round(bars_per_year * float(self._freq_obj.minutes))))
+        return vbt_freq, pd.Timedelta(minutes=total_minutes), bars_per_year
+
+    @staticmethod
+    def _week_session_count(cal: Any, session_id: str) -> Optional[int]:
+        """Return the number of trading sessions covered by the weekly bar at ``session_id``."""
+        if cal is None:
+            return None
+        if hasattr(cal, "_week_on") and hasattr(cal, "_padded_sessions"):
+            try:
+                week = cal._week_on(session_id, "ETH")
+                if week:
+                    return len(week)
+            except Exception:
+                pass
+        if hasattr(cal, "sessions"):
+            try:
+                day = pd.Timestamp(session_id).normalize()
+                monday = day - pd.Timedelta(days=int(day.weekday()))
+                sunday = monday + pd.Timedelta(days=6)
+                start_bound = getattr(cal, "start", monday)
+                end_bound = getattr(cal, "end", sunday)
+                s0 = max(start_bound, monday)
+                s1 = min(end_bound, sunday)
+                if s0 <= s1:
+                    n_sess = len(cal.sessions(s0, s1))
+                    if n_sess > 0:
+                        return int(n_sess)
+            except Exception:
+                pass
+        return None
+
+    def bars_per_session(
+        self,
+        price_db_conn: Optional[Any] = None,
+        price_db_path: Optional[str] = None,
+        *,
+        calendar: Optional[Any] = None,
+    ) -> float:
+        """Resolve expected bar count per trading session for the runner's frequency."""
+        if self._freq_obj.kind == "session":
+            return 1.0
+        cal = calendar
+        if cal is None:
+            try:
+                cal = self.resolve_calendar(price_db_conn, price_db_path)
+            except MarketDbProfileError:
+                raise
+            except Exception:
+                cal = None
+        if self._freq_obj.kind == "week":
+            if cal is not None and hasattr(cal, "bar_grid"):
+                try:
+                    sess = cal.sessions()
+                    if len(sess) > 0:
+                        grid = cal.bar_grid("1w", sess[0], sess[-1])
+                        if not grid.empty:
+                            covered_sessions = 0
+                            for sid in grid["session_id"].astype(str):
+                                n_week_sess = self._week_session_count(cal, sid)
+                                if n_week_sess is not None and n_week_sess > 0:
+                                    covered_sessions += n_week_sess
+                            if covered_sessions > 0:
+                                return float(len(grid)) / float(covered_sessions)
+                            return float(len(grid)) / float(len(sess))
+                except Exception:
+                    pass
+            if cal is not None and hasattr(cal, "sessions"):
+                try:
+                    sess = cal.sessions()
+                    if any(pd.Timestamp(d).weekday() >= 5 for d in sess):
+                        return 1.0 / 7.0
+                except Exception:
+                    pass
+            return 0.2
+
         bars_per_session: Optional[float] = None
         slot = self.slot or self._auto_slot
         profile = slot.market_db_profile if slot is not None else None
@@ -557,11 +638,10 @@ class SlotDataProvider:
             except Exception:
                 bars_per_session = None
         if bars_per_session is None or bars_per_session <= 0:
-            raise ValueError(f"Cannot determine bars per session for {self.frequency} from the market calendar")
-
-        bars_per_year = float(sessions_per_year * bars_per_session)
-        total_minutes = max(1, int(round(bars_per_year * float(self._freq_obj.minutes))))
-        return vbt_freq, pd.Timedelta(minutes=total_minutes), bars_per_year
+            raise ValueError(
+                f"Cannot determine bars per session for {self.frequency} from the market calendar"
+            )
+        return float(bars_per_session)
 
     def align_price_index(self, price_df: pd.DataFrame, calendar: Any) -> pd.DatetimeIndex:
         """Align ``price_df`` index to ``calendar`` for both daily and UTC/intraday bars."""
@@ -934,6 +1014,187 @@ class SlotDataProvider:
             row_cache[cache_key] = list(allowed)
         return allowed
 
+    def _read_traded_value_bars(
+        self,
+        stocks: List[str],
+        as_of_date_str: str,
+        lookback_calendar_days: int,
+        price_db_conn: Optional[Any],
+        price_db_path: Optional[str],
+    ) -> tuple[pd.DataFrame, Optional[MarketSlot], Optional[pd.Timestamp], Optional[pd.Timestamp]]:
+        """Read causally truncated execution bars with positive traded value."""
+        slot, _, _ = self._resolve_slot_and_conn(price_db_conn, price_db_path)
+        if slot is None:
+            return pd.DataFrame(), None, None, None
+        as_of_ts = pd.Timestamp(as_of_date_str)
+        if not self._is_date_only_key(as_of_date_str):
+            as_of_utc: Optional[pd.Timestamp] = (
+                as_of_ts.tz_localize("UTC")
+                if as_of_ts.tzinfo is None
+                else as_of_ts.tz_convert("UTC")
+            )
+            end_day = self.session_date_for_bar(as_of_utc, daily_naive=False, cal=slot.calendar)
+        else:
+            as_of_utc = None
+            end_day = as_of_ts.normalize()
+        start_day = max(
+            slot.calendar.start,
+            end_day - pd.Timedelta(days=int(lookback_calendar_days)),
+        )
+        bounds = self._window_utc_bounds(
+            slot,
+            start_date=start_day.strftime("%Y-%m-%d"),
+            end_date=end_day.strftime("%Y-%m-%d"),
+        )
+        if bounds is None:
+            return pd.DataFrame(), slot, as_of_utc, end_day
+        bars = slot.bar_feed.read_execution_bars(
+            stocks, self._freq_obj, start_utc=bounds[0], end_utc=bounds[1]
+        )
+        if as_of_utc is not None and not bars.empty and "timestamp_utc" in bars.columns:
+            bars = bars.loc[pd.to_datetime(bars["timestamp_utc"], utc=True) <= as_of_utc]
+        if bars.empty:
+            return pd.DataFrame(), slot, as_of_utc, end_day
+        if "money" in bars.columns and bars["money"].notna().any():
+            traded = pd.to_numeric(bars["money"], errors="coerce")
+        elif "volume" in bars.columns and "close" in bars.columns:
+            traded = pd.to_numeric(bars["volume"], errors="coerce") * pd.to_numeric(
+                bars["close"], errors="coerce"
+            )
+        else:
+            traded = pd.Series(dtype=float)
+        valid = bars.assign(_traded=traded)
+        valid = valid.loc[
+            valid["_traded"].notna()
+            & np.isfinite(valid["_traded"])
+            & (valid["_traded"] > 0)
+        ]
+        if valid.empty:
+            return pd.DataFrame(), slot, as_of_utc, end_day
+        if "session_id" in valid.columns and valid["session_id"].notna().all():
+            session_ids = valid["session_id"].astype(str)
+        else:
+            session_ids = pd.to_datetime(valid["timestamp_utc"], utc=True).map(
+                lambda ts: self.session_date_for_bar(
+                    ts, daily_naive=False, cal=slot.calendar
+                ).strftime("%Y-%m-%d")
+            )
+        return valid.assign(_session_id=session_ids), slot, as_of_utc, end_day
+
+    def average_daily_traded_value(
+        self,
+        stocks: List[str],
+        as_of_date_str: str,
+        lookback_days: int,
+        price_db_conn: Optional[Any],
+        price_db_path: Optional[str],
+        *,
+        include_incomplete_session: bool = False,
+    ) -> Dict[str, float]:
+        """Trailing average daily traded value (ADV) per instrument up to ``as_of_date_str``.
+
+        Execution bars are truncated causally at ``as_of_utc`` (when timestamped),
+        summed by ``(instrument_id, session_id)`` to obtain each session's total
+        traded value, and averaged over the trailing ``lookback_days`` sessions.
+
+        Incomplete intraday session policy: when ``as_of_date_str`` specifies an
+        intraday timestamp strictly earlier than ``end_day``'s final calendar bar,
+        the in-progress session is excluded by default
+        (``include_incomplete_session=False``) so partial-day volume does not
+        understate ADV; pass ``include_incomplete_session=True`` to include the
+        observed partial session sum up to ``as_of_utc``.
+
+        Weekly bars (``1w``) carry the full week's traded value on the week's
+        final session, so each weekly bar is normalized by the actual number of
+        trading sessions in that week before averaging over the trailing
+        ``lookback_days`` trading sessions.
+        """
+        if not stocks:
+            return {}
+        lookback = int(lookback_days)
+        if lookback <= 0:
+            raise ValueError(f"lookback_days must be positive, got {lookback_days!r}")
+        if self.slot is None and price_db_conn is not None and not _is_duckdb_conn(price_db_conn):
+            stocks_str = "', '".join(stocks)
+            rows = query_legacy_stub(price_db_conn, "adv", stocks_str, as_of_date_str, lookback)
+            return {str(stock_code): float(adv) for stock_code, adv in rows}
+
+        cache_key = (as_of_date_str, lookback, bool(include_incomplete_session))
+        cached = self._adv_cache.setdefault(cache_key, {})
+        missing = [s for s in stocks if s not in cached]
+        if missing:
+            try:
+                valid, slot, as_of_utc, end_day = self._read_traded_value_bars(
+                    missing,
+                    as_of_date_str,
+                    max(lookback * 4, 90),
+                    price_db_conn,
+                    price_db_path,
+                )
+                if not valid.empty and slot is not None:
+                    if (
+                        not include_incomplete_session
+                        and as_of_utc is not None
+                        and end_day is not None
+                        and self._freq_obj.kind == "intraday"
+                    ):
+                        end_day_str = end_day.strftime("%Y-%m-%d")
+                        day_grid = slot.calendar.bar_grid(
+                            self.frequency, end_day_str, end_day_str
+                        )
+                        if not day_grid.empty:
+                            last_bar_utc = pd.to_datetime(
+                                day_grid["timestamp_utc"], utc=True
+                            ).max()
+                            if as_of_utc < last_bar_utc:
+                                # Exclude the unfinished current session so partial-day
+                                # sums are never averaged on the same footing as full days.
+                                valid = valid.loc[valid["_session_id"] < end_day_str]
+                    if not valid.empty:
+                        daily_totals = (
+                            valid.groupby(["instrument_id", "_session_id"], sort=False)[
+                                "_traded"
+                            ]
+                            .sum()
+                            .reset_index()
+                            .sort_values("_session_id")
+                        )
+                        if self._freq_obj.kind == "week":
+                            session_counts = {
+                                str(sid): self._week_session_count(slot.calendar, str(sid))
+                                for sid in daily_totals["_session_id"].unique()
+                            }
+                            for stock_code, grp in daily_totals.groupby(
+                                "instrument_id", sort=False
+                            ):
+                                daily_series: List[float] = []
+                                for sid, traded_val in zip(
+                                    grp["_session_id"], grp["_traded"]
+                                ):
+                                    n_sess = session_counts.get(str(sid))
+                                    if n_sess is None or n_sess <= 0:
+                                        raise ValueError(
+                                            f"Cannot determine session count for weekly bar {sid!r}"
+                                        )
+                                    daily_val = float(traded_val) / float(n_sess)
+                                    daily_series.extend([daily_val] * int(n_sess))
+                                if daily_series:
+                                    cached[str(stock_code)] = float(
+                                        np.mean(daily_series[-lookback:])
+                                    )
+                        else:
+                            for stock_code, grp in daily_totals.groupby(
+                                "instrument_id", sort=False
+                            ):
+                                cached[str(stock_code)] = float(
+                                    grp["_traded"].tail(lookback).mean()
+                                )
+            except Exception as exc:
+                self.logger.warning(f"[Overlay] ADV query failed at {as_of_date_str}: {exc}")
+            for s in missing:
+                cached.setdefault(s, None)
+        return {s: cached[s] for s in stocks if cached.get(s) is not None}
+
     def average_daily_value(
         self,
         stocks: List[str],
@@ -941,66 +1202,140 @@ class SlotDataProvider:
         lookback_days: int,
         price_db_conn: Optional[Any],
         price_db_path: Optional[str],
+        *,
+        include_incomplete_session: bool = False,
     ) -> Dict[str, float]:
-        """Trailing average traded value per instrument up to ``as_of_date_str``."""
+        """Backward-compatible alias forwarding to :meth:`average_daily_traded_value`."""
+        return self.average_daily_traded_value(
+            stocks,
+            as_of_date_str,
+            lookback_days,
+            price_db_conn,
+            price_db_path,
+            include_incomplete_session=include_incomplete_session,
+        )
+
+    def average_bar_traded_value(
+        self,
+        stocks: List[str],
+        as_of_date_str: str,
+        lookback_bars: int,
+        price_db_conn: Optional[Any],
+        price_db_path: Optional[str],
+    ) -> Dict[str, float]:
+        """Trailing average single-bar traded value (ABV) per instrument up to ``as_of_date_str``."""
         if not stocks:
             return {}
+        lookback = int(lookback_bars)
+        if lookback <= 0:
+            raise ValueError(f"lookback_bars must be positive, got {lookback_bars!r}")
         if self.slot is None and price_db_conn is not None and not _is_duckdb_conn(price_db_conn):
+            if self._freq_obj.kind != "session":
+                raise ValueError(
+                    "Legacy stub connection only supports daily ('1d') bars for ABV"
+                )
             stocks_str = "', '".join(stocks)
-            rows = query_legacy_stub(price_db_conn, "adv", stocks_str, as_of_date_str, lookback_days)
-            return {str(stock_code): float(adv) for stock_code, adv in rows}
+            rows = query_legacy_stub(price_db_conn, "adv", stocks_str, as_of_date_str, lookback)
+            return {str(stock_code): float(abv) for stock_code, abv in rows}
 
-        cache_key = (as_of_date_str, int(lookback_days))
-        cached = self._adv_cache.setdefault(cache_key, {})
+        cache_key = (as_of_date_str, lookback)
+        cached = self._abv_cache.setdefault(cache_key, {})
         missing = [s for s in stocks if s not in cached]
         if missing:
-            slot, _, _ = self._resolve_slot_and_conn(price_db_conn, price_db_path)
-            if slot is not None:
-                try:
-                    as_of_ts = pd.Timestamp(as_of_date_str)
-                    as_of_utc = as_of_ts.tz_convert("UTC") if as_of_ts.tzinfo is not None else None
-                    end_day = (
-                        self.session_date_for_bar(as_of_utc, daily_naive=False, cal=slot.calendar)
-                        if as_of_utc is not None
-                        else as_of_ts.normalize()
-                    )
-                    start_day = max(
-                        slot.calendar.start,
-                        end_day - pd.Timedelta(days=max(int(lookback_days) * 4, 90)),
-                    )
-                    bounds = self._window_utc_bounds(
-                        slot,
-                        start_date=start_day.strftime("%Y-%m-%d"),
-                        end_date=end_day.strftime("%Y-%m-%d"),
-                    )
-                    if bounds is not None:
-                        bars = slot.bar_feed.read_execution_bars(
-                            missing, self._freq_obj, start_utc=bounds[0], end_utc=bounds[1]
+            try:
+                if self._freq_obj.kind == "intraday":
+                    bpd = self.bars_per_session(price_db_conn, price_db_path)
+                    est_days = max(int(np.ceil(lookback / max(bpd, 1.0))) * 4, 90)
+                elif self._freq_obj.kind == "week":
+                    est_days = max(lookback * 14, 90)
+                else:
+                    est_days = max(lookback * 4, 90)
+                valid, _, _, _ = self._read_traded_value_bars(
+                    missing, as_of_date_str, est_days, price_db_conn, price_db_path
+                )
+                if not valid.empty:
+                    valid = valid.sort_values("timestamp_utc")
+                    for stock_code, grp in valid.groupby("instrument_id", sort=False):
+                        cached[str(stock_code)] = float(
+                            grp["_traded"].tail(lookback).mean()
                         )
-                        if as_of_utc is not None and not bars.empty and "timestamp_utc" in bars.columns:
-                            bars = bars.loc[pd.to_datetime(bars["timestamp_utc"], utc=True) <= as_of_utc]
-                        if not bars.empty:
-                            if "money" in bars.columns and bars["money"].notna().any():
-                                traded = pd.to_numeric(bars["money"], errors="coerce")
-                            elif "volume" in bars.columns and "close" in bars.columns:
-                                traded = pd.to_numeric(bars["volume"], errors="coerce") * pd.to_numeric(
-                                    bars["close"], errors="coerce"
-                                )
-                            else:
-                                traded = pd.Series(dtype=float)
-                            valid = bars.assign(_traded=traded)
-                            valid = valid.loc[valid["_traded"].notna() & (valid["_traded"] > 0)]
-                            if not valid.empty:
-                                valid = valid.sort_values("timestamp_utc")
-                                for stock_code, grp in valid.groupby("instrument_id", sort=False):
-                                    cached[str(stock_code)] = float(
-                                        grp["_traded"].tail(int(lookback_days)).mean()
-                                    )
-                except Exception as exc:
-                    self.logger.warning(f"[Overlay] ADV query failed at {as_of_date_str}: {exc}")
+            except Exception as exc:
+                self.logger.warning(f"[Overlay] ABV query failed at {as_of_date_str}: {exc}")
             for s in missing:
                 cached.setdefault(s, None)
         return {s: cached[s] for s in stocks if cached.get(s) is not None}
+
+    def liquidity_weight_caps(
+        self,
+        stocks: List[str],
+        as_of_date_str: str,
+        *,
+        liq_config: Mapping[str, Any],
+        raw_liq_config: Optional[Mapping[str, Any]] = None,
+        holding_period: Union[int, float],
+        capital: float,
+        price_db_conn: Optional[Any],
+        price_db_path: Optional[str],
+        adv_fetcher: Optional[Any] = None,
+    ) -> Dict[str, float]:
+        """Resolve liquidity basis/units and compute per-name absolute weight caps."""
+        if not stocks or capital <= 0:
+            return {}
+        raw = raw_liq_config if isinstance(raw_liq_config, Mapping) else {}
+        basis_raw = liq_config.get("liquidity_basis", raw.get("liquidity_basis", "adv"))
+        unit_raw = liq_config.get(
+            "holding_period_unit", raw.get("holding_period_unit", "bars")
+        )
+        basis = basis_raw.strip().lower() if isinstance(basis_raw, str) else ""
+        if basis not in {"adv", "abv"}:
+            raise ValueError(
+                f"Unsupported liquidity_basis: {basis_raw!r}; expected 'adv' or 'abv'"
+            )
+        unit = unit_raw.strip().lower() if isinstance(unit_raw, str) else ""
+        if unit not in {"bars", "days"}:
+            raise ValueError(
+                f"Unsupported holding_period_unit: {unit_raw!r}; expected 'bars' or 'days'"
+            )
+
+        if basis == "abv":
+            raw_abv_lb = liq_config.get("abv_lookback_bars")
+            if raw_abv_lb is None:
+                raw_abv_lb = raw.get("abv_lookback_bars")
+            if raw_abv_lb is not None:
+                lookback = int(raw_abv_lb)
+                if lookback <= 0:
+                    raise ValueError(
+                        f"abv_lookback_bars must be positive, got {raw_abv_lb!r}"
+                    )
+            else:
+                lookback = int(liq_config["adv_lookback_days"])
+            liq_values = self.average_bar_traded_value(
+                stocks, as_of_date_str, lookback, price_db_conn, price_db_path
+            )
+        else:
+            lookback = int(liq_config["adv_lookback_days"])
+            if adv_fetcher is not None:
+                liq_values = adv_fetcher(stocks, as_of_date_str, lookback)
+            else:
+                liq_values = self.average_daily_traded_value(
+                    stocks, as_of_date_str, lookback, price_db_conn, price_db_path
+                )
+
+        bars_per_day = (
+            self.bars_per_session(price_db_conn, price_db_path)
+            if ((basis == "adv" and unit == "bars") or (basis == "abv" and unit == "days"))
+            else None
+        )
+        return compute_liquidity_weight_caps(
+            liq_values,
+            stocks,
+            max_participation=float(liq_config["max_participation"]),
+            holding_period=holding_period,
+            capital=capital,
+            holding_period_unit=unit,
+            bars_per_day=bars_per_day,
+            liquidity_basis=basis,
+        )
 
     def style_exposures_for(
         self,
@@ -1468,16 +1803,88 @@ def compute_liquidity_weight_caps(
     stocks: Iterable[str],
     *,
     max_participation: float,
-    holding_period: int,
+    holding_period: Union[int, float],
     capital: float,
+    holding_period_unit: str = "bars",
+    bars_per_day: Optional[float] = None,
+    liquidity_basis: str = "adv",
 ) -> Dict[str, float]:
-    """Compute per-name absolute weight caps from ADV participation limits."""
-    if capital <= 0:
+    """Compute per-name absolute weight caps with explicit ADV/ABV time-unit alignment.
+
+    When ``liquidity_basis == "adv"`` (daily traded value), ``holding_period`` is
+    converted to trading days (divided by ``bars_per_day`` when
+    ``holding_period_unit == "bars"``). When ``liquidity_basis == "abv"``
+    (per-bar traded value), ``holding_period`` is expressed in bars (multiplied by
+    ``bars_per_day`` when ``holding_period_unit == "days"``).
+    """
+    basis = liquidity_basis.strip().lower() if isinstance(liquidity_basis, str) else ""
+    if basis not in {"adv", "abv"}:
+        raise ValueError(
+            f"Unsupported liquidity_basis: {liquidity_basis!r}; expected 'adv' or 'abv'"
+        )
+    unit = holding_period_unit.strip().lower() if isinstance(holding_period_unit, str) else ""
+    if unit not in {"bars", "days"}:
+        raise ValueError(
+            f"Unsupported holding_period_unit: {holding_period_unit!r}; expected 'bars' or 'days'"
+        )
+    try:
+        hp = float(holding_period)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid holding_period: {holding_period!r}") from exc
+    if not np.isfinite(hp) or hp <= 0:
+        raise ValueError(f"holding_period must be finite and positive, got {holding_period!r}")
+    try:
+        participation = float(max_participation)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid max_participation: {max_participation!r}") from exc
+    if not np.isfinite(participation) or participation <= 0:
+        raise ValueError(
+            f"max_participation must be finite and positive, got {max_participation!r}"
+        )
+    try:
+        cap_val = float(capital)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid capital: {capital!r}") from exc
+    if not np.isfinite(cap_val):
+        raise ValueError(f"capital must be finite, got {capital!r}")
+    if cap_val <= 0:
         return {}
-    hp = max(1, int(holding_period or 1))
+
+    bpd: Optional[float] = None
+    if bars_per_day is not None:
+        try:
+            bpd = float(bars_per_day)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid bars_per_day: {bars_per_day!r}") from exc
+        if not np.isfinite(bpd) or bpd <= 0:
+            raise ValueError(
+                f"bars_per_day must be finite and positive, got {bars_per_day!r}"
+            )
+
+    if basis == "adv":
+        if unit == "days":
+            effective_horizon = hp
+        else:
+            if bpd is None:
+                raise ValueError(
+                    "bars_per_day is required when liquidity_basis='adv' and holding_period_unit='bars'"
+                )
+            effective_horizon = hp / bpd
+    else:
+        if unit == "bars":
+            effective_horizon = hp
+        else:
+            if bpd is None:
+                raise ValueError(
+                    "bars_per_day is required when liquidity_basis='abv' and holding_period_unit='days'"
+                )
+            effective_horizon = hp * bpd
+
     caps: Dict[str, float] = {}
     for stock in sorted(set(stocks)):
-        stock_adv = adv.get(stock)
-        if stock_adv is not None and stock_adv > 0:
-            caps[stock] = float(max_participation) * float(stock_adv) * hp / float(capital)
+        stock_val = adv.get(stock)
+        if stock_val is not None:
+            val = float(stock_val)
+            if np.isfinite(val) and val > 0:
+                caps[stock] = participation * val * effective_horizon / cap_val
     return caps

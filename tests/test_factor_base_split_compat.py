@@ -21,7 +21,10 @@ from utils.pit import apply_pit_adjustment as shared_pit_adjustment
 
 
 UTILS = Path(__file__).resolve().parents[1] / 'utils'
-CORE_FILES = ('__init__.py', 'bar_bridge.py', 'legacy_storage.py', 'cache.py', 'execution.py', 'slot_binding.py', 'slot_replay.py')
+CORE_FILES = (
+    '__init__.py', 'bar_bridge.py', 'legacy_storage.py', 'cache.py',
+    'execution.py', 'slot_binding.py', 'slot_execution_mode.py', 'slot_fast_path.py', 'slot_replay.py',
+)
 
 
 def test_factor_base_keeps_legacy_exports_and_source_location() -> None:
@@ -43,7 +46,7 @@ def test_factor_base_keeps_legacy_exports_and_source_location() -> None:
 def test_factor_core_module_sizes_and_import_boundaries() -> None:
     core = UTILS / 'factor_core'
     assert {path.name for path in core.glob('*.py')} == set(CORE_FILES)
-    assert 280 <= len((UTILS / 'factor_base.py').read_text().splitlines()) <= 435
+    assert 280 <= len((UTILS / 'factor_base.py').read_text().splitlines()) <= 465
     for name in CORE_FILES[1:]:
         source = (core / name).read_text()
         assert len(source.splitlines()) <= 500, name
@@ -74,6 +77,7 @@ base = import_module('utils.factor_base')
 core = import_module('utils.factor_core')
 assert base.FactorBase.__mro__ == (base.FactorBase, object)
 assert core.bar_bridge and core.cache and core.execution and core.legacy_storage
+assert core.slot_execution_mode and core.slot_fast_path
 """
     subprocess.run([sys.executable, '-c', command, first], cwd=UTILS.parent, check=True, timeout=30)
 

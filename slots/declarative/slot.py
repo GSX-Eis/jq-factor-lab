@@ -23,7 +23,7 @@ from utils.session_calendar import SessionCalendar
 from utils.slots import ExecutionProfile, InstrumentSpec, MarketSlot, SlotConfig
 from utils.time_axis import BarSchedule, Frequency
 
-from .source import FrameSource
+from .source import FrameSource, ReadRequest
 
 
 _KEYS = ['instrument_id', 'timestamp_utc', 'session_id']
@@ -104,7 +104,7 @@ class DeclarativeUniverse:
             return self.static[universe_id]
         if self.membership is None:
             raise KeyError(f'Unknown universe: {universe_id!r}')
-        data = self.membership.read_mapped()
+        data = self.membership.read_mapped(ReadRequest(columns=('universe_id', 'instrument_id', _AVAILABLE)))
         _validate_events(data, ('universe_id', 'instrument_id'), self.specs)
         rows = data.loc[data.universe_id.eq(universe_id)].copy()
         if rows.empty:
@@ -151,7 +151,22 @@ class DeclarativeAuxFeatures:
         if self.source is None or not columns:
             return grid.loc[:, _KEYS].iloc[:0].assign(
                 available_at_utc=pd.DatetimeIndex([], tz='UTC'), **{column: [] for column in columns})
-        data = self.source.read_mapped()
+        if grid.empty:
+            request = ReadRequest(columns=('instrument_id', _AVAILABLE), optional_columns=tuple(columns))
+        else:
+            instruments = tuple(dict.fromkeys(grid.instrument_id.astype(str)))
+            max_ts = pd.Timestamp(grid.timestamp_utc.max()) if 'timestamp_utc' in grid else pd.NaT
+            as_of = (
+                max_ts.tz_convert('UTC').to_pydatetime()
+                if not pd.isna(max_ts) and max_ts.tzinfo is not None else None
+            )
+            request = ReadRequest(
+                instruments=instruments,
+                as_of_utc=as_of,
+                columns=('instrument_id', _AVAILABLE),
+                optional_columns=tuple(columns),
+            )
+        data = self.source.read_mapped(request)
         _validate_events(data, ('instrument_id',))
         if missing := set(columns) - set(data):
             raise ValueError(f'Unknown auxiliary features: {sorted(missing)}')
@@ -182,7 +197,17 @@ class DeclarativeMicrostructure:
                             for ts, day, field in zip(grid.timestamp_utc, grid.session_id, price_fields)],
                            index=grid.index, name='tradable', dtype=bool)
         if self.source is not None and not grid.empty:
-            data = self.source.read_mapped()
+            max_ts = pd.Timestamp(grid.timestamp_utc.max()) if 'timestamp_utc' in grid else pd.NaT
+            as_of = (
+                max_ts.tz_convert('UTC').to_pydatetime()
+                if not pd.isna(max_ts) and max_ts.tzinfo is not None else None
+            )
+            push_inst = (instrument_id,) if isinstance(instrument_id, str) and instrument_id.strip() else None
+            data = self.source.read_mapped(ReadRequest(
+                instruments=push_inst,
+                as_of_utc=as_of,
+                columns=('instrument_id', _AVAILABLE, 'tradable'),
+            ))
             _validate_events(data, ('instrument_id',))
             if 'tradable' not in data or not pd.api.types.is_bool_dtype(data.tradable) or data.tradable.isna().any():
                 raise ValueError('Microstructure source requires a non-null boolean tradable column')
@@ -231,16 +256,60 @@ class DeclarativeBarFeed:
             for spec in specs.values()
         ]))
 
-    def load(self, *, instruments: Sequence[str] | None = None, as_of_utc: datetime | None = None,
-             bucket_strategy: str | None = None) -> pd.DataFrame:
-        data = self.source.read()
-        if instruments is not None:
-            instrument_column = next((src for src, dest in self.spec.column_mapping.items()
-                                      if dest == 'instrument_id'), None)
-            if instrument_column is not None:
-                data = data.loc[data[instrument_column].isin(instruments)]
-            elif self.instrument_id not in instruments:
-                data = data.iloc[:0]
+    def _load_data(self, *, instruments: Sequence[str] | None = None,
+                   start_utc: datetime | None = None, end_utc: datetime | None = None,
+                   as_of_utc: datetime | None = None) -> pd.DataFrame:
+        required_columns = tuple(dict.fromkeys(self.spec.column_mapping.values()))
+        optional_columns = tuple(
+            field for field in ('money', 'factor', 'open_interest')
+            if field not in required_columns and field not in self.spec.column_mapping
+        )
+        request = ReadRequest(
+            instruments=instruments,
+            start_utc=start_utc,
+            end_utc=end_utc,
+            as_of_utc=as_of_utc,
+            columns=required_columns,
+            optional_columns=optional_columns,
+        )
+        return self.source.read(request)
+
+    def _pushdown_window(self, start: pd.Timestamp, end: pd.Timestamp, *,
+                         grid: pd.DataFrame | None = None) -> tuple[pd.Timestamp, pd.Timestamp]:
+        if self.frequency.kind != 'intraday':
+            bar_grid = self.calendar.bar_grid(self.frequency) if grid is None else grid
+            matched = bar_grid.loc[bar_grid.timestamp_utc.between(start, end)]
+            if matched.empty:
+                return start, end
+            push_start = self.schedule.for_session(matched.session_id.iloc[0]).start_utc.min()
+            push_end = self.schedule.for_session(matched.session_id.iloc[-1]).end_utc.max()
+            return push_start, push_end
+
+        push_start, push_end = start, end
+        if self.spec.volume_mode == 'interval' and self.spec.timestamp_anchor != 'bar_end':
+            return push_start, push_end
+
+        tz = self.calendar.timezone
+        d0 = max(self.calendar.start, (start.tz_convert(tz) - pd.Timedelta(days=15)).tz_localize(None).normalize())
+        d1 = min(self.calendar.end, (end.tz_convert(tz) + pd.Timedelta(days=15)).tz_localize(None).normalize())
+        if d0 <= d1:
+            session_days = self.calendar.sessions(d0, d1)
+            if self.spec.volume_mode != 'interval':
+                for day in session_days:
+                    session = self.calendar.session_on(day, self.schedule.view)
+                    if session is not None and session.segments and session.segments[-1][1] >= start and session.segments[0][0] <= end:
+                        push_start = min(push_start, session.segments[0][0])
+                        break
+            if self.spec.timestamp_anchor == 'bar_end':
+                for day in reversed(session_days):
+                    session = self.calendar.session_on(day, self.schedule.view)
+                    if session is not None and session.segments and session.segments[0][0] <= end and session.segments[-1][1] >= start:
+                        push_end = max(push_end, session.segments[-1][1])
+                        break
+        return push_start, push_end
+
+    def _adapt_bars(self, data: pd.DataFrame, *, as_of_utc: datetime | None = None,
+                    bucket_strategy: str | None = None) -> pd.DataFrame:
         schedule = self.schedule if bucket_strategy is None else BarSchedule(
             self.calendar, self.frequency, bucket_strategy=bucket_strategy)
         return adapt_external_bars(
@@ -248,6 +317,11 @@ class DeclarativeBarFeed:
             source=self.source_name, data_version=self.data_version, instrument_id=self.instrument_id,
             bucket_strategy=schedule.bucket_strategy, schedule=schedule, through_utc=as_of_utc,
         )
+
+    def load(self, *, instruments: Sequence[str] | None = None, as_of_utc: datetime | None = None,
+             bucket_strategy: str | None = None) -> pd.DataFrame:
+        data = self._load_data(instruments=instruments, as_of_utc=as_of_utc)
+        return self._adapt_bars(data, as_of_utc=as_of_utc, bucket_strategy=bucket_strategy)
 
     def _read(self, instruments: Sequence[str], frequency: Frequency, *, start_utc: datetime,
               end_utc: datetime, as_of_utc: datetime | None = None) -> pd.DataFrame:
@@ -257,7 +331,12 @@ class DeclarativeBarFeed:
         if start is None or end is None:
             raise ValueError('Declarative bar reads require start_utc and end_utc')
         ids = _instrument_ids(instruments)
-        bars = self.load(instruments=ids, as_of_utc=as_of_utc)
+        grid = self.calendar.bar_grid(self.frequency) if self.frequency.kind != 'intraday' else None
+        push_start, push_end = self._pushdown_window(start, end, grid=grid)
+        data = self._load_data(
+            instruments=ids, start_utc=push_start, end_utc=push_end, as_of_utc=as_of_utc,
+        )
+        bars = self._adapt_bars(data, as_of_utc=as_of_utc)
         # Only the signal path needs completion, but both views validate the grid.
         if self.frequency.kind == 'intraday':
             bars = bars.loc[bars.timestamp_utc.between(start, end)].copy()
@@ -266,8 +345,8 @@ class DeclarativeBarFeed:
         days = bars.timestamp_utc if self.frequency.kind == 'intraday' else end_times - pd.Timedelta(1, 'ns')
         owners = [self.calendar.session_at(ts).session_date for ts in days]
         bars = bars.assign(session_id=pd.Series(owners, index=bars.index, dtype=object))
-        if self.frequency.kind != 'intraday':
-            keys = self.calendar.bar_grid(self.frequency).set_index('session_id').timestamp_utc
+        if grid is not None:
+            keys = grid.set_index('session_id').timestamp_utc
             bars = bars.assign(timestamp_utc=bars.session_id.map(keys))
         mask = bars.timestamp_utc.between(start, end)
         extras = [field for field in ('money', 'factor', 'open_interest') if field in bars]
