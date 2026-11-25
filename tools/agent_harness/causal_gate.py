@@ -811,23 +811,24 @@ def verify_factor_causality(
                 atol=atol,
             )
         else:
-            (
-                causal_passed,
-                checks,
-                trunc_strs,
-                pit_strs,
-                max_diff,
-                nan_cnt,
-                failure_reason,
-                samples,
-            ) = _verify_ashare_factor(
-                factor,
-                bar_grid=bar_grid,
-                n_truncations=n_truncations,
-                seed=seed,
-                rtol=rtol,
-                atol=atol,
-            )
+            with slot_execution_mode._ashare_causal_probe_context(factor):
+                (
+                    causal_passed,
+                    checks,
+                    trunc_strs,
+                    pit_strs,
+                    max_diff,
+                    nan_cnt,
+                    failure_reason,
+                    samples,
+                ) = _verify_ashare_factor(
+                    factor,
+                    bar_grid=bar_grid,
+                    n_truncations=n_truncations,
+                    seed=seed,
+                    rtol=rtol,
+                    atol=atol,
+                )
     finally:
         _restore_factor_state(factor, saved)
 

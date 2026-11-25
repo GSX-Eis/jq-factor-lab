@@ -182,6 +182,93 @@ def test_cli_rejects_constant_returns_without_publishing_results(tmp_path, capsy
     assert not (tmp_path / 'result').exists()
 
 
+def test_cli_causal_gate_rejects_lookahead_and_allows_causal_factor(tmp_path):
+    import subprocess
+    import sys
+
+    root = Path(__file__).resolve().parents[1]
+    env = {k: v for k, v in __import__("os").environ.items() if k != "PYTHONPATH"}
+    env["PYTHONPATH"] = str(root)
+    make_prices(sessions=80).to_csv(tmp_path / "input.csv", index=False)
+    factor_file = tmp_path / "causal_factors.py"
+    factor_file.write_text(
+        "from examples.momentum import DemoMomentum\n\n"
+        "class LookaheadCausalFactor(DemoMomentum):\n"
+        "    CAUSAL_VECTORIZED = True\n\n"
+        "    def calculate_factor(self, data):\n"
+        '        prices = data.pivot(index="date", columns="code", values="close").sort_index()\n'
+        "        return prices.shift(-2) / prices.shift(-1) - 1\n\n"
+        "class ValidCausalFactor(DemoMomentum):\n"
+        "    CAUSAL_VECTORIZED = True\n\n"
+        "    def calculate_factor(self, data):\n"
+        '        prices = data.pivot(index="date", columns="code", values="close").sort_index()\n'
+        "        return prices.pct_change(periods=5, fill_method=None)\n",
+        encoding="utf-8",
+    )
+    calendar_file = str(root / "config/demo_calendar.json")
+
+    rejected_dir = tmp_path / "rejected_out"
+    rejected_config = tmp_path / "rejected.json"
+    rejected_config.write_text(
+        json.dumps({
+            "input_csv": "input.csv",
+            "output_dir": str(rejected_dir),
+            "calendar_file": calendar_file,
+            "factor_file": str(factor_file),
+            "factor_class": "LookaheadCausalFactor",
+            "periods": [1, 5],
+            "execution_lag": 1,
+        }),
+        encoding="utf-8",
+    )
+    rejected = subprocess.run(
+        [sys.executable, "-m", "tools.demo_cli", "single-factor-analysis", "--config", str(rejected_config)],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert rejected.returncode != 0
+    rejected_payload = json.loads(rejected.stdout)
+    assert rejected_payload["ok"] is False
+    assert rejected_payload["exit_code"] == rejected.returncode
+    assert rejected_payload["error"]["code"] == "causal_fast_path_gate_failed"
+    assert "Causal fast-path gate rejected LookaheadCausalFactor" in rejected_payload["error"]["message"]
+    assert "Traceback" not in rejected.stderr
+    assert not (rejected_dir / "summary.json").exists()
+    assert not rejected_dir.exists()
+
+    valid_dir = tmp_path / "valid_out"
+    valid_config = tmp_path / "valid.json"
+    valid_config.write_text(
+        json.dumps({
+            "input_csv": "input.csv",
+            "output_dir": str(valid_dir),
+            "calendar_file": calendar_file,
+            "factor_file": str(factor_file),
+            "factor_class": "ValidCausalFactor",
+            "periods": [1, 5],
+            "execution_lag": 1,
+        }),
+        encoding="utf-8",
+    )
+    valid = subprocess.run(
+        [sys.executable, "-m", "tools.demo_cli", "single-factor-analysis", "--config", str(valid_config)],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert valid.returncode == 0, valid.stderr
+    valid_payload = json.loads(valid.stdout)
+    assert valid_payload["ok"] is True
+    assert valid_payload["exit_code"] == 0
+    assert valid_payload["factor"] == "ValidCausalFactor"
+    assert (valid_dir / "summary.json").is_file()
+
+
 def test_daily_demo_allocates_distinct_outputs(tmp_path, monkeypatch, capsys):
     monkeypatch.chdir(tmp_path)
     outputs = []

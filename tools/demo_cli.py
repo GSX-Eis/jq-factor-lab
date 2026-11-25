@@ -148,6 +148,9 @@ def analyze(
                      calendar_id=calendar.calendar_id, calendar_sha256=calendar.fingerprint,
                      periods=periods, execution_lag=lag, n_quantiles=quantiles,
                      **_output_plan(target, Path("outputs/daily"), overwrite))
+    from tools.agent_harness.causal_gate import CausalFastPathGateError, verify_factor_causality
+    from utils.factor_base import FactorBase
+
     classes = FactorLoader._load_classes_from_file(str(factor_path), config["factor_class"])
     if len(classes) != 1:
         raise ValueError("Select exactly one factor class")
@@ -162,6 +165,13 @@ def analyze(
             frame.date.min().strftime("%Y-%m-%d"), frame.date.max().strftime("%Y-%m-%d"),
             stock_pool=sorted(frame.stock_code.unique()), db_backend="duckdb", pit_enabled=True,
         )
+        if isinstance(factor, FactorBase):
+            gate = verify_factor_causality(factor, on_failure="reject", apply_to_factor=True)
+            if not gate.ok:
+                raise CausalFastPathGateError(
+                    f"Causal fast-path gate rejected {gate.factor_name}: {gate.failure_reason}",
+                    gate_result=gate.to_dict(),
+                )
         values = factor.get_factor_values(force_recalculate=True)
     pricing = frame.assign(adjusted_close=frame.close * frame.factor).set_index(
         ["stock_code", "date"]
@@ -427,10 +437,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     except Exception as exc:
         with _logs_to_stderr():
             from backtest_and_analysis.alphalens_runner import InsufficientCrossSectionAssets, MaxLossExceededError
+            from tools.agent_harness.causal_gate import CausalFastPathGateError
 
         if isinstance(exc, InsufficientCrossSectionAssets):
             exit_code, code = 1, exc.code
             fix = "Supply two or more assets or use time-series-analysis."
+        elif isinstance(exc, CausalFastPathGateError):
+            exit_code, code = 1, exc.code
+            fix = "Remove future/lookahead references from calculate_factor() or disable CAUSAL_VECTORIZED."
         elif isinstance(exc, MaxLossExceededError):
             exit_code, code = 1, "analysis_failed"
         elif isinstance(exc, (ValueError, TypeError, KeyError, FileNotFoundError, FileExistsError, PermissionError, SyntaxError)):

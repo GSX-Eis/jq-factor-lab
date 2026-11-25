@@ -253,3 +253,57 @@ def test_direct_cache_reader_rejects_wrong_object(cached_returns_case):
     calc, _, _, _ = cached_returns_case
     calc.save_to_cache('wrong', 'not a DataFrame')
     assert calc.load_from_cache('wrong') is None
+
+
+def test_forward_returns_labels_with_runner_keep_1d_stats_invariant_across_periods() -> None:
+    """Sparse forward_returns from _label_daily must not change 1D quantiles or 1D stats when 5D is added."""
+    dates = pd.bdate_range("2024-01-02", periods=16, name="date")
+    assets = list("ABCDEFG")
+    prices = pd.DataFrame(
+        {
+            asset: 100.0 * (1.0 + 0.003 * (idx + 1)) ** np.arange(len(dates))
+            for idx, asset in enumerate(assets)
+        },
+        index=dates,
+    )
+    # At t0=dates[0] (lag=1 -> entry dates[1]): A misses 1D exit (dates[2]) only;
+    # G misses entry (dates[1]) so both 1D and 5D are absent for G at t0.
+    prices.loc[dates[2], "A"] = np.nan
+    prices.loc[dates[1], "G"] = np.nan
+
+    pricing = prices.stack().reorder_levels([1, 0]).sort_index()
+    pricing.index.names = ["asset", "date"]
+    calendar = TradingCalendar(dates, dates.min(), dates.max())
+    pricing.attrs["trading_calendar"] = calendar
+
+    calc = ForwardReturnsCalculator(trading_calendar=calendar)
+    ret_1d = calc.calculate_forward_returns(pricing, (1,), execution_lag=1)
+    ret_15d = calc.calculate_forward_returns(pricing, (1, 5), execution_lag=1)
+
+    t0 = dates[0]
+    assert (t0, "A") not in ret_1d.index
+    assert (t0, "A") in ret_15d.index and pd.isna(ret_15d.loc[(t0, "A"), "1D"]) and pd.notna(ret_15d.loc[(t0, "A"), "5D"])
+    assert (t0, "G") not in ret_1d.index and (t0, "G") not in ret_15d.index
+
+    factors = pd.DataFrame(np.tile([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 0.0], (len(dates), 1)), index=dates, columns=assets)
+    factor_series = factors.stack()
+    factor_series.index.names = ["date", "asset"]
+
+    r_1d = AlphalensRunner(n_quantiles=3, periods=(1,), execution_lag=1)
+    r_15d = AlphalensRunner(n_quantiles=3, periods=(1, 5), execution_lag=1)
+
+    clean_1d = r_1d._prepare_factor_data_with_precomputed_returns(factor_series, ret_1d)
+    clean_15d = r_15d._prepare_factor_data_with_precomputed_returns(factor_series, ret_15d)
+    pd.testing.assert_series_equal(
+        clean_1d.loc[t0, "factor_quantile"],
+        clean_15d.loc[t0].loc[clean_1d.loc[t0].index, "factor_quantile"],
+        check_exact=True,
+    )
+    assert clean_1d.loc[t0, "factor_quantile"].tolist() == [2, 2, 3, 3, 3]
+
+    res_1d = r_1d.run(factors, pricing, ret_1d, max_loss=1.0)
+    res_15d = r_15d.run(factors, pricing, ret_15d, max_loss=1.0)
+    np.testing.assert_allclose(res_1d["ic"].loc[t0, "1D"], res_15d["ic"].loc[t0, "1D"], rtol=0, atol=1e-12)
+    q_1d = res_1d["quantile_returns"]["1D"].xs(t0, level="date").dropna().sort_index()
+    q_15d = res_15d["quantile_returns"]["1D"].xs(t0, level="date").dropna().sort_index()
+    pd.testing.assert_series_equal(q_1d, q_15d, rtol=0, atol=1e-12, check_names=False)

@@ -102,13 +102,27 @@ def clip(a, limit):
     return max(-bound, min(bound, float(a)))
 
 
-def winsorize(a, limit):
-    if not isinstance(a, pd.Series):
+def winsorize(a, limit, dates):
+    if dates is None:
+        raise ValueError("winsorize requires dates for cross-sectional grouping")
+    if np.isscalar(a) or a is pd.NA:
         return a
+    series = pd.to_numeric(
+        a if isinstance(a, pd.Series) else pd.Series(a),
+        errors="coerce",
+    ).astype(float)
     q = min(max(float(limit), 0.0), 0.49)
-    lo = a.quantile(q)
-    hi = a.quantile(1.0 - q)
-    return a.clip(lower=lo, upper=hi)
+    if not np.isfinite(q):
+        return pd.Series(np.nan, index=series.index, dtype=float)
+    if series.empty:
+        return series
+    # Compute quantiles strictly on finite values so +/-inf intermediate nodes
+    # do not turn linear quantile interpolation into NaN for the entire date.
+    finite = series.where(np.isfinite(series))
+    grouped = finite.groupby(dates, sort=False)
+    lo = grouped.transform("quantile", q)
+    hi = grouped.transform("quantile", 1.0 - q)
+    return series.clip(lower=lo, upper=hi).where(lo.notna() & hi.notna())
 
 
 def cs_rank(a, dates):
@@ -793,7 +807,7 @@ def runtime_namespace(features, dates, codes):
             "power": lambda a, b: power(a, b),
             "pow": lambda a, b: pow(a, b),
             "clip": lambda a, limit: clip(a, limit),
-            "winsorize": lambda a, limit: winsorize(a, limit),
+            "winsorize": lambda a, limit: winsorize(a, limit, dates),
             "cs_rank": lambda a: cs_rank(a, dates),
             "cs_zscore": lambda a: cs_zscore(a, dates),
             "cs_demean": lambda a: cs_demean(a, dates),
@@ -893,7 +907,7 @@ _RUNTIME_OPERATOR_BINDINGS = {
     "power": "lambda a, b: power(a, b)",
     "pow": "lambda a, b: pow(a, b)",
     "clip": "lambda a, limit: clip(a, limit)",
-    "winsorize": "lambda a, limit: winsorize(a, limit)",
+    "winsorize": "lambda a, limit: winsorize(a, limit, dates)",
     "cs_rank": "lambda a: cs_rank(a, dates)",
     "cs_zscore": "lambda a: cs_zscore(a, dates)",
     "cs_demean": "lambda a: cs_demean(a, dates)",

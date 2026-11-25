@@ -20,8 +20,9 @@ from typing import Any, Dict, List, Literal, Optional, Set, Tuple, Union
 import numpy as np
 import pandas as pd
 
+from utils.session_calendar import SessionCalendar
 from utils.slots.contracts import InstrumentSpec, MarketSlot
-from utils.time_axis import Frequency
+from utils.time_axis import BarSchedule, Frequency
 
 try:
     import vectorbt as vbt
@@ -593,6 +594,22 @@ def _valid_positive(value: Any) -> Optional[float]:
     return val if math.isfinite(val) and val > 0.0 else None
 
 
+def _normalize_utc_timestamp(value: Any) -> pd.Timestamp:
+    ts = pd.Timestamp(value)
+    if pd.isna(ts):
+        raise ValueError(f"Expected non-null timestamp, got {value!r}")
+    if ts.tzinfo is None:
+        return ts.tz_localize("UTC").as_unit("ns")
+    return ts.tz_convert("UTC").as_unit("ns")
+
+
+def _normalize_utc_index(values: Any) -> pd.DatetimeIndex:
+    idx = pd.DatetimeIndex(values)
+    if idx.tz is None:
+        return idx.tz_localize("UTC").as_unit("ns")
+    return idx.tz_convert("UTC").as_unit("ns")
+
+
 class _FuturesOrderValidator:
     """Unified order tradability verification layer backed by ``MicrostructureSlot``."""
 
@@ -602,11 +619,310 @@ class _FuturesOrderValidator:
         slot: Optional[MarketSlot],
         bar_utc_index: pd.DatetimeIndex,
         session_ids: Mapping[Tuple[int, str], str],
+        frequency: Optional[Union[str, Frequency]] = None,
+        default_execution_price_field: Literal["open", "close"] = "close",
     ) -> None:
+        if default_execution_price_field not in ("open", "close"):
+            raise ValueError(
+                f"Unsupported default_execution_price_field: {default_execution_price_field!r}"
+            )
+        freq_obj = (
+            Frequency.parse("1d")
+            if frequency is None
+            else (frequency if isinstance(frequency, Frequency) else Frequency.parse(frequency))
+        )
+        if not freq_obj.is_valid:
+            raise ValueError(f"Invalid frequency: {frequency!r}")
         self._slot = slot
         self._bar_utc_index = bar_utc_index
         self._session_ids = session_ids
-        self._mask_cache: Dict[Tuple[int, str, str], bool] = {}
+        self._freq_obj = freq_obj
+        self._default_execution_price_field: Literal["open", "close"] = (
+            default_execution_price_field
+        )
+        self._view = getattr(slot.bar_feed, "view", "ETH") if slot is not None else "ETH"
+        self._bucket_strategy_cache: Dict[str, Optional[str]] = {}
+        self._schedule_cache: Dict[Optional[str], BarSchedule] = {}
+        self._session_slots_cache: Dict[Tuple[Optional[str], str], pd.DataFrame] = {}
+        self._weekly_first_in_week: Optional[pd.Series] = None
+        self._intraday_grid_cache: Dict[
+            Tuple[Optional[str], str], Tuple[pd.DatetimeIndex, pd.DatetimeIndex]
+        ] = {}
+        self._exec_ts_cache: Dict[Tuple[int, str, str], pd.Timestamp] = {}
+        self._mask_cache: Dict[Tuple[int, str, str, str], bool] = {}
+
+    @property
+    def default_execution_price_field(self) -> Literal["open", "close"]:
+        return self._default_execution_price_field
+
+    def _normalize_price_field(
+        self, execution_price_field: Optional[str]
+    ) -> Literal["open", "close"]:
+        field = (
+            self._default_execution_price_field
+            if execution_price_field is None
+            else execution_price_field
+        )
+        if field not in ("open", "close"):
+            raise ValueError(f"Unsupported execution_price_field: {field!r}")
+        return field  # type: ignore[return-value]
+
+    def _resolve_bucket_strategy(self, inst: str) -> Optional[str]:
+        if inst in self._bucket_strategy_cache:
+            return self._bucket_strategy_cache[inst]
+        assert self._slot is not None
+        feed = self._slot.bar_feed
+        cal = self._slot.calendar
+        strategy = getattr(feed, "bucket_strategy", None)
+        if strategy is None:
+            if self._freq_obj.kind == "session":
+                strategy = "session"
+            elif getattr(cal, "is_domestic_futures", False) and self._freq_obj.kind != "week":
+                from utils.factor_core.bar_bridge import _bucket_strategy
+
+                try:
+                    strategy = _bucket_strategy(feed, self._freq_obj, inst)
+                except Exception:
+                    strategy = None
+        self._bucket_strategy_cache[inst] = strategy
+        return strategy
+
+    def _call_session_at(
+        self,
+        cal: Any,
+        ts: pd.Timestamp,
+        frequency: Optional[Union[str, Frequency]] = None,
+    ) -> Any:
+        py_dt = ts.to_pydatetime()
+        try:
+            return cal.session_at(py_dt, self._view, frequency=frequency)
+        except TypeError:
+            try:
+                return cal.session_at(py_dt, self._view)
+            except TypeError:
+                try:
+                    return cal.session_at(py_dt)
+                except Exception:
+                    return None
+        except Exception:
+            return None
+
+    def _call_bar_grid(
+        self,
+        cal: Any,
+        frequency: Union[str, Frequency],
+        *,
+        start: Optional[str] = None,
+        end: Optional[str] = None,
+        strategy: Optional[str] = None,
+    ) -> Optional[pd.DataFrame]:
+        base: Dict[str, Any] = {}
+        if start is not None:
+            base["start"] = start
+        if end is not None:
+            base["end"] = end
+        kwargs_list: List[Dict[str, Any]] = []
+        if strategy is not None:
+            kwargs_list.append({**base, "view": self._view, "bucket_strategy": strategy})
+        kwargs_list.append({**base, "view": self._view})
+        kwargs_list.append(dict(base))
+        for kwargs in kwargs_list:
+            try:
+                return cal.bar_grid(frequency, **kwargs)
+            except TypeError:
+                continue
+            except Exception:
+                return None
+        return None
+
+    def _resolve_from_session_calendar(
+        self,
+        *,
+        cal: SessionCalendar,
+        bar_ts: pd.Timestamp,
+        session_id: str,
+        inst: str,
+        execution_price_field: str,
+    ) -> Optional[pd.Timestamp]:
+        strategy = self._resolve_bucket_strategy(inst)
+        schedule = self._schedule_cache.get(strategy)
+        if schedule is None:
+            try:
+                schedule = BarSchedule(
+                    cal, self._freq_obj, view=self._view, bucket_strategy=strategy
+                )
+            except Exception:
+                return None
+            self._schedule_cache[strategy] = schedule
+
+        slot_key = (strategy, session_id)
+        slots = self._session_slots_cache.get(slot_key)
+        if slots is None:
+            try:
+                slots = schedule.for_session(session_id)
+            except Exception:
+                return None
+            self._session_slots_cache[slot_key] = slots
+
+        if slots.empty:
+            if self._freq_obj.kind == "week":
+                try:
+                    week = cal._week_on(session_id, self._view)
+                except Exception:
+                    week = []
+                if week:
+                    target = (
+                        week[0].segments[0][0]
+                        if execution_price_field == "open"
+                        else week[-1].segments[-1][1]
+                    )
+                    return _normalize_utc_timestamp(target)
+            return None
+
+        if self._freq_obj.kind == "intraday":
+            starts = _normalize_utc_index(slots["start_utc"])
+            ends = _normalize_utc_index(slots["end_utc"])
+            matches = np.flatnonzero(starts == bar_ts)
+            if len(matches) == 0:
+                matches = np.flatnonzero(ends == bar_ts)
+            if len(matches) == 0:
+                return None
+            row_idx = int(matches[0])
+            return starts[row_idx] if execution_price_field == "open" else ends[row_idx]
+
+        col = "start_utc" if execution_price_field == "open" else "end_utc"
+        return _normalize_utc_timestamp(slots[col].iloc[0])
+
+    def _resolve_from_calendar_protocol(
+        self,
+        *,
+        cal: Any,
+        bar_ts: pd.Timestamp,
+        session_id: str,
+        inst: str,
+        execution_price_field: str,
+    ) -> Optional[pd.Timestamp]:
+        session = self._call_session_at(cal, bar_ts, frequency=self._freq_obj)
+        if session is None and self._freq_obj.kind in ("session", "week"):
+            anchor_grid = self._call_bar_grid(
+                cal, self._freq_obj.canonical or "1d", start=session_id, end=session_id
+            )
+            if anchor_grid is not None and not anchor_grid.empty and "session_id" in anchor_grid.columns:
+                matched = anchor_grid.loc[anchor_grid["session_id"].astype(str) == str(session_id)]
+                if not matched.empty:
+                    anchor_ts = _normalize_utc_timestamp(matched["timestamp_utc"].iloc[0])
+                    session = self._call_session_at(cal, anchor_ts, frequency=self._freq_obj)
+        if session is None or not getattr(session, "segments", None):
+            return None
+        if str(getattr(session, "session_date", session_id)) != str(session_id):
+            return None
+
+        if self._freq_obj.kind == "intraday":
+            strategy = self._resolve_bucket_strategy(inst)
+            cache_key = (strategy, session_id)
+            cached_grid = self._intraday_grid_cache.get(cache_key)
+            if cached_grid is None:
+                grid = self._call_bar_grid(
+                    cal,
+                    self._freq_obj,
+                    start=session_id,
+                    end=session_id,
+                    strategy=strategy,
+                )
+                if grid is None or grid.empty or "session_id" not in grid.columns:
+                    return None
+                rows = grid.loc[grid["session_id"].astype(str) == str(session_id)]
+                if rows.empty:
+                    return None
+                opens = _normalize_utc_index(rows["timestamp_utc"])
+                close_end = _normalize_utc_timestamp(session.segments[-1][1])
+                break_opens = [
+                    _normalize_utc_timestamp(opening) for opening, _ in session.segments[1:]
+                ]
+                break_closes = [
+                    _normalize_utc_timestamp(closing) for _, closing in session.segments[:-1]
+                ]
+                closes = opens[1:].append(pd.DatetimeIndex([close_end]))
+                if break_opens:
+                    breaks = pd.Series(break_closes, index=break_opens)
+                    closes = _normalize_utc_index(
+                        breaks.reindex(closes).fillna(closes.to_series(index=closes))
+                    )
+                cached_grid = (opens, closes)
+                self._intraday_grid_cache[cache_key] = cached_grid
+            opens, closes = cached_grid
+            matches = np.flatnonzero(opens == bar_ts)
+            if len(matches) == 0:
+                matches = np.flatnonzero(closes == bar_ts)
+            if len(matches) == 0:
+                return None
+            row_idx = int(matches[0])
+            return opens[row_idx] if execution_price_field == "open" else closes[row_idx]
+
+        if self._freq_obj.kind == "week":
+            if execution_price_field == "close":
+                return _normalize_utc_timestamp(session.segments[-1][1])
+            if self._weekly_first_in_week is None:
+                daily = self._call_bar_grid(cal, "1d")
+                if daily is None or daily.empty:
+                    return None
+                weeks = pd.to_datetime(daily["session_id"]).dt.to_period("W-SUN")
+                self._weekly_first_in_week = daily.groupby(weeks)["timestamp_utc"].first()
+            week_period = pd.Period(session_id, freq="W-SUN")
+            if week_period not in self._weekly_first_in_week.index:
+                return None
+            day_key = _normalize_utc_timestamp(self._weekly_first_in_week.loc[week_period])
+            opening_session = self._call_session_at(cal, day_key, frequency="1d")
+            if opening_session is None or not getattr(opening_session, "segments", None):
+                return None
+            return _normalize_utc_timestamp(opening_session.segments[0][0])
+
+        target = (
+            session.segments[0][0]
+            if execution_price_field == "open"
+            else session.segments[-1][1]
+        )
+        return _normalize_utc_timestamp(target)
+
+    def _resolve_execution_timestamp(
+        self,
+        *,
+        bar_idx: int,
+        inst: str,
+        execution_price_field: str,
+    ) -> pd.Timestamp:
+        cache_key = (bar_idx, inst, execution_price_field)
+        cached = self._exec_ts_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        bar_ts = _normalize_utc_timestamp(self._bar_utc_index[bar_idx])
+        if self._slot is None:
+            self._exec_ts_cache[cache_key] = bar_ts
+            return bar_ts
+
+        cal = self._slot.calendar
+        session_id = self._session_ids.get((bar_idx, inst), bar_ts.strftime("%Y-%m-%d"))
+        if isinstance(cal, SessionCalendar) and hasattr(cal, "_intervals"):
+            resolved = self._resolve_from_session_calendar(
+                cal=cal,
+                bar_ts=bar_ts,
+                session_id=session_id,
+                inst=inst,
+                execution_price_field=execution_price_field,
+            )
+        else:
+            resolved = self._resolve_from_calendar_protocol(
+                cal=cal,
+                bar_ts=bar_ts,
+                session_id=session_id,
+                inst=inst,
+                execution_price_field=execution_price_field,
+            )
+
+        out = resolved if resolved is not None else bar_ts
+        self._exec_ts_cache[cache_key] = out
+        return out
 
     def is_mask_tradable(
         self,
@@ -616,34 +932,45 @@ class _FuturesOrderValidator:
         contract: str,
         side: str,
         price: Optional[float] = None,
+        execution_price_field: Optional[str] = None,
     ) -> bool:
         """Query ``slot.microstructure.tradability_mask`` uniformly across all order types."""
         if self._slot is None:
             return True
         if side not in ("buy", "sell", "hold", "both"):
             raise ValueError(f"Unsupported futures order side: {side!r}")
+        price_field = self._normalize_price_field(execution_price_field)
         if side == "both":
             return self.is_mask_tradable(
-                bar_idx=bar_idx, inst=inst, contract=contract, side="buy", price=price
+                bar_idx=bar_idx,
+                inst=inst,
+                contract=contract,
+                side="buy",
+                price=price,
+                execution_price_field=price_field,
             ) and self.is_mask_tradable(
-                bar_idx=bar_idx, inst=inst, contract=contract, side="sell", price=price
+                bar_idx=bar_idx,
+                inst=inst,
+                contract=contract,
+                side="sell",
+                price=price,
+                execution_price_field=price_field,
             )
 
-        cache_key = (bar_idx, contract, side)
+        cache_key = (bar_idx, contract, side, price_field)
         if cache_key in self._mask_cache:
             return self._mask_cache[cache_key]
 
-        bar_ts = pd.Timestamp(self._bar_utc_index[bar_idx])
-        if bar_ts.tzinfo is None:
-            bar_ts = bar_ts.tz_localize("UTC")
-        else:
-            bar_ts = bar_ts.tz_convert("UTC")
-        session_id = self._session_ids.get((bar_idx, inst), bar_ts.strftime("%Y-%m-%d"))
+        exec_ts = self._resolve_execution_timestamp(
+            bar_idx=bar_idx, inst=inst, execution_price_field=price_field
+        )
+        session_id = self._session_ids.get((bar_idx, inst), exec_ts.strftime("%Y-%m-%d"))
 
         grid_data: Dict[str, Any] = {
             "instrument_id": [contract],
-            "timestamp_utc": pd.DatetimeIndex([bar_ts], tz="UTC"),
+            "timestamp_utc": pd.DatetimeIndex([exec_ts], tz="UTC"),
             "session_id": [session_id],
+            "execution_price_field": [price_field],
         }
         if side in ("buy", "sell"):
             grid_data["side"] = [side]
@@ -668,10 +995,16 @@ class _FuturesOrderValidator:
         contract: str,
         side: str,
         price: Optional[float],
+        execution_price_field: Optional[str] = None,
     ) -> Tuple[bool, str]:
         """Validate both tradability mask and physical execution price availability."""
         if not self.is_mask_tradable(
-            bar_idx=bar_idx, inst=inst, contract=contract, side=side, price=price
+            bar_idx=bar_idx,
+            inst=inst,
+            contract=contract,
+            side=side,
+            price=price,
+            execution_price_field=execution_price_field,
         ):
             return False, "tradability_mask_blocked"
         if price is None or not math.isfinite(price) or price <= 0.0:
@@ -802,6 +1135,7 @@ class _FuturesAccountView:
                     contract=contract,
                     side="hold",
                     price=px,
+                    execution_price_field=self._validator.default_execution_price_field,
                 )
             else:
                 ok, _ = self._validator.validate_order(
@@ -810,6 +1144,7 @@ class _FuturesAccountView:
                     contract=contract,
                     side=side,
                     price=px,
+                    execution_price_field=self._validator.default_execution_price_field,
                 )
             if ok:
                 allowed.append(inst)
@@ -1018,10 +1353,13 @@ def simulate_futures_contract_portfolio(
                 concrete_close[(pos, inst)] = c_px
                 concrete_open[(pos, inst)] = o_px if o_px is not None else c_px
 
+    default_execution_price_field: Literal["open", "close"] = "open" if use_open else "close"
     validator = _FuturesOrderValidator(
         slot=slot,
         bar_utc_index=bar_utc_index,
         session_ids=session_ids,
+        frequency=freq_obj,
+        default_execution_price_field=default_execution_price_field,
     )
 
     spec_cache: Dict[str, InstrumentSpec] = {}
@@ -1328,8 +1666,14 @@ def simulate_futures_contract_portfolio(
                 c_id = active_contract[(bar_idx, inst)]
                 # If microstructure explicitly marks the bar non-tradable, do not fail
                 # missing-execution-bar validation; let order validation block/defer it.
+                missing_field = default_execution_price_field if exec_px is None else "close"
                 if not validator.is_mask_tradable(
-                    bar_idx=bar_idx, inst=inst, contract=c_id, side="hold", price=exec_px
+                    bar_idx=bar_idx,
+                    inst=inst,
+                    contract=c_id,
+                    side="hold",
+                    price=exec_px,
+                    execution_price_field=missing_field,
                 ):
                     missing_bar_insts.add(inst)
                     continue
@@ -1363,6 +1707,7 @@ def simulate_futures_contract_portfolio(
                     contract=c_old,
                     side=close_side,
                     price=roll_px,
+                    execution_price_field=default_execution_price_field,
                 )
                 used_fallback = False
                 if roll_px is None:
@@ -1408,6 +1753,7 @@ def simulate_futures_contract_portfolio(
                 contract=pos_obj.concrete_instrument_id,
                 side=liq_side,
                 price=liq_px,
+                execution_price_field=default_execution_price_field,
             )
             if liq_ok and liq_px is not None:
                 eq_before = float(equity)
@@ -1476,6 +1822,7 @@ def simulate_futures_contract_portfolio(
                 contract=c_old,
                 side=close_side,
                 price=p_old_exec,
+                execution_price_field=default_execution_price_field,
             )
             if not roll_close_ok or p_old_exec is None:
                 roll_close_blocked_count += 1
@@ -1848,6 +2195,7 @@ def simulate_futures_contract_portfolio(
                     contract=pos_obj.concrete_instrument_id,
                     side=close_side,
                     price=px,
+                    execution_price_field=default_execution_price_field,
                 )
                 if not ok or px is None:
                     _block_exit(dt, inst, px)
@@ -1890,6 +2238,7 @@ def simulate_futures_contract_portfolio(
                     contract=pos_obj.concrete_instrument_id,
                     side=close_side,
                     price=px,
+                    execution_price_field=default_execution_price_field,
                 )
                 if not ok or px is None:
                     if policy_driven:
@@ -1941,6 +2290,7 @@ def simulate_futures_contract_portfolio(
                 contract=c_cur,
                 side=open_side,
                 price=px,
+                execution_price_field=default_execution_price_field,
             )
             if not ok or px is None:
                 if order_type == "ROLL_OPEN":
@@ -2229,6 +2579,7 @@ def simulate_futures_contract_portfolio(
                             contract=pos_obj.concrete_instrument_id,
                             side=liq_side,
                             price=liq_close_px,
+                            execution_price_field="close",
                         )
                         if not liq_ok or liq_close_px is None:
                             liquidation_blocked_count += 1

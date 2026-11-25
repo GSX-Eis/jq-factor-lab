@@ -884,3 +884,128 @@ class UnmappedSessionFactor(FactorBase):
             },
             {"analysis_mode": "cross_sectional"},
         )
+
+
+def test_ashare_causal_gate_fails_closed_for_unverified_and_lookahead_factors() -> None:
+    from utils.factor_core.slot_execution_mode import _ACTIVE_ASHARE_PROBE_IDS, require_ashare_causal_gate
+
+    raw_panel = pd.DataFrame(
+        {
+            "date": pd.to_datetime(
+                ["2026-01-05", "2026-01-06", "2026-01-07", "2026-01-08", "2026-01-09"] * 2
+            ),
+            "code": ["000001.XSHE"] * 5 + ["000002.XSHE"] * 5,
+            "close": [10.0, 11.0, 12.0, 13.0, 14.0, 20.0, 21.0, 22.0, 23.0, 24.0],
+        }
+    )
+
+    class _CausalAShareFactor(FactorBase):
+        CAUSAL_VECTORIZED = True
+
+        def _get_raw_data_for_factor(self):
+            return raw_panel.copy()
+
+        def calculate_factor(self, data):
+            wide = data.pivot(index="date", columns="code", values="close").sort_index()
+            return wide.pct_change(fill_method=None)
+
+    class _LegacyAShareFactor(FactorBase):
+        def _get_raw_data_for_factor(self):
+            return raw_panel.copy()
+
+        def calculate_factor(self, data):
+            return data.pivot(index="date", columns="code", values="close").sort_index()
+
+    class _FutureReturnAShareFactor(FactorBase):
+        CAUSAL_VECTORIZED = True
+
+        def _get_raw_data_for_factor(self):
+            return raw_panel.copy()
+
+        def calculate_factor(self, data):
+            prices = data.pivot(index="date", columns="code", values="close").sort_index()
+            return prices.shift(-2) / prices.shift(-1) - 1.0
+
+    # 1. Unverified CAUSAL_VECTORIZED=True A-share factor MUST fail closed on all direct evaluation entry points.
+    unverified = _CausalAShareFactor(
+        None, "ashare_unverified", "2026-01-05", "2026-01-09",
+        stock_pool=["000001.XSHE", "000002.XSHE"], data_bindings={}, pit_enabled=False,
+    )
+    for method_name in ("get_factor_values", "get_factor_values_unfiltered", "_get_market_factor_values"):
+        with pytest.raises(RuntimeError, match="verify_factor_causality"):
+            getattr(unverified, method_name)()
+
+    # apply_to_factor=False must leave the factor unverified and still blocked.
+    preview_gate = verify_factor_causality(unverified, apply_to_factor=False)
+    assert preview_gate.ok is True
+    assert preview_gate.causal_passed is True
+    assert getattr(unverified, "_causal_gate_passed", None) is None
+    with pytest.raises(RuntimeError, match="verify_factor_causality"):
+        unverified.get_factor_values()
+
+    # Requesting slot_execution_mode="pit_replay" on A-share cannot bypass CAUSAL_VECTORIZED=True gate.
+    pit_mode_ashare = _CausalAShareFactor(
+        None, "ashare_pit_mode", "2026-01-05", "2026-01-09",
+        stock_pool=["000001.XSHE", "000002.XSHE"], data_bindings={}, pit_enabled=False,
+        slot_execution_mode="pit_replay",
+    )
+    skipped_pit = verify_factor_causality(pit_mode_ashare, apply_to_factor=True)
+    assert skipped_pit.status == "skipped_pit_replay"
+    with pytest.raises(RuntimeError, match="verify_factor_causality"):
+        pit_mode_ashare.get_factor_values()
+
+    # 2. Legacy A-share factor without CAUSAL_VECTORIZED=True remains unaffected.
+    legacy = _LegacyAShareFactor(
+        None, "ashare_legacy", "2026-01-05", "2026-01-09",
+        stock_pool=["000001.XSHE", "000002.XSHE"], data_bindings={}, pit_enabled=False,
+    )
+    assert not legacy.get_factor_values().empty
+    assert not legacy.get_factor_values_unfiltered().empty
+
+    # 3. Valid causal A-share factor passes verify_factor_causality(apply_to_factor=True) and evaluates normally.
+    ok_gate = verify_factor_causality(unverified, apply_to_factor=True)
+    assert ok_gate.ok is True
+    assert ok_gate.causal_passed is True
+    assert getattr(unverified, "_causal_gate_passed", None) is True
+    df_filtered = unverified.get_factor_values()
+    df_unfiltered = unverified.get_factor_values_unfiltered()
+    assert not df_filtered.empty
+    pd.testing.assert_frame_equal(df_filtered, df_unfiltered)
+
+    # 4. Internal probe context allows re-entrant gate checks only during verify_factor_causality and cleans up on error.
+    class _ProbeCheckAndErrorFactor(_CausalAShareFactor):
+        def _get_raw_data_for_factor(self):
+            require_ashare_causal_gate(self)
+            raise RuntimeError("boom_in_raw_fetch")
+
+    probe_err = _ProbeCheckAndErrorFactor(
+        None, "ashare_probe_err", "2026-01-05", "2026-01-09",
+        stock_pool=["000001.XSHE"], data_bindings={}, pit_enabled=False,
+    )
+    with pytest.raises(RuntimeError, match="boom_in_raw_fetch"):
+        verify_factor_causality(probe_err, apply_to_factor=True)
+    assert id(probe_err) not in _ACTIVE_ASHARE_PROBE_IDS.get()
+    with pytest.raises(RuntimeError, match="verify_factor_causality"):
+        probe_err.get_factor_values()
+
+    # 5. Future-return factor (shift(-2)/shift(-1) - 1) cannot produce values with or without calling the gate.
+    unverified_future = _FutureReturnAShareFactor(
+        None, "ashare_future_unverified", "2026-01-05", "2026-01-09",
+        stock_pool=["000001.XSHE", "000002.XSHE"], data_bindings={}, pit_enabled=False,
+    )
+    with pytest.raises(RuntimeError, match="verify_factor_causality"):
+        unverified_future.get_factor_values()
+
+    for policy in ("reject", "fallback"):
+        checked_future = _FutureReturnAShareFactor(
+            None, f"ashare_future_{policy}", "2026-01-05", "2026-01-09",
+            stock_pool=["000001.XSHE", "000002.XSHE"], data_bindings={}, pit_enabled=False,
+        )
+        gate_res = verify_factor_causality(checked_future, on_failure=policy, apply_to_factor=True)
+        assert gate_res.ok is False
+        assert gate_res.causal_passed is False
+        assert gate_res.status == "failed_rejected"
+        assert gate_res.resolved_mode == "rejected"
+        assert gate_res.failure_reason == "lookahead_truncation_mismatch"
+        with pytest.raises(RuntimeError, match="no pit_replay fallback"):
+            checked_future.get_factor_values()

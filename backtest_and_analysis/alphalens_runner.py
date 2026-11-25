@@ -693,16 +693,33 @@ class AlphalensRunner:
         if not isinstance(forward_returns.index, pd.MultiIndex):
             raise ValueError("前瞻收益率数据必须是MultiIndex (date, asset)格式")
         
+        factor_numeric = factor_series.to_numpy(dtype=float, na_value=np.nan)
+        valid_factor = factor_series.loc[np.isfinite(factor_numeric)]
+
         # 对齐因子数据和前瞻收益率数据
-        common_index = factor_series.index.intersection(forward_returns.index)
+        common_index = valid_factor.index.intersection(forward_returns.index)
         self.logger.info(f"因子数据点数: {len(factor_series)}, 前瞻收益率数据点数: {len(forward_returns)}")
         self.logger.info(f"对齐后共同数据点数: {len(common_index)}")
         
         if len(common_index) == 0:
             raise ValueError("因子数据与前瞻收益率数据没有重叠的时间-股票点")
+
+        # Fix per-date quantiles on the full signal-time cross-section before
+        # aligning with forward returns so future return availability never alters bins.
+        # Equal values stay together. Collapsed edges produce fewer bins;
+        # constant cross-sections have no quantile or valid IC and are skipped.
+        # Never pool dates: future observations must not change historical bins.
+        signal_quantiles = valid_factor.groupby(level=0).transform(
+            lambda values: (
+                pd.qcut(values, q=self.n_quantiles, labels=False, duplicates='drop') + 1
+                if values.nunique() > 1
+                else np.nan
+            )
+        )
         
         # 获取对齐后的数据
-        aligned_factor = factor_series.loc[common_index]
+        aligned_factor = valid_factor.loc[common_index]
+        aligned_quantiles = signal_quantiles.loc[common_index]
         aligned_returns = forward_returns.loc[common_index]
         
         # 创建合并的DataFrame
@@ -711,16 +728,9 @@ class AlphalensRunner:
         # 添加各期间的前瞻收益率
         for col in aligned_returns.columns:
             result_data[col] = aligned_returns[col]
+        result_data['factor_quantile'] = aligned_quantiles
         
         clean_factor = pd.DataFrame(result_data)
-        
-        # Equal values stay together. Collapsed edges produce fewer bins;
-        # constant cross-sections have no quantile or valid IC and are skipped.
-        # Never pool dates: future observations must not change historical bins.
-        clean_factor['factor_quantile'] = clean_factor.groupby(level=0)['factor'].transform(
-            lambda values: (pd.qcut(values, q=self.n_quantiles, labels=False, duplicates='drop') + 1
-                            if values.nunique() > 1 else np.nan)
-        )
 
         # Keep rows valid for any requested horizon; each IC column is
         # evaluated pairwise, so a missing 60D return must not erase 20D.

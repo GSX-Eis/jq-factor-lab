@@ -1096,3 +1096,506 @@ def test_p0_4_matrix_mode_blocked_exit_retries_on_subsequent_tradable_bar() -> N
     assert pf.lots_history.loc[dates[2], "FUT"] == 0
     assert pf.lots_history.loc[dates[3], "FUT"] == 0
     assert diag["open_deferred_rolls_at_end"] == 0
+
+
+def _build_clocked_futures_slot(
+    tmp_path: Path,
+    *,
+    cal: Any,
+    instruments: List[str],
+    open_panel: Dict[str, List[float]],
+    close_panel: Dict[str, List[float]],
+    use_open: bool,
+    halt_rows: Optional[List[Tuple[str, str, str]]] = None,
+    recorded_queries: Optional[List[Dict[str, Any]]] = None,
+) -> MarketSlot:
+    """Build a clocked futures MarketSlot backed by DeclarativeMicrostructure."""
+    from slots.declarative.slot import DeclarativeMicrostructure
+    from slots.declarative.source import FrameSource
+    from utils.slots import ProviderConfig
+
+    grid_1d = cal.bar_grid("1d")
+    session_dates = list(grid_1d["session_id"])
+    utc_closes = pd.DatetimeIndex(grid_1d["timestamp_utc"]).tz_convert("UTC")
+    spec_map = {
+        inst: InstrumentSpec(inst, "futures", "USD", lot_size=1, contract_multiplier=10.0)
+        for inst in instruments
+    }
+
+    class _ClockedUniverse:
+        def resolve_universe(self, universe_id: str, *, as_of_utc) -> Tuple[str, ...]:
+            return tuple(instruments)
+
+        def resolve_active_contract(self, instrument_id: str, *, as_of_utc) -> str:
+            return instrument_id
+
+        def instrument_spec(self, contract_id: str) -> InstrumentSpec:
+            return spec_map[contract_id]
+
+    class _ClockedBarFeed:
+        def read_signal_bars(self, req_insts, frequency, *, start_utc, end_utc, as_of_utc) -> pd.DataFrame:
+            return pd.DataFrame()
+
+        def read_execution_bars(self, req_insts, frequency, *, start_utc, end_utc) -> pd.DataFrame:
+            start_ts = pd.Timestamp(start_utc)
+            end_ts = pd.Timestamp(end_utc)
+            if start_ts.tzinfo is None:
+                start_ts = start_ts.tz_localize("UTC")
+            if end_ts.tzinfo is None:
+                end_ts = end_ts.tz_localize("UTC")
+            rows = []
+            for pos, (sid, utc_ts) in enumerate(zip(session_dates, utc_closes)):
+                if utc_ts < start_ts or utc_ts > end_ts:
+                    continue
+                for inst in req_insts:
+                    rows.append(
+                        {
+                            "timestamp_utc": utc_ts,
+                            "session_id": sid,
+                            "instrument_id": inst,
+                            "concrete_instrument_id": inst,
+                            "open": open_panel[inst][pos],
+                            "close": close_panel[inst][pos],
+                            "volume": 1_000_000.0,
+                        }
+                    )
+            return pd.DataFrame(rows)
+
+    class _EmptyAux:
+        def read_aux_features(self, grid, *, features):
+            return pd.DataFrame()
+
+    source = None
+    if halt_rows:
+        csv_name = f"halts_{len(halt_rows)}_{abs(hash(tuple(halt_rows)))}.csv"
+        csv_lines = ["instrument_id,available_at_utc,tradable"]
+        for inst_id, ts_str, tradable_str in halt_rows:
+            csv_lines.append(f"{inst_id},{ts_str},{tradable_str}")
+        (tmp_path / csv_name).write_text("\n".join(csv_lines) + "\n", encoding="utf-8")
+        source = FrameSource(
+            ProviderConfig("csv_files", {"paths": [csv_name]}),
+            tmp_path,
+            ("instrument_id", "available_at_utc"),
+        )
+
+    profile = ExecutionProfile(
+        entry_price_field="open" if use_open else "close",
+        exit_price_field="open" if use_open else "close",
+        min_entry_offset_bars=1,
+        exit_adjustment=0,
+        return_unit="decimal",
+        gap_rule="endpoints_only",
+        boundary_policy="cross_session",
+        allow_short=False,
+    )
+    inner_micro = DeclarativeMicrostructure(cal, profile, source)
+
+    class _RecordingMicro:
+        def __init__(self, inner: DeclarativeMicrostructure) -> None:
+            self._inner = inner
+            self.execution_profile = inner.execution_profile
+
+        def tradability_mask(self, grid: pd.DataFrame, *, instrument_id: str) -> pd.Series:
+            mask = self._inner.tradability_mask(grid, instrument_id=instrument_id)
+            if recorded_queries is not None:
+                for row_idx, row in grid.iterrows():
+                    recorded_queries.append(
+                        {
+                            "instrument_id": instrument_id,
+                            "timestamp_utc": pd.Timestamp(row["timestamp_utc"]),
+                            "session_id": str(row["session_id"]),
+                            "execution_price_field": row.get("execution_price_field"),
+                            "side": row.get("side"),
+                            "allowed": bool(mask.loc[row_idx]),
+                        }
+                    )
+            return mask
+
+    return MarketSlot(
+        slot_id="global_futures",
+        calendar=cal,
+        universe=_ClockedUniverse(),
+        bar_feed=_ClockedBarFeed(),
+        aux_features=_EmptyAux(),
+        microstructure=_RecordingMicro(inner_micro),
+    )
+
+
+def test_p1_2_open_execution_queries_open_timestamp_and_ignores_future_intraday_restriction(
+    tmp_path: Path,
+) -> None:
+    """NERE-1395: Open orders query bar open timestamp and must not leak mid-session restrictions."""
+    from utils.session_calendar import SessionCalendar
+
+    cal = SessionCalendar(
+        "SYNTH_FUT",
+        "2026-01-05",
+        "2026-01-09",
+        custom_sessions={
+            "timezone": "UTC",
+            "weekdays": [0, 1, 2, 3, 4],
+            "segments": [{"open": "00:00", "close": "16:00"}],
+        },
+    )
+    dates = cal.sessions()
+    open_p = {"FUT": [100.0, 102.0, 105.0, 107.0, 109.0]}
+    close_p = {"FUT": [101.0, 104.0, 106.0, 108.0, 110.0]}
+    open_df = pd.DataFrame(open_p, index=dates)
+    close_df = pd.DataFrame(close_p, index=dates)
+    target_weights = pd.DataFrame({"FUT": [np.nan, 1.0, np.nan, np.nan, np.nan]}, index=dates)
+    cfg = FuturesExecutionConfig(
+        execution_mode="futures_contract",
+        margin_rate=0.50,
+        leverage=1.0,
+    )
+
+    # 1. Baseline without mid-day restriction event (use_open=True).
+    base_slot = _build_clocked_futures_slot(
+        tmp_path,
+        cal=cal,
+        instruments=["FUT"],
+        open_panel=open_p,
+        close_panel=close_p,
+        use_open=True,
+        halt_rows=None,
+    )
+    pf_base, diag_base = simulate_futures_contract_portfolio(
+        target_weights=target_weights,
+        price_aligned=close_df,
+        open_aligned=open_df,
+        use_open=True,
+        slot=base_slot,
+        frequency="1d",
+        init_cash=100_000.0,
+        buy_cost_rate=0.0,
+        sell_cost_rate=0.0,
+        slippage=0.0,
+        config=cfg,
+        target_value_mode="target_weight",
+    )
+
+    # 2. Counter-example: 12:00Z tradable=False event on 2026-01-06 (restored 2026-01-07 00:00Z).
+    # Open fill occurs at 00:00Z so it MUST remain identical to baseline.
+    open_queries: List[Dict[str, Any]] = []
+    open_slot_with_midday_halt = _build_clocked_futures_slot(
+        tmp_path,
+        cal=cal,
+        instruments=["FUT"],
+        open_panel=open_p,
+        close_panel=close_p,
+        use_open=True,
+        halt_rows=[
+            ("FUT", "2026-01-06T12:00:00Z", "false"),
+            ("FUT", "2026-01-07T00:00:00Z", "true"),
+        ],
+        recorded_queries=open_queries,
+    )
+    pf_open, diag_open = simulate_futures_contract_portfolio(
+        target_weights=target_weights,
+        price_aligned=close_df,
+        open_aligned=open_df,
+        use_open=True,
+        slot=open_slot_with_midday_halt,
+        frequency="1d",
+        init_cash=100_000.0,
+        buy_cost_rate=0.0,
+        sell_cost_rate=0.0,
+        slippage=0.0,
+        config=cfg,
+        target_value_mode="target_weight",
+    )
+
+    pd.testing.assert_frame_equal(pf_open.lots_history, pf_base.lots_history)
+    pd.testing.assert_frame_equal(pf_open.orders.records_readable, pf_base.orders.records_readable)
+    pd.testing.assert_series_equal(pf_open.value(), pf_base.value())
+    assert diag_open["blocked_order_count"] == 0
+    assert pf_open.lots_history.loc[dates[1], "FUT"] > 0
+    bar1_open_buy_queries = [
+        q for q in open_queries if q["session_id"] == "2026-01-06" and q["side"] == "buy"
+    ]
+    assert len(bar1_open_buy_queries) >= 1
+    assert bar1_open_buy_queries[0]["timestamp_utc"] == pd.Timestamp("2026-01-06T00:00:00Z")
+    assert bar1_open_buy_queries[0]["execution_price_field"] == "open"
+    assert bar1_open_buy_queries[0]["allowed"] is True
+
+    # 3. Control A: use_open=False (close execution at 16:00Z) MUST be blocked by the 12:00Z event.
+    close_queries: List[Dict[str, Any]] = []
+    close_slot_with_midday_halt = _build_clocked_futures_slot(
+        tmp_path,
+        cal=cal,
+        instruments=["FUT"],
+        open_panel=open_p,
+        close_panel=close_p,
+        use_open=False,
+        halt_rows=[
+            ("FUT", "2026-01-06T12:00:00Z", "false"),
+            ("FUT", "2026-01-07T00:00:00Z", "true"),
+        ],
+        recorded_queries=close_queries,
+    )
+    pf_close, diag_close = simulate_futures_contract_portfolio(
+        target_weights=target_weights,
+        price_aligned=close_df,
+        open_aligned=None,
+        use_open=False,
+        slot=close_slot_with_midday_halt,
+        frequency="1d",
+        init_cash=100_000.0,
+        buy_cost_rate=0.0,
+        sell_cost_rate=0.0,
+        slippage=0.0,
+        config=cfg,
+        target_value_mode="target_weight",
+    )
+    assert pf_close.lots_history.loc[dates[1], "FUT"] == 0
+    assert diag_close["blocked_order_count"] >= 1
+    assert any(
+        e["reason"] == "tradability_mask_blocked" and e["side"] == "buy"
+        for e in diag_close["blocked_order_events"]
+    )
+    bar1_close_buy_queries = [
+        q for q in close_queries if q["session_id"] == "2026-01-06" and q["side"] == "buy"
+    ]
+    assert len(bar1_close_buy_queries) >= 1
+    assert bar1_close_buy_queries[0]["timestamp_utc"] == pd.Timestamp("2026-01-06T16:00:00Z")
+    assert bar1_close_buy_queries[0]["execution_price_field"] == "close"
+    assert bar1_close_buy_queries[0]["allowed"] is False
+
+    # 4. Control B: restriction effective at 00:00Z (at/before open) MUST block use_open=True buy.
+    open_blocked_queries: List[Dict[str, Any]] = []
+    open_slot_with_open_halt = _build_clocked_futures_slot(
+        tmp_path,
+        cal=cal,
+        instruments=["FUT"],
+        open_panel=open_p,
+        close_panel=close_p,
+        use_open=True,
+        halt_rows=[
+            ("FUT", "2026-01-06T00:00:00Z", "false"),
+            ("FUT", "2026-01-07T00:00:00Z", "true"),
+        ],
+        recorded_queries=open_blocked_queries,
+    )
+    pf_open_blocked, diag_open_blocked = simulate_futures_contract_portfolio(
+        target_weights=target_weights,
+        price_aligned=close_df,
+        open_aligned=open_df,
+        use_open=True,
+        slot=open_slot_with_open_halt,
+        frequency="1d",
+        init_cash=100_000.0,
+        buy_cost_rate=0.0,
+        sell_cost_rate=0.0,
+        slippage=0.0,
+        config=cfg,
+        target_value_mode="target_weight",
+    )
+    assert pf_open_blocked.lots_history.loc[dates[1], "FUT"] == 0
+    assert diag_open_blocked["blocked_order_count"] >= 1
+    assert any(
+        e["reason"] == "tradability_mask_blocked" and e["side"] == "buy"
+        for e in diag_open_blocked["blocked_order_events"]
+    )
+    bar1_open_blocked = [
+        q for q in open_blocked_queries if q["session_id"] == "2026-01-06" and q["side"] == "buy"
+    ]
+    assert bar1_open_blocked[0]["timestamp_utc"] == pd.Timestamp("2026-01-06T00:00:00Z")
+    assert bar1_open_blocked[0]["execution_price_field"] == "open"
+    assert bar1_open_blocked[0]["allowed"] is False
+
+
+def test_p1_2_same_bar_open_and_close_mask_cache_do_not_collide(tmp_path: Path) -> None:
+    """Open entry at 00:00Z and close liquidation check at 16:00Z on the same bar use distinct cache keys."""
+    from utils.session_calendar import SessionCalendar
+
+    cal = SessionCalendar(
+        "SYNTH_FUT",
+        "2026-01-05",
+        "2026-01-08",
+        custom_sessions={
+            "timezone": "UTC",
+            "weekdays": [0, 1, 2, 3, 4],
+            "segments": [{"open": "00:00", "close": "16:00"}],
+        },
+    )
+    dates = cal.sessions()
+    # Bar 0: buy 400 lots @ 100.0 open (100k * 4x / (100 * 10) = 400).
+    # Bar 1: open=100.0 (tradable at 00:00Z), close drops to 80.0 -> equity=20k < maint=32k,
+    # while 12:00Z restriction blocks close liquidation at 16:00Z!
+    # Also add a pre-check on Bar 1 with side="sell" at open? Even better: enter Bar 1 at open=100,
+    # then close=80 triggers Step 4.7 close liquidation on Bar 1; and verify via direct validator
+    # that querying open vs close on the same bar+side does not collide.
+    open_p = {"FUT": [100.0, 100.0, 76.0, 90.0]}
+    close_p = {"FUT": [100.0, 80.0, 85.0, 90.0]}
+    queries: List[Dict[str, Any]] = []
+    slot = _build_clocked_futures_slot(
+        tmp_path,
+        cal=cal,
+        instruments=["FUT"],
+        open_panel=open_p,
+        close_panel=close_p,
+        use_open=True,
+        halt_rows=[
+            ("FUT", "2026-01-06T12:00:00Z", "false"),
+            ("FUT", "2026-01-07T00:00:00Z", "true"),
+        ],
+        recorded_queries=queries,
+    )
+    # Bar 0 enters 400 lots; Bar 1 reduces by 1 lot at open (sell @ 00:00Z, allowed & cached under open),
+    # then close=80 triggers Step 4.7 liquidation (sell @ 16:00Z, MUST query close & be blocked!).
+    target_weights = pd.DataFrame({"FUT": [1.0, 0.9975, np.nan, np.nan]}, index=dates)
+    cfg = FuturesExecutionConfig(
+        execution_mode="futures_contract",
+        margin_rate=0.20,
+        maintenance_margin_rate=0.10,
+        leverage=4.0,
+        liquidation_policy="liquidate",
+    )
+    pf, diag = simulate_futures_contract_portfolio(
+        target_weights=target_weights,
+        price_aligned=pd.DataFrame(close_p, index=dates),
+        open_aligned=pd.DataFrame(open_p, index=dates),
+        use_open=True,
+        slot=slot,
+        frequency="1d",
+        init_cash=100_000.0,
+        buy_cost_rate=0.0,
+        sell_cost_rate=0.0,
+        slippage=0.0,
+        config=cfg,
+        target_value_mode="target_weight",
+    )
+
+    bar1_sells = [q for q in queries if q["session_id"] == "2026-01-06" and q["side"] == "sell"]
+    assert [(q["execution_price_field"], q["timestamp_utc"], q["allowed"]) for q in bar1_sells] == [
+        ("open", pd.Timestamp("2026-01-06T00:00:00Z"), True),
+        ("close", pd.Timestamp("2026-01-06T16:00:00Z"), False),
+    ]
+    assert pf.lots_history.loc[dates[1], "FUT"] == 399
+    assert pf.lots_history.loc[dates[2], "FUT"] == 0
+    assert diag["liquidation_blocked_count"] == 1
+    assert diag["liquidation_deferred_executed_count"] == 1
+
+
+@pytest.mark.parametrize("use_public_protocol", [False, True], ids=["SessionCalendar", "CalendarSlotProtocol"])
+@pytest.mark.parametrize("frequency", ["1d", "1w", "1h"])
+def test_p1_2_validator_aligns_execution_times_with_label_axis_across_frequencies(
+    use_public_protocol: bool, frequency: str
+) -> None:
+    """_FuturesOrderValidator resolves open/close timestamps matching _LabelAxis across 1d/1w/intraday."""
+    from backtest_and_analysis.evaluation.labels import _LabelAxis
+    from utils.session_calendar import SessionCalendar
+
+    cal = SessionCalendar(
+        "SYNTH_MULTI",
+        "2026-01-05",
+        "2026-01-16",
+        custom_sessions={
+            "timezone": "UTC",
+            "weekdays": [0, 1, 2, 3, 4],
+            "segments": [
+                {"open": "01:00", "close": "03:00"},
+                {"open": "05:00", "close": "07:00"},
+            ],
+        },
+    )
+
+    if use_public_protocol:
+        class _PublicCalendar:
+            calendar_hash = cal.calendar_hash
+            sessions = staticmethod(cal.sessions)
+            session_at = staticmethod(cal.session_at)
+            bar_grid = staticmethod(cal.bar_grid)
+
+        active_cal: Any = _PublicCalendar()
+    else:
+        active_cal = cal
+
+    freq_obj = Frequency.parse(frequency)
+    grid = active_cal.bar_grid(
+        freq_obj,
+        "2026-01-05",
+        "2026-01-16" if frequency != "1h" else "2026-01-05",
+        view="ETH",
+    )
+    axis = _LabelAxis.from_slot_grid(active_cal, grid, freq_obj, "ETH")
+    bar_utc_index = pd.DatetimeIndex(grid["timestamp_utc"]).tz_convert("UTC").as_unit("ns")
+    session_ids = {
+        (idx, "FUT"): str(sid) for idx, sid in enumerate(grid["session_id"].tolist())
+    }
+
+    seen: List[Tuple[pd.Timestamp, Optional[str]]] = []
+
+    class _SpyMicro:
+        execution_profile = ExecutionProfile(
+            entry_price_field="open",
+            exit_price_field="close",
+            min_entry_offset_bars=1,
+            exit_adjustment=0,
+            return_unit="decimal",
+            gap_rule="endpoints_only",
+            boundary_policy="cross_session",
+            allow_short=True,
+        )
+
+        def tradability_mask(self, query_grid: pd.DataFrame, *, instrument_id: str) -> pd.Series:
+            del instrument_id
+            seen.append(
+                (
+                    pd.Timestamp(query_grid["timestamp_utc"].iloc[0]),
+                    query_grid["execution_price_field"].iloc[0],
+                )
+            )
+            return pd.Series(True, index=query_grid.index, dtype=bool)
+
+    class _NoopFeed:
+        def read_signal_bars(self, *a, **kw):
+            return pd.DataFrame()
+
+        def read_execution_bars(self, *a, **kw):
+            return pd.DataFrame()
+
+    class _NoopUniverse:
+        def instrument_spec(self, instrument_id: str) -> InstrumentSpec:
+            return InstrumentSpec(instrument_id, "futures", "USD")
+
+        def resolve_universe(self, universe_id: str, *, as_of_utc):
+            return ("FUT",)
+
+        def resolve_active_contract(self, instrument_id: str, *, as_of_utc) -> str:
+            return instrument_id
+
+    class _NoopAux:
+        def read_aux_features(self, g, *, features):
+            return pd.DataFrame()
+
+    slot = MarketSlot(
+        slot_id="global_futures",
+        calendar=active_cal,
+        bar_feed=_NoopFeed(),
+        universe=_NoopUniverse(),
+        aux_features=_NoopAux(),
+        microstructure=_SpyMicro(),
+    )
+    validator = fut_exec_mod._FuturesOrderValidator(
+        slot=slot,
+        bar_utc_index=bar_utc_index,
+        session_ids=session_ids,
+        frequency=freq_obj,
+        default_execution_price_field="open",
+    )
+
+    for field in ("open", "close"):
+        seen.clear()
+        expected_times = axis.execution_times(field)
+        for bar_idx in range(len(bar_utc_index)):
+            assert validator.is_mask_tradable(
+                bar_idx=bar_idx,
+                inst="FUT",
+                contract="FUT",
+                side="buy",
+                price=100.0,
+                execution_price_field=field,
+            )
+        assert [ts for ts, _ in seen] == list(expected_times)
+        assert all(f == field for _, f in seen)

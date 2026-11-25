@@ -2,20 +2,20 @@
 from __future__ import annotations
 
 from collections import deque
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 import math
 from numbers import Integral, Real
 from typing import Any, Protocol, runtime_checkable
-
 import numpy as np
 import pandas as pd
 
-
 SLOT_EXECUTION_MODES = ("auto", "vectorized", "incremental", "pit_replay")
 RESOLVED_EXECUTION_MODES = ("vectorized", "incremental", "pit_replay")
-
 _BAR_KEYS = ["timestamp_utc", "instrument_id"]
 _SUPPORTED_ROLLING_AGGS = ("mean", "sum", "std", "min", "max", "median")
+_ACTIVE_ASHARE_PROBE_IDS: ContextVar[frozenset[int]] = ContextVar("_active_ashare_probe_ids", default=frozenset())
 
 
 @runtime_checkable
@@ -479,9 +479,21 @@ def resolve_slot_execution_mode(
     return "pit_replay", "fallback_pit_replay:unverified_factor_causality"
 
 
-def require_ashare_causal_gate(factor) -> None:
-    """Block direct factor evaluation when an A-share factor failed the causal gate."""
-    if getattr(factor, "_ashare_panel", True) and getattr(factor, "_causal_gate_passed", None) is False:
-        raise RuntimeError(
-            f"Causal fast-path gate rejected A-share factor {factor.factor_name}; no pit_replay fallback exists"
-        )
+@contextmanager
+def _ashare_causal_probe_context(factor: Any):
+    """Allow verify_factor_causality internal probes without exposing a public bypass."""
+    token = _ACTIVE_ASHARE_PROBE_IDS.set(_ACTIVE_ASHARE_PROBE_IDS.get() | {id(factor)})
+    try:
+        yield
+    finally:
+        _ACTIVE_ASHARE_PROBE_IDS.reset(token)
+
+def require_ashare_causal_gate(factor: Any) -> None:
+    """Fail closed for unverified CAUSAL_VECTORIZED or rejected A-share factors."""
+    if not getattr(factor, "_ashare_panel", True) or id(factor) in _ACTIVE_ASHARE_PROBE_IDS.get():
+        return
+    gate_passed = getattr(factor, "_causal_gate_passed", None)
+    if gate_passed is False or (getattr(factor, "CAUSAL_VECTORIZED", None) is True and gate_passed is not True):
+        name = getattr(factor, "factor_name", type(factor).__name__)
+        detail = f"rejected A-share factor {name}" if gate_passed is False else f"requires verify_factor_causality() before evaluating CAUSAL_VECTORIZED=True A-share factor {name}"
+        raise RuntimeError(f"Causal fast-path gate {detail}; no pit_replay fallback exists")
