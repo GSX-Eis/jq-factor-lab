@@ -1,6 +1,7 @@
 """Contract validation for Stage 1, using synthetic adapters and clocks."""
 from dataclasses import asdict, replace
 from datetime import date, datetime
+from functools import cached_property
 import json
 from types import SimpleNamespace
 
@@ -220,3 +221,85 @@ def test_instrument_spec_supports_dated_and_perpetual_instruments():
 def test_instrument_spec_rejects_invalid_lifecycle_dates(listing, expiry, field):
     with pytest.raises(ValueError, match=field):
         InstrumentSpec('ES.H26', 'future', 'USD', listing_date=listing, expiry_date=expiry)
+
+
+@pytest.mark.parametrize('descriptor', ['property', 'cached_property'])
+def test_market_slot_and_writer_protocol_checks_do_not_evaluate_calendar_hash(slot, descriptor):
+    from utils.market_factor.writer import _validate_calendars_for_batch
+    from utils.slots.contracts import CalendarSlot, implements_slot_protocol
+
+    evaluations = 0
+
+    class _PropertyCalendar:
+        @property
+        def calendar_hash(self) -> str:
+            nonlocal evaluations
+            evaluations += 1
+            raise AssertionError('calendar_hash must not be evaluated during protocol checks')
+
+        @staticmethod
+        def sessions(start=None, end=None):
+            return pd.DatetimeIndex([])
+
+        @classmethod
+        def session_at(cls, ts_utc, view='ETH', *, frequency=None):
+            return None
+
+        def bar_grid(self, frequency, start=None, end=None, *, view='ETH', bucket_strategy=None):
+            return pd.DataFrame()
+
+    class _CachedPropertyCalendar(_PropertyCalendar):
+        @cached_property
+        def calendar_hash(self) -> str:
+            nonlocal evaluations
+            evaluations += 1
+            raise AssertionError('calendar_hash must not be evaluated during protocol checks')
+
+    calendar = _PropertyCalendar() if descriptor == 'property' else _CachedPropertyCalendar()
+    assert implements_slot_protocol(calendar, CalendarSlot)
+    bound = replace(slot, calendar=calendar)
+    assert bound.calendar is calendar
+
+    empty = pd.DataFrame(columns=['instrument_id', 'timestamp_utc', 'session_id', 'calendar_hash'])
+    _validate_calendars_for_batch(empty, 'ETH', calendar)
+    _validate_calendars_for_batch(empty, 'ETH', {'A': calendar})
+    assert evaluations == 0
+
+
+def test_market_slot_protocol_check_rejects_missing_or_non_callable_members_without_eval(slot):
+    evaluations = 0
+
+    class _MissingCalendarHash:
+        def sessions(self, start=None, end=None):
+            return pd.DatetimeIndex([])
+
+        def session_at(self, ts_utc, view='ETH', *, frequency=None):
+            return None
+
+        def bar_grid(self, frequency, start=None, end=None, *, view='ETH', bucket_strategy=None):
+            return pd.DataFrame()
+
+    class _PropertyMethodCalendar:
+        calendar_hash = 'static'
+
+        @property
+        def sessions(self):
+            nonlocal evaluations
+            evaluations += 1
+            raise AssertionError('non-callable method property must not be evaluated')
+
+        def session_at(self, ts_utc, view='ETH', *, frequency=None):
+            return None
+
+        def bar_grid(self, frequency, start=None, end=None, *, view='ETH', bucket_strategy=None):
+            return pd.DataFrame()
+
+    for bad_calendar in (
+        _MissingCalendarHash(),
+        _PropertyMethodCalendar(),
+        SimpleNamespace(calendar_hash='static', sessions=1, session_at=lambda *a, **kw: None,
+                        bar_grid=lambda *a, **kw: pd.DataFrame()),
+    ):
+        with pytest.raises(TypeError, match='CalendarSlot'):
+            replace(slot, calendar=bad_calendar)
+    assert evaluations == 0

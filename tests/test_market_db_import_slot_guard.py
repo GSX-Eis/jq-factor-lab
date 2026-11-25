@@ -554,3 +554,37 @@ def test_vectorbt_implicit_frozen_input_requires_exact_calendar_view(tmp_path, m
             provider.resolve_calendar(None, None)
     finally:
         provider.close()
+
+
+def test_factor_base_init_does_not_evaluate_calendar_hash_or_load_profile(tmp_path, monkeypatch):
+    from utils.factor_base import FactorBase
+    from utils.factor_core.slot_binding import AShareFactorCalendar, AShareFactorFeed
+
+    path = tmp_path / 'factor-input.duckdb'
+    with duckdb.connect(str(path)) as connection:
+        connection.execute("""
+            CREATE TABLE price_data_daily AS SELECT '000001.XSHG' AS stock_code, DATE '2026-03-09' AS date,
+                10. AS "close"
+        """)
+
+    calls = {'calendar_hash': 0, 'calendar_profile': 0}
+
+    @property
+    def fail_calendar_hash(self) -> str:
+        calls['calendar_hash'] += 1
+        raise AssertionError('calendar_hash must not be evaluated during FactorBase.__init__')
+
+    def fail_calendar_profile(self):
+        calls['calendar_profile'] += 1
+        raise AssertionError('calendar_profile must not be evaluated during FactorBase.__init__')
+
+    monkeypatch.setattr(AShareFactorCalendar, 'calendar_hash', fail_calendar_hash)
+    monkeypatch.setattr(AShareFactorFeed, 'calendar_profile', fail_calendar_profile)
+
+    factor = FactorBase(None, 'fixture', '2026-03-09', '2026-03-09', stock_pool=['000001.XSHG'],
+                        duckdb_path=str(path), data_bindings={}, pit_enabled=False)
+    try:
+        assert factor._duckdb_adapter._conn is None
+        assert calls == {'calendar_hash': 0, 'calendar_profile': 0}
+    finally:
+        factor.close()

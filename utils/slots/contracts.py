@@ -4,9 +4,11 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
+from functools import partialmethod
+import inspect
 from math import isfinite
 from numbers import Integral, Real
-from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Generic, Literal, Protocol, runtime_checkable
 
 import pandas as pd
 
@@ -216,6 +218,40 @@ if TYPE_CHECKING:
     from utils.market_db import MarketDbProfile
 
 
+def _is_static_callable(member: object) -> bool:
+    if callable(member):
+        return True
+    if isinstance(member, classmethod):
+        return callable(member.__func__)
+    if isinstance(member, partialmethod):
+        return callable(member.func)
+    return False
+
+
+def implements_slot_protocol(component: object, protocol: type[Any]) -> bool:
+    """Check runtime Protocol conformance statically without evaluating descriptors."""
+    for cls in protocol.__mro__:
+        if cls in (Protocol, Generic, object) or not getattr(cls, '_is_protocol', False):
+            continue
+        for name, expected in vars(cls).items():
+            if name.startswith('_'):
+                continue
+            try:
+                actual = inspect.getattr_static(component, name)
+            except AttributeError:
+                return False
+            if _is_static_callable(expected) and not _is_static_callable(actual):
+                return False
+        for name in getattr(cls, '__annotations__', ()):
+            if name.startswith('_'):
+                continue
+            try:
+                inspect.getattr_static(component, name)
+            except AttributeError:
+                return False
+    return True
+
+
 @dataclass(frozen=True)
 class MarketSlot:
     slot_id: str
@@ -236,10 +272,7 @@ class MarketSlot:
             ('aux_features', AuxFeatureSlot), ('microstructure', MicrostructureSlot),
         ):
             component = getattr(self, field)
-            if not isinstance(component, protocol) or any(
-                    not callable(getattr(component, method, None))
-                    for method, member in vars(protocol).items()
-                    if not method.startswith('_') and callable(member)):
+            if not implements_slot_protocol(component, protocol):
                 raise TypeError(f'{field} must implement {protocol.__name__}')
         if not isinstance(self.microstructure.execution_profile, ExecutionProfile):
             raise TypeError('microstructure.execution_profile must be an ExecutionProfile')

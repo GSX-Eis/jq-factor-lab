@@ -25,9 +25,9 @@ defaults:
 
 jobs:
   checks:
-    name: Python ${{ matrix.python-version }}
+    name: Checks (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -109,18 +109,154 @@ jobs:
           assert read["ok"] is True and read["exit_code"] == 0, read
           assert read["metrics"]["run_count"] == 1, read
           PY
+      - name: Exercise the MCP stdio protocol
+        run: |
+          python3 -m pip install '.[dev,mcp]'
+          python3 -m pip check
+          python3 -m pytest -q -p no:cacheprovider tests/test_public_mcp.py
+
+  tests:
+    name: Tests (Python ${{ matrix.python-version }}, shard ${{ matrix.shard }}/4)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+        shard: [1, 2, 3, 4]
+    env:
+      PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
+      OPENBLAS_NUM_THREADS: "1"
+      OMP_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
       - name: Run the public test suite
         run: |
+          numba_cache="$(mktemp -d "${RUNNER_TEMP:-/tmp}/jq-numba.XXXXXX")"
+          trap 'rm -rf -- "$numba_cache"' EXIT
+          export NUMBA_CACHE_DIR="$numba_cache"
           python3 -m pip install '.[dev,synthesis,backtest]'
           python3 -m pip check
           python3 -c 'import vectorbt as vbt; assert hasattr(vbt, "Portfolio")'
           if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.run_slow_suite }}" = "true" ]; then
-            python3 -m pytest -q -p xdist -n auto --dist worksteal -p no:cacheprovider -m "not external_data"
+            marker_expr="not external_data"
           else
-            python3 -m pytest -q -p xdist -n auto --dist worksteal -p no:cacheprovider -m "not slow and not perf_gate and not external_data"
+            marker_expr="not slow and not perf_gate and not external_data"
           fi
-      - name: Exercise the MCP stdio protocol
-        run: |
-          python3 -m pip install '.[mcp]'
-          python3 -m pip check
-          python3 -m pytest -q -p no:cacheprovider tests/test_public_mcp.py
+          shard_list="$(
+          SHARD_INDEX="${{ matrix.shard }}" SHARD_TOTAL="4" MARKER_EXPR="$marker_expr" python3 - <<'PY'
+          from collections import Counter
+          import os
+          from pathlib import Path
+          import subprocess
+          import sys
+          import tomllib
+
+
+          def discover_test_files(root: Path) -> list[str]:
+              config = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
+              testpaths = config.get("tool", {}).get("pytest", {}).get("ini_options", {}).get("testpaths", ["tests"])
+              files: set[str] = set()
+              for base in testpaths:
+                  base_path = root / base
+                  if not base_path.exists():
+                      continue
+                  if base_path.is_file():
+                      files.add(base_path.relative_to(root).as_posix())
+                      continue
+                  for pattern in ("test_*.py", "*_test.py"):
+                      for path in base_path.rglob(pattern):
+                          if path.is_file():
+                              files.add(path.relative_to(root).as_posix())
+              return sorted(files)
+
+
+          def collect_test_weights(root: Path, files: list[str], marker_expr: str) -> dict[str, int]:
+              command = [
+                  sys.executable, "-m", "pytest", "--collect-only", "-q", "-p", "no:cacheprovider",
+              ]
+              if marker_expr:
+                  command.extend(["-m", marker_expr])
+              completed = subprocess.run(command, cwd=root, capture_output=True, text=True, check=False)
+              if completed.returncode not in (0, 5):
+                  raise RuntimeError(
+                      f"pytest --collect-only failed ({completed.returncode}):\n"
+                      f"{completed.stdout}\n{completed.stderr}"
+                  )
+              known = set(files)
+              counts: Counter[str] = Counter()
+              for raw_line in completed.stdout.splitlines():
+                  line = raw_line.strip()
+                  if "::" not in line:
+                      continue
+                  file_part = line.split("::", 1)[0].replace("\\", "/")
+                  if file_part in known:
+                      counts[file_part] += 1
+              return {path: counts[path] for path in files}
+
+
+          def partition_shards(
+              files: list[str],
+              weights: dict[str, int],
+              sizes: dict[str, int],
+              total_shards: int,
+          ) -> list[list[str]]:
+              if total_shards < 1:
+                  raise ValueError(f"total_shards must be >= 1, got {total_shards}")
+              ordered = sorted(
+                  files,
+                  key=lambda path: (-weights.get(path, 0), -sizes.get(path, 0), path),
+              )
+              buckets: list[list[str]] = [[] for _ in range(total_shards)]
+              loads = [0] * total_shards
+              byte_loads = [0] * total_shards
+              for path in ordered:
+                  idx = min(
+                      range(total_shards),
+                      key=lambda i: (loads[i], byte_loads[i], len(buckets[i]), i),
+                  )
+                  buckets[idx].append(path)
+                  loads[idx] += weights.get(path, 0)
+                  byte_loads[idx] += sizes.get(path, 0)
+              return [sorted(bucket) for bucket in buckets]
+
+
+          def select_shard(root: Path, shard_index: int, total_shards: int, marker_expr: str) -> list[str]:
+              if not (1 <= shard_index <= total_shards):
+                  raise ValueError(f"shard_index must be in 1..{total_shards}, got {shard_index}")
+              files = discover_test_files(root)
+              if not files:
+                  raise RuntimeError("No public test files discovered")
+              weights = collect_test_weights(root, files, marker_expr)
+              sizes = {path: (root / path).stat().st_size for path in files}
+              shards = partition_shards(files, weights, sizes, total_shards)
+              return shards[shard_index - 1]
+
+
+          if __name__ == "__main__":
+              shard_index = int(os.environ["SHARD_INDEX"])
+              total_shards = int(os.environ["SHARD_TOTAL"])
+              marker_expr = os.environ.get("MARKER_EXPR", "")
+              selected = select_shard(Path.cwd(), shard_index, total_shards, marker_expr)
+              if not selected:
+                  raise RuntimeError(f"Shard {shard_index}/{total_shards} has no test files")
+              print("\n".join(selected))
+          PY
+          )"
+          [ -n "$shard_list" ] || { echo "empty shard" >&2; exit 1; }
+          mapfile -t shard_files <<<"$shard_list"
+          [ "${#shard_files[@]}" -gt 0 ] || { echo "empty shard" >&2; exit 1; }
+          echo "Running shard ${{ matrix.shard }}/4 (${#shard_files[@]} files)"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.run_slow_suite }}" = "true" ]; then
+            python3 -m pytest -q -p xdist -n auto --dist worksteal -p no:cacheprovider -m "not external_data" "${shard_files[@]}"
+          else
+            python3 -m pytest -q -p xdist -n auto --dist worksteal -p no:cacheprovider -m "not slow and not perf_gate and not external_data" "${shard_files[@]}"
+          fi

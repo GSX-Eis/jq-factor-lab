@@ -20,6 +20,7 @@ from pandas.api.types import is_bool_dtype, is_complex_dtype, is_numeric_dtype
 from backtest_and_analysis.time_series.contracts import DuplicateKeyError
 from utils._storage_compat import _legacy_binding
 from utils.slots import CalendarSlot
+from utils.slots.contracts import implements_slot_protocol
 from utils.time_axis import Frequency
 
 from .identity import (
@@ -76,7 +77,7 @@ def _validate_calendars_for_batch(
 ) -> None:
     """Verify intraday ownership and exact daily/weekly anchors."""
     keys = ["timestamp_utc", "session_id", "calendar_hash"]
-    if isinstance(calendar, CalendarSlot):
+    if implements_slot_protocol(calendar, CalendarSlot):
         groups = (("all instruments", df),)
     elif isinstance(calendar, Mapping):
         groups = df.groupby("instrument_id", sort=False)
@@ -84,7 +85,7 @@ def _validate_calendars_for_batch(
         raise TypeError("calendar must be a CalendarSlot or instrument_id -> CalendarSlot mapping")
     for inst, group in groups:
         cal = calendar.get(inst) if isinstance(calendar, Mapping) else calendar
-        if not isinstance(cal, CalendarSlot):
+        if not implements_slot_protocol(cal, CalendarSlot):
             raise ValueError(f"Missing CalendarSlot for instrument_id={inst!r}")
         for ts, sid, calendar_hash in group[keys].drop_duplicates().itertuples(index=False):
             owner = cal.session_at(ts, session_view, frequency=frequency)
