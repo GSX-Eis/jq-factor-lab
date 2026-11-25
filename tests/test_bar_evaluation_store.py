@@ -816,7 +816,7 @@ def test_pre_registration_hac_artifact_inserts_and_replays_with_frozen_usability
         previous.setattr(code_version, "resolve_code_version", lambda _: (historical, "git"))
         previous.setattr(calibration, "REGISTERED_ADAPTIVE_CALIBRATIONS", tuple(
             domain for domain in calibration.REGISTERED_ADAPTIVE_CALIBRATIONS
-            if domain.report_ref != "reports/NERE-1280/cs_hac_calibration.json"
+            if domain.report_ref != "backtest_and_analysis/evaluation/calibration_data/cs_hac_adaptive_v1_size.json"
         ))
         historical_payload = evaluate(settings, output)
     row, = historical_payload["metrics"]["splits"]["train"]["horizons"]
@@ -853,7 +853,7 @@ def test_pre_registration_hac_artifact_inserts_and_replays_with_frozen_usability
     new_row, = current_payload["metrics"]["splits"]["train"]["horizons"]
     assert new_row["interval_usability"]["calibration_status"] == "calibrated_pass"
     assert new_row["interval_usability"]["calibration_evidence"]["report_ref"] == (
-        "reports/NERE-1280/cs_hac_calibration.json"
+        "backtest_and_analysis/evaluation/calibration_data/cs_hac_adaptive_v1_size.json"
     )
     assert new_row["hac"] == row["hac"]
     assert new_row["p_value"] == row["p_value"]

@@ -388,7 +388,7 @@ def _candidate_adaptive_domain(
     )
 
 
-_CS_HAC_SIZE_REPORT = "reports/NERE-1280/cs_hac_calibration.json"
+_CS_HAC_SIZE_REPORT = "backtest_and_analysis/evaluation/calibration_data/cs_hac_adaptive_v1_size.json"
 _CS_HAC_SIZE_ALPHAS = (.01, .05)
 
 # Retained NERE-1280 null cells at T=1024. Counts are ordered by _CS_HAC_SIZE_ALPHAS.
@@ -409,12 +409,12 @@ _CS_HAC_SIZE_COUNTS = (
 _CS_HAC_SIZE_REPETITIONS = {256: 20000, 1024: 16000}
 
 
-# NERE-936 S5 released HAC. NERE-962 S3 separately released Bootstrap v2.
+# S5 released cross-section HAC. Bootstrap v2 was separately released.
 REGISTERED_ADAPTIVE_CALIBRATIONS: tuple[AdaptiveCalibrationDomain, ...] = tuple(
     replace(
         _candidate_adaptive_domain(cross_section=True, scenario=scenario, horizon=horizon, gap=gap, s5=True),
-        report_ref="reports/NERE-936/adaptive-calibration-s5.json",
-        report_sha256="b56486d13112787bff507143f56bbc82413112d05bc73dac4c79889321242d62",
+        report_ref="backtest_and_analysis/evaluation/calibration_data/cs_hac_adaptive_v1_coverage.json",
+        report_sha256="d0828711fcee509b781cd240057b9f0ab36fc539b01acc3d2c6be004e4122f88",
         coverage_cell_ids=cell_ids,
         covered=covered,
         repetitions=500,
@@ -433,8 +433,8 @@ REGISTERED_ADAPTIVE_CALIBRATIONS: tuple[AdaptiveCalibrationDomain, ...] = tuple(
 ) + tuple(
     replace(
         _candidate_adaptive_domain(cross_section=False, scenario=scenario, horizon=horizon, gap=gap, v2_boot=True),
-        report_ref="reports/NERE-962/adaptive-calibration-v2.json",
-        report_sha256="f6ffd98efb29cd155589b24cb8396214ddab505d119139ac4a5c5b2b97370dc7",
+        report_ref="backtest_and_analysis/evaluation/calibration_data/ts_bootstrap_v2_coverage.json",
+        report_sha256="9d63d9272b172b1aa3efa8368f0207df2f0b42b95f38f226dd6c5355b50c50b7",
         coverage_cell_ids=cell_ids,
         covered=covered,
         repetitions=500,
@@ -462,7 +462,7 @@ REGISTERED_ADAPTIVE_CALIBRATIONS: tuple[AdaptiveCalibrationDomain, ...] = tuple(
         min_effective_df=1,
         nominal_coverage=1 - alpha,
         report_ref=_CS_HAC_SIZE_REPORT,
-        report_sha256="c16f6c989a5f3d5faa951c410dc94fa50b9629790b5565cea81da6fe3d857994",
+        report_sha256="d6529bfe5cb92aa737b6c1e75c42f95a6458072564863d535ec679c5054f8234",
         coverage_cell_ids=(f"{scenario}:{width}:1024:{horizon}:{alpha}",),
         covered=_CS_HAC_SIZE_REPETITIONS[width] - rejected,
         repetitions=_CS_HAC_SIZE_REPETITIONS[width],

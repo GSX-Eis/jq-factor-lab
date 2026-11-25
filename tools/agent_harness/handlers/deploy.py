@@ -63,7 +63,7 @@ def _export(
     root = Path(args.output_dir).expanduser().resolve()
     protected = (runner.REPO_ROOT / "state",
                  runner.REPO_ROOT / "scripts/build/cloud_runtime", runner.REPO_ROOT / "factors",
-                 runner.REPO_ROOT / "reports/NERE-936", runner.REPO_ROOT / "reports/NERE-962", Path("/Volumes"))
+                 runner.REPO_ROOT / "backtest_and_analysis/evaluation/calibration_data", Path("/Volumes"))
     if any(root.is_relative_to(path.resolve()) for path in protected):
         raise DeployTargetError(f"Output directory overlaps a protected input: {root}",
                                 code=TARGET_ARTIFACT_INTEGRITY_FAILED)

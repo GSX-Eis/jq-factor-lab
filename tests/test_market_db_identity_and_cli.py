@@ -270,7 +270,7 @@ def test_synthesis_loads_only_the_selected_database(us_market, tmp_path, monkeyp
     assert panel.attrs["market_factor_inputs"]["identities"] == {"alpha": expected}
 
 def test_strategy_bundle_market_metadata_is_hash_bound(us_market, tmp_path):
-    from test_stage5_synthesis_parity_and_bundle import _make_sample_strategy_bundle
+    from strategy_bundle_test_support import _make_sample_strategy_bundle
 
     profile, _, _ = us_market
     identity = market_db_identity(profile)

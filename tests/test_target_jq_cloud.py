@@ -529,8 +529,9 @@ def test_budget_preflight_counts_partial_session_and_rounding(tmp_path, window, 
 
 def test_target_preserves_frozen_files_and_has_no_upload_imports(tmp_path, cloud_bundle):
     contents = {path: (ROOT / path).read_bytes() for path in FREEZE_PATHS}
-    with pytest.raises(DeployTargetError, match="protected input"):
-        _export(JqCloudTarget(), cloud_bundle, ROOT / "scripts/build/cloud_runtime")
+    for protected_dir in (ROOT / "scripts/build/cloud_runtime", ROOT / "backtest_and_analysis/evaluation/calibration_data"):
+        with pytest.raises(DeployTargetError, match="protected input"):
+            _export(JqCloudTarget(), cloud_bundle, protected_dir)
     _export(JqCloudTarget(), cloud_bundle, tmp_path / "candidate")
     assert contents == {path: (ROOT / path).read_bytes() for path in FREEZE_PATHS}
     for path in (ROOT / "targets/jq_cloud").glob("*.py"):

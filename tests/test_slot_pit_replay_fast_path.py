@@ -809,6 +809,7 @@ def test_non_bar_grid_panel_vectorized_fast_path(tmp_path: Path, monkeypatch) ->
     assert reads == 0
 
 
+@pytest.mark.slow
 def test_minute_bar_performance_and_io_benchmark(tmp_path: Path, monkeypatch) -> None:
     # 15min bars over 3 full 24x7 days x 2 instruments = 288 cutoffs, 576 bar-rows.
     slot = _build_minute_declarative_slot(

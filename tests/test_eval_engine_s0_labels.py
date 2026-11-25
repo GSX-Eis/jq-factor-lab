@@ -7,18 +7,11 @@ import pytest
 from backtest_and_analysis.forward_returns_calculator import ForwardReturnsCalculator
 from backtest_and_analysis.time_series.labels import BarReturnLabeler
 from calendar_test_support import synthetic_calendar
+from eval_engine_label_test_support import _bars
 from futures_roll_samples import futures_sample, warm_market_calendars  # noqa: F401
 from utils.continuous_bars import ContinuousBarSource
 from utils.futures_roll import build_roll_schedule
 from utils.session_calendar import SessionCalendar
-
-
-def _bars(times: pd.DatetimeIndex, frequency: str = '1min') -> pd.DataFrame:
-    return pd.DataFrame(dict(
-        timestamp_utc=times, instrument_id='SYNTHETIC', frequency=frequency,
-        open=100., high=110., low=90., close=105., volume=1.,
-        source='SYNTHETIC', data_version='NERE-792', factor_value=1.,
-    ))
 
 
 def test_daily_close_to_close_and_bar_open_to_close_use_different_labels() -> None:

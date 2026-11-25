@@ -73,7 +73,11 @@
   supported threshold, or use 1 if it exceeds 0.05. A 95% or 99% interval may
   be paired with either supported family alpha. Earlier registrations retain
   their gates.
-  See [NERE-1280 results](../reports/NERE-1280/cs_hac_calibration.json).
+  See local archive `reports/NERE-1280/cs_hac_calibration.md` and the
+  package-local calibration manifests
+  ([cs_hac_adaptive_v1_coverage.json](../backtest_and_analysis/evaluation/calibration_data/cs_hac_adaptive_v1_coverage.json),
+  [ts_bootstrap_v2_coverage.json](../backtest_and_analysis/evaluation/calibration_data/ts_bootstrap_v2_coverage.json),
+  [cs_hac_adaptive_v1_size.json](../backtest_and_analysis/evaluation/calibration_data/cs_hac_adaptive_v1_size.json)).
 
 See [Unified Evaluation Engine](EVALUATION_ENGINE.md) for formulas, calibration
 results and fixture links.

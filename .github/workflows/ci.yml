@@ -5,6 +5,12 @@ name: CI
     branches: [main, dev]
   pull_request:
   workflow_dispatch:
+    inputs:
+      run_slow_suite:
+        description: "Run slow and perf_gate tests in addition to the fast public suite"
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: read
@@ -108,7 +114,11 @@ jobs:
           python3 -m pip install '.[dev,synthesis,backtest]'
           python3 -m pip check
           python3 -c 'import vectorbt as vbt; assert hasattr(vbt, "Portfolio")'
-          python3 -m pytest -q -p no:cacheprovider
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.run_slow_suite }}" = "true" ]; then
+            python3 -m pytest -q -p xdist -n auto --dist worksteal -p no:cacheprovider -m "not external_data"
+          else
+            python3 -m pytest -q -p xdist -n auto --dist worksteal -p no:cacheprovider -m "not slow and not perf_gate and not external_data"
+          fi
       - name: Exercise the MCP stdio protocol
         run: |
           python3 -m pip install '.[mcp]'

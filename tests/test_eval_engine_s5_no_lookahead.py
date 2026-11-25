@@ -12,7 +12,7 @@ from backtest_and_analysis.evaluation.labels import ExecutionConvention, label_f
 from backtest_and_analysis.evaluation.panel import EvaluationPanel
 from backtest_and_analysis.evaluation.quantiles import fit_quantiles
 from backtest_and_analysis.evaluation.split import SplitConfig, align_released_features, evaluate_splits
-from test_eval_engine_s0_labels import _bars
+from eval_engine_label_test_support import _bars
 from utils.session_calendar import SessionCalendar
 from utils.trading_calendar import TradingCalendar
 

@@ -40,7 +40,7 @@ Issues = "https://github.com/GSX-Eis/jq-factor-lab/issues"
 Changelog = "https://github.com/GSX-Eis/jq-factor-lab/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
-dev = ["pytest>=7", "alphalens-reloaded>=0.4,<0.5"]
+dev = ["pytest>=7", "pytest-xdist>=3.5", "alphalens-reloaded>=0.4,<0.5"]
 synthesis = [
   "scikit-learn>=1.3,<1.8",
   "dcor>=0.6,<0.7",
@@ -77,10 +77,18 @@ exclude = ["*.tests", "*.tests.*"]
 config = ["data_access.json", "calendar_overrides.json", "futures_calendar_map.json", "demo_calendar.json", "market_databases/*.yaml", "market_slots/*/*.yaml"]
 utils = ["legacy_cache_identity.json"]
 "scripts.build" = ["cloud_runtime/*.py.txt"]
+"backtest_and_analysis.evaluation" = ["calibration_data/*.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests", "factor_synthesis", "data_pipeline/loaders/tests"]
 pythonpath = ["."]
+addopts = "--strict-markers"
+markers = [
+    "slow: expensive end-to-end, synthesis, long-history, or repository-wide regression",
+    "golden: replay or integrity check against frozen expected outputs",
+    "perf_gate: benchmark or performance and memory gate",
+    "external_data: requires a local database or frozen data outside the source tree",
+]
 
 [tool.setuptools]
 py-modules = ["run_analysis_main", "run_factor_synthesis", "run_symbolic_factor_mining"]

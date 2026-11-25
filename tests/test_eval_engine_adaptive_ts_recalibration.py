@@ -196,6 +196,7 @@ def test_checkpoint_rejects_changed_calculation_dependencies(tmp_path, monkeypat
     assert kept.read_bytes() == kept_payload
 
 
+@pytest.mark.slow
 def test_nested_resume_recompiles_after_scoring_source_change(tmp_path):
     pytest.importorskip("numba")
     root = Path(__file__).resolve().parents[1]

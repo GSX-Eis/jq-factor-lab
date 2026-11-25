@@ -11,7 +11,7 @@ import pytest
 
 from backtest_and_analysis.forward_returns_calculator import ForwardReturnsCalculator
 from fixtures.eval_engine.baseline.regenerate import BASELINE_DIR, PERIODS, _freeze_frame, synthetic_inputs
-from test_eval_engine_s0_labels import _bars
+from eval_engine_label_test_support import _bars
 from utils.session_calendar import SessionCalendar
 from utils.trading_calendar import TradingCalendar
 

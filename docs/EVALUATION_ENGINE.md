@@ -325,7 +325,8 @@ $h\in\{1,5,20\}$、95% 区间、至少 4 个有效块，以及每复制最少配
 - `outside_pvalue_calibration_domain` 表示场景或设计超出预登记诊断范围。
 - `multi_asset_pvalue_undefined` 用于多品种汇总。每个品种自己的区间可以报告诊断值。
 
-可运行公开基准脚本 [tools/benchmarks/ts_bootstrap_pvalue_calibration.py](../tools/benchmarks/ts_bootstrap_pvalue_calibration.py)。
+本地归档：预登记 `reports/NERE-1269/ts_bootstrap_pvalue_preregistration.json` ·
+模拟校准报告 `reports/NERE-1269/ts_bootstrap_pvalue_calibration.md`
 
 #### NERE-1279 确认性重校准
 
@@ -344,8 +345,8 @@ T ∈ {512, 1024, 2048}、h ∈ {1, 5, 20} 和 α ∈ {0.05, 0.01, 0.0025}，
 单侧 99% 上界 0.3840% 超过 0.375% 硬上限。该格在排除失败新增特征后
 仍属于存留范围，超出预登记允许移除的 T=512、α=0.05 配置。
 本轮重校准未通过，v3 P 值继续在其原有单品种诊断范围内发布。
-可运行公开基准脚本 [tools/benchmarks/ts_pvalue_confirmatory.py](../tools/benchmarks/ts_pvalue_confirmatory.py) ·
-[tools/benchmarks/ts_pvalue_recalibration.py](../tools/benchmarks/ts_pvalue_recalibration.py)。
+本地归档：确认性登记 `reports/NERE-1279/ts_recalibration_preregistration.json` ·
+逐格报告与嵌套抽查 `reports/NERE-1279/ts_recalibration.md`
 
 ### 6.2 择优的尝试账本与多重检验
 
@@ -436,7 +437,11 @@ GARCH(1,1) 的零效应及正负对照。单格以单侧 99% Clopper–Pearson �
 方差和自由度，按预登记的 95% 区间口径重算 P 值，再取大于等于该值的最小
 登记档，超过 0.05 时使用 1。95% 或 99% 区间的端点均按原口径保留。
 家族阈值独立取 0.05 或 0.01。
-冻结数值结果见 [cs_hac_calibration.json](../reports/NERE-1280/cs_hac_calibration.json)。
+可运行公开基准脚本 [tools/benchmarks/eval_engine_coverage_calibration.py](../tools/benchmarks/eval_engine_coverage_calibration.py) ·
+[包内保留摘要](../backtest_and_analysis/evaluation/calibration_data/cs_hac_adaptive_v1_size.json)
+
+- S5 自适应 HAC 包内覆盖摘要见
+  [cs_hac_adaptive_v1_coverage.json](../backtest_and_analysis/evaluation/calibration_data/cs_hac_adaptive_v1_coverage.json)。
 
 - `ts_boot_adaptive_v1` 登记 0 域，生产一律返回 `uncalibrated`。
   `T=128` 和 `T=256` 同时低于 S5 泛化候选域的 `T=512` 下界。
@@ -455,6 +460,7 @@ GARCH(1,1) 的零效应及正负对照。单格以单侧 99% Clopper–Pearson �
 
 可运行公开基准脚本
 [tools/benchmarks/adaptive_inference_calibration.py](../tools/benchmarks/adaptive_inference_calibration.py)复现自适应区间的合成覆盖率和多重检验实验。
+[Bootstrap v2 包内覆盖摘要](../backtest_and_analysis/evaluation/calibration_data/ts_bootstrap_v2_coverage.json)
 
 ## 7. 不可估计状态
 
@@ -503,8 +509,8 @@ S0-B 的数值反例见 [`tests/test_eval_engine_s0_counterexamples.py`](../test
 
 | 阶段 | 回归入口与夹具 |
 | --- | --- |
-| S1 | [Alphalens 参照测试](../tests/test_eval_engine_s1_alphalens_ref.py)、[日频主路径与回退快照](../tests/test_eval_engine_s1_runner_golden.py)、[合成日频快照](../tests/fixtures/eval_engine/baseline/synthetic.json)、[性能基准冒烟](../tests/test_eval_engine_s1_perf_harness.py)。S1-B 私有 Harness 合成回放的结果见第 10.2 节。 |
-| S2 | [面板与内核逐值对照](../tests/test_eval_engine_s2_kernels.py)、[内核性能门禁冒烟](../tests/test_eval_engine_s2_perf_gate.py)。 |
+| S1 | [Alphalens 参照测试](../tests/test_eval_engine_s1_alphalens_ref.py)、[日频主路径与回退快照](../tests/test_eval_engine_s1_runner_golden.py)、[合成日频快照](../tests/fixtures/eval_engine/baseline/synthetic.json)、[性能基准脚本](../tools/benchmarks/eval_engine_baseline.py)。S1-B 私有 Harness 合成回放的结果见第 10.2 节。 |
+| S2 | [面板与内核逐值对照](../tests/test_eval_engine_s2_kernels.py)、[内核性能门禁脚本](../tools/benchmarks/eval_engine_kernels.py)。 |
 | S3 | [截面统计](../tests/test_eval_engine_s3_cross_section.py)、[时序统计](../tests/test_eval_engine_s3_time_series.py)、[合成校准及尝试账本](../tests/test_eval_engine_s3_calibration.py)。 |
 | S4 | [日频标签端点冻结值](../tests/fixtures/eval_engine/baseline/s4_forward_returns.json)。 |
 | S5 | [无前视篡改测试](../tests/test_eval_engine_s5_no_lookahead.py)。 |

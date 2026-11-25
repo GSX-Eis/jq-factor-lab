@@ -37,6 +37,7 @@ def test_registered_adaptive_calibration_reports_match_frozen_hashes() -> None:
         assert sha256(report.read_bytes()).hexdigest() == domain.report_sha256, domain.domain_id
 
 
+@pytest.mark.slow
 def test_quick_cli_emits_all_preregistered_cells(tmp_path: Path) -> None:
     output = tmp_path / "quick.json"
     subprocess.run(
@@ -62,6 +63,7 @@ def test_quick_cli_emits_all_preregistered_cells(tmp_path: Path) -> None:
             assert set(auto["out_of_domain_reasons"]) == {"n_boot", "min_valid_replicates"}
 
 
+@pytest.mark.slow
 def test_s5_quick_cli_preserves_matrix_and_resumes_by_cell(tmp_path: Path) -> None:
     output = tmp_path / "adaptive-calibration-s5-quick.json"
     command = [
@@ -366,11 +368,23 @@ def _v2_hac_row(
 
 
 def test_s5_production_registry_is_bound_to_formal_hac_evidence() -> None:
+    report_ref = "backtest_and_analysis/evaluation/calibration_data/cs_hac_adaptive_v1_coverage.json"
     *core, generalized = (
         domain for domain in calibration.REGISTERED_ADAPTIVE_CALIBRATIONS
         if domain.method_version == "cs_hac_adaptive_v1"
-        and domain.report_ref == "reports/NERE-936/adaptive-calibration-s5.json"
+        and domain.report_ref == report_ref
     )
+    report_bytes = (Path(__file__).resolve().parents[1] / report_ref).read_bytes()
+    digest = sha256(report_bytes).hexdigest()
+    report = json.loads(report_bytes)
+    assert report["manifest_sha256"] == sha256(
+        json.dumps({k: v for k, v in report.items() if k != "manifest_sha256"},
+                   sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    assert report["source_report_sha256"] == "b56486d13112787bff507143f56bbc82413112d05bc73dac4c79889321242d62"
+    assert report["total_cells"] == 88 and report["registered_cells"] == len(report["coverage"]) == 62
+    assert report["hac_release_passes"] is True and report["repetitions"] == 500
+    rows = {row["cell_id"]: row for row in report["coverage"]}
     assert [domain.scenario for domain in core] == [design.scenario for design in benchmark.CORE]
     assert generalized.scenario == "generalized_ar_heteroskedastic"
     for index, domain in enumerate(core):
@@ -390,9 +404,13 @@ def test_s5_production_registry_is_bound_to_formal_hac_evidence() -> None:
     assert [domain.covered for domain in (*core, generalized)] == [465, 479, 478, 472, 470, 478, 468, 480, 461]
     for domain in (*core, generalized):
         assert domain.method_version == "cs_hac_adaptive_v1"
-        assert domain.min_effective_df == 4.0 and domain.repetitions == 500
-        assert domain.report_ref == "reports/NERE-936/adaptive-calibration-s5.json"
-        assert domain.report_sha256 == "b56486d13112787bff507143f56bbc82413112d05bc73dac4c79889321242d62"
+        assert domain.min_effective_df == 4.0 and domain.repetitions == report["repetitions"]
+        assert domain.report_ref == report_ref
+        assert domain.report_sha256 == digest
+        support = [rows[cell_id] for cell_id in domain.coverage_cell_ids]
+        assert all(row["passes"] is True and row["scenario"] == domain.scenario for row in support)
+        weakest = min(support, key=lambda row: (-abs(row["covered"] - 475), row["cell_id"]))
+        assert domain.covered == weakest["covered"]
     assert len(calibration.REGISTERED_CALIBRATIONS) == 14
 
 
@@ -429,6 +447,7 @@ def test_s5_production_hac_domain_through_v2_and_trial_ledger(grid, mismatches) 
 
 
 def test_s3_production_registry_is_bound_to_formal_bootstrap_evidence() -> None:
+    report_ref = "backtest_and_analysis/evaluation/calibration_data/ts_bootstrap_v2_coverage.json"
     *core, generalized = (
         domain for domain in calibration.REGISTERED_ADAPTIVE_CALIBRATIONS
         if domain.method_version == BOOTSTRAP_V2[0]
@@ -439,20 +458,17 @@ def test_s3_production_registry_is_bound_to_formal_bootstrap_evidence() -> None:
     assert generalized.horizons == (1, 5, 20)
     assert generalized.missing_patterns == ("none", "periodic_17_3", "periodic_17_5")
     assert generalized.coverage_cell_ids == tuple(f"3:{index:03d}" for index in range(18))
-    assert all(domain.report_ref == "reports/NERE-962/adaptive-calibration-v2.json" for domain in (*core, generalized))
+    assert all(domain.report_ref == report_ref for domain in (*core, generalized))
     report_bytes = (Path(__file__).resolve().parents[1] / generalized.report_ref).read_bytes()
     digest = sha256(report_bytes).hexdigest()
     report = json.loads(report_bytes)
-    assert report["output"] == "reports/NERE-962/adaptive-calibration-v2.json"
-    report_fields = {
-        "synthetic", "nominal_coverage", "coverage_tolerance", "error_rate_upper_bound",
-        "coverage", "multiplicity", "release_passes", "run_fingerprint", "bootstrap_release_passes",
-    }
-    metadata = {key: value for key, value in report.items() if key not in report_fields}
-    fingerprint = sha256(json.dumps(metadata, sort_keys=True).encode()).hexdigest()
-    assert report["run_fingerprint"] == fingerprint
-    assert len(report["coverage"]) == 26
-    assert all(row["run_fingerprint"] == fingerprint for row in report["coverage"])
+    assert report["manifest_sha256"] == sha256(
+        json.dumps({k: v for k, v in report.items() if k != "manifest_sha256"},
+                   sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    assert report["source_report_sha256"] == "f6ffd98efb29cd155589b24cb8396214ddab505d119139ac4a5c5b2b97370dc7"
+    assert report["run_fingerprint"] == "52d85917443f9b134e121e636d71be144eb8f5c40960e4080161df04c669ca84"
+    assert len(report["coverage"]) == report["registered_cells"] == report["total_cells"] == 26
     assert report["bootstrap_release_passes"] is True and report["repetitions"] == 500
     rows = {row["cell_id"]: row for row in report["coverage"]}
     for index, domain in enumerate(core):
@@ -465,8 +481,8 @@ def test_s3_production_registry_is_bound_to_formal_bootstrap_evidence() -> None:
         assert domain.report_sha256 == digest and domain.repetitions == report["repetitions"]
         support = [rows[cell_id] for cell_id in domain.coverage_cell_ids]
         assert all(row["passes"] is True and row["scenario"] == domain.scenario for row in support)
-        weakest = min(support, key=lambda row: (-abs(row["adaptive"]["covered"] - 475), row["cell_id"]))
-        assert domain.covered == weakest["adaptive"]["covered"]
+        weakest = min(support, key=lambda row: (-abs(row["covered"] - 475), row["cell_id"]))
+        assert domain.covered == weakest["covered"]
     assert not any(domain.method_version == BOOTSTRAP_V1[0] for domain in calibration.REGISTERED_ADAPTIVE_CALIBRATIONS)
 
 
@@ -821,6 +837,7 @@ def test_trial_family_reads_conflicting_bootstrap_sample_count(
     assert use["calibration_evidence"] is use["verified_horizon"] is None
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize(
     "corruption", ["zero_coverage", "fixed_zero_coverage", "in_domain", "budget_reasons", "valid_fraction"],
 )

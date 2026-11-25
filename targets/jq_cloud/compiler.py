@@ -131,8 +131,7 @@ def export_bundle(
         verified_dir,
         RUNTIME_DIR,
         REPO_ROOT / "factors",
-        REPO_ROOT / "reports/NERE-936",
-        REPO_ROOT / "reports/NERE-962",
+        REPO_ROOT / "backtest_and_analysis/evaluation/calibration_data",
         REPO_ROOT / "state",
         Path("/Volumes"),
     )
