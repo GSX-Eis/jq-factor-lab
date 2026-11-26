@@ -340,9 +340,9 @@ class FactorBase:
         """Return UTC (timestamp_utc, instrument_id, factor_value), retaining NaNs."""
         return _bar_bridge.get_bar_factor_frame(self, force_recalculate)
 
-    def get_session_daily_pricing(self) -> pd.Series:
+    def get_session_daily_pricing(self, *, adjusted: bool = True) -> pd.Series:
         """Return MultiIndex(asset, date) prices bound to the Session calendar."""
-        return _bar_bridge.get_session_daily_pricing(self)
+        return _bar_bridge.get_session_daily_pricing(self, adjusted=adjusted)
 
     def evaluate_bar_factor(self, **evaluator_options):
         """Label and evaluate a Bar factor using the same read snapshot."""

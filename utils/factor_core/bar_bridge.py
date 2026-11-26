@@ -148,11 +148,8 @@ def _read_slot_bars(self, *, execution: bool = False, expected=None, as_of=None)
             session = calendar.session_at(end, 'ETH' if record is not None else view, frequency=frequency)
             cutoff = max(end, session.segments[-1][1])
         metadata.append(record if record is not None else _metadata_for(slot, instrument, calendar, cutoff))
-        if execution:
-            part = slot.bar_feed.read_execution_bars([instrument], frequency, start_utc=start, end_utc=end)
-        else:
-            part = slot.bar_feed.read_signal_bars([instrument], frequency, start_utc=start, end_utc=end,
-                                                 as_of_utc=cutoff)
+        part = (slot.bar_feed.read_execution_bars([instrument], frequency, start_utc=start, end_utc=end)
+                if execution else slot.bar_feed.read_signal_bars([instrument], frequency, start_utc=start, end_utc=end, as_of_utc=cutoff))
         for name, value in [('frequency', frequency.canonical), ('source', slot.slot_id),
                             ('data_version', self.data_version or 'unversioned')]:
             if name not in part:
@@ -168,20 +165,17 @@ def _read_slot_bars(self, *, execution: bool = False, expected=None, as_of=None)
         if view == 'RTH' and record is None:
             part = part.loc[part.timestamp_utc.isin(grid.timestamp_utc)]
         parts.append(part.assign(timestamp_utc=part.timestamp_utc.astype('datetime64[ns, UTC]')))
+    from utils.price_adjustment import collect_adjustment_attrs
     bars = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(
         columns=BAR_COLUMNS).astype({'timestamp_utc': 'datetime64[ns, UTC]',
                                      **dict.fromkeys((*PRICE_COLUMNS, 'volume'), float)})
     bars = validate_bar_frame(bars)
     if not bars.frequency.eq(frequency.canonical).all():
         raise ValueError('market Bars do not match the requested frequency')
-    if (not execution and self.data_version is not None
-            and not bars.data_version.eq(self.data_version).all()):
+    if not execution and self.data_version is not None and not bars.data_version.eq(self.data_version).all():
         raise ValueError('market Bars do not match the requested data_version')
     keys = ['timestamp_utc', 'instrument_id']
-    if grids:
-        grid = pd.concat(grids, ignore_index=True)
-    else:
-        grid = bars[keys].iloc[:0].assign(session_id=pd.Series(dtype=str))
+    grid = pd.concat(grids, ignore_index=True) if grids else bars[keys].iloc[:0].assign(session_id=pd.Series(dtype=str))
     bars = bars.drop(columns='session_id', errors='ignore').merge(grid, on=keys, how='left', validate='one_to_one')
     if bars.session_id.isna().any():
         raise ValueError('bars contain timestamps outside the requested Session grid')
@@ -190,8 +184,10 @@ def _read_slot_bars(self, *, execution: bool = False, expected=None, as_of=None)
     aligned['frequency'] = frequency.canonical
     hashes = {instrument: calendar.calendar_hash for instrument, calendar in calendars.items()}
     bars.attrs = dict(_raw_coverage_attrs(coverage), session_view=view, calendar_hash=hashes, instrument_metadata=metadata)
+    bars.attrs.update(collect_adjustment_attrs(parts))
+    aligned = aligned.sort_values(['instrument_id', 'timestamp_utc']).reset_index(drop=True)
     aligned.attrs = bars.attrs.copy()
-    return bars, aligned.sort_values(['instrument_id', 'timestamp_utc']).reset_index(drop=True), calendars
+    return bars, aligned, calendars
 
 
 def _remember_market_bars(self, bars, grid, calendars) -> None:
@@ -445,34 +441,39 @@ def get_bar_factor_frame(self, force_recalculate: bool = False) -> pd.DataFrame:
     return mask_incomplete_bars(aligned, panel.attrs['incomplete_bar_keys']).sort_values(_BAR_KEYS).reset_index(drop=True)
 
 
+def _prepared_execution_grid(self, price_type: str, *, adjusted: bool = True) -> tuple[pd.DataFrame, dict]:
+    from utils.price_adjustment import adjust_execution_grid_prices
+    _, grid, calendars = _read_slot_bars(self, execution=True)
+    grid = adjust_execution_grid_prices(grid, price_type=price_type, pit_enabled=self.pit_enabled,
+        factor_column=self.pit_factor_column, ashare_panel=self._ashare_panel, adjusted=adjusted)
+    attrs = dict(grid.attrs)
+    price = grid[price_type].where(grid['is_complete'].eq(True)) if 'is_complete' in grid else grid[price_type]
+    grid = grid.assign(**{price_type: price.where(_pool_mask(self, grid)) if self.use_dynamic_pool else price})
+    grid.attrs = attrs
+    return grid, calendars
+
+
 def execution_panel(self, price_type: str, period: int | None = None, *, adjusted: bool = True) -> pd.DataFrame:
     """Compute moves on each instrument's full execution clock, including absent Bars."""
-    from utils.price_adjustment import PRICE_ADJUSTED_ATTR, adjust_execution_grid_prices
-    _, grid, _ = _read_slot_bars(self, execution=True)
-    grid = adjust_execution_grid_prices(
-        grid, price_type=price_type, pit_enabled=self.pit_enabled, factor_column=self.pit_factor_column, ashare_panel=self._ashare_panel, adjusted=adjusted)
-    price = grid[price_type].where(grid['is_complete'].eq(True)) if 'is_complete' in grid else grid[price_type]
-    price = price.where(_pool_mask(self, grid)) if self.use_dynamic_pool else price
-    values = grid.assign(factor_value=price)
+    from utils.price_adjustment import PRICE_ADJUSTED_ATTR
+    grid, _ = _prepared_execution_grid(self, price_type, adjusted=adjusted)
+    values = grid.assign(factor_value=grid[price_type])
     if period is not None and not _session_rollup(self):
-        values['factor_value'] = price.groupby(grid.instrument_id, sort=False).shift(-period) / price - 1
+        values['factor_value'] = grid[price_type].groupby(grid.instrument_id, sort=False).shift(-period) / grid[price_type] - 1
     wide = panel_slot_values(self, values)
     result = wide.shift(-period) / wide - 1 if period is not None and _session_rollup(self) else wide
     result.attrs[PRICE_ADJUSTED_ATTR] = bool(grid.attrs.get(PRICE_ADJUSTED_ATTR, False))
     return result
 
 
-def get_session_daily_pricing(self) -> pd.Series:
+def get_session_daily_pricing(self, *, adjusted: bool = True) -> pd.Series:
     """Return MultiIndex(asset, date) prices bound to the Session calendar."""
     from backtest_and_analysis.time_series.factor_bridge import session_daily_pricing
     if not self._frequency_route.bar_grid:
         raise ValueError('Session pricing requires minute Bar input')
-    if self._ashare_panel:
-        if not hasattr(self, 'market_bar_grid'):
-            self._fetch_market_bars()
-        return session_daily_pricing(self.market_bar_grid, self.market_calendars)
-    _, grid, calendars = _read_slot_bars(self, execution=True)
-    return session_daily_pricing(grid, calendars)
+    grid, calendars = _prepared_execution_grid(self, 'close', adjusted=adjusted)
+    return session_daily_pricing(grid, calendars, adjusted=adjusted, pit_enabled=self.pit_enabled,
+        factor_column=self.pit_factor_column, ashare_panel=self._ashare_panel)
 
 
 def evaluate_bar_factor(self, **evaluator_options):
@@ -489,12 +490,10 @@ def evaluate_bar_factor(self, **evaluator_options):
             factors, on=_BAR_KEYS, how='left', validate='many_to_one')
         bars.attrs = dict(execution.attrs)
         return evaluate_bars(bars, labeler=labeler, analysis_mode=self.analysis_mode, **evaluator_options)
-
     factors = factors.merge(self.market_bars[_BAR_KEYS], on=_BAR_KEYS, validate='one_to_one')
     execution, grid, _ = _read_slot_bars(self, execution=True)
     for name, missing in [('volume', 0), ('source', self.slot_id), ('data_version', 'unversioned')]:
         grid[name] = grid[name].fillna(missing)
     grid['is_complete'] = grid.observed & grid.get('is_complete', grid.observed).eq(True)
     grid.attrs = execution.attrs.copy()
-    return evaluate_bars(grid, factors=factors, labeler=labeler,
-                         analysis_mode=self.analysis_mode, **evaluator_options)
+    return evaluate_bars(grid, factors=factors, labeler=labeler, analysis_mode=self.analysis_mode, **evaluator_options)

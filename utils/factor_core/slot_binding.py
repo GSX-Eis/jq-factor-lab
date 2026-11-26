@@ -183,9 +183,15 @@ class AShareFactorFeed:
         adapter = factor._duckdb_adapter or self.adapter
         config = adapter.data_config if adapter is not None else factor._get_local_data_config()
         standard = date_field == 'date' and code_field == 'stock_code' and not additional_condition
-        normalize = adapter is not None and standard
-        if normalize and factor.data_frequency in ('daily', '1d') and 'money' in selected and 'paused' not in selected:
-            selected.append('paused')
+        normalize = standard
+        if (
+            normalize
+            and factor._frequency_route.frequency.kind == 'session'
+            and 'money' in selected
+            and 'paused' not in selected
+            and 'paused' not in optional
+        ):
+            optional = (*optional, 'paused')
         check_profile = self._check_input_profile if adapter is not None and adapter.duckdb_path else None
 
         frame = ASharePanelReader.read_panel(

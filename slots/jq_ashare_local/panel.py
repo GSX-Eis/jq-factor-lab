@@ -301,18 +301,26 @@ class ASharePanelReader(BarSource):
                         dataset=None) -> set[str]:
         from utils.data_store import table_name
 
+        def parquet_columns() -> set[str]:
+            if adapter is None or adapter.parquet_dir is None or dataset is None:
+                return set()
+            parquet_path = adapter.parquet_dir / dataset.parquet_subdir
+            if not parquet_path.is_dir():
+                return set()
+            return {row[0] for row in conn.execute(
+                'DESCRIBE SELECT * FROM read_parquet(?, hive_partitioning=true)',
+                [str(parquet_path / '**' / '*.parquet')],
+            ).fetchall()}
+
         try:
             if adapter is not None and not adapter.duckdb_path and adapter.parquet_dir is not None and dataset is not None:
-                parquet_path = adapter.parquet_dir / dataset.parquet_subdir
-                if parquet_path.is_dir():
-                    return {row[0] for row in conn.execute(
-                        'DESCRIBE SELECT * FROM read_parquet(?, hive_partitioning=true)',
-                        [str(parquet_path / '**' / '*.parquet')],
-                    ).fetchall()}
-                return set()
+                return parquet_columns()
             return {row[0] for row in conn.execute(f'DESCRIBE {table_name(table)}').fetchall()}
         except duckdb.Error:
-            return set()
+            try:
+                return parquet_columns()
+            except duckdb.Error:
+                return set()
 
     @classmethod
     def read_panel(cls, instruments: Sequence[str], frequency: str | None, start: str,

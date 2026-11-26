@@ -2018,14 +2018,16 @@ class SlotDataProvider:
                 return None
             if "paused" in bars.columns:
                 bars = bars.loc[bars["paused"].isna() | (bars["paused"] == 0)]
-            if "money" in bars.columns and bars["money"].notna().any():
-                traded = pd.to_numeric(bars["money"], errors="coerce")
-            elif "volume" in bars.columns and "close" in bars.columns:
-                traded = pd.to_numeric(bars["volume"], errors="coerce") * pd.to_numeric(
-                    bars["close"], errors="coerce"
-                )
-            else:
+            if bars.empty:
                 return None
+            traded = self._resolve_traded_value_series(slot, bars)
+            if traded.empty:
+                return None
+            valid_mask = traded.notna() & np.isfinite(traded) & (traded >= 0)
+            if not bool(valid_mask.any()):
+                return None
+            bars = bars.loc[valid_mask]
+            traded = traded.loc[valid_mask]
             money = traded.groupby(_session_or_bar_index(bars)).sum().sort_index()
             short_ma = money.rolling(short_window, min_periods=short_window).mean()
             long_ma = money.rolling(long_window, min_periods=long_window).mean()

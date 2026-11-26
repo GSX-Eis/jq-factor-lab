@@ -19,6 +19,7 @@ from utils.market_db.validation import (
     market_db_calendar_bounds, validate_market_db_calendar, validate_market_db_execution_rules,
     validate_market_db_frequencies, validate_market_db_provider,
 )
+from utils.pit import normalize_price_money
 from utils.session_calendar import SessionCalendar
 from utils.slots import ExecutionProfile, InstrumentSpec, MarketSlot, SlotConfig
 from utils.time_axis import BarSchedule, Frequency
@@ -258,10 +259,16 @@ class DeclarativeBarFeed:
 
     def _load_data(self, *, instruments: Sequence[str] | None = None,
                    start_utc: datetime | None = None, end_utc: datetime | None = None,
-                   as_of_utc: datetime | None = None) -> pd.DataFrame:
+                   as_of_utc: datetime | None = None,
+                   include_paused: bool = False) -> pd.DataFrame:
         required_columns = tuple(dict.fromkeys(self.spec.column_mapping.values()))
+        optional_candidates = (
+            ('money', 'factor', 'open_interest', 'paused')
+            if include_paused
+            else ('money', 'factor', 'open_interest')
+        )
         optional_columns = tuple(
-            field for field in ('money', 'factor', 'open_interest')
+            field for field in optional_candidates
             if field not in required_columns and field not in self.spec.column_mapping
         )
         request = ReadRequest(
@@ -324,7 +331,8 @@ class DeclarativeBarFeed:
         return self._adapt_bars(data, as_of_utc=as_of_utc, bucket_strategy=bucket_strategy)
 
     def _read(self, instruments: Sequence[str], frequency: Frequency, *, start_utc: datetime,
-              end_utc: datetime, as_of_utc: datetime | None = None) -> pd.DataFrame:
+              end_utc: datetime, as_of_utc: datetime | None = None,
+              normalize_money: bool = False) -> pd.DataFrame:
         if frequency.canonical != self.frequency.canonical:
             raise ValueError(f'Declarative feed serves {self.frequency.canonical}, got {frequency.raw!r}')
         start, end = _bounds(start_utc, end_utc)
@@ -335,6 +343,7 @@ class DeclarativeBarFeed:
         push_start, push_end = self._pushdown_window(start, end, grid=grid)
         data = self._load_data(
             instruments=ids, start_utc=push_start, end_utc=push_end, as_of_utc=as_of_utc,
+            include_paused=normalize_money,
         )
         bars = self._adapt_bars(data, as_of_utc=as_of_utc)
         # Only the signal path needs completion, but both views validate the grid.
@@ -348,6 +357,15 @@ class DeclarativeBarFeed:
         if grid is not None:
             keys = grid.set_index('session_id').timestamp_utc
             bars = bars.assign(timestamp_utc=bars.session_id.map(keys))
+        if normalize_money and 'money' in bars and 'paused' in bars:
+            money_frequency = (
+                'daily' if self.frequency.kind == 'session'
+                else '1m' if self.frequency.canonical == '1min'
+                else '5m' if self.frequency.canonical == '5min'
+                else None
+            )
+            if money_frequency is not None:
+                bars = normalize_price_money(bars, source='local', frequency=money_frequency)
         mask = bars.timestamp_utc.between(start, end)
         extras = [field for field in ('money', 'factor', 'open_interest') if field in bars]
         return bars.loc[mask, [*BAR_COLUMNS, 'session_id', *extras]].reset_index(drop=True)
@@ -355,7 +373,10 @@ class DeclarativeBarFeed:
     def read_signal_bars(self, instruments: Sequence[str], frequency: Frequency, *, start_utc: datetime,
                          end_utc: datetime, as_of_utc: datetime) -> pd.DataFrame:
         _utc(as_of_utc, 'as_of_utc')
-        return self._read(instruments, frequency, start_utc=start_utc, end_utc=end_utc, as_of_utc=as_of_utc)
+        return self._read(
+            instruments, frequency, start_utc=start_utc, end_utc=end_utc,
+            as_of_utc=as_of_utc, normalize_money=True,
+        )
 
     def read_execution_bars(self, instruments: Sequence[str], frequency: Frequency, *, start_utc: datetime,
                             end_utc: datetime) -> pd.DataFrame:

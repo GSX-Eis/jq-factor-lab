@@ -71,13 +71,27 @@ def _validate_source_timezone(value: object) -> str | None:
     return value
 
 
-def _utc_bound_datetime(bound: pd.Timestamp, *, upper: bool, unit: str = 'us') -> datetime:
-    if unit == 's':
-        shifted = bound.ceil('s') if upper else bound.floor('s')
-    elif unit == 'ms':
-        shifted = bound.ceil('ms') if upper else bound.floor('ms')
+def _utc_bound_datetime(
+    bound: pd.Timestamp, *, upper: bool, unit: str = 'us', exact: bool = False,
+) -> datetime:
+    """Round a UTC Timestamp bound to a Python datetime at ``unit`` precision.
+
+    With ``exact=True`` (for discrete integer-unit tz-aware pushdown), lower bounds
+    round up (``ceil``) and upper bounds round down (``floor``) so pushdown never
+    admits out-of-range rows. With ``exact=False`` (for padded/widened pre-filters),
+    lower bounds round down and upper bounds round up so ``_filter_frame`` receives a
+    complete superset.
+    """
+    if unit == 'ns':
+        if exact:
+            raise ValueError('Python datetime cannot represent exact nanosecond bounds')
+        round_unit = 'us'
+    elif unit in ('s', 'ms', 'us'):
+        round_unit = unit
     else:
-        shifted = bound.ceil('us') if (upper and bound.nanosecond > 0) else bound.floor('us')
+        raise ValueError(f'Unsupported timestamp bound unit: {unit!r}')
+    round_up = (not upper) if exact else upper
+    shifted = bound.ceil(round_unit) if round_up else bound.floor(round_unit)
     return shifted.to_pydatetime()
 
 
@@ -810,14 +824,10 @@ class FrameSource:
                 if ts_type in ('TIMESTAMP WITH TIME ZONE', 'TIMESTAMPTZ'):
                     if lower_utc is not None:
                         where_clauses.append(f'{quoted_ts} >= ?')
-                        params.append(_utc_bound_datetime(lower_utc, upper=False))
+                        params.append(_utc_bound_datetime(lower_utc, upper=False, unit='us', exact=True))
                     if upper_utc is not None:
                         where_clauses.append(f'{quoted_ts} <= ?')
-                        params.append(_utc_bound_datetime(upper_utc, upper=True))
-                    if ((lower_utc is not None and lower_utc.nanosecond > 0)
-                            or (upper_utc is not None and upper_utc.nanosecond > 0)):
-                        exact_time_pushed = False
-                        need_temp_ts = ts_col not in select_cols
+                        params.append(_utc_bound_datetime(upper_utc, upper=True, unit='us', exact=True))
                 elif 'TIMESTAMP' in ts_type or ts_type == 'DATE':
                     exact_time_pushed = False
                     need_temp_ts = ts_col not in select_cols
@@ -936,23 +946,21 @@ class FrameSource:
                 if pa.types.is_timestamp(ts_type):
                     time_expr = None
                     if ts_type.tz is not None:
-                        if lower_utc is not None:
-                            scalar_low = (
-                                pa.scalar(lower_utc.value, type=ts_type) if ts_type.unit == 'ns'
-                                else pa.scalar(_utc_bound_datetime(lower_utc, upper=False, unit=ts_type.unit), type=ts_type)
-                            )
-                            time_expr = pc.field(ts_col) >= scalar_low
-                        if upper_utc is not None:
-                            scalar_high = (
-                                pa.scalar(upper_utc.value, type=ts_type) if ts_type.unit == 'ns'
-                                else pa.scalar(_utc_bound_datetime(upper_utc, upper=True, unit=ts_type.unit), type=ts_type)
-                            )
-                            cond = pc.field(ts_col) <= scalar_high
-                            time_expr = cond if time_expr is None else (time_expr & cond)
-                        if ts_type.unit != 'ns' and (
-                            (lower_utc is not None and lower_utc.nanosecond > 0)
-                            or (upper_utc is not None and upper_utc.nanosecond > 0)
-                        ):
+                        if ts_type.unit in ('s', 'ms', 'us', 'ns'):
+                            def _pq_utc_scalar(bound: pd.Timestamp, *, upper: bool) -> Any:
+                                if ts_type.unit == 'ns':
+                                    return pa.scalar(bound.as_unit('ns').value, type=ts_type)
+                                return pa.scalar(
+                                    _utc_bound_datetime(bound, upper=upper, unit=ts_type.unit, exact=True),
+                                    type=ts_type,
+                                )
+
+                            if lower_utc is not None:
+                                time_expr = pc.field(ts_col) >= _pq_utc_scalar(lower_utc, upper=False)
+                            if upper_utc is not None:
+                                cond = pc.field(ts_col) <= _pq_utc_scalar(upper_utc, upper=True)
+                                time_expr = cond if time_expr is None else (time_expr & cond)
+                        else:
                             exact_time_pushed = False
                             need_temp_ts = ts_col not in selected_cols
                     else:

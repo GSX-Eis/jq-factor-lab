@@ -147,20 +147,45 @@ def session_daily_frame(values: pd.DataFrame, grid: pd.DataFrame, *,
     return wide
 
 
-def session_daily_pricing(grid: pd.DataFrame, calendars: dict) -> pd.Series:
+def session_daily_pricing(
+    grid: pd.DataFrame,
+    calendars: dict,
+    *,
+    adjusted: bool = True,
+    pit_enabled: bool = True,
+    factor_column: str = 'factor',
+    ashare_panel: bool = True,
+) -> pd.Series:
     """Session-close pricing for daily Alphalens, bound to one TradingCalendar."""
+    from utils.price_adjustment import (
+        PRICE_ADJUSTED_ATTR,
+        PRICE_ADJUSTMENT_MODE_ATTR,
+        adjust_execution_grid_prices,
+    )
     from utils.trading_calendar import TradingCalendar
 
     identities = {calendar.calendar_hash for calendar in calendars.values()}
     if len(identities) != 1:
         raise ContractValidationError('daily cross-sectional pricing requires one shared calendar')
-    values = grid[['timestamp_utc', 'instrument_id', 'close']].rename(columns={'close': 'factor_value'})
+    grid = adjust_execution_grid_prices(
+        grid,
+        price_type='close',
+        pit_enabled=pit_enabled,
+        factor_column=factor_column,
+        ashare_panel=ashare_panel,
+        adjusted=adjusted,
+    )
+    close = grid['close'].where(grid['is_complete'].eq(True)) if 'is_complete' in grid else grid['close']
+    values = grid[['timestamp_utc', 'instrument_id']].assign(factor_value=close)
     daily = session_daily_frame(values, grid)
     pricing = daily.rename_axis(columns='asset').unstack().rename('close')
     calendar = next(iter(calendars.values()))
     days = calendar.sessions()
     pricing.attrs['trading_calendar'] = TradingCalendar(days, calendar.start, calendar.end,
                                                        calendar_id=calendar.calendar_id)
+    pricing.attrs[PRICE_ADJUSTED_ATTR] = bool(grid.attrs.get(PRICE_ADJUSTED_ATTR, False))
+    if PRICE_ADJUSTMENT_MODE_ATTR in grid.attrs:
+        pricing.attrs[PRICE_ADJUSTMENT_MODE_ATTR] = grid.attrs[PRICE_ADJUSTMENT_MODE_ATTR]
     return pricing
 
 

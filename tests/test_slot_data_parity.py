@@ -246,3 +246,229 @@ def test_bars_core_has_no_legacy_or_shanghai_specifics(record_property):
         contents = path.read_text(encoding='utf-8').lower()
         assert 'legacy' not in contents and 'asia/shanghai' not in contents, path.name
     record_property('scanned_modules', len(paths))
+
+
+def test_data_source_parity_csv_duckdb_file_and_borrowed_connection(tmp_path):
+    """Same market data across CSV, DuckDB file, and borrowed connection yields identical factor, IC, and ranks."""
+    from dataclasses import replace
+
+    from backtest_and_analysis.alphalens_runner import AlphalensRunner
+    from backtest_and_analysis.time_series.evaluator import evaluate_slot
+    from backtest_and_analysis.time_series.factor_bridge import bar_factor_frame
+    from slots import build_slot_from_config
+    from slots.jq_ashare_local import build_jq_ashare_local
+    from utils.factor_base import FactorBase
+    from utils.session_calendar import SessionCalendar
+    from utils.slots import ExecutionProfile, ProviderConfig, SlotConfig
+    from utils.trading_calendar import TradingCalendar
+
+    dates = tuple(SessionCalendar('XSHG', '2026-01-05', '2026-01-23').sessions().strftime('%Y-%m-%d'))
+    stocks = ['000001.XSHE', '000002.XSHE', '600000.XSHG', '600519.XSHG']
+    # Include a paused day (paused=1, money=0 -> NaN) and a normal zero-turnover day (paused=0, money=0 -> 0.0).
+    # Keep >= 50 valid points so AlphalensRunner runs full IC & quantile analysis too.
+    money_by_stock = {
+        '000001.XSHE': [100., 0., 200., 240., 260.] + [280. + 20. * i for i in range(10)],
+        '000002.XSHE': [300., 340., 0., 120., 90.] + [110. + 15. * i for i in range(10)],
+        '600000.XSHG': [200., 180., 260., 320., 380.] + [400. + 25. * i for i in range(10)],
+        '600519.XSHG': [500., 540., 620., 700., 760.] + [800. + 30. * i for i in range(10)],
+    }
+    rows = []
+    for day_idx, day in enumerate(dates):
+        for stock_idx, code in enumerate(stocks):
+            is_paused = int(code == '000001.XSHE' and day_idx == 1)
+            money = float(money_by_stock[code][day_idx])
+            vol = 0.0 if money == 0.0 else 100.0 + 10.0 * day_idx + 25.0 * stock_idx
+            close = 10.0 * (stock_idx + 1) + 0.4 * day_idx + 0.15 * ((day_idx + stock_idx) % 3)
+            rows.append((code, day, close - 0.1, close + 0.3, close - 0.3, close, vol, money, is_paused, 1.0))
+    frame = pd.DataFrame(
+        rows,
+        columns=['stock_code', 'date', 'open', 'high', 'low', 'close', 'volume', 'money', 'paused', 'factor'],
+    )
+
+    class MoneyMeanParityFactor(FactorBase):
+        def _get_raw_data_for_factor(self) -> pd.DataFrame:
+            return self._fetch_raw_data(['money'], table_name='price_data')
+
+        def calculate_factor(self, data: pd.DataFrame) -> pd.DataFrame:
+            time_col, code_col = ('date', 'code') if 'date' in data else ('timestamp_utc', 'instrument_id')
+            wide = data.pivot(index=time_col, columns=code_col, values='money').sort_index()
+            return wide.rolling(2, min_periods=1).mean()
+
+    csv_df = frame.assign(date=frame['date'] + ' 15:00:00')
+    csv_df.to_csv(tmp_path / 'bars.csv', index=False)
+    csv_cfg = SlotConfig(
+        schema_version=1,
+        slot_id='csv_parity_slot',
+        market_domain='cn_equity',
+        calendar=ProviderConfig('pmc', {'calendar_id': 'XSHG', 'start': dates[0], 'end': dates[-1]}),
+        bar_feed=ProviderConfig('csv_files', {
+            'paths': ['bars.csv'],
+            'frequency': '1d',
+            'timestamp_anchor': 'bar_end',
+            'source_timezone': 'Asia/Shanghai',
+            'volume_mode': 'interval',
+            'source': 'csv_parity',
+            'data_version': 'v1',
+            'column_mapping': {
+                'date': 'timestamp',
+                'stock_code': 'instrument_id',
+                'open': 'open',
+                'high': 'high',
+                'low': 'low',
+                'close': 'close',
+                'volume': 'volume',
+            },
+        }),
+        universe=ProviderConfig('static', {
+            'instruments': {
+                code: {'asset_class': 'equity', 'currency': 'CNY', 'lot_size': 100, 'contract_multiplier': 1.0}
+                for code in stocks
+            },
+            'universes': {'all': tuple(stocks)},
+        }),
+        aux_features=ProviderConfig('none', {}),
+        microstructure=ProviderConfig('open', {}),
+        execution_profile=ExecutionProfile('close', 'close', 0, 0, 'decimal', 'endpoints_only', 'cross_session', False),
+    )
+    csv_slot = build_slot_from_config(csv_cfg, base_dir=tmp_path)
+
+    db_path = tmp_path / 'parity.duckdb'
+    with duckdb.connect(str(db_path)) as writer:
+        declare_market_db(writer, 'cn_equity')
+        writer.register('source_rows', frame.assign(date=pd.to_datetime(frame['date'])))
+        writer.execute('CREATE TABLE price_data_daily AS SELECT * FROM source_rows')
+
+    csv_factor = MoneyMeanParityFactor(
+        None, 'MoneyParityCSV', dates[0], dates[-1],
+        stock_pool=stocks, slot=csv_slot, data_frequency='1d', analysis_mode='cross_sectional',
+    )
+    csv_raw_panel = csv_factor.get_factor_values()
+    csv_eval = evaluate_slot(
+        csv_slot,
+        bar_factor_frame(csv_raw_panel),
+        frequency='1d',
+        start_date=dates[0],
+        end_date=dates[-1],
+        instruments=stocks,
+        horizons=[1, 2],
+        entry_offset_bars=1,
+        n_quantiles=2,
+        min_ic_samples=3,
+        min_cross_section_size=3,
+        analysis_mode='cross_sectional',
+    )
+    csv_panel = csv_raw_panel.copy()
+    csv_panel.index = pd.DatetimeIndex(csv_panel.index.tz_convert('Asia/Shanghai').tz_localize(None).normalize(), name='date')
+    csv_panel.columns.name = 'code'
+
+    # Compare CSV against both DuckDB file (duckdb_path) and borrowed DuckDB connection (db_connection).
+    duckdb_factor_daily = MoneyMeanParityFactor(
+        None, 'MoneyParityFileDaily', dates[0], dates[-1],
+        stock_pool=stocks, duckdb_path=str(db_path), data_frequency='daily',
+    )
+    duckdb_factor_1d = MoneyMeanParityFactor(
+        None, 'MoneyParityFile1d', dates[0], dates[-1],
+        stock_pool=stocks, duckdb_path=str(db_path), data_frequency='1d', analysis_mode='cross_sectional',
+    )
+    with duckdb.connect(str(db_path), read_only=True) as borrowed:
+        borrowed_factor_daily = MoneyMeanParityFactor(
+            borrowed, 'MoneyParityBorrowedDaily', dates[0], dates[-1],
+            stock_pool=stocks, data_frequency='daily',
+        )
+        borrowed_factor_1d = MoneyMeanParityFactor(
+            borrowed, 'MoneyParityBorrowed1d', dates[0], dates[-1],
+            stock_pool=stocks, data_frequency='1d', analysis_mode='cross_sectional',
+        )
+        try:
+            file_daily_panel = duckdb_factor_daily.get_factor_values()
+            file_1d_panel = duckdb_factor_1d.get_factor_values()
+            borrowed_daily_panel = borrowed_factor_daily.get_factor_values()
+            borrowed_1d_panel = borrowed_factor_1d.get_factor_values()
+
+            # P1-01 suspended day rolling mean & unpaused zero-turnover preservation across all paths.
+            for panel in (csv_panel, file_daily_panel, file_1d_panel, borrowed_daily_panel, borrowed_1d_panel):
+                np.testing.assert_allclose(
+                    panel['000001.XSHE'].iloc[:5].to_numpy(dtype=float),
+                    [100.0, 100.0, 200.0, 220.0, 250.0],
+                    rtol=0, atol=1e-12,
+                )
+                np.testing.assert_allclose(
+                    panel['000002.XSHE'].iloc[:5].to_numpy(dtype=float),
+                    [300.0, 320.0, 170.0, 60.0, 105.0],
+                    rtol=0, atol=1e-12,
+                )
+
+            # 1. Exact factor value and cross-sectional rank parity across CSV, DuckDB file, and borrowed connection.
+            for other in (file_daily_panel, file_1d_panel, borrowed_daily_panel, borrowed_1d_panel):
+                pd.testing.assert_frame_equal(
+                    other, csv_panel, check_exact=False, rtol=0, atol=1e-12, check_names=False, check_freq=False,
+                )
+                pd.testing.assert_frame_equal(
+                    other.rank(axis=1, ascending=True),
+                    csv_panel.rank(axis=1, ascending=True),
+                    check_exact=True,
+                    check_names=False,
+                    check_freq=False,
+                )
+
+            # 2. Unified Slot evaluation (IC & quantile stats) parity across CSV, DuckDB file, and borrowed connection.
+            grid = csv_slot.calendar.bar_grid('1d', dates[0], dates[-1])
+            keys = grid.groupby(pd.to_datetime(grid.session_id))['timestamp_utc'].max()
+            file_eval_slot = replace(
+                build_jq_ashare_local(duckdb_factor_daily._duckdb_adapter._get_connection(), start=dates[0], end=dates[-1]),
+                slot_config_hash='ashare-file-v1',
+            )
+            borrowed_eval_slot = replace(
+                build_jq_ashare_local(borrowed, start=dates[0], end=dates[-1]),
+                slot_config_hash='ashare-borrowed-v1',
+            )
+            for eval_slot, panel in ((file_eval_slot, file_1d_panel), (borrowed_eval_slot, borrowed_1d_panel)):
+                utc_panel = panel.set_axis(pd.DatetimeIndex(pd.to_datetime(panel.index).map(keys)))
+                slot_eval = evaluate_slot(
+                    eval_slot,
+                    bar_factor_frame(utc_panel),
+                    frequency='1d',
+                    start_date=dates[0],
+                    end_date=dates[-1],
+                    instruments=stocks,
+                    horizons=[1, 2],
+                    entry_offset_bars=1,
+                    n_quantiles=2,
+                    min_ic_samples=3,
+                    min_cross_section_size=3,
+                    analysis_mode='cross_sectional',
+                )
+                pd.testing.assert_frame_equal(
+                    slot_eval.ic_by_horizon[['horizon_bars', 'mean_ic', 'median_ic', 'icir']],
+                    csv_eval.ic_by_horizon[['horizon_bars', 'mean_ic', 'median_ic', 'icir']],
+                    check_exact=False, rtol=0, atol=1e-12,
+                )
+                pd.testing.assert_frame_equal(
+                    slot_eval.cross_sections[['signal_timestamp', 'horizon_bars', 'valid_instruments', 'spearman_ic']],
+                    csv_eval.cross_sections[['signal_timestamp', 'horizon_bars', 'valid_instruments', 'spearman_ic']],
+                    check_exact=False, rtol=0, atol=1e-12,
+                )
+                pd.testing.assert_frame_equal(
+                    slot_eval.quantile_stats[['horizon_bars', 'quantile', 'total_sample_count', 'mean_return_pct']],
+                    csv_eval.quantile_stats[['horizon_bars', 'quantile', 'total_sample_count', 'mean_return_pct']],
+                    check_exact=False, rtol=0, atol=1e-12,
+                )
+
+            # 3. Alphalens IC parity across DuckDB file and borrowed connection (plus CSV pricing).
+            cal = duckdb_factor_daily.slot.calendar.default
+            trading_cal = TradingCalendar(cal.sessions(), cal.start, cal.end, calendar_id=cal.calendar_id)
+            file_pricing = duckdb_factor_daily.get_price_data('close').rename_axis(columns='asset').unstack().rename('close')
+            borrowed_pricing = borrowed_factor_daily.get_price_data('close').rename_axis(columns='asset').unstack().rename('close')
+            file_pricing.attrs['trading_calendar'] = trading_cal
+            borrowed_pricing.attrs['trading_calendar'] = trading_cal
+            runner = AlphalensRunner(periods=(1, 2), n_quantiles=2, execution_lag=1)
+            al_file = runner.run(file_daily_panel, file_pricing)
+            al_borrowed = runner.run(borrowed_daily_panel, borrowed_pricing)
+            al_csv = runner.run(csv_panel, borrowed_pricing)
+            pd.testing.assert_frame_equal(al_borrowed['ic'], al_file['ic'], check_exact=False, rtol=0, atol=1e-12)
+            pd.testing.assert_frame_equal(al_csv['ic'], al_file['ic'], check_exact=False, rtol=0, atol=1e-12)
+            pd.testing.assert_frame_equal(al_borrowed['quantile_returns'], al_file['quantile_returns'], check_exact=False, rtol=0, atol=1e-12)
+            pd.testing.assert_frame_equal(al_csv['quantile_returns'], al_file['quantile_returns'], check_exact=False, rtol=0, atol=1e-12)
+        finally:
+            duckdb_factor_daily.close()
+            duckdb_factor_1d.close()

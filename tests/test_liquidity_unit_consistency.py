@@ -1671,3 +1671,399 @@ def test_futures_ohlcv_fallback_applies_contract_multiplier_without_double_count
         assert p_root.average_daily_traded_value([root], end, 2, None, None)[root] == pytest.approx(500_000.0)
     finally:
         conn_diff.close()
+
+
+@pytest.mark.parametrize("pretrade_fixed_targets", [False, True])
+def test_p104_capacity_constraint_end_to_end_portfolio_pipeline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pretrade_fixed_targets: bool
+) -> None:
+    """P1-04 + Capacity Constraint: zero trailing ADV/cap stays 0.0 and other caps hold through full policy/overlay pipeline."""
+    days_5 = ("2026-01-05", "2026-01-06", "2026-01-07", "2026-01-08", "2026-01-09")
+    daily_totals_5 = {
+        # Exact P1-04 counterexample: [2400, 2400, 0, 0] -> lookback_days=2 gives ADV=0.0
+        "A_zero": {"2026-01-05": 2_400.0, "2026-01-06": 2_400.0, "2026-01-07": 0.0, "2026-01-08": 0.0, "2026-01-09": 0.0},
+        # Tight cap: max_participation=0.1, hp=1 -> 200_000 notional cap (20% of 1M)
+        "B_tight": {d: 2_000_000.0 for d in days_5},
+        "C_deep": {d: 100_000_000.0 for d in days_5},
+        "D_blocked": {d: 50_000_000.0 for d in days_5},
+    }
+    slot5, close5, open5 = _build_declarative_market_slot(
+        tmp_path / f"cap_e2e_5d_{int(pretrade_fixed_targets)}",
+        frequency="1d",
+        daily_traded_values=daily_totals_5,
+        start="2026-01-05",
+        end="2026-01-09",
+        use_money_column=False,
+    )
+    idx5 = pd.DatetimeIndex(slot5.calendar.sessions())
+    close5.index = idx5
+    open5.index = idx5
+
+    # Verify ADV and cap at 2026-01-08 (after [2400, 2400, 0, 0])
+    provider = SlotDataProvider(slot=slot5, frequency="1d")
+    adv_0108 = provider.average_daily_traded_value(
+        ["A_zero", "B_tight", "C_deep", "D_blocked"], "2026-01-08", 2, None, None
+    )
+    assert adv_0108["A_zero"] == pytest.approx(0.0)
+    assert adv_0108["B_tight"] == pytest.approx(2_000_000.0)
+    caps_0108 = compute_liquidity_weight_caps(
+        adv_0108,
+        ["A_zero", "B_tight", "C_deep", "D_blocked"],
+        max_participation=0.1,
+        holding_period=1,
+        capital=1_000_000.0,
+        holding_period_unit="days",
+    )
+    assert caps_0108["A_zero"] == pytest.approx(0.0)
+    assert caps_0108["B_tight"] == pytest.approx(0.2)
+
+    # Trigger breadth_filter derisking (exposure=0.5) before 2026-01-09
+    close5.loc[idx5[3], ["B_tight", "C_deep", "D_blocked"]] = 85.0
+    close5.loc[idx5[4], ["B_tight", "C_deep", "D_blocked"]] = 85.0
+    scores5 = pd.DataFrame(
+        {"A_zero": 4.0, "B_tight": 3.0, "C_deep": 2.0, "D_blocked": 1.0},
+        index=idx5,
+    )
+    rebal_d1 = idx5[2]  # prev=2026-01-06 -> ADV(A)=2400 -> A held on rebal_d1
+    rebal_d2 = idx5[4]  # prev=2026-01-08 -> trailing 2 sessions (01-07, 01-08) -> ADV(A)=0.0
+
+    runner = VectorBTBacktestRunner(
+        {
+            "top_k_strategy": {
+                "top_k": 4,
+                "holding_period": 1,
+                "score_source": "input_factor",
+                "cost_rate": 0.0,
+                "init_cash": 1_000_000.0,
+                "enable_tday_filter": True,
+                "pretrade_fixed_targets": pretrade_fixed_targets,
+                "weighting": {"scheme": "signal", "max_weight": 0.75},
+                "partial_rebalance": {"enabled": True, "trade_rate": 0.5, "min_weight": 0.0001},
+                "liquidity_cap": {"enabled": True, "adv_lookback_days": 2, "max_participation": 0.1},
+                "risk_overlay": {
+                    "breadth_filter": {
+                        "enabled": True,
+                        "loss_threshold": -0.05,
+                        "breadth_threshold": 0.5,
+                        "derisk_exposure": 0.5,
+                    }
+                },
+            }
+        },
+        slot=slot5,
+        frequency="1d",
+    )
+
+    def _filter_tradeable(date_str: str, stocks: list[str], side: str = "both", require_non_st: bool = True) -> list[str]:
+        if date_str == "2026-01-09" and side == "buy":
+            return [s for s in stocks if s != "D_blocked"]
+        return list(stocks)
+
+    monkeypatch.setattr(runner, "_filter_tradeable_stocks", _filter_tradeable)
+    try:
+        res = runner.run_backtest(
+            scores5,
+            close5,
+            open_df=open5,
+            rebalance_dates=[rebal_d1.to_pydatetime(), rebal_d2.to_pydatetime()],
+        )
+        assert "error" not in res, res
+        tw = runner._last_target_weights
+        # Confirm risk overlay reduced exposure on pass 2 and rebal_d1 entered A_zero
+        assert runner._last_exposure_by_date is not None
+        assert runner._last_exposure_by_date[rebal_d2] == pytest.approx(0.5)
+        assert float(tw.loc[rebal_d1, "A_zero"]) > 0.0
+
+        # At rebal_d2 (prev=2026-01-08, ADV_A=0.0):
+        # 1. A_zero target weight & realized position must be strictly 0.0
+        assert float(tw.loc[rebal_d2, "A_zero"]) == pytest.approx(0.0)
+        asset_vals = res["portfolio"].asset_value(group_by=False)
+        assert asset_vals.index[-1] == rebal_d2
+        assert float(np.asarray(asset_vals["A_zero"].iloc[-1]).item()) == pytest.approx(0.0, abs=1e-9)
+
+        # 2. Tight-liquidity B_tight must never exceed its ADV participation dollar cap (0.1 * 2M = 200k)
+        #    even after weighting normalization, partial_rebalance blending, risk_overlay scaling,
+        #    and buy-blocked reallocation in portfolio_policy.
+        b_dollar_cap = 0.1 * 2_000_000.0
+        assert float(tw.loc[rebal_d2, "B_tight"]) <= b_dollar_cap + 1e-6
+        assert float(np.asarray(asset_vals["B_tight"].iloc[-1]).item()) <= b_dollar_cap + 1e-6
+        # C_deep absorbs redistributed capacity within its own cap (0.1 * 100M = 10M)
+        assert float(tw.loc[rebal_d2, "C_deep"]) <= 0.1 * 100_000_000.0 + 1e-6
+        assert float(tw.loc[rebal_d2, "C_deep"]) > 0.0
+    finally:
+        runner.close()
+
+    # Long-short (allow_short=True) + liquidity_cap path: zero-ADV name on short or long leg stays 0.0
+    slot_ls, close_ls, open_ls = _build_declarative_market_slot(
+        tmp_path / f"cap_ls_{int(pretrade_fixed_targets)}",
+        frequency="1d",
+        daily_traded_values=daily_totals_5,
+        start="2026-01-05",
+        end="2026-01-09",
+        use_money_column=False,
+    )
+    idx_ls = pd.DatetimeIndex(slot_ls.calendar.sessions())
+    close_ls.index = idx_ls
+    open_ls.index = idx_ls
+    scores_ls = pd.DataFrame(
+        {"A_zero": -4.0, "B_tight": 3.0, "C_deep": 2.0, "D_blocked": -1.0},
+        index=idx_ls,
+    )
+    runner_ls = VectorBTBacktestRunner(
+        {
+            "top_k_strategy": {
+                "top_k": 2,
+                "holding_period": 1,
+                "score_source": "input_factor",
+                "cost_rate": 0.0,
+                "init_cash": 1_000_000.0,
+                "allow_short": True,
+                "enable_tday_filter": False,
+                "pretrade_fixed_targets": pretrade_fixed_targets,
+                "liquidity_cap": {"enabled": True, "adv_lookback_days": 2, "max_participation": 0.1},
+            }
+        },
+        slot=slot_ls,
+        frequency="1d",
+    )
+    try:
+        tw_ls = runner_ls._compute_target_weights(
+            scores_ls, close_ls, {}, [rebal_d2.to_pydatetime()], open_df=open_ls
+        )
+        assert float(tw_ls.loc[rebal_d2, "A_zero"]) == pytest.approx(0.0)
+        assert abs(float(tw_ls.loc[rebal_d2, "B_tight"])) <= 200_000.0 + 1e-6
+    finally:
+        runner_ls.close()
+
+
+def test_p202_cross_entry_multiplier_parity_adv_abv_and_pool_turnover(tmp_path: Path) -> None:
+    """P2-02 cross-entry parity: multi-multiplier futures ADV, ABV, and pool_turnover_ratio match explicit money."""
+    from dataclasses import replace
+
+    from utils.session_calendar import SessionCalendar
+
+    start, end = "2026-01-05", "2026-01-10"
+    sessions_spec = {
+        "timezone": "UTC",
+        "weekdays": [0, 1, 2, 3, 4, 5, 6],
+        "segments": [{"open": "00:00", "close": "00:00", "open_day_offset": 0, "close_day_offset": 1}],
+    }
+    cal = SessionCalendar("crypto_utc", start, end, custom_sessions=sessions_spec)
+    grid = cal.bar_grid("1d", start, end)
+
+    # CU (mult=10) vs IF (mult=300):
+    # Days 1..4: CU vol=100 -> 100*100*10 = 100_000; IF vol=10 -> 10*100*300 = 300_000; pool sum = 400_000.
+    # Days 5..6: CU drops vol=10 (10_000), IF surges vol=40 (1_200_000); pool sum = 1_210_000.
+    # Without multiplier (volume*close), pool sum would fall 11_000 -> 5_000 (false collapse 0.625 < 0.7),
+    # whereas with true multipliers it rises 400_000 -> 1_210_000 (ratio = 1_210_000 / 805_000 ≈ 1.5031).
+    mults = {"CU": 10.0, "IF": 300.0}
+    vols_by_day = {
+        "2026-01-05": {"CU": 100.0, "IF": 10.0},
+        "2026-01-06": {"CU": 100.0, "IF": 10.0},
+        "2026-01-07": {"CU": 100.0, "IF": 10.0},
+        "2026-01-08": {"CU": 100.0, "IF": 10.0},
+        "2026-01-09": {"CU": 10.0, "IF": 40.0},
+        "2026-01-10": {"CU": 10.0, "IF": 40.0},
+    }
+
+    def _build_multi_futures_slot(sub_dir: Path, *, with_money: bool):
+        sub_dir.mkdir(parents=True, exist_ok=True)
+        rows = []
+        for sid, ts in zip(grid["session_id"], grid["timestamp_utc"]):
+            sid_str = str(sid)
+            for sym in ("CU", "IF"):
+                v = vols_by_day[sid_str][sym]
+                px = 100.0
+                row: dict[str, Any] = {
+                    "symbol": sym,
+                    "time": pd.Timestamp(ts).isoformat(),
+                    "open": px,
+                    "high": px * 1.01,
+                    "low": px * 0.99,
+                    "close": px,
+                    "volume": v,
+                }
+                if with_money:
+                    row["money"] = v * px * mults[sym]
+                rows.append(row)
+        csv_path = sub_dir / "bars.csv"
+        pd.DataFrame(rows).to_csv(csv_path, index=False)
+        col_map = {
+            "symbol": "instrument_id",
+            "time": "timestamp",
+            "open": "open",
+            "high": "high",
+            "low": "low",
+            "close": "close",
+            "volume": "volume",
+        }
+        if with_money:
+            col_map["money"] = "money"
+        cfg = {
+            "schema_version": 1,
+            "slot_id": f"multi_futures_{int(with_money)}",
+            "calendar": {
+                "provider": "custom_sessions",
+                "options": {
+                    "calendar_id": "crypto_utc",
+                    "start": start,
+                    "end": end,
+                    "custom_sessions": sessions_spec,
+                },
+            },
+            "bar_feed": {
+                "provider": "csv_files",
+                "options": {
+                    "paths": [csv_path.name],
+                    "frequency": "1d",
+                    "timestamp_anchor": "bar_end",
+                    "source_timezone": "UTC",
+                    "volume_mode": "interval",
+                    "data_version": "v1",
+                    "column_mapping": col_map,
+                },
+            },
+            "universe": {
+                "provider": "static",
+                "options": {
+                    "instruments": {
+                        sym: {
+                            "asset_class": "futures",
+                            "currency": "CNY",
+                            "contract_multiplier": mults[sym],
+                            "expiry_date": "2026-03-16",
+                        }
+                        for sym in ("CU", "IF")
+                    },
+                    "universes": {"pool": ["CU", "IF"]},
+                },
+            },
+            "aux_features": {"provider": "none"},
+            "microstructure": {"provider": "open"},
+            "execution_profile": {
+                "entry_price_field": "open",
+                "exit_price_field": "open",
+                "min_entry_offset_bars": 1,
+                "exit_adjustment": 0,
+                "return_unit": "decimal",
+                "gap_rule": "endpoints_only",
+                "boundary_policy": "cross_session",
+                "allow_short": True,
+                "commission_bps": 0.0,
+                "sell_tax_bps": 0.0,
+                "slippage_bps": 0.0,
+                "benchmark_instrument": None,
+            },
+        }
+        return build_declarative_slot(SlotConfig.from_mapping(cfg), base_dir=sub_dir)
+
+    slot_fallback = _build_multi_futures_slot(tmp_path / "fallback", with_money=False)
+    slot_money = _build_multi_futures_slot(tmp_path / "money", with_money=True)
+    p_fallback = SlotDataProvider(slot=slot_fallback, frequency="1d")
+    p_money = SlotDataProvider(slot=slot_money, frequency="1d")
+
+    # 1. ADV and ABV match explicit money across multi-multiplier instruments
+    expected_adv = {"CU": (100_000.0 + 10_000.0) / 2.0, "IF": (300_000.0 + 1_200_000.0) / 2.0}
+    adv_fb = p_fallback.average_daily_traded_value(["CU", "IF"], "2026-01-09", 2, None, None)
+    adv_mn = p_money.average_daily_traded_value(["CU", "IF"], "2026-01-09", 2, None, None)
+    abv_fb = p_fallback.average_bar_traded_value(["CU", "IF"], "2026-01-09", 2, None, None)
+    abv_mn = p_money.average_bar_traded_value(["CU", "IF"], "2026-01-09", 2, None, None)
+    assert adv_fb == pytest.approx(expected_adv, rel=1e-12)
+    assert adv_mn == pytest.approx(expected_adv, rel=1e-12)
+    assert abv_fb == pytest.approx(expected_adv, rel=1e-12)
+    assert abv_mn == pytest.approx(expected_adv, rel=1e-12)
+
+    # 2. pool_turnover_ratio matches explicit money and avoids false turnover_collapse
+    ratio_fb = p_fallback.pool_turnover_ratio(["CU", "IF"], 2, 4, None, None, start_date=start, end_date=end)
+    ratio_mn = p_money.pool_turnover_ratio(["CU", "IF"], 2, 4, None, None, start_date=start, end_date=end)
+    assert ratio_fb is not None and ratio_mn is not None
+    pd.testing.assert_series_equal(ratio_fb, ratio_mn, rtol=1e-12, atol=1e-12, check_names=False)
+    expected_tail_ratio = 1_210_000.0 / ((400_000.0 * 2.0 + 1_210_000.0 * 2.0) / 4.0)
+    assert float(ratio_fb.iloc[-1]) == pytest.approx(expected_tail_ratio, rel=1e-12)
+    assert float(ratio_fb.iloc[-1]) > 1.0  # surge, never false collapse < 0.7
+
+    # Also verify via VectorBTBacktestRunner._crisis_guard_vote_series
+    runner = VectorBTBacktestRunner(
+        {
+            "top_k_strategy": {
+                "top_k": 2,
+                "holding_period": 1,
+                "risk_overlay": {
+                    "crisis_guard": {
+                        "enabled": True,
+                        "signals": {
+                            "limit_down": {"enabled": False},
+                            "breadth": {"enabled": False},
+                            "spread": {"enabled": False},
+                            "turnover_collapse": {
+                                "enabled": True,
+                                "short_window": 2,
+                                "long_window": 4,
+                                "ratio_threshold": 0.7,
+                            },
+                        },
+                    }
+                },
+            }
+        },
+        slot=slot_fallback,
+        frequency="1d",
+    )
+    try:
+        price_stub = pd.DataFrame({"CU": [100.0], "IF": [100.0]}, index=pd.DatetimeIndex([pd.Timestamp("2026-01-10", tz="UTC")]))
+        votes = runner._crisis_guard_vote_series(
+            runner.overlay["risk_overlay"]["crisis_guard"], ["CU", "IF"], price_stub
+        )
+        assert len(votes) == 1
+        assert bool(votes[0].iloc[-1]) is False
+    finally:
+        runner.close()
+
+    # 3. Paused vs zero-volume vs missing-data semantics in pool_turnover_ratio match ADV/ABV
+    orig_feed = slot_fallback.bar_feed
+
+    def _wrap_bars(mutator):
+        return replace(
+            slot_fallback,
+            bar_feed=type(
+                "_PoolMutFeed",
+                (),
+                {
+                    "read_signal_bars": lambda _s, insts, freq, *, start_utc, end_utc, as_of_utc: orig_feed.read_signal_bars(
+                        insts, freq, start_utc=start_utc, end_utc=end_utc, as_of_utc=as_of_utc
+                    ),
+                    "read_execution_bars": lambda _s, insts, freq, *, start_utc, end_utc: mutator(
+                        orig_feed.read_execution_bars(insts, freq, start_utc=start_utc, end_utc=end_utc)
+                    ),
+                },
+            )(),
+        )
+
+    # Non-paused 0-volume on 01-09/01-10 drives turnover to 0 (ratio=0.0), while paused=1 row is excluded
+    def _zero_and_paused(df: pd.DataFrame) -> pd.DataFrame:
+        out = df.copy()
+        out["paused"] = 0
+        out.loc[out["session_id"].isin(["2026-01-09", "2026-01-10"]), "volume"] = 0.0
+        # Mark CU on 2026-01-08 as paused with huge bogus volume -> must be excluded from pool turnover
+        mask_p = out["instrument_id"].eq("CU") & out["session_id"].eq("2026-01-08")
+        out.loc[mask_p, ["paused", "volume"]] = [1, 999_999.0]
+        return out
+
+    p_zp = SlotDataProvider(slot=_wrap_bars(_zero_and_paused), frequency="1d")
+    r_zp = p_zp.pool_turnover_ratio(["CU", "IF"], 2, 4, None, None, start_date=start, end_date=end)
+    assert r_zp is not None
+    # On 2026-01-10: short_ma(01-09, 01-10) = 0.0; long_ma(01-07=400k, 01-08=300k [CU paused excluded], 01-09=0, 01-10=0) = 175k -> 0.0
+    assert float(r_zp.iloc[-1]) == pytest.approx(0.0)
+
+    # All-paused or missing money/volume+close returns None cleanly
+    p_all_paused = SlotDataProvider(
+        slot=_wrap_bars(lambda df: df.assign(paused=1)),
+        frequency="1d",
+    )
+    assert p_all_paused.pool_turnover_ratio(["CU", "IF"], 2, 4, None, None, start_date=start, end_date=end) is None
+
+    p_no_turnover_cols = SlotDataProvider(
+        slot=_wrap_bars(lambda df: df.drop(columns=["volume"])),
+        frequency="1d",
+    )
+    assert p_no_turnover_cols.pool_turnover_ratio(["CU", "IF"], 2, 4, None, None, start_date=start, end_date=end) is None

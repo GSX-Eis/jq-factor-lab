@@ -398,3 +398,363 @@ def test_read_analysis_price_rows_explicit_require_factor_and_unobserved_rows(tm
         assert pd.isna(sparse["close"].iloc[1])
         assert pd.isna(sparse["money"].iloc[1])
         assert sparse["close"].iloc[2] == pytest.approx(10.0)
+
+
+def _create_full_session_5m_split_db(path: Path, *, include_third_day: bool = False) -> None:
+    """Create daily + complete 5m A-share bars with a 2-for-1 split on SPLIT_DAY."""
+    from utils.session_calendar import SessionCalendar
+
+    _create_split_db(path, include_third_day=include_third_day)
+    end_day = SPLIT_EXTENDED if include_third_day else SPLIT_DAY
+    calendar = SessionCalendar("XSHG", SPLIT_START, end_day)
+    grid = calendar.bar_grid("5min")
+    with duckdb.connect(str(path)) as conn:
+        daily = conn.execute("SELECT * FROM price_data_daily").fetchdf()
+        minute_rows = []
+        for _, row in daily.iterrows():
+            session_id = pd.Timestamp(row["date"]).strftime("%Y-%m-%d")
+            session_bars = grid.loc[grid["session_id"] == session_id, "timestamp_utc"]
+            bar_ends = (session_bars + pd.Timedelta(minutes=5)).dt.tz_convert("Asia/Shanghai").dt.tz_localize(None)
+            for ts in bar_ends:
+                minute_rows.append({**row.to_dict(), "date": ts})
+        conn.execute("DROP TABLE price_data_5m")
+        conn.from_df(pd.DataFrame(minute_rows)).create("price_data_5m")
+
+
+@pytest.mark.parametrize("pit", [False, True])
+def test_p103_session_daily_pricing_split_zero_return_and_idempotency(tmp_path: Path, pit: bool) -> None:
+    from backtest_and_analysis.time_series.factor_bridge import session_daily_pricing
+    from utils.factor_core.bar_bridge import _read_slot_bars
+    from utils.session_calendar import SessionCalendar
+
+    db = tmp_path / "p103_5m_split.duckdb"
+    _create_full_session_5m_split_db(db)
+
+    with duckdb.connect(str(db), read_only=True) as conn:
+        factor = _CloseFactor(
+            conn, "p103_5m", SPLIT_START, SPLIT_DAY, stock_pool=["S"],
+            data_frequency="5m", analysis_mode="cross_sectional", output_frequency="1d",
+            pit_enabled=pit,
+        )
+        pricing = factor.get_session_daily_pricing()
+        assert pricing.attrs[PRICE_ADJUSTED_ATTR] is True
+        series = pricing.unstack("asset")["S"]
+        expected_prices = [50.0, 50.0] if pit else [100.0, 100.0]
+        np.testing.assert_allclose(series.to_numpy(), expected_prices, rtol=0, atol=1e-12)
+        assert series.pct_change().dropna().iloc[0] == pytest.approx(0.0, abs=1e-12)
+
+        raw = factor.get_session_daily_pricing(adjusted=False)
+        assert raw.attrs[PRICE_ADJUSTED_ATTR] is False
+        np.testing.assert_allclose(raw.unstack("asset")["S"].to_numpy(), [100.0, 50.0], rtol=0, atol=1e-12)
+
+        # Direct session_daily_pricing call on raw execution grid adjusts and preserves idempotency
+        _, raw_grid, calendars = _read_slot_bars(factor, execution=True)
+        direct = session_daily_pricing(raw_grid, calendars, pit_enabled=pit)
+        assert direct.attrs[PRICE_ADJUSTED_ATTR] is True
+        direct_series = direct.unstack("asset")["S"]
+        np.testing.assert_allclose(direct_series.to_numpy(), expected_prices, rtol=0, atol=1e-12)
+        assert direct_series.pct_change().dropna().iloc[0] == pytest.approx(0.0, abs=1e-12)
+
+        # Pre-adjusted grid with attrs['price_adjusted']=True and factor column still present must not double-adjust
+        pre_adjusted_grid = raw_grid.copy()
+        pre_adjusted_grid.attrs = {**raw_grid.attrs, PRICE_ADJUSTED_ATTR: True}
+        direct_pre = session_daily_pricing(pre_adjusted_grid, calendars, pit_enabled=pit)
+        assert direct_pre.attrs[PRICE_ADJUSTED_ATTR] is True
+        np.testing.assert_allclose(direct_pre.unstack("asset")["S"].to_numpy(), [100.0, 50.0], rtol=0, atol=1e-12)
+
+        # FactorBase.get_session_daily_pricing also respects pre-adjusted bar_feed output
+        original_read = factor.slot.bar_feed.read_execution_bars
+
+        def read_pre_adjusted(*args, **kwargs):
+            bars = original_read(*args, **kwargs).copy()
+            bars.attrs[PRICE_ADJUSTED_ATTR] = True
+            return bars
+
+        factor.slot.bar_feed.read_execution_bars = read_pre_adjusted
+        try:
+            factor_pre = factor.get_session_daily_pricing()
+            assert factor_pre.attrs[PRICE_ADJUSTED_ATTR] is True
+            np.testing.assert_allclose(factor_pre.unstack("asset")["S"].to_numpy(), [100.0, 50.0], rtol=0, atol=1e-12)
+        finally:
+            factor.slot.bar_feed.read_execution_bars = original_read
+
+
+def test_session_daily_pricing_matches_execution_panel_completeness_and_dynamic_pool(tmp_path: Path) -> None:
+    db = tmp_path / "p103_parity_masks.duckdb"
+    _create_full_session_5m_split_db(db, include_third_day=True)
+    stocks = ["A", "C"]
+    pools = {SPLIT_START: ["A", "C"], SPLIT_DAY: ["A"], SPLIT_EXTENDED: ["A", "C"]}
+
+    with duckdb.connect(str(db), read_only=True) as conn:
+        for pit in (False, True):
+            factor = _CloseFactor(
+                conn, "p103_pool", SPLIT_START, SPLIT_EXTENDED,
+                use_dynamic_pool=True, stock_pools_by_period=pools,
+                data_frequency="5m", analysis_mode="cross_sectional", output_frequency="1d",
+                pit_enabled=pit,
+            )
+            pricing_wide = factor.get_session_daily_pricing().unstack("asset")
+            exec_wide = factor.get_price_data("close")
+            pd.testing.assert_frame_equal(pricing_wide, exec_wide, check_names=False, rtol=0, atol=1e-12)
+            assert np.isnan(pricing_wide.loc[pd.Timestamp(SPLIT_DAY), "C"])
+
+            # Incomplete final bar of SPLIT_DAY must be masked to NaN identically across both paths
+            original_read = factor.slot.bar_feed.read_execution_bars
+            last_slot_split_day = pd.Timestamp(f"{SPLIT_DAY} 07:00Z") - pd.Timedelta(minutes=5)
+
+            def read_with_incomplete(instruments, frequency, *, start_utc, end_utc):
+                bars = original_read(instruments, frequency, start_utc=start_utc, end_utc=end_utc).copy()
+                bars["is_complete"] = ~(
+                    bars["instrument_id"].eq("A") & bars["timestamp_utc"].eq(last_slot_split_day)
+                )
+                return bars
+
+            factor.slot.bar_feed.read_execution_bars = read_with_incomplete
+            try:
+                masked_pricing = factor.get_session_daily_pricing().unstack("asset")
+                masked_exec = factor.get_price_data("close")
+                pd.testing.assert_frame_equal(masked_pricing, masked_exec, check_names=False, rtol=0, atol=1e-12)
+                assert np.isnan(masked_pricing.loc[pd.Timestamp(SPLIT_DAY), "A"])
+            finally:
+                factor.slot.bar_feed.read_execution_bars = original_read
+
+
+@pytest.mark.parametrize("pit", [False, True])
+def test_evaluation_parity_across_daily_execution_panel_and_session_pricing(tmp_path: Path, pit: bool) -> None:
+    db = tmp_path / "eval_parity.duckdb"
+    _create_full_session_5m_split_db(db, include_third_day=True)
+    stocks = ["A", "B", "C"]
+    signal_scores = pd.Series([1.0, 2.0, 3.0], index=stocks)
+
+    fetcher = PriceFetcher(db, "price_data_daily")
+    try:
+        pf_pricing = fetcher.fetch(stocks, SPLIT_START, SPLIT_EXTENDED, future_periods=0)
+        pf_returns = (
+            ForwardReturnsCalculator()
+            .calculate_forward_returns(pf_pricing, periods=(1,), execution_lag=0)["1D"]
+            .unstack("asset")[stocks]
+        )
+    finally:
+        fetcher.close()
+
+    with duckdb.connect(str(db), read_only=True) as conn:
+        daily_factor = _CloseFactor(
+            conn, "parity_daily", SPLIT_START, SPLIT_EXTENDED, stock_pool=stocks,
+            data_frequency="daily", pit_enabled=pit,
+        )
+        daily_returns = daily_factor.calculate_forward_returns(1)[stocks].iloc[:-1]
+
+        bar_5m_factor = _CloseFactor(
+            conn, "parity_5m", SPLIT_START, SPLIT_EXTENDED, stock_pool=stocks,
+            data_frequency="5m", analysis_mode="cross_sectional", output_frequency="1d",
+            pit_enabled=pit,
+        )
+        exec_panel_prices = bar_5m_factor.get_price_data("close")[stocks]
+        exec_panel_returns = bar_5m_factor.calculate_forward_returns(1)[stocks].iloc[:-1]
+        session_pricing = bar_5m_factor.get_session_daily_pricing()
+        session_prices = session_pricing.unstack("asset")[stocks]
+        session_returns = (
+            ForwardReturnsCalculator()
+            .calculate_forward_returns(session_pricing, periods=(1,), execution_lag=0)["1D"]
+            .unstack("asset")[stocks]
+        )
+
+        # Adjusted close panels and forward returns match across all evaluation paths
+        pd.testing.assert_frame_equal(session_prices, exec_panel_prices, check_names=False, rtol=0, atol=1e-12)
+        pd.testing.assert_frame_equal(
+            session_prices, daily_factor.get_price_data("close")[stocks], check_names=False, rtol=0, atol=1e-12
+        )
+        pd.testing.assert_frame_equal(session_returns, exec_panel_returns, check_names=False, rtol=0, atol=1e-12)
+        pd.testing.assert_frame_equal(session_returns, daily_returns, check_names=False, rtol=0, atol=1e-12)
+        pd.testing.assert_frame_equal(session_returns, pf_returns, check_names=False, rtol=0, atol=1e-12)
+
+        # Exact expected returns across split (A=+1%, B=+2%, C=+3%) and Rank IC == +1.0
+        for day in (pd.Timestamp(SPLIT_START), pd.Timestamp(SPLIT_DAY)):
+            row = session_returns.loc[day]
+            assert row["A"] == pytest.approx(0.01, abs=1e-12)
+            assert row["B"] == pytest.approx(0.02, abs=1e-12)
+            assert row["C"] == pytest.approx(0.03, abs=1e-12)
+            assert signal_scores.corr(row, method="spearman") == pytest.approx(1.0, abs=1e-12)
+
+
+def test_session_daily_pricing_market_bars_and_alphalens_split_ic_parity(tmp_path: Path) -> None:
+    from data_pipeline.loaders.market_bar_importer import import_market_bars
+    from market_db_samples import declare_equity_bars
+    from utils.session_calendar import SessionCalendar
+
+    db = tmp_path / "market_bars_split.duckdb"
+    stocks = ["600000.XSHG", "600001.XSHG", "600002.XSHG"]
+    calendar = SessionCalendar("XSHG", "2024-01-02", "2024-02-05")
+    sessions = calendar.sessions()[:19]
+    grid = calendar.bar_grid("5min", sessions[0].strftime("%Y-%m-%d"), sessions[-1].strftime("%Y-%m-%d"))
+
+    bar_frames = []
+    meta_rows = []
+    for code, daily_ret, has_split in zip(stocks, (0.01, 0.02, 0.03), (False, False, True)):
+        meta_rows.append(
+            dict(
+                instrument_id=code, asset_class="equity", exchange="XSHG", timezone="Asia/Shanghai",
+                contract_expiry=None, price_adjustment="split_dividend_factor",
+                point_value=1.0, calendar_id="XSHG", rth_reference_calendar="XSHG",
+            )
+        )
+        for idx, day in enumerate(sessions):
+            session_id = day.strftime("%Y-%m-%d")
+            times = grid.loc[grid["session_id"] == session_id, "timestamp_utc"]
+            f_val = 2.0 if (has_split and idx >= 9) else 1.0
+            px = 100.0 * ((1.0 + daily_ret) ** idx) / f_val
+            bar_frames.append(
+                pd.DataFrame(
+                    dict(
+                        timestamp_utc=times, instrument_id=code, frequency="5min",
+                        open=px, high=px, low=px, close=px, volume=1000.0 * f_val,
+                        source="SYNTHETIC", data_version="v1", factor=f_val,
+                    )
+                )
+            )
+
+    with duckdb.connect(str(db)) as conn:
+        declare_equity_bars(conn)
+        import_market_bars(conn, pd.concat(bar_frames, ignore_index=True), pd.DataFrame(meta_rows))
+
+    al_factors = pd.DataFrame(
+        np.tile([1.0, 2.0, 3.0], (len(sessions) - 1, 1)),
+        index=sessions[:-1],
+        columns=stocks,
+    )
+    with duckdb.connect(str(db), read_only=True) as conn:
+        for pit in (False, True):
+            factor_5m = _CloseFactor(
+                conn, "mb_5m", sessions[0].strftime("%Y-%m-%d"), sessions[-1].strftime("%Y-%m-%d"),
+                stock_pool=stocks, data_frequency="5m", analysis_mode="cross_sectional",
+                output_frequency="1d", data_version="v1", session_calendar=calendar, pit_enabled=pit,
+            )
+            pricing = factor_5m.get_session_daily_pricing()
+            assert pricing.attrs[PRICE_ADJUSTED_ATTR] is True
+            result = AlphalensRunner(n_quantiles=3, periods=(1,), execution_lag=0).run(al_factors, pricing)
+            np.testing.assert_allclose(result["ic"]["1D"].to_numpy(), 1.0, rtol=0, atol=1e-12)
+
+
+@pytest.mark.parametrize("pit", [False, True])
+def test_ashare_all_null_factor_raises_while_price_adjustment_none_skips(tmp_path: Path, pit: bool) -> None:
+    from backtest_and_analysis.time_series.factor_bridge import session_daily_pricing
+    from data_pipeline.loaders.market_bar_importer import import_market_bars
+    from market_db_samples import declare_equity_bars
+    from utils.factor_core.bar_bridge import _read_slot_bars
+    from utils.session_calendar import SessionCalendar
+
+    # 1. Legacy price_data_5m with all-NULL factor must fail closed on execution_panel & get_session_daily_pricing
+    legacy_db = tmp_path / "all_null_legacy_5m.duckdb"
+    _create_full_session_5m_split_db(legacy_db)
+    with duckdb.connect(str(legacy_db)) as conn:
+        conn.execute("UPDATE price_data_5m SET factor = NULL")
+
+    with duckdb.connect(str(legacy_db), read_only=True) as conn:
+        factor_legacy = _CloseFactor(
+            conn, "null_legacy_5m", SPLIT_START, SPLIT_DAY, stock_pool=["S"],
+            data_frequency="5m", analysis_mode="cross_sectional", output_frequency="1d",
+            pit_enabled=pit,
+        )
+        with pytest.raises(ValueError, match="pit_factor_missing_or_invalid"):
+            factor_legacy.get_price_data("close")
+        with pytest.raises(ValueError, match="pit_factor_missing_or_invalid"):
+            factor_legacy.calculate_forward_returns(1)
+        with pytest.raises(ValueError, match="pit_factor_missing_or_invalid"):
+            factor_legacy.get_session_daily_pricing()
+        _, raw_grid, calendars = _read_slot_bars(factor_legacy, execution=True)
+        with pytest.raises(ValueError, match="pit_factor_missing_or_invalid"):
+            session_daily_pricing(raw_grid, calendars, pit_enabled=pit)
+
+    # 2. market_bars with price_adjustment='split_dividend_factor' and all-NULL factor must fail closed
+    calendar = SessionCalendar("XSHG", SPLIT_START, SPLIT_DAY)
+    sessions = calendar.sessions()
+    grid = calendar.bar_grid("5min", SPLIT_START, SPLIT_DAY)
+    adj_db = tmp_path / "all_null_market_bars_adj.duckdb"
+    bars_s0 = pd.concat([
+        pd.DataFrame(dict(
+            timestamp_utc=grid.loc[grid["session_id"] == day.strftime("%Y-%m-%d"), "timestamp_utc"],
+            instrument_id="600000.XSHG", frequency="5min",
+            open=100.0 if idx == 0 else 50.0,
+            high=100.0 if idx == 0 else 50.0,
+            low=100.0 if idx == 0 else 50.0,
+            close=100.0 if idx == 0 else 50.0,
+            volume=1000.0, source="SYNTHETIC", data_version="v1",
+        ))
+        for idx, day in enumerate(sessions)
+    ], ignore_index=True)
+    meta_s0 = pd.DataFrame([dict(
+        instrument_id="600000.XSHG", asset_class="equity", exchange="XSHG",
+        timezone="Asia/Shanghai", contract_expiry=None, price_adjustment="split_dividend_factor",
+        point_value=1.0, calendar_id="XSHG", rth_reference_calendar="XSHG",
+    )])
+    with duckdb.connect(str(adj_db)) as conn:
+        declare_equity_bars(conn)
+        import_market_bars(conn, bars_s0, meta_s0)
+
+    with duckdb.connect(str(adj_db), read_only=True) as conn:
+        factor_mb_adj = _CloseFactor(
+            conn, "null_mb_adj", SPLIT_START, SPLIT_DAY, stock_pool=["600000.XSHG"],
+            data_frequency="5m", analysis_mode="cross_sectional", output_frequency="1d",
+            data_version="v1", session_calendar=calendar, pit_enabled=pit,
+        )
+        with pytest.raises(ValueError, match="pit_factor_missing_or_invalid"):
+            factor_mb_adj.get_price_data("close")
+        with pytest.raises(ValueError, match="pit_factor_missing_or_invalid"):
+            factor_mb_adj.get_session_daily_pricing()
+
+    # 3. market_bars with price_adjustment='none' and all-NULL factor skips adjustment without error;
+    #    mixed grid adjusts only instruments not declaring price_adjustment='none'
+    mixed_db = tmp_path / "mixed_market_bars.duckdb"
+    bars_split = pd.concat([
+        pd.DataFrame(dict(
+            timestamp_utc=grid.loc[grid["session_id"] == day.strftime("%Y-%m-%d"), "timestamp_utc"],
+            instrument_id="600000.XSHG", frequency="5min",
+            open=100.0 if idx == 0 else 50.0,
+            high=100.0 if idx == 0 else 50.0,
+            low=100.0 if idx == 0 else 50.0,
+            close=100.0 if idx == 0 else 50.0,
+            volume=1000.0 if idx == 0 else 2000.0,
+            source="SYNTHETIC", data_version="v1",
+            factor=1.0 if idx == 0 else 2.0,
+        ))
+        for idx, day in enumerate(sessions)
+    ], ignore_index=True)
+    bars_none = bars_s0.assign(instrument_id="600001.XSHG", close=20.0, open=20.0, high=20.0, low=20.0)
+    meta_mixed = pd.DataFrame([
+        dict(
+            instrument_id="600000.XSHG", asset_class="equity", exchange="XSHG",
+            timezone="Asia/Shanghai", contract_expiry=None, price_adjustment="split_dividend_factor",
+            point_value=1.0, calendar_id="XSHG", rth_reference_calendar="XSHG",
+        ),
+        dict(
+            instrument_id="600001.XSHG", asset_class="equity", exchange="XSHG",
+            timezone="Asia/Shanghai", contract_expiry=None, price_adjustment="none",
+            point_value=1.0, calendar_id="XSHG", rth_reference_calendar="XSHG",
+        ),
+    ])
+    with duckdb.connect(str(mixed_db)) as conn:
+        declare_equity_bars(conn)
+        import_market_bars(conn, pd.concat([bars_split, bars_none], ignore_index=True), meta_mixed)
+
+    with duckdb.connect(str(mixed_db), read_only=True) as conn:
+        # Pure price_adjustment='none' stock passes with NULL factor
+        factor_none = _CloseFactor(
+            conn, "none_only", SPLIT_START, SPLIT_DAY, stock_pool=["600001.XSHG"],
+            data_frequency="5m", analysis_mode="cross_sectional", output_frequency="1d",
+            data_version="v1", session_calendar=calendar, pit_enabled=pit,
+        )
+        np.testing.assert_allclose(
+            factor_none.get_session_daily_pricing().to_numpy(), [20.0, 20.0], rtol=0, atol=1e-12,
+        )
+        # Mixed grid adjusts 600000.XSHG while leaving 600001.XSHG unadjusted
+        factor_mixed = _CloseFactor(
+            conn, "mixed_adj", SPLIT_START, SPLIT_DAY, stock_pool=["600000.XSHG", "600001.XSHG"],
+            data_frequency="5m", analysis_mode="cross_sectional", output_frequency="1d",
+            data_version="v1", session_calendar=calendar, pit_enabled=pit,
+        )
+        mixed_pricing = factor_mixed.get_session_daily_pricing().unstack("asset")
+        mixed_exec = factor_mixed.get_price_data("close")
+        pd.testing.assert_frame_equal(mixed_pricing, mixed_exec, check_names=False, rtol=0, atol=1e-12)
+        expected_split = [50.0, 50.0] if pit else [100.0, 100.0]
+        np.testing.assert_allclose(mixed_pricing["600000.XSHG"].to_numpy(), expected_split, rtol=0, atol=1e-12)
+        np.testing.assert_allclose(mixed_pricing["600001.XSHG"].to_numpy(), [20.0, 20.0], rtol=0, atol=1e-12)
