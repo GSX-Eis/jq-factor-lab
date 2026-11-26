@@ -145,14 +145,24 @@ def test_explicit_and_implicit_ashare_panels_match_before_slot_migration(tmp_pat
         explicit = factor_type(FactorBase)(*args, slot=native, **options)
         try:
             for actual in (implicit, explicit):
-                for name in ('get_factor_values', 'get_factor_values_unfiltered', 'get_price_data',
-                             'calculate_forward_returns'):
+                for name in ('get_factor_values', 'get_factor_values_unfiltered'):
                     _assert_equal(getattr(actual, name)(), getattr(before, name)())
                 _assert_equal(actual.get_factor_values_unfiltered_chunked(1),
                               before.get_factor_values_unfiltered_chunked(1))
                 if mode is not None and frequency == 'daily':
                     _assert_equal(actual._get_factor_values_by_rebalance_pool(1, rebalance_only=False),
                                   before._get_factor_values_by_rebalance_pool(1, rebalance_only=False))
+            for name in ('get_price_data', 'calculate_forward_returns'):
+                _assert_equal(getattr(implicit, name)(), getattr(explicit, name)())
+            # Verify PIT-adjusted prices and forward returns vs raw unadjusted baseline.
+            prices = implicit.get_price_data()
+            expected_a = [5.0, 12.0, 14.0] if mode is None else [5.0, np.nan, 14.0]
+            np.testing.assert_allclose(prices['A'], expected_a, rtol=0, atol=1e-12, equal_nan=True)
+            np.testing.assert_allclose(prices['B'], [20.0, 22.0, np.nan], rtol=0, atol=1e-12, equal_nan=True)
+            fwd = implicit.calculate_forward_returns()
+            expected_fwd_a = [12.0 / 5.0 - 1.0, 14.0 / 12.0 - 1.0, np.nan] if mode is None else [np.nan, np.nan, np.nan]
+            np.testing.assert_allclose(fwd['A'], expected_fwd_a, rtol=0, atol=1e-12, equal_nan=True)
+            np.testing.assert_allclose(fwd['B'], [22.0 / 20.0 - 1.0, np.nan, np.nan], rtol=0, atol=1e-12, equal_nan=True)
         finally:
             for item in (implicit, explicit, before):
                 if item._duckdb_adapter is not None:

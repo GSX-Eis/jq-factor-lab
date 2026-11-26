@@ -117,6 +117,10 @@ def bind_synthesis_panel(synthesizer, panel, config, market_inputs, labels=None)
         config = dict(config, _label_exit_dates=label_exits)
     if frequency != "1d" and not panel.empty and not freq_uses_utc(panel):
         raise ValueError("Non-daily synthesis requires UTC timestamps")
+    if panel is not None:
+        alignment = panel.attrs.get("panel_date_alignment")
+        if alignment not in (None, "trade_date_aligned", "raw_signal"):
+            raise ValueError(f"Unsupported panel_date_alignment: {alignment!r}")
     if (slot_id != "jq_ashare_local" and labels is not None and not panel.empty
             and panel.index.get_level_values("stock_code").nunique() == 1
             and "target_cs_demean" not in config):

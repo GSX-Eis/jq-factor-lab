@@ -129,8 +129,32 @@ def test_joinquant_bundle_matches_stage6_sha256(tmp_path, monkeypatch):
             else:
                 assert (node.module or "").split(".")[0] in allowed_imports
 
+    # Guard against PEP 585 / PEP 604 runtime-evaluated annotations that break Python 3.6 import.
+    pep585_builtins = {"tuple", "list", "dict", "set", "frozenset", "type"}
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            annotations = [node.returns] + [
+                arg.annotation for arg in (*node.args.args, *node.args.kwonlyargs)
+            ]
+            for annotation in annotations:
+                if annotation is None:
+                    continue
+                for sub in ast.walk(annotation):
+                    if isinstance(sub, ast.Subscript) and isinstance(sub.value, ast.Name):
+                        assert sub.value.id not in pep585_builtins, (
+                            f"PEP 585 annotation at line {node.lineno}: {ast.dump(sub)}"
+                        )
+                    if isinstance(sub, ast.BinOp):
+                        assert not isinstance(sub.op, ast.BitOr), (
+                            f"PEP 604 union annotation at line {node.lineno}: {ast.dump(sub)}"
+                        )
+
     # NERE-1227 changes the S6a digest (6915c894...) solely through inlined factor_runtime.py bar support.
-    assert sha256(artifact).hexdigest() == "29e0e431d0c0369bd7fb169884c497493f7e0f76dbf46cd577735b8980e469b8"
+    # NERE-1399 changes the digest (40d4fa8e...) solely through utils/pit.py (idempotent price_adjusted
+    # attrs and Real check in apply_pit_adjustment; local factor scaling moved to utils/price_adjustment.py).
+    # NERE-1401 changes the digest (2c9789cc...) solely through inlined utils/strategy_kernel.py
+    # (added rank preprocessing, explicit "none" handling, and shared preprocessing helpers).
+    assert sha256(artifact).hexdigest() == "2c9789cc904ef89598b8b0f38fa655d56d000889e07b39110d1e15ad567a9338"
 
 
 def test_daily_adapter_has_no_alphalens_import():

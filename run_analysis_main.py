@@ -694,7 +694,7 @@ def analyze_factor_dynamic(
     # ==========================================================================
     # PIT 动态复权配置
     # 因子计算时使用动态复权，确保跨日价格比较的正确性
-    # IC/IR 分析时使用静态复权数据（PriceFetcher 默认行为）
+    # IC/IR 分析时由 PriceFetcher 读取并应用 factor 复权价格 (close * factor)
     # ==========================================================================
     pit_config = load_pit_config(config)
     pit_enabled = pit_config.get('enabled', True)  # 默认启用动态复权
@@ -825,7 +825,7 @@ def analyze_factor_dynamic(
         
         # 获取价格数据 (支持 DuckDB 高性能后端)
         # 注意：PIT 动态复权已在 FactorBase 中处理（因子计算时）
-        # PriceFetcher 获取静态前复权价格用于 IC/IR 分析（不需要动态复权）
+        # PriceFetcher 读取并应用 factor 复权价格 (close * factor) 用于 IC/IR 分析
         price_fetcher = PriceFetcher(
             duckdb_path=config['duckdb_path'],
             price_table=config['price_table'],
@@ -1115,7 +1115,7 @@ def main(config: Dict, *, execution=None):
     # ==========================================================================
     # 创建各模块实例 (支持 DuckDB 高性能后端)
     # ==========================================================================
-    # 注意：PIT 动态复权已移至 FactorBase 中统一处理，PriceFetcher 仅获取静态前复权价格
+    # 注意：PIT 动态复权已移至 FactorBase 中统一处理，PriceFetcher 读取并应用 factor 复权价格 (close * factor)
     price_fetcher = None
     runner = None
     if not materialize_only:

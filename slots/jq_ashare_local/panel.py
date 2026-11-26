@@ -296,6 +296,25 @@ class ASharePanelReader(BarSource):
         return bars
 
     @classmethod
+    def _source_columns(cls, conn: duckdb.DuckDBPyConnection, table: str,
+                        adapter: DuckDBAdapter | None = None,
+                        dataset=None) -> set[str]:
+        from utils.data_store import table_name
+
+        try:
+            if adapter is not None and not adapter.duckdb_path and adapter.parquet_dir is not None and dataset is not None:
+                parquet_path = adapter.parquet_dir / dataset.parquet_subdir
+                if parquet_path.is_dir():
+                    return {row[0] for row in conn.execute(
+                        'DESCRIBE SELECT * FROM read_parquet(?, hive_partitioning=true)',
+                        [str(parquet_path / '**' / '*.parquet')],
+                    ).fetchall()}
+                return set()
+            return {row[0] for row in conn.execute(f'DESCRIBE {table_name(table)}').fetchall()}
+        except duckdb.Error:
+            return set()
+
+    @classmethod
     def read_panel(cls, instruments: Sequence[str], frequency: str | None, start: str,
                    end: str, fields: Sequence[str], *, config: DataAccessConfig,
                    connection: duckdb.DuckDBPyConnection | None = None,
@@ -303,6 +322,7 @@ class ASharePanelReader(BarSource):
                    code_field: str = 'stock_code', additional_condition: str = '',
                    market_db_profile: MarketDbProfile | None = None,
                    check_profile: Callable[[duckdb.DuckDBPyConnection], MarketDbProfile] | None = None,
+                   optional_fields: Sequence[str] = (),
                    ) -> pd.DataFrame:
         """Catalog entry for legacy panels, retaining their exact SQL/PIT inputs.
 
@@ -361,11 +381,23 @@ class ASharePanelReader(BarSource):
                 bars = reader.read(instruments, frequency, start, end)
             panel = bars.rename(columns={'timestamp_utc': 'date', 'instrument_id': 'code'})
             panel['date'] = panel.date.dt.tz_convert(TIMEZONE).dt.tz_localize(None)
-            return panel[['date', 'code', *selected]].sort_values(
+            final_selected = list(selected)
+            for opt in optional_fields:
+                if opt in panel.columns and opt not in final_selected and opt not in excluded:
+                    final_selected.append(opt)
+            return panel[['date', 'code', *final_selected]].sort_values(
                 ['code', 'date'], kind='mergesort', ignore_index=True)
         dataset = config.dataset(entry.table_name)
+        extra_optional = []
+        if optional_fields:
+            available_cols = cls._source_columns(conn, dataset.table, adapter=adapter if adapter_panel else None, dataset=dataset)
+            for opt in optional_fields:
+                if opt in available_cols and opt not in selected and opt not in excluded:
+                    selected = (*selected, opt)
+                    extra_optional.append(opt)
         if adapter_panel:
-            frame = adapter._fetch_panel(dataset, instruments, start, end, fields)
+            query_fields = [*fields, *extra_optional] if extra_optional else fields
+            frame = adapter._fetch_panel(dataset, instruments, start, end, query_fields)
         else:
             columns = [f'{quote(date_field)} AS date', f'{quote(code_field)} AS code',
                        *[quote(field) for field in selected]]

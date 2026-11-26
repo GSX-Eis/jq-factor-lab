@@ -12,6 +12,8 @@ def preprocess_series(
         raise ValueError("invalid_winsorize_percentile")
     if method in (None, "", "none") or series.empty:
         return series.copy()
+    if method == "rank":
+        return series.rank(pct=True, method="average")
     if method == "rank_zscore":
         values = series.rank(pct=True, method="average")
     elif method in ("zscore", "winsorize_zscore"):
@@ -37,6 +39,37 @@ def preprocess_series(
     if pd.isna(std) or std == 0 or (not zero_degenerate and std < 1e-8):
         return pd.Series(0.0, index=series.index) if zero_degenerate else values - mean
     return (values - mean) / std
+
+
+def resolve_preprocess_method(methods, name, default="zscore"):
+    cfg = methods if hasattr(methods, "get") else {}
+    fallback = cfg.get("ALL", default)
+    if fallback in (None, ""):
+        fallback = default
+    mode = cfg.get(name)
+    if mode in (None, ""):
+        return fallback
+    return mode
+
+
+def preprocess_cross_section_series(series, method, methods=None):
+    cfg = methods if hasattr(methods, "get") else {}
+    if method in (None, "", "none"):
+        return series.copy()
+    if method == "binning":
+        return bin_series(series, cfg.get("_binning_n_bins", 5))
+    percentile = (
+        cfg.get("_winsorize_percentile", 0.025)
+        if method in ("zscore", "winsorize_zscore")
+        else 0.025
+    )
+    return preprocess_series(series, method, percentile)
+
+
+def standardize_composite_scores(scores):
+    if len(scores) > 1:
+        return (scores - scores.mean()) / (scores.std() + 1e-8)
+    return scores
 
 
 def model_for_date(models, asof, date_field="train_end", inclusive=False):
@@ -120,29 +153,21 @@ def linear_signal(raw, model, parent_scores=None):
         raise ValueError("model_features_missing: " + ",".join(sorted(missing)))
     methods = model.get("standardization_method", {})
     processed = pd.DataFrame(index=raw.index)
+    standardize = model.get("standardize", True)
     for name in sorted(needed):
-        method = methods.get(name) or methods.get("ALL", "zscore") or "zscore"
-        if not model.get("standardize", True):
+        method = resolve_preprocess_method(methods, name, default="zscore")
+        if not standardize:
             values = raw[name]
-        elif method == "binning":
-            values = bin_series(raw[name], methods.get("_binning_n_bins", 5))
         else:
-            # VectorBT's legacy `none` spelling means its default transform.
-            method = "zscore" if method == "none" else method
-            percentile = (
-                methods.get("_winsorize_percentile", 0.025)
-                if method == "winsorize_zscore"
-                else 0.025
-            )
-            values = preprocess_series(raw[name], method, percentile)
+            values = preprocess_cross_section_series(raw[name], method, methods)
         processed[name] = values.fillna(0.0)
     score = (
         weighted_score(processed, weights)
         if weights
         else pd.Series(0.0, index=raw.index)
     )
-    if weights and model.get("postprocess_cs_standardize", True) and len(score) > 1:
-        score = (score - score.mean()) / (score.std() + 1e-8)
+    if weights and model.get("postprocess_cs_standardize", True):
+        score = standardize_composite_scores(score)
     if ratio > 0 and parent_scores is not None:
         parent = parent_scores.reindex(score.index).dropna()
         if parent.empty:

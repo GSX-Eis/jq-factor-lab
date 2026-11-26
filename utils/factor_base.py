@@ -293,9 +293,10 @@ class FactorBase:
 
     def _fetch_raw_data(self, fields: List[str], date_field: str = 'date',
                         code_field: str = 'stock_code', table_name: str = 'factor_data',
-                        additional_condition: str = "") -> pd.DataFrame:
+                        additional_condition: str = "", *, optional_fields=()) -> pd.DataFrame:
         return _legacy_storage._fetch_raw_data(
-            self, _bar_bridge.read_slot_panel, fields, date_field, code_field, table_name, additional_condition)
+            self, _bar_bridge.read_slot_panel, fields, date_field, code_field, table_name,
+            additional_condition, optional_fields=optional_fields)
 
     def _fetch_raw_data_duckdb(self, fields: List[str], table_name: str = 'factor_data') -> pd.DataFrame:
         if self._duckdb_adapter is None:
@@ -404,16 +405,16 @@ class FactorBase:
             combine_duplicate_dates, rebalance_only,
         )
 
-    def get_price_data(self, price_type: str = 'close') -> pd.DataFrame:
-        """Read execution prices from the factor's market input."""
+    def get_price_data(self, price_type: str = 'close', *, adjusted: bool = True) -> pd.DataFrame:
+        """Read execution prices from the factor's market input (adjusted unless ``adjusted=False``)."""
         if not self._ashare_panel or self._frequency_route.bar_grid:
-            return _bar_bridge.execution_panel(self, price_type)
-        return _legacy_storage.get_price_data(self, price_type)
+            return _bar_bridge.execution_panel(self, price_type, adjusted=adjusted)
+        return _legacy_storage.get_price_data(self, price_type, adjusted=adjusted)
 
     def calculate_forward_returns(self, period: int = 1) -> pd.DataFrame:
-        """Compute forward returns from unadjusted close prices."""
+        """Compute forward returns from factor-adjusted close prices."""
         if not self._ashare_panel or self._frequency_route.bar_grid:
-            return _bar_bridge.execution_panel(self, 'close', period)
+            return _bar_bridge.execution_panel(self, 'close', period, adjusted=True)
         return _legacy_storage.calculate_forward_returns(self, period)
 
     def _get_cache_inputs(self) -> Optional[dict]:

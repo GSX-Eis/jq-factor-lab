@@ -173,12 +173,13 @@ class AShareFactorFeed:
         return self.read_execution_bars(instruments, frequency, start_utc=start_utc, end_utc=end_utc)
 
     def read_factor_panel(self, factor, fields, date_field, code_field, table_name,
-                          additional_condition) -> pd.DataFrame:
+                          additional_condition, *, optional_fields=()) -> pd.DataFrame:
         if not isinstance(fields, (list, tuple)):
             raise ValueError('fields must be a list or tuple of column names')
         selected = list(fields)
         if factor.pit_enabled and factor.pit_factor_column not in selected:
             selected.append(factor.pit_factor_column)
+        optional = tuple(col for col in optional_fields if col not in selected)
         adapter = factor._duckdb_adapter or self.adapter
         config = adapter.data_config if adapter is not None else factor._get_local_data_config()
         standard = date_field == 'date' and code_field == 'stock_code' and not additional_condition
@@ -192,6 +193,7 @@ class AShareFactorFeed:
             config=config, connection=factor.db_connection or self.connection, adapter=adapter,
             date_field=date_field, code_field=code_field, additional_condition=additional_condition,
             market_db_profile=self.profile, check_profile=check_profile,
+            optional_fields=optional,
         )
         if normalize:
             frequency = factor._frequency_route.frequency
@@ -219,7 +221,7 @@ class AShareFactorAux:
             ).read_aux_features(grid, features=features)
 
     def read_factor_panel(self, factor, fields, date_field, code_field, table_name,
-                          additional_condition) -> pd.DataFrame:
+                          additional_condition, *, optional_fields=()) -> pd.DataFrame:
         adapter = factor._duckdb_adapter or self.feed.adapter
         if adapter is not None and adapter.duckdb_path and factor.all_stocks:
             self.feed._check_input_profile(adapter._get_connection())

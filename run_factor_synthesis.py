@@ -1873,6 +1873,7 @@ class FactorSynthesizer:
         run_alphalens: bool = True,
         *,
         synthesis_name: Optional[str] = None,
+        execution_lag: Optional[int] = None,
     ):
         """直接分析合成因子而不保存到数据库 - 内存模式
 
@@ -2041,6 +2042,9 @@ class FactorSynthesizer:
                 and len(stocks) >= 2
                 and getattr(self, "result_writer", None) is not None
             )
+            resolved_execution_lag = self._resolve_evaluation_execution_lag(
+                execution_lag
+            )
 
             # 获取价格数据
             pricing = self._get_pricing_data(
@@ -2051,6 +2055,7 @@ class FactorSynthesizer:
                     if effective_run_alphalens
                     else 0
                 ),
+                execution_lag=resolved_execution_lag,
             )
 
             if pricing.empty:
@@ -2120,11 +2125,18 @@ class FactorSynthesizer:
             ):
                 # 动态池分析通常会产生大量的数据丢失（非池内股票），因此需要提高max_loss
                 results = self._run_alphalens_analysis(
-                    factor_df_filled, pricing, factor_name, max_loss=0.99
+                    factor_df_filled,
+                    pricing,
+                    factor_name,
+                    max_loss=0.99,
+                    execution_lag=resolved_execution_lag,
                 )
             else:
                 results = self._run_alphalens_analysis(
-                    factor_df_filled, pricing, factor_name
+                    factor_df_filled,
+                    pricing,
+                    factor_name,
+                    execution_lag=resolved_execution_lag,
                 )
 
             # 保存分析结果到数据库
@@ -2963,14 +2975,27 @@ class FactorSynthesizer:
         )
 
     def _get_pricing_data(
-        self, stocks: list, dates: pd.Index, *, future_periods: Optional[int] = None
+        self,
+        stocks: list,
+        dates: pd.Index,
+        *,
+        future_periods: Optional[int] = None,
+        execution_lag: Optional[int] = None,
     ) -> pd.Series:
         """获取价格数据用于alphalens分析 - 代理到核心模块"""
-        resolved_future = (
-            future_periods
-            if future_periods is not None
-            else max(self.config.get('performance_evaluation', {}).get('ic_periods') or (1, 5, 10)) + 1
-        )
+        if future_periods is not None:
+            resolved_future = future_periods
+        else:
+            cfg = getattr(self, "config", None)
+            pe_cfg = (
+                cfg.get("performance_evaluation", {})
+                if isinstance(cfg, Mapping)
+                and isinstance(cfg.get("performance_evaluation", {}), Mapping)
+                else {}
+            )
+            ic_periods = tuple(pe_cfg.get("ic_periods") or (1, 5, 10))
+            resolved_lag = self._resolve_evaluation_execution_lag(execution_lag)
+            resolved_future = max(ic_periods) + resolved_lag
         return core_get_pricing_data(
             price_conn=self._get_price_conn(),
             price_table=self.price_table,
@@ -3040,39 +3065,92 @@ class FactorSynthesizer:
 
         return price_df, factor_ratio_df
 
+    def _resolve_evaluation_execution_lag(
+        self, execution_lag: Optional[int] = None
+    ) -> int:
+        """Resolve execution_lag for already trade-date-aligned composite panels.
+
+        Composite factor panels produced by FactorSynthesizer are already shifted
+        by the loader so row T carries T-1 features and match
+        ExecutionConvention.CLOSE_TO_CLOSE training labels (close[T+h]/close[T]-1).
+        Evaluation defaults to execution_lag=0 unless explicitly overridden.
+        """
+        if execution_lag is None:
+            cfg = getattr(self, "config", None)
+            pe_cfg = cfg.get("performance_evaluation", {}) if isinstance(cfg, Mapping) else {}
+            raw_lag = pe_cfg.get("execution_lag") if isinstance(pe_cfg, Mapping) else None
+            resolved = 0 if raw_lag is None else raw_lag
+        else:
+            resolved = execution_lag
+        if (
+            isinstance(resolved, (bool, np.bool_))
+            or not isinstance(resolved, (int, np.integer))
+            or int(resolved) < 0
+        ):
+            raise ValueError("execution_lag must be a non-negative integer")
+        return int(resolved)
+
     def _run_alphalens_analysis(
         self,
         factor_df: pd.DataFrame,
         pricing: pd.Series,
         factor_name: str,
         max_loss: float = 0.35,
+        *,
+        execution_lag: Optional[int] = None,
     ) -> dict:
         """Evaluate the daily composite via the engine-backed legacy result adapter."""
+        resolved_lag = self._resolve_evaluation_execution_lag(execution_lag)
         try:
+            cfg = getattr(self, "config", None)
+            cfg_map = cfg if isinstance(cfg, Mapping) else {}
+            pe_cfg = (
+                cfg_map.get("performance_evaluation", {})
+                if isinstance(cfg_map.get("performance_evaluation", {}), Mapping)
+                else {}
+            )
             runner = AlphalensRunner(
-                n_quantiles=self.config["performance_evaluation"].get("quantiles", 10),
-                periods=tuple(
-                    self.config["performance_evaluation"].get("ic_periods")
-                    or (1, 5, 10)
-                ),
+                n_quantiles=pe_cfg.get("quantiles", 10),
+                periods=tuple(pe_cfg.get("ic_periods") or (1, 5, 10)),
+                execution_lag=resolved_lag,
             )
 
             # 准备前瞻收益率
             forward_returns = None
-            if self.config.get("use_precomputed_returns", False):
+            if cfg_map.get("use_precomputed_returns", False) and not factor_df.empty:
                 from backtest_and_analysis.forward_returns_calculator import (
                     ForwardReturnsCalculator,
                 )
 
-                returns_calculator = ForwardReturnsCalculator(cache_dir="./cache")
+                if "forward_returns_cache_dir" in pe_cfg:
+                    cache_dir = pe_cfg["forward_returns_cache_dir"]
+                elif "forward_returns_cache_dir" in cfg_map:
+                    cache_dir = cfg_map["forward_returns_cache_dir"]
+                else:
+                    cache_dir = "./cache"
+                trading_calendar = (
+                    pricing.attrs.get("trading_calendar")
+                    if isinstance(pricing, pd.Series)
+                    else None
+                )
+                returns_calculator = ForwardReturnsCalculator(
+                    cache_dir=cache_dir,
+                    trading_calendar=trading_calendar,
+                )
 
                 periods = runner.periods
                 stock_list = list(factor_df.columns)
-                start_date = factor_df.index.min().strftime("%Y-%m-%d")
-                end_date = factor_df.index.max().strftime("%Y-%m-%d")
+                factor_dates = pd.to_datetime(factor_df.index)
+                start_date = factor_dates.min().strftime("%Y-%m-%d")
+                end_date = factor_dates.max().strftime("%Y-%m-%d")
 
                 forward_returns = returns_calculator.calculate_or_load_forward_returns(
-                    pricing, stock_list, start_date, end_date, periods
+                    pricing,
+                    stock_list,
+                    start_date,
+                    end_date,
+                    periods,
+                    execution_lag=resolved_lag,
                 )
 
             # 运行分析
@@ -3719,12 +3797,26 @@ class FactorSynthesizer:
 
         # [自动扩展] 向前扩展 train_window_days + buffer 以满足第一个训练窗口的数据需求
         # start_date 是合成输出的起始日期，第一个训练窗口为 [start_date - train_window_days, start_date]
-        train_window_days = (
-            0
-            if method == "weighted_sum" and "rolling_window" not in self.config
-            else self.config["rolling_window"]["train_window_days"]
-        )
-        _buffer_days = 0 if method == "weighted_sum" and train_window_days == 0 else 30  # buffer 用于 shift(1) 和交易日历对齐
+        if method == "weighted_sum":
+            from factor_synthesis.core.feature_preprocessor import TIME_SERIES_METHODS
+            from utils.strategy_kernel import resolve_preprocess_method
+
+            preprocess_cfg = synthesis_config.get("preprocess") or {}
+            default_mode = resolve_preprocess_method(preprocess_cfg, "ALL", default="none")
+            uses_ts = any(
+                resolve_preprocess_method(preprocess_cfg, f, default=default_mode)
+                in TIME_SERIES_METHODS
+                for f in all_factor_names
+            )
+            train_window_days = 0
+            if uses_ts:
+                ts_window = int(preprocess_cfg.get("_ts_window", 20))
+                _buffer_days = max(30, ts_window * 2 + 15)
+            else:
+                _buffer_days = 30  # buffer 用于 shift(1) 和交易日历对齐
+        else:
+            train_window_days = self.config["rolling_window"]["train_window_days"]
+            _buffer_days = 30  # buffer 用于 shift(1) 和交易日历对齐
         data_start_dt = pd.to_datetime(start_date) - timedelta(days=train_window_days + _buffer_days)
         active_slot = self._get_slot() if self._use_slot_feeds() else None
         if active_slot is not None:
@@ -3754,6 +3846,7 @@ class FactorSynthesizer:
                 neutralization_config=synthesis_config.get("neutralization"),
             )
             market_factor_inputs = frame.attrs.get("market_factor_inputs")
+            panel_date_alignment = frame.attrs.get("panel_date_alignment")
             frame = self._apply_dynamic_stock_pool_filter(
                 frame, start_date=data_start_date, end_date=end_date
             ).sort_index()
@@ -3763,6 +3856,8 @@ class FactorSynthesizer:
                 frame = self._apply_skip_months(frame)
             if market_factor_inputs is not None:
                 frame.attrs["market_factor_inputs"] = market_factor_inputs
+            if panel_date_alignment is not None:
+                frame.attrs["panel_date_alignment"] = panel_date_alignment
             return frame
 
         prepared_panel = None

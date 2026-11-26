@@ -445,20 +445,21 @@ def get_bar_factor_frame(self, force_recalculate: bool = False) -> pd.DataFrame:
     return mask_incomplete_bars(aligned, panel.attrs['incomplete_bar_keys']).sort_values(_BAR_KEYS).reset_index(drop=True)
 
 
-def execution_panel(self, price_type: str, period: int | None = None) -> pd.DataFrame:
+def execution_panel(self, price_type: str, period: int | None = None, *, adjusted: bool = True) -> pd.DataFrame:
     """Compute moves on each instrument's full execution clock, including absent Bars."""
+    from utils.price_adjustment import PRICE_ADJUSTED_ATTR, adjust_execution_grid_prices
     _, grid, _ = _read_slot_bars(self, execution=True)
-    price = grid[price_type]
-    if 'is_complete' in grid:
-        price = price.where(grid.is_complete.eq(True))
-    if self.use_dynamic_pool:
-        price = price.where(_pool_mask(self, grid))
+    grid = adjust_execution_grid_prices(
+        grid, price_type=price_type, pit_enabled=self.pit_enabled, factor_column=self.pit_factor_column, ashare_panel=self._ashare_panel, adjusted=adjusted)
+    price = grid[price_type].where(grid['is_complete'].eq(True)) if 'is_complete' in grid else grid[price_type]
+    price = price.where(_pool_mask(self, grid)) if self.use_dynamic_pool else price
     values = grid.assign(factor_value=price)
     if period is not None and not _session_rollup(self):
-        future = price.groupby(grid.instrument_id, sort=False).shift(-period)
-        values['factor_value'] = future / price - 1
+        values['factor_value'] = price.groupby(grid.instrument_id, sort=False).shift(-period) / price - 1
     wide = panel_slot_values(self, values)
-    return wide.shift(-period) / wide - 1 if period is not None and _session_rollup(self) else wide
+    result = wide.shift(-period) / wide - 1 if period is not None and _session_rollup(self) else wide
+    result.attrs[PRICE_ADJUSTED_ATTR] = bool(grid.attrs.get(PRICE_ADJUSTED_ATTR, False))
+    return result
 
 
 def get_session_daily_pricing(self) -> pd.Series:

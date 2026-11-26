@@ -10,7 +10,13 @@ import pandas as pd
 
 from utils.bars.catalog import identifier
 from utils.bars.source import _bounds, _instrument_ids
-from utils.pit import apply_pit_adjustment, normalize_price_money
+from utils.pit import (
+    PRICE_ADJUSTED_ATTR,
+    PRICE_ADJUSTMENT_MODE_ATTR,
+    apply_pit_adjustment,
+    normalize_price_money,
+)
+from utils.price_adjustment import adjust_prices_by_factor
 from utils.session_calendar import SessionCalendar
 from utils.time_axis import Frequency
 
@@ -42,21 +48,39 @@ def _empty_bars() -> pd.DataFrame:
 
 def read_analysis_price_rows(
     connection: duckdb.DuckDBPyConnection, instruments: Sequence[str], start: date | str, end: date | str, *,
-    table: str, date_column: str, instrument_column: str,
+    table: str, date_column: str, instrument_column: str, require_factor: bool = False,
 ) -> pd.DataFrame:
-    """Read the materialized A-share analysis price scale and configured aliases."""
+    """Read A-share analysis prices, scaling by ``factor`` (``price * factor``) when present.
+
+    Minimal test tables without a ``factor`` column pass through unscaled unless
+    ``require_factor=True``. The returned frame drops ``factor`` after scaling and
+    sets ``attrs['price_adjusted']`` to prevent downstream double adjustment.
+    """
     from utils.data_store import quote, table_name
 
     day, asset = quote(date_column), quote(instrument_column)
-    return connection.execute(
+    qualified = table_name(table)
+    columns = {row[0] for row in connection.execute(f"DESCRIBE {qualified}").fetchall()}
+    has_factor = "factor" in columns
+    if require_factor and not has_factor:
+        raise ValueError("pit_factor_column_missing: 'factor'")
+    factor_select = ", factor" if has_factor else ""
+    frame = connection.execute(
         f"""
-        SELECT {asset} AS stock_code, {day} AS date, open, high, low, close, volume, money
-        FROM {table_name(table)}
+        SELECT {asset} AS stock_code, {day} AS date, open, high, low, close, volume, money{factor_select}
+        FROM {qualified}
         WHERE {asset} = ANY(?) AND CAST({day} AS DATE) BETWEEN ? AND ?
         ORDER BY stock_code, date
         """,
         [list(instruments), start, end],
     ).fetchdf()
+    if has_factor:
+        frame = adjust_prices_by_factor(frame, factor_column="factor", require_factor=True)
+        frame = frame.drop(columns=["factor"])
+    else:
+        frame.attrs[PRICE_ADJUSTED_ATTR] = False
+        frame.attrs[PRICE_ADJUSTMENT_MODE_ATTR] = "unadjusted_no_factor_column"
+    return frame
 
 
 class AShareBarFeed:
@@ -142,10 +166,12 @@ class AShareBarFeed:
 
 
 class AShareDailyEvaluationFeed(AShareBarFeed):
-    """Daily evaluation uses the historical materialized price scale.
+    """Daily evaluation feed retaining raw ``factor`` or pre-adjusted snapshot pricing.
 
-    The native storage factor describes the separate PIT signal view. It must
-    not be applied again to the historical analysis prices.
+    When ``pricing`` is None, execution bars retain the storage ``factor`` column so
+    ``UnifiedReturnLabeler`` computes split/dividend-adjusted returns. When ``pricing``
+    is supplied (e.g. from ``PriceFetcher``), prices are already factor-adjusted and no
+    ``factor`` column is emitted, preventing double adjustment.
     """
 
     def __init__(self, feed: AShareBarFeed, *, pricing: pd.Series | None = None,
@@ -161,7 +187,7 @@ class AShareDailyEvaluationFeed(AShareBarFeed):
         if self.pricing is None:
             return super().read_execution_bars(
                 instruments, frequency, start_utc=start_utc, end_utc=end_utc,
-            ).rename(columns={'factor': 'pit_factor'})
+            )
 
         grid = self.calendar.bar_grid(frequency, local_day(pd.Timestamp(start_utc)), local_day(pd.Timestamp(end_utc)))
         snapshot = self.pricing.rename('close').reset_index().rename(columns={'asset': 'instrument_id'})
@@ -171,4 +197,5 @@ class AShareDailyEvaluationFeed(AShareBarFeed):
         bars = bars.loc[bars.timestamp_utc.between(start_utc, end_utc)]
         bars = bars.assign(open=float('nan'), high=float('nan'), low=float('nan'))
         bars.attrs['sources'] = [self.source_table]
+        bars.attrs[PRICE_ADJUSTED_ATTR] = bool(self.pricing.attrs.get(PRICE_ADJUSTED_ATTR, False))
         return bars

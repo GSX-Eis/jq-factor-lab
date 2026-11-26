@@ -188,7 +188,7 @@ def load_replay_models(bundle: StrategyBundle, bundle_dir: Path) -> list[dict[st
     factors = {item.factor_id for item in bundle.factors}
     models = payload["index"]["models"]
     allowed_methods = {
-        "none", "zscore", "rank_zscore", "winsorize_zscore", "raw_zscore", "gauss_rank", "binning"
+        "none", "zscore", "rank", "rank_zscore", "winsorize_zscore", "raw_zscore", "gauss_rank", "binning"
     }
     dates = set()
     for model in models:

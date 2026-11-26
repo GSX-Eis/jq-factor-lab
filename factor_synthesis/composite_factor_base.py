@@ -234,7 +234,7 @@ class CompositeFactorBase(FactorBase):
                 slot = self.factor_reader.slot
                 price_df = get_complete_price_data(
                     None, "", self.all_stocks, self.start_date, self.end_date, slot=slot,
-                    frequency=frequency, pit_enabled=False,
+                    frequency=frequency, pit_enabled=None,
                 )
                 if price_df is None:
                     return pd.DataFrame()

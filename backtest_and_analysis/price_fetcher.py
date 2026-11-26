@@ -101,6 +101,8 @@ class PriceFetcher:
         df = self._fetch_from_duckdb(code_list, query_start.date(), query_end.date())
         if df.empty:
             raise ValueError("No price data found for the specified parameters")
+        from utils.pit import PRICE_ADJUSTED_ATTR, PRICE_ADJUSTMENT_MODE_ATTR
+
         df["date"] = pd.to_datetime(df["date"], format="mixed")
         if self.is_daily_table:
             df["date"] = df["date"].dt.normalize()
@@ -112,6 +114,10 @@ class PriceFetcher:
         daily_prices.index = pd.MultiIndex.from_tuples(daily_prices.index.to_list(), names=["asset", "date"])
         daily_prices.attrs['trading_calendar'] = calendar
         daily_prices.attrs['execution_profile'] = slot.microstructure.execution_profile
+        daily_prices.attrs[PRICE_ADJUSTED_ATTR] = bool(df.attrs.get(PRICE_ADJUSTED_ATTR, False))
+        daily_prices.attrs[PRICE_ADJUSTMENT_MODE_ATTR] = df.attrs.get(
+            PRICE_ADJUSTMENT_MODE_ATTR, "unadjusted"
+        )
         return daily_prices
 
     def _fetch_from_duckdb(self, code_list: List[str], start_date, end_date) -> pd.DataFrame:

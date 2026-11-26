@@ -303,6 +303,11 @@ def _with_market_factor_inputs(
     return frame
 
 
+PANEL_DATE_ALIGNMENT_ATTR = "panel_date_alignment"
+PANEL_DATE_ALIGNMENT_TRADE_DATE = "trade_date_aligned"
+PANEL_DATE_ALIGNMENT_RAW = "raw_signal"
+
+
 def load_factor_data(
     factor_conn,
     factor_table: str,
@@ -472,6 +477,7 @@ def load_factor_data(
                         os.utime(processed_cache_path, ns=(time.time_ns(), stamp.st_mtime_ns))
                     except OSError as exc:
                         log.warning("Cache use timestamp could not be refreshed: %s", exc)
+                    cached.attrs[PANEL_DATE_ALIGNMENT_ATTR] = PANEL_DATE_ALIGNMENT_TRADE_DATE
                     return _with_market_factor_inputs(cached, market_identities, market_plan, slot_id, frequency)
                 except Exception as e:
                     log.warning(f"[缓存] 已处理因子缓存读取失败，回退到原始缓存: {e}")
@@ -685,6 +691,7 @@ def process_raw_factor_df(
 
         # Remove rows with NaNs introduced by shift or gaps
         factor_df = factor_df.dropna(how='all')
+        factor_df.attrs[PANEL_DATE_ALIGNMENT_ATTR] = PANEL_DATE_ALIGNMENT_TRADE_DATE
 
         return factor_df
 

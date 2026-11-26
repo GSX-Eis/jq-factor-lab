@@ -1,7 +1,8 @@
 """Local DuckDB reads, PIT adjustment and stock-pool membership for FactorBase."""
 from datetime import datetime
+import inspect
 import os
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Sequence
 
 import numpy as np
 import pandas as pd
@@ -235,13 +236,14 @@ def _apply_dynamic_pool_to_factor_df(self, factor_base_cls: type, factor_df: pd.
 
 def _fetch_raw_data(self, read_slot_panel: Callable, fields: List[str], date_field: str = 'date',
                     code_field: str = 'stock_code', table_name: str = 'factor_data',
-                    additional_condition: str = "") -> pd.DataFrame:
+                    additional_condition: str = "", *, optional_fields: Sequence[str] = ()) -> pd.DataFrame:
     """Retain the FactorBase panel contract while letting the slot supply its rows."""
     price = table_name.startswith('price_data')
     component = self.slot.bar_feed if price else self.slot.aux_features
     read_panel = getattr(component, 'read_factor_panel', None)
     if read_panel is not None:
-        frame = read_panel(self, fields, date_field, code_field, table_name, additional_condition)
+        kwargs = {'optional_fields': optional_fields} if optional_fields else {}
+        frame = read_panel(self, fields, date_field, code_field, table_name, additional_condition, **kwargs)
     else:
         if additional_condition or date_field != 'date' or code_field != 'stock_code':
             raise ValueError('SQL panel options require the historical A-share slot')
@@ -251,18 +253,50 @@ def _fetch_raw_data(self, read_slot_panel: Callable, fields: List[str], date_fie
     return frame
 
 
-def get_price_data(self, price_type: str = 'close') -> pd.DataFrame:
-    """Read the historical unadjusted price panel."""
-    frame = self._fetch_raw_data([price_type], table_name='price_data')
+def get_price_data(self, price_type: str = 'close', *, adjusted: bool = True) -> pd.DataFrame:
+    """Read the historical price panel, factor-adjusted once unless ``adjusted=False``."""
+    from utils.pit import (
+        ADJUSTABLE_PRICE_FIELDS,
+        PRICE_ADJUSTED_ATTR,
+        PRICE_ADJUSTMENT_MODE_ATTR,
+    )
+    from utils.price_adjustment import adjust_prices_by_factor
+
+    adjustable = price_type in (*ADJUSTABLE_PRICE_FIELDS, 'volume')
+    if adjusted and adjustable and not self.pit_enabled:
+        params = inspect.signature(self._fetch_raw_data).parameters
+        accepts_optional = 'optional_fields' in params or any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
+        )
+        frame = (
+            self._fetch_raw_data([price_type], table_name='price_data', optional_fields=(self.pit_factor_column,))
+            if accepts_optional
+            else self._fetch_raw_data([price_type], table_name='price_data')
+        )
+    else:
+        frame = self._fetch_raw_data([price_type], table_name='price_data')
     if frame.empty:
         return pd.DataFrame()
     if self.use_dynamic_pool:
         frame = self._filter_data_by_pools(frame)
-    return frame.pivot(index='date', columns='code', values=price_type).sort_index()
+        if frame.empty:
+            return pd.DataFrame()
+    if adjusted and adjustable and not frame.attrs.get(PRICE_ADJUSTED_ATTR):
+        if self.pit_enabled:
+            frame = self._apply_pit_adjustment(frame)
+        elif self.pit_factor_column in frame.columns:
+            frame = adjust_prices_by_factor(
+                frame, factor_column=self.pit_factor_column, require_factor=False,
+            )
+    wide = frame.pivot(index='date', columns='code', values=price_type).sort_index()
+    wide.attrs[PRICE_ADJUSTED_ATTR] = bool(frame.attrs.get(PRICE_ADJUSTED_ATTR, False))
+    if PRICE_ADJUSTMENT_MODE_ATTR in frame.attrs:
+        wide.attrs[PRICE_ADJUSTMENT_MODE_ATTR] = frame.attrs[PRICE_ADJUSTMENT_MODE_ATTR]
+    return wide
 
 
 def calculate_forward_returns(self, period: int = 1) -> pd.DataFrame:
-    """Calculate forward returns for a specific period
+    """Calculate forward returns from factor-adjusted close prices.
 
     Args:
         period: Number of days for the forward-looking period (default: 1)
@@ -270,7 +304,7 @@ def calculate_forward_returns(self, period: int = 1) -> pd.DataFrame:
     Returns:
         DataFrame with forward returns, rows are dates and columns are stock codes
     """
-    # 获取收盘价
+    # 获取复权收盘价 (若 get_price_data 已完成 PIT/factor 复权则不会重复乘 factor)
     price_df = self.get_price_data(price_type='close')
 
     # 计算前瞻收益率 (future_price / current_price - 1)
