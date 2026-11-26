@@ -1129,6 +1129,244 @@ class SlotDataProvider:
                 return bar_key
         return bar_key
 
+    @staticmethod
+    def _resolve_roll_schedule_contract(
+        roll_schedule: Any,
+        inst_id: str,
+        session_id: Optional[str],
+        ts_val: Any,
+    ) -> Optional[str]:
+        """Resolve a concrete contract ID from an optional ``slot.roll_schedule`` helper."""
+        if roll_schedule is None:
+            return None
+        if callable(roll_schedule):
+            try:
+                res = roll_schedule(inst_id, session_id)
+            except TypeError:
+                if ts_val is None or pd.isna(ts_val):
+                    return None
+                res = roll_schedule(inst_id, ts_val)
+            if res is not None and pd.notna(res):
+                text = str(res).strip()
+                return text or None
+            return None
+        if isinstance(roll_schedule, Mapping):
+            if session_id is not None and (inst_id, session_id) in roll_schedule:
+                val = roll_schedule[(inst_id, session_id)]
+                if val is not None and pd.notna(val):
+                    text = str(val).strip()
+                    return text or None
+            entry = roll_schedule.get(inst_id)
+            if isinstance(entry, Mapping) and session_id is not None:
+                val = entry.get(session_id)
+                if val is not None and pd.notna(val):
+                    text = str(val).strip()
+                    return text or None
+            elif isinstance(entry, str) and entry.strip():
+                return entry.strip()
+            return None
+        if isinstance(roll_schedule, pd.DataFrame) and not roll_schedule.empty:
+            mask = pd.Series(True, index=roll_schedule.index)
+            if "product_root" in roll_schedule.columns:
+                mask &= roll_schedule["product_root"].astype(str).eq(inst_id)
+            elif "instrument_id" in roll_schedule.columns:
+                mask &= roll_schedule["instrument_id"].astype(str).eq(inst_id)
+            if session_id is not None:
+                if "effective_session_id" in roll_schedule.columns:
+                    mask &= roll_schedule["effective_session_id"].astype(str).eq(session_id)
+                elif "session_id" in roll_schedule.columns:
+                    mask &= roll_schedule["session_id"].astype(str).eq(session_id)
+            matched = roll_schedule.loc[mask]
+            if not matched.empty:
+                for col in ("to_contract", "concrete_instrument_id", "contract_id"):
+                    if col in matched.columns and pd.notna(matched[col].iloc[0]):
+                        text = str(matched[col].iloc[0]).strip()
+                        if text:
+                            return text
+        return None
+
+    def _resolve_bar_contract_multipliers(
+        self,
+        slot: Optional[MarketSlot],
+        bars: pd.DataFrame,
+    ) -> pd.Series:
+        """Resolve per-row ``contract_multiplier`` for OHLCV ``volume * close`` fallback."""
+        if bars.empty:
+            return pd.Series(dtype=float, index=bars.index)
+        universe = getattr(slot, "universe", None) if slot is not None else None
+        spec_fn = getattr(universe, "instrument_spec", None)
+        if not callable(spec_fn):
+            return pd.Series(1.0, index=bars.index, dtype=float)
+
+        spec_mult_cache: Dict[str, Optional[float]] = {}
+
+        def _spec_multiplier(target_id: str) -> Optional[float]:
+            if target_id in spec_mult_cache:
+                return spec_mult_cache[target_id]
+            try:
+                spec = spec_fn(target_id)
+            except (KeyError, ValueError, LookupError):
+                spec_mult_cache[target_id] = None
+                return None
+            raw_mult = getattr(spec, "contract_multiplier", 1.0)
+            mult_val = float(raw_mult)
+            if not np.isfinite(mult_val) or mult_val <= 0:
+                raise ValueError(
+                    f"Invalid contract_multiplier for {target_id!r}: {raw_mult!r}"
+                )
+            spec_mult_cache[target_id] = mult_val
+            return mult_val
+
+        roll_schedule = getattr(slot, "roll_schedule", None)
+        resolve_active_fn = getattr(universe, "resolve_active_contract", None)
+        concrete_col = (
+            "concrete_instrument_id"
+            if "concrete_instrument_id" in bars.columns
+            else ("contract_id" if "contract_id" in bars.columns else None)
+        )
+        has_session_col = "session_id" in bars.columns
+        has_ts_col = "timestamp_utc" in bars.columns
+
+        inst_vals = (
+            bars["instrument_id"].tolist()
+            if "instrument_id" in bars.columns
+            else [None] * len(bars)
+        )
+        concrete_vals = bars[concrete_col].tolist() if concrete_col else [None] * len(bars)
+        session_vals = bars["session_id"].tolist() if has_session_col else [None] * len(bars)
+        ts_vals = bars["timestamp_utc"].tolist() if has_ts_col else [None] * len(bars)
+
+        row_cache: Dict[tuple[str, str, str], float] = {}
+        multipliers: List[float] = []
+        for inst_raw, concrete_raw, sid_raw, ts_raw in zip(
+            inst_vals, concrete_vals, session_vals, ts_vals
+        ):
+            inst_id = (
+                str(inst_raw).strip()
+                if inst_raw is not None and pd.notna(inst_raw)
+                else ""
+            )
+            concrete_id = (
+                str(concrete_raw).strip()
+                if concrete_raw is not None and pd.notna(concrete_raw)
+                else ""
+            )
+            if not concrete_id and roll_schedule is None and inst_id:
+                direct_mult = _spec_multiplier(inst_id)
+                if direct_mult is not None:
+                    multipliers.append(direct_mult)
+                    continue
+
+            sid_str: Optional[str] = (
+                str(sid_raw).strip()
+                if sid_raw is not None and pd.notna(sid_raw)
+                else None
+            )
+            if (
+                sid_str is None
+                and roll_schedule is not None
+                and ts_raw is not None
+                and pd.notna(ts_raw)
+                and slot is not None
+                and slot.calendar is not None
+            ):
+                sid_str = self.session_date_for_bar(
+                    ts_raw, daily_naive=False, cal=slot.calendar
+                ).strftime("%Y-%m-%d")
+
+            cache_key = (inst_id, concrete_id, sid_str or "")
+            if (concrete_id or roll_schedule is not None) and cache_key in row_cache:
+                multipliers.append(row_cache[cache_key])
+                continue
+
+            mult: Optional[float] = None
+            if concrete_id:
+                mult = _spec_multiplier(concrete_id)
+            if mult is None and roll_schedule is not None and inst_id:
+                sched_contract = self._resolve_roll_schedule_contract(
+                    roll_schedule, inst_id, sid_str, ts_raw
+                )
+                if sched_contract:
+                    mult = _spec_multiplier(sched_contract)
+            if mult is None and inst_id:
+                mult = _spec_multiplier(inst_id)
+            if (
+                mult is None
+                and callable(resolve_active_fn)
+                and inst_id
+                and ts_raw is not None
+                and pd.notna(ts_raw)
+            ):
+                ts_utc = pd.Timestamp(ts_raw)
+                ts_utc = (
+                    ts_utc.tz_localize("UTC")
+                    if ts_utc.tzinfo is None
+                    else ts_utc.tz_convert("UTC")
+                )
+                try:
+                    active_id = resolve_active_fn(inst_id, as_of_utc=ts_utc.to_pydatetime())
+                    if active_id is not None and pd.notna(active_id):
+                        active_str = str(active_id).strip()
+                        if active_str:
+                            mult = _spec_multiplier(active_str)
+                except (KeyError, ValueError, LookupError):
+                    mult = None
+
+            resolved = float(mult) if mult is not None else 1.0
+            if concrete_id or roll_schedule is not None:
+                row_cache[cache_key] = resolved
+            multipliers.append(resolved)
+
+        return pd.Series(multipliers, index=bars.index, dtype=float)
+
+    def _resolve_traded_value_series(
+        self,
+        slot: Optional[MarketSlot],
+        bars: pd.DataFrame,
+    ) -> pd.Series:
+        """Resolve per-bar traded value, falling back to ``volume * close * multiplier`` only when ``money`` is missing."""
+        if bars.empty:
+            return pd.Series(dtype=float)
+        has_money_col = "money" in bars.columns
+        has_vc = "volume" in bars.columns and "close" in bars.columns
+        if not has_money_col and not has_vc:
+            return pd.Series(dtype=float)
+
+        if has_money_col:
+            raw_money = bars["money"]
+            money_num = pd.to_numeric(raw_money, errors="coerce").astype(float)
+            money_missing = raw_money.isna() | (
+                money_num.isna() & raw_money.astype(str).str.strip().eq("")
+            )
+            traded = money_num.copy()
+        else:
+            money_missing = pd.Series(True, index=bars.index, dtype=bool)
+            traded = pd.Series(np.nan, index=bars.index, dtype=float)
+
+        if bool(money_missing.any()) and has_vc:
+            missing_bars = bars.loc[money_missing]
+            vol = pd.to_numeric(missing_bars["volume"], errors="coerce").astype(float)
+            close = pd.to_numeric(missing_bars["close"], errors="coerce").astype(float)
+            valid_vc = (
+                vol.notna()
+                & np.isfinite(vol)
+                & (vol >= 0)
+                & close.notna()
+                & np.isfinite(close)
+                & (close > 0)
+            )
+            fallback = pd.Series(np.nan, index=missing_bars.index, dtype=float)
+            if bool(valid_vc.any()):
+                mult = self._resolve_bar_contract_multipliers(
+                    slot, missing_bars.loc[valid_vc]
+                )
+                fallback.loc[valid_vc] = (
+                    vol.loc[valid_vc] * close.loc[valid_vc] * mult
+                )
+            traded.loc[money_missing] = fallback
+
+        return traded
+
     def _read_traded_value_bars(
         self,
         stocks: List[str],
@@ -1137,7 +1375,7 @@ class SlotDataProvider:
         price_db_conn: Optional[Any],
         price_db_path: Optional[str],
     ) -> tuple[pd.DataFrame, Optional[MarketSlot], Optional[pd.Timestamp], Optional[pd.Timestamp]]:
-        """Read causally truncated execution bars with positive traded value."""
+        """Read causally truncated execution bars with valid non-negative finite traded value."""
         slot, _, _ = self._resolve_slot_and_conn(price_db_conn, price_db_path)
         if slot is None:
             return pd.DataFrame(), None, None, None
@@ -1189,19 +1427,12 @@ class SlotDataProvider:
                 bars = bars.loc[avail_utc <= as_of_utc]
         if bars.empty:
             return pd.DataFrame(), slot, as_of_utc, end_day
-        if "money" in bars.columns and bars["money"].notna().any():
-            traded = pd.to_numeric(bars["money"], errors="coerce")
-        elif "volume" in bars.columns and "close" in bars.columns:
-            traded = pd.to_numeric(bars["volume"], errors="coerce") * pd.to_numeric(
-                bars["close"], errors="coerce"
-            )
-        else:
-            traded = pd.Series(dtype=float)
+        traded = self._resolve_traded_value_series(slot, bars)
         valid = bars.assign(_traded=traded)
         valid = valid.loc[
             valid["_traded"].notna()
             & np.isfinite(valid["_traded"])
-            & (valid["_traded"] > 0)
+            & (valid["_traded"] >= 0)
         ]
         if valid.empty:
             return pd.DataFrame(), slot, as_of_utc, end_day
@@ -1911,15 +2142,22 @@ def apply_magnitude_caps(
         return result
     for _ in range(100):
         over = {
-            s: v for s, v in result.items() if s in caps and abs(v) > caps[s] + tol
+            s: v
+            for s, v in result.items()
+            if s in caps
+            and (
+                abs(v) > max(0.0, float(caps[s])) + tol
+                or (float(caps[s]) <= 0.0 and abs(v) > 0.0)
+            )
         }
         if not over:
             break
         excess_by_sign = {1: 0.0, -1: 0.0}
         for s, v in over.items():
             sign = 1 if v >= 0 else -1
-            excess_by_sign[sign] += abs(v) - caps[s]
-            result[s] = sign * caps[s]
+            cap = max(0.0, float(caps[s]))
+            excess_by_sign[sign] += max(0.0, abs(v) - cap)
+            result[s] = 0.0 if cap == 0.0 else sign * cap
         for sign, excess in excess_by_sign.items():
             if excess <= tol:
                 continue
@@ -2026,6 +2264,6 @@ def compute_liquidity_weight_caps(
         stock_val = adv.get(stock)
         if stock_val is not None:
             val = float(stock_val)
-            if np.isfinite(val) and val > 0:
+            if np.isfinite(val) and val >= 0:
                 caps[stock] = participation * val * effective_horizon / cap_val
     return caps

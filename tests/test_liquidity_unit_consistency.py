@@ -12,6 +12,7 @@ import pytest
 from factor_synthesis.vectorbt_adapter.backtest_runner import VectorBTBacktestRunner
 from factor_synthesis.vectorbt_adapter.slot_provider import (
     SlotDataProvider,
+    apply_magnitude_caps,
     compute_liquidity_weight_caps,
 )
 from slots.declarative.slot import build_declarative_slot
@@ -1115,3 +1116,558 @@ def test_runner_rebalance_decision_uses_available_at_and_never_leaks_current_bar
         assert float(tw_abv.loc[rebal_mid, "C"]) == pytest.approx(4_995_000.0)
     finally:
         runner_abv.close()
+
+
+@pytest.mark.parametrize("use_money_column", [True, False])
+def test_zero_volume_preserved_vs_missing_nan_ignored_across_daily_and_hourly(
+    tmp_path: Path, use_money_column: bool
+) -> None:
+    """Real 0-volume observations stay in ADV/ABV windows (2400,2400,0,0 -> 0.0), while NaN/invalid observations are ignored."""
+    from dataclasses import replace
+
+    # 1. Daily (1d): sequence [2400, 2400, 0, 0] vs all-zero vs NaN-missing vs negative/inf invalid
+    days = ("2026-01-05", "2026-01-06", "2026-01-07", "2026-01-08")
+    daily_totals = {
+        "A_zero": {"2026-01-05": 2400.0, "2026-01-06": 2400.0, "2026-01-07": 0.0, "2026-01-08": 0.0},
+        "B_all_zero": {d: 0.0 for d in days},
+        "C_missing": {"2026-01-05": 2400.0, "2026-01-06": 2400.0, "2026-01-07": 1.0, "2026-01-08": 1.0},
+        "D_all_missing": {d: 1.0 for d in days},
+        "E_invalid": {"2026-01-05": 2400.0, "2026-01-06": 2400.0, "2026-01-07": 1.0, "2026-01-08": 1.0},
+    }
+    base_1d, _, _ = _build_declarative_market_slot(
+        tmp_path / f"z1d_{int(use_money_column)}",
+        frequency="1d",
+        daily_traded_values=daily_totals,
+        start="2026-01-05",
+        end="2026-01-08",
+        use_money_column=use_money_column,
+    )
+    orig_feed_1d = base_1d.bar_feed
+
+    def _mutate_1d(df: pd.DataFrame) -> pd.DataFrame:
+        out = df.copy()
+        c_tail = out["instrument_id"].eq("C_missing") & out["session_id"].isin(["2026-01-07", "2026-01-08"])
+        d_all = out["instrument_id"].eq("D_all_missing")
+        e_tail_neg = out["instrument_id"].eq("E_invalid") & out["session_id"].eq("2026-01-07")
+        e_tail_inf = out["instrument_id"].eq("E_invalid") & out["session_id"].eq("2026-01-08")
+        if use_money_column:
+            out.loc[c_tail | d_all, ["money", "volume"]] = np.nan
+            out.loc[e_tail_neg, "money"] = -100.0
+            out.loc[e_tail_inf, "money"] = np.inf
+        else:
+            out.loc[c_tail | d_all, "volume"] = np.nan
+            out.loc[e_tail_neg, "volume"] = -100.0
+            out.loc[e_tail_inf, "volume"] = np.inf
+        return out
+
+    slot_1d = replace(
+        base_1d,
+        bar_feed=type(
+            "_ZeroMutFeed1d",
+            (),
+            {
+                "read_signal_bars": lambda _s, inst, freq, *, start_utc, end_utc, as_of_utc: orig_feed_1d.read_signal_bars(
+                    inst, freq, start_utc=start_utc, end_utc=end_utc, as_of_utc=as_of_utc
+                ),
+                "read_execution_bars": lambda _s, inst, freq, *, start_utc, end_utc: _mutate_1d(
+                    orig_feed_1d.read_execution_bars(inst, freq, start_utc=start_utc, end_utc=end_utc)
+                ),
+            },
+        )(),
+    )
+    p_1d = SlotDataProvider(slot=slot_1d, frequency="1d")
+    names = ["A_zero", "B_all_zero", "C_missing", "D_all_missing", "E_invalid"]
+    for _ in range(2):  # verify both uncached compute and cached retrieval preserve 0.0 vs None
+        adv_1d = p_1d.average_daily_traded_value(names, "2026-01-08", 2, None, None)
+        abv_1d = p_1d.average_bar_traded_value(names, "2026-01-08", 2, None, None)
+        assert adv_1d["A_zero"] == pytest.approx(0.0)
+        assert adv_1d["B_all_zero"] == pytest.approx(0.0)
+        assert adv_1d["C_missing"] == pytest.approx(2400.0)
+        assert adv_1d["E_invalid"] == pytest.approx(2400.0)
+        assert "D_all_missing" not in adv_1d
+
+        assert abv_1d["A_zero"] == pytest.approx(0.0)
+        assert abv_1d["B_all_zero"] == pytest.approx(0.0)
+        assert abv_1d["C_missing"] == pytest.approx(2400.0)
+        assert abv_1d["E_invalid"] == pytest.approx(2400.0)
+        assert "D_all_missing" not in abv_1d
+
+    # 2. Hourly (1h): 2400/day = 100/bar on first 2 days, then 0/bar on last 2 days vs NaN on last 2 days
+    base_1h, _, _ = _build_declarative_market_slot(
+        tmp_path / f"z1h_{int(use_money_column)}",
+        frequency="1h",
+        daily_traded_values=daily_totals,
+        start="2026-01-05",
+        end="2026-01-08",
+        use_money_column=use_money_column,
+        intraday_profile="uniform",
+    )
+    orig_feed_1h = base_1h.bar_feed
+
+    def _mutate_1h(df: pd.DataFrame) -> pd.DataFrame:
+        return _mutate_1d(df)
+
+    slot_1h = replace(
+        base_1h,
+        bar_feed=type(
+            "_ZeroMutFeed1h",
+            (),
+            {
+                "schedule": orig_feed_1h.schedule,
+                "read_signal_bars": lambda _s, inst, freq, *, start_utc, end_utc, as_of_utc: orig_feed_1h.read_signal_bars(
+                    inst, freq, start_utc=start_utc, end_utc=end_utc, as_of_utc=as_of_utc
+                ),
+                "read_execution_bars": lambda _s, inst, freq, *, start_utc, end_utc: _mutate_1h(
+                    orig_feed_1h.read_execution_bars(inst, freq, start_utc=start_utc, end_utc=end_utc)
+                ),
+            },
+        )(),
+    )
+    p_1h = SlotDataProvider(slot=slot_1h, frequency="1h")
+    as_of_1h = "2026-01-09T00:00:00+00:00"
+    for _ in range(2):
+        adv_1h = p_1h.average_daily_traded_value(names, as_of_1h, 2, None, None)
+        abv_1h = p_1h.average_bar_traded_value(names, as_of_1h, 2, None, None)
+        assert adv_1h["A_zero"] == pytest.approx(0.0)
+        assert adv_1h["B_all_zero"] == pytest.approx(0.0)
+        assert adv_1h["C_missing"] == pytest.approx(2400.0)
+        assert "D_all_missing" not in adv_1h
+
+        assert abv_1h["A_zero"] == pytest.approx(0.0)
+        assert abv_1h["B_all_zero"] == pytest.approx(0.0)
+        assert abv_1h["C_missing"] == pytest.approx(100.0)
+        assert "D_all_missing" not in abv_1h
+
+    # 3. Weekly (1w): trailing zero week yields 0.0 while missing week is ignored
+    weekly_totals = {
+        "A_zero": {"2026-01-11": 7000.0, "2026-01-18": 0.0},
+        "C_missing": {"2026-01-11": 7000.0, "2026-01-18": 1.0},
+    }
+    base_1w, _, _ = _build_declarative_market_slot(
+        tmp_path / f"z1w_{int(use_money_column)}",
+        frequency="1w",
+        daily_traded_values=weekly_totals,
+        start="2026-01-05",
+        end="2026-01-18",
+        use_money_column=use_money_column,
+    )
+    orig_feed_1w = base_1w.bar_feed
+
+    def _mutate_1w(df: pd.DataFrame) -> pd.DataFrame:
+        out = df.copy()
+        c_tail = out["instrument_id"].eq("C_missing") & out["session_id"].eq("2026-01-18")
+        if use_money_column:
+            out.loc[c_tail, ["money", "volume"]] = np.nan
+        else:
+            out.loc[c_tail, "volume"] = np.nan
+        return out
+
+    slot_1w = replace(
+        base_1w,
+        bar_feed=type(
+            "_ZeroMutFeed1w",
+            (),
+            {
+                "schedule": orig_feed_1w.schedule,
+                "read_signal_bars": lambda _s, inst, freq, *, start_utc, end_utc, as_of_utc: orig_feed_1w.read_signal_bars(
+                    inst, freq, start_utc=start_utc, end_utc=end_utc, as_of_utc=as_of_utc
+                ),
+                "read_execution_bars": lambda _s, inst, freq, *, start_utc, end_utc: _mutate_1w(
+                    orig_feed_1w.read_execution_bars(inst, freq, start_utc=start_utc, end_utc=end_utc)
+                ),
+            },
+        )(),
+    )
+    p_1w = SlotDataProvider(slot=slot_1w, frequency="1w")
+    adv_1w = p_1w.average_daily_traded_value(["A_zero", "C_missing"], "2026-01-19T00:00:00+00:00", 7, None, None)
+    abv_1w = p_1w.average_bar_traded_value(["A_zero", "C_missing"], "2026-01-19T00:00:00+00:00", 1, None, None)
+    assert adv_1w["A_zero"] == pytest.approx(0.0)
+    assert adv_1w["C_missing"] == pytest.approx(1000.0)
+    assert abv_1w["A_zero"] == pytest.approx(0.0)
+    assert abv_1w["C_missing"] == pytest.approx(7000.0)
+
+
+@pytest.mark.parametrize("pretrade_fixed_targets", [True, False])
+def test_zero_liquidity_cap_zero_penetrates_to_final_target_weights(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pretrade_fixed_targets: bool
+) -> None:
+    """Explicit cap=0.0 from zero-volume history must force final target weights to 0.0 across single/multi/blocked paths."""
+    # Unit checks for explicit cap=0.0 generation and magnitude capping
+    caps_zero = compute_liquidity_weight_caps(
+        {"A": 0.0},
+        ["A", "Missing"],
+        max_participation=0.1,
+        holding_period=1,
+        capital=1_000_000.0,
+        holding_period_unit="days",
+    )
+    assert caps_zero == {"A": 0.0}
+    assert apply_magnitude_caps({"A": 1.0}, {"A": 0.0}) == {"A": 0.0}
+    assert apply_magnitude_caps({"A": 1e-10}, {"A": 0.0}, tol=1e-9) == {"A": 0.0}
+    assert apply_magnitude_caps({"A": -0.5, "B": 0.5}, {"A": 0.0, "B": 0.0}) == {"A": 0.0, "B": 0.0}
+    assert apply_magnitude_caps({"A": 0.5, "B": 0.5}, {"A": 0.0, "B": 0.8}) == {"A": 0.0, "B": 0.8}
+
+    # 1. Single-name all-zero history (1d & 1h): final target weight == 0.0, zero orders, 100% cash
+    for freq, hp_bars, rebal_str in (
+        ("1d", 1, "2026-01-07"),
+        ("1h", 24, "2026-01-07T00:00:00+00:00"),
+    ):
+        slot_single, close_s, open_s = _build_declarative_market_slot(
+            tmp_path / f"single_{freq}_{int(pretrade_fixed_targets)}",
+            frequency=freq,
+            daily_traded_values={"A": {"2026-01-05": 0.0, "2026-01-06": 0.0, "2026-01-07": 0.0}},
+            start="2026-01-05",
+            end="2026-01-07",
+            use_money_column=False,
+            intraday_profile="uniform",
+        )
+        if freq == "1d":
+            idx = pd.DatetimeIndex(slot_single.calendar.sessions())
+            close_s.index = idx
+            open_s.index = idx
+        scores_s = pd.DataFrame({"A": 1.0}, index=close_s.index)
+        runner_s = VectorBTBacktestRunner(
+            {
+                "top_k_strategy": {
+                    "top_k": 1,
+                    "holding_period": hp_bars,
+                    "score_source": "input_factor",
+                    "cost_rate": 0.0,
+                    "init_cash": 100_000.0,
+                    "enable_tday_filter": False,
+                    "pretrade_fixed_targets": pretrade_fixed_targets,
+                    "liquidity_cap": {"enabled": True, "adv_lookback_days": 2, "max_participation": 0.1},
+                }
+            },
+            slot=slot_single,
+            frequency=freq,
+        )
+        try:
+            assert runner_s._apply_liquidity_cap({"A": 1.0}, "2026-01-06" if freq == "1d" else rebal_str, 100_000.0) == {
+                "A": 0.0
+            }
+            res_s = runner_s.run_backtest(
+                scores_s, close_s, open_df=open_s, rebalance_dates=[pd.Timestamp(rebal_str).to_pydatetime()]
+            )
+            assert "error" not in res_s, res_s
+            tw_s = runner_s._last_target_weights
+            assert float(tw_s.loc[pd.Timestamp(rebal_str), "A"]) == pytest.approx(0.0)
+            assert len(res_s["portfolio"].orders.records_readable) == 0
+            assert (res_s["portfolio"].asset_value(group_by=False).abs() < 1e-12).all().all()
+        finally:
+            runner_s.close()
+
+    # 2. Multi-name all-zero history (1d): both A and B drop to 0.0
+    days_4 = ("2026-01-05", "2026-01-06", "2026-01-07", "2026-01-08")
+    slot_all_zero, close_az, open_az = _build_declarative_market_slot(
+        tmp_path / f"all_zero_{int(pretrade_fixed_targets)}",
+        frequency="1d",
+        daily_traded_values={"A": {d: 0.0 for d in days_4}, "B": {d: 0.0 for d in days_4}},
+        start="2026-01-05",
+        end="2026-01-08",
+        use_money_column=False,
+    )
+    idx_az = pd.DatetimeIndex(slot_all_zero.calendar.sessions())
+    close_az.index = idx_az
+    open_az.index = idx_az
+    scores_az = pd.DataFrame({"A": 2.0, "B": 1.0}, index=idx_az)
+    runner_az = VectorBTBacktestRunner(
+        {
+            "top_k_strategy": {
+                "top_k": 2,
+                "holding_period": 1,
+                "score_source": "input_factor",
+                "cost_rate": 0.0,
+                "init_cash": 100_000.0,
+                "enable_tday_filter": False,
+                "pretrade_fixed_targets": pretrade_fixed_targets,
+                "liquidity_cap": {"enabled": True, "adv_lookback_days": 2, "max_participation": 0.1},
+            }
+        },
+        slot=slot_all_zero,
+        frequency="1d",
+    )
+    try:
+        res_az = runner_az.run_backtest(
+            scores_az, close_az, open_df=open_az, rebalance_dates=[pd.Timestamp("2026-01-08").to_pydatetime()]
+        )
+        assert "error" not in res_az, res_az
+        tw_az = runner_az._last_target_weights
+        assert float(tw_az.loc[pd.Timestamp("2026-01-08"), "A"]) == pytest.approx(0.0)
+        assert float(tw_az.loc[pd.Timestamp("2026-01-08"), "B"]) == pytest.approx(0.0)
+        assert len(res_az["portfolio"].orders.records_readable) == 0
+    finally:
+        runner_az.close()
+
+    # 3. Multi-name partial-zero + buy-block reallocation (1h):
+    #    A has ADV=0 on 01-07/01-08 (previously liquid on 01-05/01-06 so held on 01-07, then liquidated to 0.0 on 01-08),
+    #    B has cap=40k (40%), C is buy-blocked on 01-08. Under pretrade_fixed_targets=False, B must stay <=40k and A must stay 0.0.
+    slot_part, close_p, open_p = _build_declarative_market_slot(
+        tmp_path / f"part_zero_{int(pretrade_fixed_targets)}",
+        frequency="1h",
+        daily_traded_values={
+            "A": {"2026-01-05": 4_000_000.0, "2026-01-06": 4_000_000.0, "2026-01-07": 0.0, "2026-01-08": 0.0},
+            "B": {d: 400_000.0 for d in days_4},  # cap = 0.1 * 400k * 1 = 40k
+            "C": {d: 10_000_000.0 for d in days_4},
+        },
+        start="2026-01-05",
+        end="2026-01-08",
+        use_money_column=False,
+        intraday_profile="uniform",
+    )
+    t_rebal_1 = pd.Timestamp("2026-01-07T00:00:00+00:00")
+    t_rebal_2 = pd.Timestamp("2026-01-08T00:00:00+00:00")
+    scores_p = pd.DataFrame({"A": 3.0, "B": 2.0, "C": 1.0}, index=close_p.index)
+    runner_p = VectorBTBacktestRunner(
+        {
+            "top_k_strategy": {
+                "top_k": 3,
+                "holding_period": 24,
+                "score_source": "input_factor",
+                "cost_rate": 0.0,
+                "init_cash": 100_000.0,
+                "enable_tday_filter": False,
+                "pretrade_fixed_targets": pretrade_fixed_targets,
+                "liquidity_cap": {"enabled": True, "adv_lookback_days": 1, "max_participation": 0.1},
+            }
+        },
+        slot=slot_part,
+        frequency="1h",
+    )
+
+    def _block_c_day2(date_str: str, stocks: list[str], side: str = "both", require_non_st: bool = True) -> list[str]:
+        ts = pd.Timestamp(date_str).tz_convert("UTC") if pd.Timestamp(date_str).tzinfo else pd.Timestamp(date_str, tz="UTC")
+        if ts == t_rebal_2 and side == "buy":
+            return [s for s in stocks if s != "C"]
+        return list(stocks)
+
+    monkeypatch.setattr(runner_p, "_filter_tradeable_stocks", _block_c_day2)
+    try:
+        res_p = runner_p.run_backtest(
+            scores_p,
+            close_p,
+            open_df=open_p,
+            rebalance_dates=[t_rebal_1.to_pydatetime(), t_rebal_2.to_pydatetime()],
+        )
+        assert "error" not in res_p, res_p
+        tw_p = runner_p._last_target_weights
+        # At t_rebal_1 (using 01-06 ADV): A liquid -> 1/3 (~33.3k), B capped 40k, C gets remainder
+        assert float(tw_p.loc[t_rebal_1, "A"]) > 0.0
+        # At t_rebal_2 (using 01-07 ADV=0 for A): A must be liquidated to 0.0; C is buy-blocked; B stays <= 40k cap
+        assert float(tw_p.loc[t_rebal_2, "A"]) == pytest.approx(0.0)
+        assert float(tw_p.loc[t_rebal_2, "B"]) == pytest.approx(40_000.0)
+        assert float(tw_p.loc[t_rebal_2, "C"]) == pytest.approx(0.0) or pd.isna(tw_p.loc[t_rebal_2, "C"])
+    finally:
+        runner_p.close()
+
+
+def test_futures_ohlcv_fallback_applies_contract_multiplier_without_double_counting(tmp_path: Path) -> None:
+    """Futures OHLCV fallback (volume * close) multiplies by contract_multiplier without double-counting real money."""
+    from dataclasses import replace
+
+    import duckdb
+
+    from data_pipeline.loaders.market_bar_importer import import_market_bars
+    from market_db_samples import declare_futures_bars
+    from slots.cn_futures import build_cn_futures_slot
+    from utils.bars.futures_roll import build_roll_schedule
+    from utils.session_calendar import SessionCalendar
+    from utils.time_axis import BarSchedule
+    from utils.time_axis.futures import futures_calendar
+
+    start, end = "2026-01-05", "2026-01-09"
+    root, exchange = "CU", "SHFE"
+    fcal = futures_calendar(root)
+    cal = SessionCalendar(fcal["calendar_id"], start, end, rth_reference_calendar=fcal["rth_reference_calendar"])
+    sessions = cal.sessions()
+    schedule = BarSchedule(cal, "1d", bucket_strategy="segment_anchored")
+    slot_times = pd.concat([schedule.for_session(day) for day in sessions], ignore_index=True)["start_utc"]
+    c1, c2 = "CU2603.SHFE", "CU2604.SHFE"
+
+    def _build_futures_db(db_file: Path, *, mult_c1: float, mult_c2: float, closes_c1: list[float], closes_c2: list[float]) -> str:
+        meta = pd.DataFrame(
+            [
+                dict(
+                    instrument_id=c1,
+                    product_root=root,
+                    asset_class="futures",
+                    exchange=exchange,
+                    timezone=cal.timezone,
+                    contract_expiry="2026-03-16",
+                    contract_month="2026-03",
+                    price_adjustment="none",
+                    point_value=float(mult_c1),
+                    rth_reference_calendar=fcal["rth_reference_calendar"],
+                ),
+                dict(
+                    instrument_id=c2,
+                    product_root=root,
+                    asset_class="futures",
+                    exchange=exchange,
+                    timezone=cal.timezone,
+                    contract_expiry="2026-04-16",
+                    contract_month="2026-04",
+                    price_adjustment="none",
+                    point_value=float(mult_c2),
+                    rth_reference_calendar=fcal["rth_reference_calendar"],
+                ),
+            ]
+        )
+        # C1 leads sessions 0..2 (effective 01-06..01-08), C2 leads sessions 3..4 (effective 01-09)
+        oi_c1 = [500.0, 500.0, 500.0, 100.0, 100.0]
+        oi_c2 = [100.0, 100.0, 100.0, 500.0, 500.0]
+        bars = []
+        for contract, closes, ois in ((c1, closes_c1, oi_c1), (c2, closes_c2, oi_c2)):
+            c_arr = np.asarray(closes, dtype=float)
+            bars.append(
+                pd.DataFrame(
+                    {
+                        "timestamp_utc": slot_times,
+                        "instrument_id": contract,
+                        "frequency": "1d",
+                        "open": c_arr - 1.0,
+                        "high": c_arr + 1.0,
+                        "low": c_arr - 2.0,
+                        "close": c_arr,
+                        "open_interest": ois,
+                        "volume": 500.0,
+                        "source": "SYNTH",
+                        "data_version": "v1",
+                    }
+                )
+            )
+        conn = duckdb.connect(str(db_file))
+        try:
+            declare_futures_bars(conn, exchange)
+            import_market_bars(
+                conn, pd.concat(bars, ignore_index=True), meta, bucket_strategy="segment_anchored", legacy_compatibility=False
+            )
+            roll_start = sessions[1].strftime("%Y-%m-%d")
+            build_roll_schedule(conn, product_roots=[root], start=roll_start, end=end)
+            return roll_start
+        finally:
+            conn.close()
+
+    # 1. Native & continuous futures: mult=10, trailing 2 sessions close=[111, 113], volume=500 -> ADV = 560,000
+    db_same = tmp_path / "futures_same_mult.duckdb"
+    roll_start = _build_futures_db(
+        db_same,
+        mult_c1=10.0,
+        mult_c2=10.0,
+        closes_c1=[105.0, 107.0, 109.0, 111.0, 113.0],
+        closes_c2=[105.0, 107.0, 109.0, 111.0, 113.0],
+    )
+    conn_same = duckdb.connect(str(db_same), read_only=True)
+    try:
+        slot = build_cn_futures_slot(conn_same, product_root=root, start=roll_start, end=end)
+        orig_feed = slot.bar_feed
+
+        def _wrap_money(mode: str):
+            def _read_exec(insts, freq, *, start_utc, end_utc):
+                df = orig_feed.read_execution_bars(insts, freq, start_utc=start_utc, end_utc=end_utc).copy()
+                if mode == "full":
+                    df["money"] = df["volume"] * df["close"] * 10.0
+                elif mode == "partial":
+                    # First bar has real money, last bar falls back to volume * close * multiplier
+                    df["money"] = df["volume"] * df["close"] * 10.0
+                    last_sid = df["session_id"].max()
+                    df.loc[df["session_id"].eq(last_sid), "money"] = np.nan
+                return df
+
+            return replace(
+                slot,
+                bar_feed=type(
+                    "_MoneyFeed",
+                    (),
+                    {
+                        "read_signal_bars": lambda _s, insts, freq, *, start_utc, end_utc, as_of_utc: orig_feed.read_signal_bars(
+                            insts, freq, start_utc=start_utc, end_utc=end_utc, as_of_utc=as_of_utc
+                        ),
+                        "read_execution_bars": lambda _s, insts, freq, *, start_utc, end_utc: _read_exec(
+                            insts, freq, start_utc=start_utc, end_utc=end_utc
+                        ),
+                    },
+                )(),
+            )
+
+        # Native concrete contract (CU2604.SHFE) and continuous root (CU)
+        for target_inst in (c2, root):
+            # Missing money column -> fallback volume * close * 10 == 560,000
+            p_nomoney = SlotDataProvider(slot=slot, frequency="1d")
+            assert p_nomoney.average_daily_traded_value([target_inst], end, 2, None, None)[target_inst] == pytest.approx(560_000.0)
+            assert p_nomoney.average_bar_traded_value([target_inst], end, 2, None, None)[target_inst] == pytest.approx(560_000.0)
+
+            # Full money column -> exact 560,000 (never double-multiplied to 5,600,000)
+            p_full = SlotDataProvider(slot=_wrap_money("full"), frequency="1d")
+            assert p_full.average_daily_traded_value([target_inst], end, 2, None, None)[target_inst] == pytest.approx(560_000.0)
+            assert p_full.average_bar_traded_value([target_inst], end, 2, None, None)[target_inst] == pytest.approx(560_000.0)
+
+            # Partial money column -> rows with money keep money, rows without money use volume * close * 10
+            p_partial = SlotDataProvider(slot=_wrap_money("partial"), frequency="1d")
+            assert p_partial.average_daily_traded_value([target_inst], end, 2, None, None)[target_inst] == pytest.approx(560_000.0)
+            assert p_partial.average_bar_traded_value([target_inst], end, 2, None, None)[target_inst] == pytest.approx(560_000.0)
+    finally:
+        conn_same.close()
+
+    # 2. Continuous futures rolling across contracts with different multipliers (10 -> 20)
+    db_diff = tmp_path / "futures_diff_mult.duckdb"
+    roll_start_diff = _build_futures_db(
+        db_diff,
+        mult_c1=10.0,
+        mult_c2=20.0,
+        closes_c1=[100.0] * 5,
+        closes_c2=[100.0] * 5,
+    )
+    conn_diff = duckdb.connect(str(db_diff), read_only=True)
+    try:
+        slot_diff = build_cn_futures_slot(conn_diff, product_root=root, start=roll_start_diff, end=end)
+        # Session 2026-01-08 uses CU2603.SHFE (mult=10 -> 500*100*10 = 500,000),
+        # Session 2026-01-09 uses CU2604.SHFE (mult=20 -> 500*100*20 = 1,000,000) -> ADV(2) = 750,000
+        p_diff = SlotDataProvider(slot=slot_diff, frequency="1d")
+        assert p_diff.average_daily_traded_value([root], end, 2, None, None)[root] == pytest.approx(750_000.0)
+        assert p_diff.average_bar_traded_value([root], end, 2, None, None)[root] == pytest.approx(750_000.0)
+
+        # Also test slot.roll_schedule resolution when concrete_instrument_id is absent, and root-spec fallback
+        orig_diff_feed = slot_diff.bar_feed
+
+        class _RollSchedSlot:
+            calendar = slot_diff.calendar
+            universe = slot_diff.universe
+            aux_features = slot_diff.aux_features
+            microstructure = slot_diff.microstructure
+            slot_id = slot_diff.slot_id
+            roll_schedule = {root: {"2026-01-08": c1, "2026-01-09": c2}}
+            bar_feed = type(
+                "_NoConcreteFeed",
+                (),
+                {
+                    "read_signal_bars": lambda _s, insts, freq, *, start_utc, end_utc, as_of_utc: orig_diff_feed.read_signal_bars(
+                        insts, freq, start_utc=start_utc, end_utc=end_utc, as_of_utc=as_of_utc
+                    ),
+                    "read_execution_bars": lambda _s, insts, freq, *, start_utc, end_utc: orig_diff_feed.read_execution_bars(
+                        insts, freq, start_utc=start_utc, end_utc=end_utc
+                    ).drop(columns=["concrete_instrument_id"]),
+                },
+            )()
+
+        p_sched = SlotDataProvider(slot=_RollSchedSlot(), frequency="1d")  # type: ignore[arg-type]
+        assert p_sched.average_daily_traded_value([root], end, 2, None, None)[root] == pytest.approx(750_000.0)
+
+        # Root-only fallback when neither concrete_instrument_id nor roll_schedule exists
+        from utils.slots.contracts import InstrumentSpec
+
+        class _RootSpecUniverse:
+            def instrument_spec(self, instrument_id: str) -> InstrumentSpec:
+                return InstrumentSpec(instrument_id, "futures", "CNY", contract_multiplier=10.0)
+
+            def resolve_universe(self, universe_id: str, *, as_of_utc):
+                return (root,)
+
+            def resolve_active_contract(self, instrument_id: str, *, as_of_utc):
+                return instrument_id
+
+        slot_root = replace(slot_diff, universe=_RootSpecUniverse(), bar_feed=_RollSchedSlot.bar_feed)
+        p_root = SlotDataProvider(slot=slot_root, frequency="1d")
+        assert p_root.average_daily_traded_value([root], end, 2, None, None)[root] == pytest.approx(500_000.0)
+    finally:
+        conn_diff.close()

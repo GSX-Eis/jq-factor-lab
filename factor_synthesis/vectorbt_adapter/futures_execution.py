@@ -1033,6 +1033,7 @@ class _FuturesAccountView:
         buy_cost_rate: float,
         sell_cost_rate: float,
         slippage: float,
+        roll_exit_prices: Optional[Mapping[str, Tuple[Optional[float], bool]]] = None,
     ) -> None:
         self._bar_idx = bar_idx
         self._equity = float(equity)
@@ -1049,6 +1050,25 @@ class _FuturesAccountView:
         self._buy_cost_rate = float(buy_cost_rate)
         self._sell_cost_rate = float(sell_cost_rate)
         self._slippage = float(slippage)
+        self._roll_exit_prices = roll_exit_prices or {}
+
+    def _held_position_price(self, instrument: str, pos: _OpenPosition) -> Optional[float]:
+        """Resolve mark/valuation price using the actual held concrete contract."""
+        c_cur = self._active_contract.get((self._bar_idx, instrument), instrument)
+        if pos.concrete_instrument_id == c_cur:
+            px = self.execution_price(instrument)
+            if px is not None:
+                return px
+            return pos.last_mark_price
+        # Position is still on an old contract (e.g., deferred roll / pending liquidation):
+        # never value it with the new active contract's execution price.
+        if instrument in self._roll_exit_prices:
+            roll_px, _used_fallback = self._roll_exit_prices[instrument]
+            if roll_px is not None:
+                return float(roll_px)
+        if pos.last_mark_price is not None and math.isfinite(pos.last_mark_price):
+            return float(pos.last_mark_price)
+        return self._last_contract_close.get(pos.concrete_instrument_id)
 
     def held_instruments(self) -> Set[str]:
         return set(self._positions.keys())
@@ -1057,7 +1077,7 @@ class _FuturesAccountView:
         pos = self._positions.get(instrument)
         if pos is None:
             return 0.0
-        px = self.mark_price(instrument)
+        px = self._held_position_price(instrument, pos)
         if px is None:
             px = pos.last_mark_price
         return float(pos.lots) * float(px) * float(pos.multiplier)
@@ -1086,12 +1106,12 @@ class _FuturesAccountView:
         return self._exec_price_fn(self._bar_idx, instrument)
 
     def mark_price(self, instrument: str) -> Optional[float]:
+        pos = self._positions.get(instrument)
+        if pos is not None:
+            return self._held_position_price(instrument, pos)
         px = self.execution_price(instrument)
         if px is not None:
             return px
-        pos = self._positions.get(instrument)
-        if pos is not None:
-            return pos.last_mark_price
         c_cur = self._active_contract.get((self._bar_idx, instrument), instrument)
         return self._last_contract_close.get(c_cur)
 
@@ -1122,12 +1142,18 @@ class _FuturesAccountView:
                     or (pos.lots < 0 and side == "buy")
                 )
             )
+            c_cur = self._active_contract.get((self._bar_idx, inst), inst)
             contract = (
                 pos.concrete_instrument_id
                 if (pos is not None and (is_closing_held or side == "hold"))
                 else self._active_contract[(self._bar_idx, inst)]
             )
-            px = self.mark_price(inst) if side == "hold" else self.execution_price(inst)
+            if side == "hold":
+                px = self.mark_price(inst)
+            elif is_closing_held and pos is not None and pos.concrete_instrument_id != c_cur:
+                px = self._roll_exit_prices.get(inst, (None, False))[0]
+            else:
+                px = self.execution_price(inst)
             if side == "hold":
                 ok = self._validator.is_mask_tradable(
                     bar_idx=self._bar_idx,
@@ -1173,16 +1199,18 @@ class _FuturesAccountView:
         if not self._positions:
             if effective_top_k <= 0:
                 return 0.0
+            # Under target_weight_basis == "margin", return the per-slot margin budget
+            # so the execution layer divides by each contract's margin_rate_for(inst, c_cur).
             base = max(0.0, self._equity) * float(exposure) * self._config.leverage
-            if self._config.target_weight_basis == "margin":
-                base /= self._config.margin_rate
             return base / float(effective_top_k)
 
         close_costs = 0.0
         for s in executed_sells:
             pos_obj = self._positions.get(s)
-            px = self.execution_price(s)
-            if pos_obj is not None and px is not None:
+            if pos_obj is None:
+                continue
+            px = self._held_position_price(s, pos_obj)
+            if px is not None:
                 fee_r = (
                     max(self._sell_cost_rate, 0.0)
                     if pos_obj.lots > 0
@@ -1197,8 +1225,11 @@ class _FuturesAccountView:
                 for s in remaining_held
                 if s in self._positions
             )
-            free_margin = max(0.0, post_sell_equity * float(exposure) - used_margin)
-            return (free_margin / float(buy_count) / self._config.margin_rate) * self._config.leverage
+            free_margin = max(
+                0.0,
+                post_sell_equity * float(exposure) * self._config.leverage - used_margin,
+            )
+            return free_margin / float(buy_count)
 
         used_notional = sum(
             abs(self.held_notional(s))
@@ -1921,6 +1952,7 @@ def simulate_futures_contract_portfolio(
                 buy_cost_rate=buy_cost_rate,
                 sell_cost_rate=sell_cost_rate,
                 slippage=slippage,
+                roll_exit_prices=roll_exit_prices,
             )
             decision = policy.evaluate_bar(
                 ctx=policy_ctx,
@@ -1935,6 +1967,11 @@ def simulate_futures_contract_portfolio(
                 _block_exit(dt, s, account_view.mark_price(s))
                 pos_blk = positions.get(s)
                 if pos_blk is not None:
+                    blk_px = (
+                        account_view.mark_price(s)
+                        if pos_blk.concrete_instrument_id != active_contract[(bar_idx, s)]
+                        else account_view.execution_price(s)
+                    )
                     _record_blocked_order(
                         dt=dt,
                         inst=s,
@@ -1943,7 +1980,7 @@ def simulate_futures_contract_portfolio(
                         side="sell" if pos_blk.lots > 0 else "buy",
                         requested_delta_lots=-pos_blk.lots,
                         multiplier=pos_blk.multiplier,
-                        price=account_view.execution_price(s),
+                        price=blk_px,
                         reason="tradability_mask_blocked",
                         status="deferred",
                         current_lots=pos_blk.lots,
@@ -2019,7 +2056,15 @@ def simulate_futures_contract_portfolio(
                     if inst in decision.hold_instruments or inst in decision.forced_instruments:
                         target_weights_out.loc[dt, inst] = np.nan
                     elif inst in decision.target_values:
-                        target_weights_out.loc[dt, inst] = float(decision.target_values[inst])
+                        target_val = float(decision.target_values[inst])
+                        if (
+                            decision.kind == "branch_topk"
+                            and config.target_weight_basis == "margin"
+                            and inst not in decision.sell_instruments
+                        ):
+                            c_cur_out = active_contract[(bar_idx, inst)]
+                            target_val /= config.margin_rate_for(inst, c_cur_out)
+                        target_weights_out.loc[dt, inst] = target_val
                     elif inst in roll_completed_exits:
                         target_weights_out.loc[dt, inst] = 0.0
 
@@ -2080,6 +2125,8 @@ def simulate_futures_contract_portfolio(
                         )
                     ):
                         target_notional = float(decision.target_values[inst])
+                        if decision.kind == "branch_topk" and config.target_weight_basis == "margin":
+                            target_notional /= mr
                     elif inst in decision.target_weights:
                         w = float(decision.target_weights[inst])
                         if not allow_short and w < 0.0:

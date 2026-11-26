@@ -1599,3 +1599,531 @@ def test_p1_2_validator_aligns_execution_times_with_label_axis_across_frequencie
             )
         assert [ts for ts, _ in seen] == list(expected_times)
         assert all(f == field for _, f in seen)
+
+
+def _make_contract_priced_mock_slot(
+    *,
+    dates: pd.DatetimeIndex,
+    instruments: List[str],
+    open_panel: Dict[str, List[float]],
+    close_panel: Dict[str, List[float]],
+    contract_open_panel: Dict[str, List[float]],
+    contract_close_panel: Dict[str, List[float]],
+    contract_map: Dict[Tuple[int, str], str],
+    tradability_fn: Optional[Callable[[pd.DataFrame, str], pd.Series]] = None,
+    specs: Optional[Dict[str, InstrumentSpec]] = None,
+    allow_short: bool = False,
+    commission_bps: float = 0.0,
+    slippage_bps: float = 0.0,
+) -> MarketSlot:
+    """Wrap mock slot so querying a concrete contract returns its own prices (distinct from new active)."""
+    base_slot = _make_mock_futures_slot(
+        dates=dates,
+        instruments=instruments,
+        open_panel=open_panel,
+        close_panel=close_panel,
+        contract_map=contract_map,
+        specs=specs,
+        tradability_fn=tradability_fn,
+        allow_short=allow_short,
+        commission_bps=commission_bps,
+        slippage_bps=slippage_bps,
+    )
+    utc_dates = pd.DatetimeIndex(dates).tz_localize("UTC") if dates.tz is None else dates.tz_convert("UTC")
+
+    class _ContractPricedBarFeed:
+        def read_signal_bars(self, req_insts, frequency, *, start_utc, end_utc, as_of_utc) -> pd.DataFrame:
+            return base_slot.bar_feed.read_signal_bars(
+                req_insts, frequency, start_utc=start_utc, end_utc=end_utc, as_of_utc=as_of_utc
+            )
+
+        def read_execution_bars(self, req_insts, frequency, *, start_utc, end_utc) -> pd.DataFrame:
+            rows = []
+            start_ts = pd.Timestamp(start_utc)
+            end_ts = pd.Timestamp(end_utc)
+            if start_ts.tzinfo is None:
+                start_ts = start_ts.tz_localize("UTC")
+            if end_ts.tzinfo is None:
+                end_ts = end_ts.tz_localize("UTC")
+            for pos, (d, utc_ts) in enumerate(zip(dates, utc_dates)):
+                if utc_ts < start_ts or utc_ts > end_ts:
+                    continue
+                for inst in req_insts:
+                    if inst in open_panel:
+                        o_px = open_panel[inst][pos]
+                        c_px = close_panel[inst][pos]
+                        c_id = contract_map.get((pos, inst), inst)
+                    elif inst in contract_open_panel:
+                        o_px = contract_open_panel[inst][pos]
+                        c_px = contract_close_panel[inst][pos]
+                        c_id = inst
+                    else:
+                        continue
+                    rows.append(
+                        {
+                            "timestamp_utc": utc_ts,
+                            "session_id": pd.Timestamp(d).strftime("%Y-%m-%d"),
+                            "instrument_id": inst,
+                            "concrete_instrument_id": c_id,
+                            "open": o_px,
+                            "close": c_px,
+                            "volume": 1_000_000.0,
+                            "money": 1_000_000.0 * c_px,
+                        }
+                    )
+            return pd.DataFrame(rows)
+
+    return replace(base_slot, bar_feed=_ContractPricedBarFeed())
+
+
+@pytest.mark.parametrize("target_weight_basis", ["notional", "margin"])
+def test_p1_3_deferred_roll_old_contract_valuation_preserves_weights_and_avoids_false_sell(
+    monkeypatch: pytest.MonkeyPatch,
+    target_weight_basis: str,
+) -> None:
+    """[一-3] Deferred roll with price spread (old=100, new=200) must value held old contract at 100 and not false-sell B."""
+    dates = pd.bdate_range("2026-01-05", periods=5)
+    # A rolls from A_C1 (100) to A_C2 (200) on bar 2, while A_C1 stays at 100 and is blocked from selling on bar 2.
+    open_p = {
+        "A": [100.0, 100.0, 200.0, 200.0, 200.0],
+        "B": [100.0, 100.0, 100.0, 100.0, 100.0],
+    }
+    close_p = {
+        "A": [100.0, 100.0, 200.0, 200.0, 200.0],
+        "B": [100.0, 100.0, 100.0, 100.0, 100.0],
+    }
+    contract_open_p = {
+        "A_C1": [100.0, 100.0, 100.0, 100.0, 100.0],
+        "A_C2": [200.0, 200.0, 200.0, 200.0, 200.0],
+        "B_C1": [100.0, 100.0, 100.0, 100.0, 100.0],
+    }
+    contract_close_p = {
+        "A_C1": [100.0, 100.0, 100.0, 100.0, 100.0],
+        "A_C2": [200.0, 200.0, 200.0, 200.0, 200.0],
+        "B_C1": [100.0, 100.0, 100.0, 100.0, 100.0],
+    }
+    contract_map = {
+        (0, "A"): "A_C1",
+        (1, "A"): "A_C1",
+        (2, "A"): "A_C2",
+        (3, "A"): "A_C2",
+        (4, "A"): "A_C2",
+        (0, "B"): "B_C1",
+        (1, "B"): "B_C1",
+        (2, "B"): "B_C1",
+        (3, "B"): "B_C1",
+        (4, "B"): "B_C1",
+    }
+    blocked_day = dates[2].strftime("%Y-%m-%d")
+
+    def _mask_fn(grid: pd.DataFrame, instrument_id: str) -> pd.Series:
+        if instrument_id == "A_C1":
+            return grid["session_id"].astype(str) != blocked_day
+        return pd.Series(True, index=grid.index, dtype=bool)
+
+    slot = _make_contract_priced_mock_slot(
+        dates=dates,
+        instruments=["A", "B"],
+        open_panel=open_p,
+        close_panel=close_p,
+        contract_open_panel=contract_open_p,
+        contract_close_panel=contract_close_p,
+        contract_map=contract_map,
+        tradability_fn=_mask_fn,
+        allow_short=False,
+    )
+
+    observed_prev_weights: List[Dict[str, float]] = []
+    orig_blend = VectorBTBacktestRunner._blend_partial_rebalance
+
+    def _spy_blend(self, target_map: Dict[str, float], prev_weight_map: Dict[str, float]) -> Dict[str, float]:
+        observed_prev_weights.append(dict(prev_weight_map))
+        return orig_blend(self, target_map, prev_weight_map)
+
+    monkeypatch.setattr(VectorBTBacktestRunner, "_blend_partial_rebalance", _spy_blend)
+
+    margin_rate = 1.0 if target_weight_basis == "notional" else 0.2
+    expected_lots = 50 if target_weight_basis == "notional" else 250
+    scores = pd.DataFrame({"A": [2.0] * 5, "B": [1.0] * 5}, index=dates)
+    runner = VectorBTBacktestRunner(
+        {
+            "top_k_strategy": {
+                "top_k": 2,
+                "score_source": "input_factor",
+                "holding_period": 1,
+                "init_cash": 100_000.0,
+                "execution_mode": "futures_contract",
+                "margin_rate": margin_rate,
+                "target_weight_basis": target_weight_basis,
+                "allow_short": False,
+                "partial_rebalance": {"enabled": True, "trade_rate": 0.5, "min_weight": 0.01},
+            }
+        },
+        slot=slot,
+        frequency="1d",
+    )
+    res = runner.run_backtest(
+        scores,
+        pd.DataFrame(close_p, index=dates),
+        open_df=pd.DataFrame(open_p, index=dates),
+        rebalance_dates=[dates[1].to_pydatetime(), dates[2].to_pydatetime()],
+    )
+    runner.close()
+    assert "error" not in res, res
+
+    pf = res["portfolio"]
+    diag = res["futures_execution"]
+    # Bar 1 enters equal weight; Bar 2 sees deferred roll on A_C1 (100, NOT A_C2=200).
+    assert len(observed_prev_weights) == 2
+    assert observed_prev_weights[1] == pytest.approx({"A": 0.5, "B": 0.5})
+    assert pf.value().loc[dates[2]] == pytest.approx(100_000.0)
+    # Asset B must NOT be falsely sold on Bar 2 or subsequent bars.
+    assert pf.lots_history.loc[dates[1], "B"] == expected_lots
+    assert pf.lots_history.loc[dates[2], "B"] == expected_lots
+    assert pf.lots_history.loc[dates[3], "B"] == expected_lots
+    assert pf.lots_history.loc[dates[4], "B"] == expected_lots
+    orders = pf.orders.records_readable
+    assert not ((orders["Column"] == "B") & (orders["Side"] == "Sell")).any()
+    # A stays on A_C1 on Bar 2 and rolls to A_C2 on Bar 3.
+    assert pf.lots_history.loc[dates[2], "A"] == expected_lots
+    assert diag["roll_deferred_count"] == 1
+    assert diag["roll_count"] == 1
+
+
+def test_p1_3_deferred_roll_old_contract_consistency_across_account_view_and_blocked_exit_log() -> None:
+    """[一-3] Verify _FuturesAccountView, branch3 free budget, and blocked-exit logs all use old contract price."""
+    dates = pd.bdate_range("2026-01-05", periods=4)
+    # A_C1=100 on bar 1..2; on bar 2 A rolls to A_C2=200 while A_C1 is blocked at 100.
+    # On bar 2, A and B are both dropped from top_k (C and D are selected):
+    # B sells cleanly (frees 50k), A becomes a blocked exit at 100 (occupies 50k, NOT 100k),
+    # so C and D split the remaining 50k budget (25 lots each, rather than 0 lots!).
+    open_p = {
+        "A": [100.0, 100.0, 200.0, 200.0],
+        "B": [100.0, 100.0, 100.0, 100.0],
+        "C": [100.0, 100.0, 100.0, 100.0],
+        "D": [100.0, 100.0, 100.0, 100.0],
+    }
+    close_p = dict(open_p)
+    contract_open_p = {
+        "A_C1": [100.0, 100.0, 100.0, 100.0],
+        "A_C2": [200.0, 200.0, 200.0, 200.0],
+        "B_C1": [100.0, 100.0, 100.0, 100.0],
+        "C_C1": [100.0, 100.0, 100.0, 100.0],
+        "D_C1": [100.0, 100.0, 100.0, 100.0],
+    }
+    contract_close_p = dict(contract_open_p)
+    contract_map = {
+        (0, "A"): "A_C1",
+        (1, "A"): "A_C1",
+        (2, "A"): "A_C2",
+        (3, "A"): "A_C2",
+        (0, "B"): "B_C1",
+        (1, "B"): "B_C1",
+        (2, "B"): "B_C1",
+        (3, "B"): "B_C1",
+        (0, "C"): "C_C1",
+        (1, "C"): "C_C1",
+        (2, "C"): "C_C1",
+        (3, "C"): "C_C1",
+        (0, "D"): "D_C1",
+        (1, "D"): "D_C1",
+        (2, "D"): "D_C1",
+        (3, "D"): "D_C1",
+    }
+    blocked_day = dates[2].strftime("%Y-%m-%d")
+
+    def _mask_fn(grid: pd.DataFrame, instrument_id: str) -> pd.Series:
+        if instrument_id == "A_C1":
+            return grid["session_id"].astype(str) != blocked_day
+        return pd.Series(True, index=grid.index, dtype=bool)
+
+    slot = _make_contract_priced_mock_slot(
+        dates=dates,
+        instruments=["A", "B", "C", "D"],
+        open_panel=open_p,
+        close_panel=close_p,
+        contract_open_panel=contract_open_p,
+        contract_close_panel=contract_close_p,
+        contract_map=contract_map,
+        tradability_fn=_mask_fn,
+        allow_short=False,
+    )
+    # Bar 1 (reads bar 0): A=4, B=3, C=2, D=1 -> top_k=2 selects A & B (50 lots each @ 100).
+    # Bar 2 (reads bar 1): C=4, D=3, A=2, B=1 -> top_k=2 selects C & D (drops A & B!).
+    scores = pd.DataFrame(
+        {
+            "A": [4.0, 2.0, 2.0, 2.0],
+            "B": [3.0, 1.0, 1.0, 1.0],
+            "C": [2.0, 4.0, 4.0, 4.0],
+            "D": [1.0, 3.0, 3.0, 3.0],
+        },
+        index=dates,
+    )
+    runner = VectorBTBacktestRunner(
+        {
+            "top_k_strategy": {
+                "top_k": 2,
+                "score_source": "input_factor",
+                "holding_period": 1,
+                "init_cash": 100_000.0,
+                "execution_mode": "futures_contract",
+                "margin_rate": 1.0,
+                "allow_short": False,
+            }
+        },
+        slot=slot,
+        frequency="1d",
+    )
+    res = runner.run_backtest(
+        scores,
+        pd.DataFrame(close_p, index=dates),
+        open_df=pd.DataFrame(open_p, index=dates),
+        rebalance_dates=[dates[1].to_pydatetime(), dates[2].to_pydatetime()],
+    )
+    runner.close()
+    assert "error" not in res, res
+
+    pf = res["portfolio"]
+    # Bar 1: A=50, B=50, C=0, D=0.
+    assert pf.lots_history.loc[dates[1], "A"] == 50
+    assert pf.lots_history.loc[dates[1], "B"] == 50
+    # Bar 2: B is sold (frees 50k), A is roll-blocked at 100 (occupies 50k, NOT 100k!),
+    # so C and D must each enter at 25 lots (25k) rather than 0 lots!
+    assert pf.lots_history.loc[dates[2], "A"] == 50
+    assert pf.lots_history.loc[dates[2], "B"] == 0
+    assert pf.lots_history.loc[dates[2], "C"] == 25
+    assert pf.lots_history.loc[dates[2], "D"] == 25
+    # Bar 3: A_C1 unblocks and finishes pending exit at 100.
+    assert pf.lots_history.loc[dates[3], "A"] == 0
+    # Blocked REBALANCE log entry for A_C1 must record Val Price=100.0 (not new contract 200.0).
+    logs = pf.logs.records_readable
+    reb_rejected = logs.loc[
+        (logs["Column"] == "A")
+        & (logs["Result Status"] == "Rejected")
+        & (logs["Reason"] == "REBALANCE:tradability_mask_blocked")
+    ]
+    assert not reb_rejected.empty
+    assert float(reb_rejected.iloc[0]["Val Price"]) == pytest.approx(100.0)
+    assert res["execution_diagnostics"]["blocked_exit_notional"] == pytest.approx(50_000.0)
+
+
+def test_p1_5_branch_topk_margin_basis_respects_per_instrument_margin_rates() -> None:
+    """[一-5] Standard Top-K under target_weight_basis='margin' allocates equal margin budgets using margin_rates."""
+    dates = pd.bdate_range("2026-01-05", periods=4)
+    open_p = {"A": [100.0] * 4, "B": [100.0] * 4}
+    close_p = {"A": [100.0] * 4, "B": [100.0] * 4}
+    specs = {
+        "A": InstrumentSpec("A", "futures", "CNY", lot_size=1, contract_multiplier=10.0),
+        "B": InstrumentSpec("B", "futures", "CNY", lot_size=1, contract_multiplier=10.0),
+    }
+    slot = _make_mock_futures_slot(
+        dates=dates,
+        instruments=["A", "B"],
+        open_panel=open_p,
+        close_panel=close_p,
+        specs=specs,
+        allow_short=False,
+    )
+    scores = pd.DataFrame({"A": [2.0] * 4, "B": [1.0] * 4}, index=dates)
+    runner = VectorBTBacktestRunner(
+        {
+            "top_k_strategy": {
+                "top_k": 2,
+                "score_source": "input_factor",
+                "holding_period": 1,
+                "init_cash": 100_000.0,
+                "execution_mode": "futures_contract",
+                "target_weight_basis": "margin",
+                "margin_rate": 0.2,
+                "margin_rates": {"A": 0.1, "B": 0.2},
+                "allow_short": False,
+                "cost_rate": 0.0,
+                "buy_cost_rate": 0.0,
+                "sell_cost_rate": 0.0,
+                "slippage": 0.0,
+            }
+        },
+        slot=slot,
+        frequency="1d",
+    )
+    res = runner.run_backtest(
+        scores,
+        pd.DataFrame(close_p, index=dates),
+        open_df=pd.DataFrame(open_p, index=dates),
+        rebalance_dates=[dates[1].to_pydatetime()],
+    )
+    runner.close()
+    assert "error" not in res, res
+
+    pf = res["portfolio"]
+    # Bar 1: each gets 50,000 margin budget -> A: 50,000/(0.1*100*10)=500 lots; B: 50,000/(0.2*100*10)=250 lots.
+    assert pf.lots_history.loc[dates[1], "A"] == 500
+    assert pf.lots_history.loc[dates[1], "B"] == 250
+    assert pf.margin_used.loc[dates[1]] == pytest.approx(100_000.0)
+    assert pf.margin_utilization.loc[dates[1]] == pytest.approx(1.0)
+
+
+def test_p1_5_branch_topk_margin_basis_rotation_exposure_leverage_and_close_costs() -> None:
+    """[一-5] Rotation in standard Top-K margin basis handles held pos.margin_rate, close costs, leverage, and exposure."""
+    dates = pd.bdate_range("2026-01-05", periods=4)
+    open_p = {"A": [100.0] * 4, "B": [100.0] * 4, "C": [100.0] * 4}
+    close_p = dict(open_p)
+    specs = {
+        inst: InstrumentSpec(inst, "futures", "CNY", lot_size=1, contract_multiplier=10.0)
+        for inst in ("A", "B", "C")
+    }
+    slot = _make_mock_futures_slot(
+        dates=dates,
+        instruments=["A", "B", "C"],
+        open_panel=open_p,
+        close_panel=close_p,
+        specs=specs,
+        allow_short=False,
+        commission_bps=10.0,
+        slippage_bps=0.0,
+    )
+    # Bar 1 (reads bar 0): A=3, B=2, C=1 -> buy A (mr=0.1) & B (mr=0.2).
+    # Bar 2 (reads bar 1): A=3, C=2, B=1 -> sell B, keep A, buy C (mr=0.25).
+    scores = pd.DataFrame(
+        {
+            "A": [3.0, 3.0, 3.0, 3.0],
+            "B": [2.0, 1.0, 1.0, 1.0],
+            "C": [1.0, 2.0, 2.0, 2.0],
+        },
+        index=dates,
+    )
+    runner = VectorBTBacktestRunner(
+        {
+            "top_k_strategy": {
+                "top_k": 2,
+                "score_source": "input_factor",
+                "holding_period": 1,
+                "init_cash": 100_000.0,
+                "execution_mode": "futures_contract",
+                "target_weight_basis": "margin",
+                "margin_rate": 0.2,
+                "margin_rates": {"A": 0.1, "B": 0.2, "C": 0.25},
+                "leverage": 0.8,
+                "allow_short": False,
+                "cost_rate": 0.001,
+                "buy_cost_rate": 0.001,
+                "sell_cost_rate": 0.001,
+                "slippage": 0.0,
+            }
+        },
+        slot=slot,
+        frequency="1d",
+    )
+    res = runner.run_backtest(
+        scores,
+        pd.DataFrame(close_p, index=dates),
+        open_df=pd.DataFrame(open_p, index=dates),
+        rebalance_dates=[dates[1].to_pydatetime(), dates[2].to_pydatetime()],
+    )
+    runner.close()
+    assert "error" not in res, res
+
+    pf = res["portfolio"]
+    # Bar 1 (empty book): margin budget per slot = 100,000 * 0.8 / 2 = 40,000.
+    # A (mr=0.1): 400 lots (notional 400,000, entry cost 400).
+    # B (mr=0.2): 200 lots (notional 200,000, entry cost 200).
+    # End of Bar 1 equity = 99,400.
+    assert pf.lots_history.loc[dates[1], "A"] == 400
+    assert pf.lots_history.loc[dates[1], "B"] == 200
+    assert pf.value().loc[dates[1]] == pytest.approx(99_400.0)
+
+    # Bar 2 (rotation): B close cost = 200,000 * 0.001 = 200 -> post_sell_equity = 99,200.
+    # A used_margin = 400 * 100 * 10 * 0.1 = 40,000.
+    # free_margin = 99,200 * 1.0 * 0.8 - 40,000 = 39,360.
+    # C (mr=0.25): target_notional = 39,360 / 0.25 = 157,440 -> floor(157.44) = 157 lots!
+    assert pf.lots_history.loc[dates[2], "A"] == 400
+    assert pf.lots_history.loc[dates[2], "B"] == 0
+    assert pf.lots_history.loc[dates[2], "C"] == 157
+    assert pf.margin_used.loc[dates[2]] == pytest.approx(40_000.0 + 157 * 100.0 * 10.0 * 0.25)
+
+    # Also verify direct _FuturesAccountView.branch3_buy_target_value exposure scaling on empty & held states.
+    cfg = fut_exec_mod.FuturesExecutionConfig(
+        execution_mode="futures_contract",
+        margin_rate=0.2,
+        margin_rates={"A": 0.1, "C": 0.25},
+        leverage=0.8,
+        target_weight_basis="margin",
+    )
+    validator = fut_exec_mod._FuturesOrderValidator(
+        slot=None,
+        bar_utc_index=pd.DatetimeIndex(dates, tz="UTC"),
+        session_ids={},
+        frequency=Frequency.parse("1d"),
+        default_execution_price_field="open",
+    )
+    empty_view = fut_exec_mod._FuturesAccountView(
+        bar_idx=0,
+        equity=100_000.0,
+        positions={},
+        pending_rolls={},
+        pending_liquidations=set(),
+        active_contract={(0, "A"): "A_C1", (0, "C"): "C_C1"},
+        missing_bar_insts=set(),
+        exec_price_fn=lambda _b, _i: 100.0,
+        last_contract_close={},
+        validator=validator,
+        config=cfg,
+        get_spec_fn=lambda c: InstrumentSpec(c, "futures", "CNY", lot_size=1, contract_multiplier=10.0),
+        buy_cost_rate=0.001,
+        sell_cost_rate=0.001,
+        slippage=0.0,
+    )
+    assert empty_view.branch3_buy_target_value(
+        executed_sells=set(),
+        remaining_held=set(),
+        effective_top_k=2,
+        buy_count=2,
+        exposure=0.5,
+    ) == pytest.approx(100_000.0 * 0.5 * 0.8 / 2.0)
+
+    held_view = fut_exec_mod._FuturesAccountView(
+        bar_idx=1,
+        equity=100_000.0,
+        positions={
+            "A": fut_exec_mod._OpenPosition(
+                instrument_id="A",
+                concrete_instrument_id="A_C1",
+                lots=100,
+                multiplier=10.0,
+                margin_rate=0.1,
+                avg_entry_price=100.0,
+                last_mark_price=100.0,
+            ),
+            "B": fut_exec_mod._OpenPosition(
+                instrument_id="B",
+                concrete_instrument_id="B_C1",
+                lots=100,
+                multiplier=10.0,
+                margin_rate=0.2,
+                avg_entry_price=100.0,
+                last_mark_price=100.0,
+            ),
+        },
+        pending_rolls={},
+        pending_liquidations=set(),
+        active_contract={(1, "A"): "A_C1", (1, "B"): "B_C1", (1, "C"): "C_C1"},
+        missing_bar_insts=set(),
+        exec_price_fn=lambda _b, _i: 100.0,
+        last_contract_close={},
+        validator=validator,
+        config=cfg,
+        get_spec_fn=lambda c: InstrumentSpec(c, "futures", "CNY", lot_size=1, contract_multiplier=10.0),
+        buy_cost_rate=0.001,
+        sell_cost_rate=0.001,
+        slippage=0.0,
+    )
+    # B close cost = 100 * 100 * 10 * 0.001 = 100 -> post_sell_equity = 99,900.
+    # A used_margin = 100 * 100 * 10 * 0.1 = 10,000.
+    # free_margin(exposure=0.5, leverage=0.8) = 99,900 * 0.5 * 0.8 - 10,000 = 29,960.
+    assert held_view.branch3_buy_target_value(
+        executed_sells={"B"},
+        remaining_held={"A"},
+        effective_top_k=2,
+        buy_count=1,
+        exposure=0.5,
+    ) == pytest.approx(29_960.0)
