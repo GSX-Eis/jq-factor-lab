@@ -1,5 +1,7 @@
 import json
 from pathlib import Path
+import subprocess
+import sys
 
 import numpy as np
 import pandas as pd
@@ -10,6 +12,7 @@ from examples.momentum import DemoMomentum
 from tools.demo_cli import analyze, main, read_prices
 from utils.pit import apply_pit_adjustment
 from backtest_and_analysis.forward_returns_calculator import ForwardReturnsCalculator
+from test_public_entry_harness_e2e import _prepare_external_workspace
 
 
 def test_full_public_demo_and_no_output_overwrite(tmp_path):
@@ -183,9 +186,6 @@ def test_cli_rejects_constant_returns_without_publishing_results(tmp_path, capsy
 
 
 def test_cli_causal_gate_rejects_lookahead_and_allows_causal_factor(tmp_path):
-    import subprocess
-    import sys
-
     root = Path(__file__).resolve().parents[1]
     env = {k: v for k, v in __import__("os").environ.items() if k != "PYTHONPATH"}
     env["PYTHONPATH"] = str(root)
@@ -235,6 +235,10 @@ def test_cli_causal_gate_rejects_lookahead_and_allows_causal_factor(tmp_path):
     assert rejected_payload["exit_code"] == rejected.returncode
     assert rejected_payload["error"]["code"] == "causal_fast_path_gate_failed"
     assert "Causal fast-path gate rejected LookaheadCausalFactor" in rejected_payload["error"]["message"]
+    assert "lookahead" in rejected_payload["error"]["fix"].lower()
+    for text in (rejected_payload["error"]["fix"], rejected.stderr):
+        assert "disable" not in text.lower()
+        assert "causal_vectorized" not in text.lower()
     assert "Traceback" not in rejected.stderr
     assert not (rejected_dir / "summary.json").exists()
     assert not rejected_dir.exists()
@@ -267,6 +271,44 @@ def test_cli_causal_gate_rejects_lookahead_and_allows_causal_factor(tmp_path):
     assert valid_payload["exit_code"] == 0
     assert valid_payload["factor"] == "ValidCausalFactor"
     assert (valid_dir / "summary.json").is_file()
+
+
+def test_cli_external_relative_factor_repeats_and_reads_by_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    caller = _prepare_external_workspace(tmp_path)
+    monkeypatch.setenv("PYTHONPATH", str(Path(__file__).resolve().parents[1]))
+
+    def run(*args: str) -> dict:
+        process = subprocess.run(
+            [sys.executable, "-m", "tools.demo_cli", *args],
+            cwd=caller, capture_output=True, text=True, timeout=120, check=False,
+        )
+        assert process.returncode == 0, process.stderr
+        payload = json.loads(process.stdout)
+        assert payload["ok"] is True
+        return payload
+
+    database = "results/evaluation.duckdb"
+    args = (
+        "time-series-analysis", "--config", "config.json", "--slot", "slot.json",
+        "--factor", "my_probe_factor.py", "--results-db", database,
+    )
+    first = run(*args, "--output-dir", "first")
+    second = run(*args, "--output-dir", "second")
+    assert first["metrics"]["causal_gate"]["status"] == "passed"
+    inserted = first["metrics"]["results_db"]
+    repeated = second["metrics"]["results_db"]
+    assert inserted["status"] == "inserted"
+    assert repeated["status"] == "noop"
+    assert repeated["identity_hash"] == inserted["identity_hash"]
+
+    summary = json.loads((caller / "first/summary.json").read_text(encoding="utf-8"))
+    assert summary["config"]["factor_file"] == str(caller / "my_probe_factor.py")
+    assert summary["config"]["factor_id"] == "ProbeRollingFactor"
+    read = run("read-bar-evaluations", "--results-db", database, "--factor-name", "ProbeRollingFactor")
+    assert read["metrics"]["run_count"] == 1
+    assert read["metrics"]["runs"][0]["identity_hash"] == inserted["identity_hash"]
 
 
 def test_daily_demo_allocates_distinct_outputs(tmp_path, monkeypatch, capsys):

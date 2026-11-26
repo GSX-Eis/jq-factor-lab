@@ -50,6 +50,24 @@ def _validate_bar_output_paths(db_path: Path, output_dir: Path, json_out: str,
                 f"{database_label} path overlaps an output path: {db_path} / {target}")
 
 
+def _resolve_public_config_paths(config: Dict[str, Any]) -> None:
+    """Resolve public entry file paths from the caller cwd before preflight and the worker read them."""
+    for name in ("bars_csv", "factors_csv", "factor_file", "slot_db", "duckdb_path", "factor_store_root",
+                 "slot_base_dir", "slot", "slot_config"):
+        value = config.get(name)
+        if isinstance(value, str) and value.strip() and (name != "slot" or value != "jq_ashare_local"):
+            config[name] = str(Path(value).expanduser().resolve())
+    raw_slot_base = config.get("slot_base_dir")
+    if (any(isinstance(config.get(name), dict) for name in ("slot", "slot_config"))
+            and not (isinstance(raw_slot_base, str) and raw_slot_base.strip())):
+        config["slot_base_dir"] = str(Path.cwd().resolve())
+    continuous = config.get("continuous_futures")
+    if isinstance(continuous, dict):
+        db = continuous.get("db")
+        if isinstance(db, str) and db.strip():
+            continuous["db"] = str(Path(db).expanduser().resolve())
+
+
 def _handle_time_series_analysis(
     args: argparse.Namespace, *, public_output: ExitStack | None = None,
 ) -> HarnessResult:
@@ -91,7 +109,11 @@ def _handle_time_series_analysis(
         if value is not None:
             config[name] = value
     if getattr(args, "factor", None):
-        config["factor_file"] = str(cli._resolve_repo_relative_path(args.factor))
+        config["factor_file"] = (
+            str(Path(args.factor).expanduser().resolve())
+            if public_output is not None
+            else str(cli._resolve_repo_relative_path(args.factor))
+        )
     if getattr(args, "factor_class", None):
         config["factor_class"] = args.factor_class
     if getattr(args, "causal_gate_policy", None) is not None:
@@ -113,6 +135,8 @@ def _handle_time_series_analysis(
                              if diagnostics_override is None else diagnostics_override)
     guard_reason = "time_series_precondition_failed"
     try:
+        if public_output is not None:
+            _resolve_public_config_paths(config)
         requested_destination = None
         if args.output_dir:
             requested_destination = Path(args.output_dir).expanduser()
@@ -211,17 +235,6 @@ def _handle_time_series_analysis(
             raise BarEvaluationPreconditionError(f"{option} must be a nonempty path")
         results_db_path = _validate_db_target_path(guarded_db) if guarded_db is not None else None
 
-        if public_output is not None:
-            for name in ("bars_csv", "factors_csv", "slot_db", "duckdb_path", "factor_store_root", "slot_base_dir",
-                         "slot", "slot_config"):
-                value = config.get(name)
-                if isinstance(value, str) and value.strip() and (name != "slot" or value != "jq_ashare_local"):
-                    config[name] = str(Path(value).expanduser().resolve())
-            continuous = config.get("continuous_futures")
-            if isinstance(continuous, dict):
-                db = continuous.get("db")
-                if isinstance(db, str) and db.strip():
-                    continuous["db"] = str(Path(db).expanduser().resolve())
         source_db = config.get("slot_db", config.get("duckdb_path"))
         if (results_db_path is not None and isinstance(source_db, str)
                 and any(config.get(key) is not None for key in ("slot", "slot_id", "slot_config", "factor_store_root"))):

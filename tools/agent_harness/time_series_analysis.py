@@ -4,7 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sys
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from contextlib import ExitStack
 from dataclasses import replace
 from pathlib import Path
@@ -102,6 +102,27 @@ def _default_slot_instruments(slot) -> list[str]:
     raise ValueError('instruments must be provided when the Slot has no static instruments')
 
 
+def _resolve_slot_factor_id(config: Mapping[str, Any], factor_cls: type[Any]) -> str:
+    """Resolve explicit or class-derived factor_id for Slot factor_file evaluation."""
+    if 'factor_id' not in config or config['factor_id'] is None:
+        return factor_cls.__name__
+    raw = config['factor_id']
+    if not isinstance(raw, str) or not raw.strip():
+        raise ValueError('factor_id must be a nonempty string when provided')
+    return raw
+
+
+def _canonicalize_config_order(value: Any) -> Any:
+    """Recursively sort mapping keys so summary.json matches sorted config_hash order."""
+    if isinstance(value, Mapping):
+        return {key: _canonicalize_config_order(value[key]) for key in sorted(value)}
+    if isinstance(value, list):
+        return [_canonicalize_config_order(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_canonicalize_config_order(item) for item in value)
+    return value
+
+
 def _evaluate_slot(config: dict[str, Any], options: dict[str, Any]):
     import pandas as pd
 
@@ -109,7 +130,9 @@ def _evaluate_slot(config: dict[str, Any], options: dict[str, Any]):
     from backtest_and_analysis.time_series.evaluator import evaluate_slot
     from backtest_and_analysis.time_series.factor_bridge import bar_factor_frame, read_slot_factor_values
     from slots import build_slot_from_config
-    from tools.agent_harness.causal_gate import CausalFastPathGateError, verify_factor_causality
+    from tools.agent_harness.causal_gate import (
+        CausalFastPathGateError, causal_gate_semantic_summary, verify_factor_causality,
+    )
     from utils.data_revision import frame_digest
     from utils.duckdb_results_writer import connect_read_only_with_retry
     from utils.factor_core.bar_bridge import _session_rollup
@@ -133,6 +156,8 @@ def _evaluate_slot(config: dict[str, Any], options: dict[str, Any]):
             len(set(instruments)) != len(instruments)):
         raise ValueError('instruments must contain distinct nonempty instrument IDs')
 
+    slot_options = dict(options)
+    causal_gate_policy: str | None = None
     causal_gate_report: dict[str, Any] | None = None
     with ExitStack() as stack:
         connection = None
@@ -171,7 +196,9 @@ def _evaluate_slot(config: dict[str, Any], options: dict[str, Any]):
                 raise ValueError(f'Expected one factor class in {factor_path}; pass factor_class to disambiguate')
             factor_cls = classes[0]
             factor_instruments = instruments or _default_slot_instruments(slot)
-            factor_id = config.get('factor_id') or factor_cls.__name__
+            factor_id = _resolve_slot_factor_id(config, factor_cls)
+            slot_options['factor_id'] = factor_id
+            causal_gate_policy = config.get('causal_gate_policy', 'reject')
             factor = factor_cls(
                 None,
                 factor_id,
@@ -187,7 +214,7 @@ def _evaluate_slot(config: dict[str, Any], options: dict[str, Any]):
             factor._require_causal_verification = True
             gate = verify_factor_causality(
                 factor,
-                on_failure=config.get('causal_gate_policy', 'reject'),
+                on_failure=causal_gate_policy,
                 apply_to_factor=True,
             )
             causal_gate_report = gate.to_dict()
@@ -237,15 +264,20 @@ def _evaluate_slot(config: dict[str, Any], options: dict[str, Any]):
             instruments=eval_instruments,
             horizons=config.get('horizons', [1, 5, 15, 60]), entry_offset_bars=config.get('entry_offset_bars'),
             bucket_strategy=config.get('bucket_strategy'), profile=profile,
-            apply_tradability_mask=config.get('apply_tradability_mask', False), **options,
+            apply_tradability_mask=config.get('apply_tradability_mask', False), **slot_options,
         )
     resolved = {key: value for key, value in config.items() if key != 'slot'}
     resolved.update(slot_config=frozen.as_dict(), slot_id=slot.slot_id, frequency=frequency.canonical,
                     factor_identity_hash=factor_identity_hash, slot_base_dir=str(base_dir))
+    if factor_file:
+        resolved['factor_id'] = slot_options['factor_id']
     if causal_gate_report is not None:
-        resolved['causal_gate'] = causal_gate_report
+        resolved['causal_gate_policy'] = causal_gate_policy
+        # Keep runtime diagnostics (elapsed_sec, cutoffs, samples) out of config_hash / summary.json.
+        resolved['causal_gate'] = causal_gate_semantic_summary(causal_gate_report)
     if overrides:
         resolved['execution_profile'] = overrides
+    resolved = _canonicalize_config_order(resolved)
     fingerprints = result.data_identity['slot_data_fingerprint']
     hashes = {name: fingerprints[name] for name in ('execution_bars_sha256', 'factor_values_sha256')}
     return result, resolved, hashes, causal_gate_report

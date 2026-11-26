@@ -12,6 +12,7 @@ import pytest
 
 from examples.generate_data import make_prices
 from examples.synthetic_bars import write_demo_bars
+from test_public_entry_harness_e2e import _prepare_external_workspace
 from tools import mcp_server
 
 
@@ -104,6 +105,66 @@ def test_tool_call_contains_python_and_native_stdout(tmp_path, monkeypatch, capf
     assert output.out == ""
     assert "buffered native log" in output.err
     assert "python stdout log" in output.err and "native stdout log" in output.err
+
+
+def test_mcp_external_lookahead_rejection_remedies_factor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert not tmp_path.resolve().is_relative_to(ROOT)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("PYTHONPATH", str(ROOT))
+    make_prices(sessions=80).to_csv("prices.csv", index=False)
+    Path("lookahead.py").write_text(
+        "from examples.momentum import DemoMomentum\n"
+        "class LookaheadMomentum(DemoMomentum):\n"
+        "    CAUSAL_VECTORIZED = True\n"
+        "    def calculate_factor(self, data):\n"
+        '        prices = data.pivot(index="date", columns="code", values="close").sort_index()\n'
+        "        return prices.shift(-2) / prices.shift(-1) - 1\n",
+        encoding="utf-8",
+    )
+    Path("daily.json").write_text(json.dumps({
+        "input_csv": "prices.csv", "factor_file": "lookahead.py", "factor_class": "LookaheadMomentum",
+        "calendar_file": str(ROOT / "config/demo_calendar.json"), "periods": [1, 5],
+    }), encoding="utf-8")
+
+    result = mcp_server.run_single_factor_analysis("daily.json", output_dir="rejected")
+    assert result["ok"] is False
+    assert result["exit_code"] == 1
+    assert result["error"]["code"] == "causal_fast_path_gate_failed"
+    fix = result["error"]["fix"].lower()
+    assert "lookahead" in fix
+    assert "disable" not in fix
+    assert "causal_vectorized" not in fix
+    assert not Path("rejected").exists()
+
+
+def test_mcp_external_time_series_repeats_and_reads_by_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    caller = _prepare_external_workspace(tmp_path)
+    monkeypatch.chdir(caller)
+    monkeypatch.setenv("PYTHONPATH", str(ROOT))
+    config = json.loads(Path("config.json").read_text(encoding="utf-8"))
+    config.update(slot="slot.json", factor_file="my_probe_factor.py")
+    Path("config.json").write_text(json.dumps(config), encoding="utf-8")
+    database = "results/evaluation.duckdb"
+
+    first = mcp_server.run_time_series_analysis("config.json", output_root="first", results_db=database)
+    second = mcp_server.run_time_series_analysis("config.json", output_root="second", results_db=database)
+    assert first["ok"] is True, first
+    assert second["ok"] is True, second
+    assert first["metrics"]["causal_gate"]["status"] == "passed"
+    inserted = first["metrics"]["results_db"]
+    repeated = second["metrics"]["results_db"]
+    assert inserted["status"] == "inserted"
+    assert repeated["status"] == "noop"
+    assert repeated["identity_hash"] == inserted["identity_hash"]
+
+    read = mcp_server.read_bar_evaluations(database, factor_name="ProbeRollingFactor")
+    assert read["ok"] is True, read
+    assert read["metrics"]["run_count"] == 1
+    assert read["metrics"]["runs"][0]["identity_hash"] == inserted["identity_hash"]
 
 
 @pytest.mark.skipif(importlib.util.find_spec("mcp") is None, reason="wire test requires [mcp]")

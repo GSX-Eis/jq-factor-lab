@@ -13,6 +13,22 @@ from utils.factor_base import FactorBase
 from utils.factor_core import bar_bridge, slot_execution_mode, slot_fast_path
 
 CAUSAL_GATE_SCHEMA_VERSION = "causal_fast_path_gate.v1"
+_SEMANTIC_GATE_FIELDS: tuple[str, ...] = (
+    "schema_version",
+    "ok",
+    "causal_passed",
+    "status",
+    "factor_name",
+    "fast_path_requested",
+    "fast_path_allowed",
+    "requested_mode",
+    "candidate_mode",
+    "resolved_mode",
+    "resolved_reason",
+    "historical_revision",
+    "historical_revision_reason",
+    "failure_reason",
+)
 _BAR_KEYS = ["timestamp_utc", "instrument_id"]
 _AVAILABLE = "signal_available_at"
 _KEY_OR_META_COLS = {
@@ -86,6 +102,16 @@ class CausalGateResult:
         payload["pit_sample_cutoffs"] = list(self.pit_sample_cutoffs)
         payload["mismatched_samples"] = list(self.mismatched_samples)
         return payload
+
+    def semantic_summary(self) -> dict[str, Any]:
+        """Return deterministic semantic gate metadata free of runtime diagnostics."""
+        return causal_gate_semantic_summary(self)
+
+
+def causal_gate_semantic_summary(gate_result: CausalGateResult | Mapping[str, Any]) -> dict[str, Any]:
+    """Extract deterministic semantic fields from a gate result, stripping runtime diagnostics."""
+    source = gate_result.to_dict() if isinstance(gate_result, CausalGateResult) else dict(gate_result)
+    return {field: source[field] for field in _SEMANTIC_GATE_FIELDS if field in source}
 
 
 def _snapshot_factor_state(factor: Any) -> dict[str, Any]:

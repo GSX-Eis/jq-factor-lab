@@ -444,7 +444,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             fix = "Supply two or more assets or use time-series-analysis."
         elif isinstance(exc, CausalFastPathGateError):
             exit_code, code = 1, exc.code
-            fix = "Remove future/lookahead references from calculate_factor() or disable CAUSAL_VECTORIZED."
+            fix = "Remove future/lookahead references from calculate_factor() so it uses only data available at the evaluation timestamp."
         elif isinstance(exc, MaxLossExceededError):
             exit_code, code = 1, "analysis_failed"
         elif isinstance(exc, (ValueError, TypeError, KeyError, FileNotFoundError, FileExistsError, PermissionError, SyntaxError)):
