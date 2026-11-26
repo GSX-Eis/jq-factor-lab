@@ -7,9 +7,13 @@ import numpy as np
 import pandas as pd
 
 from utils.strategy_kernel import (
+    TIME_SERIES_METHODS,
     preprocess_cross_section_series,
     resolve_preprocess_method,
+    resolve_time_series_params,
     standardize_composite_scores,
+    time_series_standardize,
+    valid_factor_mask,
     weighted_score,
 )
 from .preprocessing import MarketInputOptions, bind_synthesis_panel, selected_market_inputs
@@ -18,7 +22,6 @@ from ..core.factor_data_loader import (
     PANEL_DATE_ALIGNMENT_RAW,
     PANEL_DATE_ALIGNMENT_TRADE_DATE,
 )
-from ..core.feature_preprocessor import TIME_SERIES_METHODS, time_series_standardize
 
 
 _PREPROCESS_PARAM_KEYS = (
@@ -32,6 +35,8 @@ _PREPROCESS_PARAM_KEYS = (
 def _resolve_weighted_sum_preprocess(
     preprocess_cfg: Mapping[str, Any],
     feature_names: list[str],
+    *,
+    standardize: bool = True,
 ) -> Dict[str, Any]:
     """Resolve explicit per-factor preprocessing modes and parameters for local/bundle parity."""
     default_mode = resolve_preprocess_method(preprocess_cfg, "ALL", default="none")
@@ -41,8 +46,15 @@ def _resolve_weighted_sum_preprocess(
             preprocess_cfg, factor, default=default_mode,
         )
     for key in _PREPROCESS_PARAM_KEYS:
-        if key in preprocess_cfg:
+        if key in preprocess_cfg and preprocess_cfg[key] is not None:
             resolved[key] = preprocess_cfg[key]
+    uses_ts = standardize and any(
+        resolved[key] in TIME_SERIES_METHODS for key in ["ALL", *feature_names]
+    )
+    if uses_ts:
+        ts_window, ts_min_periods = resolve_time_series_params(preprocess_cfg)
+        resolved["_ts_window"] = ts_window
+        resolved["_ts_min_periods"] = ts_min_periods
     return resolved
 
 
@@ -228,19 +240,24 @@ def run_weighted_sum_synthesis(
             shifted = wide.shift(1).stack(level="stock_code", future_stack=True)
             shifted.index = shifted.index.set_names(["date", "stock_code"])
             df = shifted.dropna(how="all").sort_index()
-            if df.empty:
-                raise RuntimeError(f"weighted_sum: empty composite for {synthesis_name}")
+        else:
+            df = df.dropna(how="all").sort_index()
+        if df.empty:
+            raise RuntimeError(f"weighted_sum: empty composite for {synthesis_name}")
 
-        resolved_preprocess = _resolve_weighted_sum_preprocess(preprocess_cfg, used_factors)
+        resolved_preprocess = _resolve_weighted_sum_preprocess(
+            preprocess_cfg, used_factors, standardize=standardize
+        )
         if standardize:
+            ts_window, ts_min_periods = resolve_time_series_params(resolved_preprocess)
             for f in used_factors:
                 mode = resolved_preprocess[f]
                 if mode in TIME_SERIES_METHODS:
                     df[f] = time_series_standardize(
                         df[f],
                         mode,
-                        window=preprocess_cfg.get("_ts_window", 20),
-                        min_periods=preprocess_cfg.get("_ts_min_periods"),
+                        window=ts_window,
+                        min_periods=ts_min_periods,
                     )
                 elif mode in (None, "", "none"):
                     logger.info(
@@ -265,7 +282,7 @@ def run_weighted_sum_synthesis(
             logger.info("weighted_sum[%s]: standardize=False，跳过全部逐因子预处理", synthesis_name)
 
         final_weights = {f: float(weights_cfg.get(f, 0.0)) for f in used_factors}
-        valid_rows = df[used_factors].notna().any(axis=1)
+        valid_rows = valid_factor_mask(df, used_factors)
         if not valid_rows.any():
             raise RuntimeError(f"weighted_sum: empty composite for {synthesis_name}")
 

@@ -8,6 +8,7 @@ with targetpercent for Top-K equal-weight rebalancing.
 import json
 import logging
 import os
+import re
 import hashlib
 from utils.output_paths import open_diagnostic
 from bisect import bisect_right
@@ -53,7 +54,19 @@ from ..core.calendar_skip import (
 from .factor_loader import (
     FactorLoader,
 )
-from utils.strategy_kernel import model_for_date, linear_signal, rank_scores, equal_target_weights, selection_count
+from utils.strategy_kernel import (
+    TIME_SERIES_METHODS,
+    equal_target_weights,
+    linear_signal,
+    model_for_date,
+    preprocess_cross_section_series,
+    preprocess_series,
+    rank_scores,
+    resolve_preprocess_method,
+    resolve_time_series_params,
+    selection_count,
+    time_series_standardize_at_asof,
+)
 from .alignment_data_writer import AlignmentDataWriter
 from .futures_execution import (
     FuturesExecutionConfig, FuturesExecutionError, execute_portfolio_simulation, parse_futures_execution_config, validate_nominal_execution_mode,
@@ -78,6 +91,20 @@ try:
 except ImportError:
     LIGHTGBM_AVAILABLE = False
     lgb = None
+
+
+_CS_PREPROCESS_METHODS = frozenset(
+    {
+        "zscore",
+        "winsorize_zscore",
+        "raw_zscore",
+        "rank_zscore",
+        "rank",
+        "binning",
+        "gauss_rank",
+    }
+)
+_SESSION_DATE_KEY_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
 
 
 class VectorBTBacktestRunner:
@@ -2570,58 +2597,60 @@ class VectorBTBacktestRunner:
             self.logger.debug(f"[LGB_PREDICT] No factor data for {date_str}")
             return pd.Series(dtype=float), None, None
 
-        # Import preprocessing functions (single-date versions from factor_loader)
-        from .factor_loader import (
-            cross_sectional_raw_zscore,
-            cross_sectional_zscore,
-            cross_sectional_rank_zscore,
-            cross_sectional_binning,
-            cross_sectional_winsorize_zscore,
-        )
-
         # Get preprocessing config
         preprocess = model_info.get("standardization_method", {})
-        default_mode = (
-            preprocess.get("ALL", "rank_zscore")
-            if isinstance(preprocess, dict)
-            else "rank_zscore"
-        )
-        n_bins = (
-            preprocess.get("_binning_n_bins", 5) if isinstance(preprocess, dict) else 5
-        )
-        winsorize_pct = (
-            preprocess.get("_winsorize_percentile", 0.025)
-            if isinstance(preprocess, dict)
-            else 0.025
-        )
+        preprocess_cfg = preprocess if isinstance(preprocess, Mapping) else {}
+        blend_ratio = float(model_info.get("blend_with_original_ratio", 0.0) or 0.0)
+        blend_weights = model_info.get("blend_weights", {})
+        ts_needed: Set[str] = set()
+        for fname in feature_names:
+            mode = resolve_preprocess_method(preprocess_cfg, fname, default="rank_zscore")
+            if mode in TIME_SERIES_METHODS:
+                ts_needed.add(fname)
+        if blend_ratio > 0 and blend_weights:
+            for fname in blend_weights:
+                mode = resolve_preprocess_method(preprocess_cfg, fname, default="zscore")
+                if mode in TIME_SERIES_METHODS:
+                    ts_needed.add(fname)
+
+        history_panel: Optional[pd.DataFrame] = None
+        if ts_needed:
+            ts_window, ts_min_periods = resolve_time_series_params(preprocess_cfg)
+            from utils.strategy_kernel import _validate_time_series_params
+
+            first_ts_mode = next(
+                resolve_preprocess_method(
+                    preprocess_cfg,
+                    fname,
+                    default="rank_zscore" if fname in feature_names else "zscore",
+                )
+                for fname in sorted(ts_needed)
+            )
+            _validate_time_series_params(first_ts_mode, ts_window, ts_min_periods)
+            history_factors = set(feature_names) | (
+                set(blend_weights) if blend_ratio > 0 and blend_weights else set()
+            )
+            history_panel = self._load_ts_history_panel(
+                date_str, canonical_stocks, history_factors, ts_window
+            )
 
         # Apply preprocessing
         processed = pd.DataFrame(index=factor_df.index)
         for fname in feature_names:
             if fname in factor_df.columns:
                 raw = factor_df[fname]
-                mode = (
-                    preprocess.get(fname, default_mode)
-                    if isinstance(preprocess, dict)
-                    else default_mode
+                mode = resolve_preprocess_method(
+                    preprocess_cfg, fname, default="rank_zscore"
                 )
-
-                if mode == "raw_zscore":
-                    processed[fname] = cross_sectional_raw_zscore(raw)
-                elif mode == "rank_zscore":
-                    processed[fname] = cross_sectional_rank_zscore(raw)
-                elif mode == "binning":
-                    processed[fname] = cross_sectional_binning(raw, n_bins=n_bins)
-                elif mode == "winsorize_zscore":
-                    processed[fname] = cross_sectional_winsorize_zscore(
-                        raw, percentile=winsorize_pct
-                    )
-                else:
-                    if mode not in ("zscore", "none", None, ""):
-                        self.logger.warning(
-                            f"[LGB_PREPROCESS] Unknown method '{mode}' for {fname}, falling back to zscore"
-                        )
-                    processed[fname] = cross_sectional_zscore(raw)
+                processed[fname] = self._preprocess_lgb_series(
+                    raw,
+                    fname,
+                    mode,
+                    preprocess_cfg,
+                    date_str=date_str,
+                    history_panel=history_panel,
+                    context_tag="LGB_PREPROCESS",
+                )
             else:
                 processed[fname] = 0.0
 
@@ -2646,9 +2675,6 @@ class VectorBTBacktestRunner:
             return pd.Series(dtype=float), None, None
 
         # Apply blend if configured
-        blend_ratio = model_info.get("blend_with_original_ratio", 0.0)
-        blend_weights = model_info.get("blend_weights", {})
-
         if blend_ratio > 0 and blend_weights:
             original_composite = pd.Series(0.0, index=score.index)
 
@@ -2659,28 +2685,18 @@ class VectorBTBacktestRunner:
 
                 if not blend_factor_df.empty and fname in blend_factor_df.columns:
                     raw = blend_factor_df[fname].reindex(score.index)
-                    preprocess_method = (
-                        preprocess.get(fname, "zscore")
-                        if isinstance(preprocess, dict)
-                        else "zscore"
+                    preprocess_method = resolve_preprocess_method(
+                        preprocess_cfg, fname, default="zscore"
                     )
-
-                    if preprocess_method == "raw_zscore":
-                        std_series = cross_sectional_raw_zscore(raw)
-                    elif preprocess_method == "rank_zscore":
-                        std_series = cross_sectional_rank_zscore(raw)
-                    elif preprocess_method == "binning":
-                        std_series = cross_sectional_binning(raw, n_bins=n_bins)
-                    elif preprocess_method == "winsorize_zscore":
-                        std_series = cross_sectional_winsorize_zscore(
-                            raw, percentile=winsorize_pct
-                        )
-                    else:
-                        if preprocess_method not in ("zscore", "none", None, ""):
-                            self.logger.warning(
-                                f"[LGB_BLEND] Unknown method '{preprocess_method}' for {fname}, falling back to zscore"
-                            )
-                        std_series = cross_sectional_zscore(raw)
+                    std_series = self._preprocess_lgb_series(
+                        raw,
+                        fname,
+                        preprocess_method,
+                        preprocess_cfg,
+                        date_str=date_str,
+                        history_panel=history_panel,
+                        context_tag="LGB_BLEND",
+                    )
 
                     original_composite += std_series.fillna(0.0) * bw
 
@@ -2692,7 +2708,7 @@ class VectorBTBacktestRunner:
 
         # Apply postprocess standardization if configured
         if model_info.get("postprocess_cs_standardize", False):
-            score = cross_sectional_zscore(score)
+            score = preprocess_series(score, "zscore")
 
         if return_raw_factors:
             return score, processed, factor_df
@@ -3308,8 +3324,295 @@ class VectorBTBacktestRunner:
 
         needed = set(weights) | (set(blend_weights) if blend_ratio > 0 and parent_scores is None else set())
         raw = self._factor_loader.load_factors(date_str, stock_list, sorted(needed)).reindex(stock_list)
-        score, processed = linear_signal(raw, model_info, parent_scores)
+        history_panel: Optional[pd.DataFrame] = None
+        ts_window = self._required_ts_window(model_info, needed)
+        if ts_window is not None:
+            history_panel = self._load_ts_history_panel(
+                date_str, stock_list, needed, ts_window, current_raw=raw
+            )
+        score, processed = linear_signal(
+            raw, model_info, parent_scores, history=history_panel, asof=date_str
+        )
         return (score, processed, raw) if return_raw_factors else (score, None, None)
+
+    def _required_ts_window(
+        self, model_info: Mapping[str, Any], needed: Set[str]
+    ) -> Optional[int]:
+        """Return validated time-series lookback window when any active factor uses TS preprocessing."""
+        if not model_info.get("standardize", True):
+            return None
+        methods = model_info.get("standardization_method", {})
+        ts_modes = [
+            resolve_preprocess_method(methods, name, default="zscore")
+            for name in sorted(needed)
+        ]
+        first_ts = next((m for m in ts_modes if m in TIME_SERIES_METHODS), None)
+        if first_ts is None:
+            return None
+        from utils.strategy_kernel import _validate_time_series_params
+
+        window, min_periods = resolve_time_series_params(methods)
+        _validate_time_series_params(first_ts, window, min_periods)
+        return int(window)
+
+    def _resolve_ts_lookback_start(self, date_str: str, window: int) -> str:
+        """Resolve a strictly causal warmup start key covering ``window`` prior bars."""
+        target_bars = max(30, int(window) * 2 + 15)
+        is_session_key = (
+            self.frequency == "1d"
+            and bool(_SESSION_DATE_KEY_RE.fullmatch(str(date_str).strip()))
+        )
+        cal = None
+        try:
+            cal = self._trading_calendar()
+        except Exception:
+            cal = None
+
+        if cal is not None:
+            try:
+                if is_session_key:
+                    end_day = pd.Timestamp(date_str).normalize()
+                    if end_day >= cal.start:
+                        sessions = cal.sessions(cal.start, min(end_day, cal.end))
+                        if not sessions.empty:
+                            idx = max(0, len(sessions) - target_bars)
+                            return sessions[idx].strftime("%Y-%m-%d")
+                elif hasattr(cal, "bar_grid"):
+                    end_ts = pd.Timestamp(date_str)
+                    end_utc = (
+                        end_ts.tz_localize("UTC")
+                        if end_ts.tz is None
+                        else end_ts.tz_convert("UTC")
+                    )
+                    sess = (
+                        cal.session_at(end_utc, frequency=self.frequency)
+                        or cal.session_at(end_utc)
+                    )
+                    anchor_day = (
+                        pd.Timestamp(sess.session_date)
+                        if sess is not None
+                        else end_utc.tz_localize(None).normalize()
+                    )
+                    anchor_day = min(anchor_day, cal.end)
+                    if anchor_day >= cal.start:
+                        days_back = max(30, target_bars * 7)
+                        start_day = max(cal.start, anchor_day - pd.Timedelta(days=days_back))
+                        grid = cal.bar_grid(self.frequency, start_day, anchor_day)
+                        prior = grid.loc[grid["timestamp_utc"] <= end_utc, "timestamp_utc"]
+                        if len(prior) < target_bars and start_day > cal.start:
+                            grid = cal.bar_grid(self.frequency, cal.start, anchor_day)
+                            prior = grid.loc[grid["timestamp_utc"] <= end_utc, "timestamp_utc"]
+                        if not prior.empty:
+                            idx = max(0, len(prior) - target_bars)
+                            return pd.Timestamp(prior.iloc[idx]).isoformat()
+            except Exception:
+                pass
+
+        if is_session_key:
+            return (
+                pd.Timestamp(date_str) - pd.Timedelta(days=max(30, int(window) * 3 + 15))
+            ).strftime("%Y-%m-%d")
+        end_ts = pd.Timestamp(date_str)
+        end_utc = (
+            end_ts.tz_localize("UTC")
+            if end_ts.tz is None
+            else end_ts.tz_convert("UTC")
+        )
+        return (
+            end_utc - pd.Timedelta(days=max(30, int(window) * 7 + 15))
+        ).isoformat()
+
+    def _resolve_ts_earliest_start(self, date_str: str) -> Optional[str]:
+        """Resolve earliest available calendar key strictly <= ``date_str``."""
+        is_session_key = (
+            self.frequency == "1d"
+            and bool(_SESSION_DATE_KEY_RE.fullmatch(str(date_str).strip()))
+        )
+        cal = None
+        try:
+            cal = self._trading_calendar()
+        except Exception:
+            cal = None
+        if cal is None:
+            return None
+        try:
+            cal_start = pd.Timestamp(cal.start)
+            if is_session_key:
+                return cal_start.normalize().strftime("%Y-%m-%d")
+            start_utc = (
+                cal_start.tz_localize("UTC")
+                if cal_start.tz is None
+                else cal_start.tz_convert("UTC")
+            )
+            return start_utc.isoformat()
+        except Exception:
+            return None
+
+    @staticmethod
+    def _panels_to_ts_history_frame(
+        panels: Mapping[str, pd.DataFrame],
+        ordered_stocks: List[str],
+        factors_sorted: List[str],
+        date_str: str,
+    ) -> pd.DataFrame:
+        """Stack wide factor panels into sparse MultiIndex (date, stock_code) <= date_str."""
+        from utils.strategy_kernel import _normalize_ts_history_panel
+
+        if not ordered_stocks or not factors_sorted:
+            return pd.DataFrame(
+                columns=factors_sorted,
+                index=pd.MultiIndex.from_tuples([], names=["date", "stock_code"]),
+                dtype=float,
+            )
+        panel_map = {
+            fname: (
+                panels[fname]
+                if fname in panels and isinstance(panels[fname], pd.DataFrame)
+                else pd.DataFrame(columns=ordered_stocks, dtype=float)
+            )
+            for fname in factors_sorted
+        }
+        frame, _ = _normalize_ts_history_panel(
+            panel_map, factors_sorted, pd.Index(ordered_stocks), asof=date_str
+        )
+        return frame.reindex(columns=factors_sorted)
+
+    def _load_ts_history_panel(
+        self,
+        date_str: str,
+        stock_list: List[str],
+        needed: Set[str],
+        ts_window: int,
+        *,
+        current_raw: Optional[pd.DataFrame] = None,
+    ) -> Optional[pd.DataFrame]:
+        """Load strictly causal ``<= date_str`` MultiIndex factor history for TS standardization.
+
+        Loads an initial bounded lookback window first, then backfills strictly
+        ``<= date_str`` earlier observations for any active instrument that still
+        has fewer than ``ts_window`` prior non-all-missing rows (e.g., across
+        long suspension or missing-data gaps).
+        """
+        if self._factor_loader is None or not hasattr(
+            self._factor_loader, "load_factor_panel"
+        ):
+            return None
+        ordered_stocks = list(dict.fromkeys(stock_list))
+        factors_sorted = sorted(needed)
+        if not ordered_stocks or not factors_sorted:
+            return pd.DataFrame(
+                columns=factors_sorted,
+                index=pd.MultiIndex.from_tuples([], names=["date", "stock_code"]),
+                dtype=float,
+            )
+        lookback_start = self._resolve_ts_lookback_start(date_str, ts_window)
+        panels = self._factor_loader.load_factor_panel(
+            lookback_start, date_str, ordered_stocks, factors_sorted
+        )
+        history_panel = self._panels_to_ts_history_frame(
+            panels, ordered_stocks, factors_sorted, date_str
+        )
+
+        from utils.strategy_kernel import _align_timestamp_to_index, valid_factor_mask
+
+        if current_raw is not None:
+            observed_mask = valid_factor_mask(
+                current_raw.reindex(index=ordered_stocks, columns=factors_sorted),
+                factors_sorted,
+            )
+            active_stocks = [
+                stock for stock in ordered_stocks if bool(observed_mask.get(stock, False))
+            ]
+        elif not history_panel.empty:
+            date_idx = pd.DatetimeIndex(history_panel.index.get_level_values("date"))
+            asof_ts = _align_timestamp_to_index(date_str, date_idx)
+            present_at_asof = set(
+                history_panel.index.get_level_values("stock_code")[date_idx == asof_ts]
+            )
+            active_stocks = [stock for stock in ordered_stocks if stock in present_at_asof]
+        else:
+            active_stocks = []
+
+        if not active_stocks:
+            return history_panel
+
+        if history_panel.empty:
+            prior_counts = pd.Series(dtype=int)
+        else:
+            date_idx = pd.DatetimeIndex(history_panel.index.get_level_values("date"))
+            asof_ts = _align_timestamp_to_index(date_str, date_idx)
+            prior_stocks = history_panel.index.get_level_values("stock_code")[
+                date_idx < asof_ts
+            ]
+            prior_counts = pd.Index(prior_stocks).value_counts()
+
+        deficit_stocks = [
+            stock
+            for stock in active_stocks
+            if int(prior_counts.get(stock, 0)) < int(ts_window)
+        ]
+        if not deficit_stocks:
+            return history_panel
+
+        backfill_panels: Optional[Mapping[str, pd.DataFrame]] = None
+        try:
+            backfill_panels = self._factor_loader.load_factor_panel(
+                None, date_str, deficit_stocks, factors_sorted
+            )
+        except (TypeError, ValueError):
+            earliest_start = self._resolve_ts_earliest_start(date_str)
+            if earliest_start is not None and earliest_start < lookback_start:
+                backfill_panels = self._factor_loader.load_factor_panel(
+                    earliest_start, date_str, deficit_stocks, factors_sorted
+                )
+
+        if not backfill_panels:
+            return history_panel
+
+        backfill_frame = self._panels_to_ts_history_frame(
+            backfill_panels, deficit_stocks, factors_sorted, date_str
+        )
+        if backfill_frame.empty:
+            return history_panel
+
+        if history_panel.empty:
+            return backfill_frame
+
+        keep_mask = ~history_panel.index.get_level_values("stock_code").isin(
+            deficit_stocks
+        )
+        merged = pd.concat([history_panel.loc[keep_mask], backfill_frame], axis=0)
+        return merged.dropna(how="all").sort_index()
+
+    def _preprocess_lgb_series(
+        self,
+        raw_series: pd.Series,
+        fname: str,
+        mode: Any,
+        preprocess_cfg: Mapping[str, Any],
+        *,
+        date_str: str,
+        history_panel: Optional[pd.DataFrame],
+        context_tag: str,
+    ) -> pd.Series:
+        """Apply unified cross-sectional, time-series, or no-op preprocessing for LGB."""
+        if mode in (None, "", "none"):
+            return raw_series.copy()
+        if mode in TIME_SERIES_METHODS:
+            return time_series_standardize_at_asof(
+                raw_series,
+                fname,
+                mode,
+                preprocess_cfg,
+                history=history_panel,
+                asof=date_str,
+            )
+        if mode in _CS_PREPROCESS_METHODS:
+            return preprocess_cross_section_series(raw_series, mode, preprocess_cfg)
+        self.logger.warning(
+            f"[{context_tag}] Unknown method '{mode}' for {fname}, falling back to zscore"
+        )
+        return preprocess_cross_section_series(raw_series, "zscore", preprocess_cfg)
 
     def _trading_calendar(self):
         return self._slot_provider.resolve_calendar(

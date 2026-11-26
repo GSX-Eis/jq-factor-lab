@@ -460,17 +460,27 @@ class FactorLoader:
         """Load wide ``(time x instrument)`` panels for one or more factors."""
         if not factor_names:
             return {}
+        if not stock_list:
+            return {name: pd.DataFrame(columns=stock_list, dtype=float) for name in factor_names}
         if self._market_store is None:
-            start_str = pd.Timestamp(start).strftime("%Y-%m-%d")
             end_str = pd.Timestamp(end).strftime("%Y-%m-%d")
             stocks_sql = ",".join("?" for _ in stock_list)
             factors_sql = ",".join("?" for _ in factor_names)
-            df = self._get_conn().execute(
-                f"SELECT date, stock_code, factor_name, factor_value FROM {self.factor_table} "
-                f"WHERE date BETWEEN ? AND ? AND factor_name IN ({factors_sql}) "
-                f"AND stock_code IN ({stocks_sql}) ORDER BY date",
-                [start_str, end_str, *factor_names, *stock_list],
-            ).fetchdf()
+            if start is None:
+                df = self._get_conn().execute(
+                    f"SELECT date, stock_code, factor_name, factor_value FROM {self.factor_table} "
+                    f"WHERE date <= ? AND factor_name IN ({factors_sql}) "
+                    f"AND stock_code IN ({stocks_sql}) ORDER BY date",
+                    [end_str, *factor_names, *stock_list],
+                ).fetchdf()
+            else:
+                start_str = pd.Timestamp(start).strftime("%Y-%m-%d")
+                df = self._get_conn().execute(
+                    f"SELECT date, stock_code, factor_name, factor_value FROM {self.factor_table} "
+                    f"WHERE date BETWEEN ? AND ? AND factor_name IN ({factors_sql}) "
+                    f"AND stock_code IN ({stocks_sql}) ORDER BY date",
+                    [start_str, end_str, *factor_names, *stock_list],
+                ).fetchdf()
             if not df.empty:
                 df["date"] = pd.to_datetime(df["date"])
             return {
@@ -489,10 +499,12 @@ class FactorLoader:
             return {name: pd.DataFrame(columns=stock_list, dtype=float) for name in factor_names}
         is_session = (
             self._freq_kind in ("session", "week")
-            and isinstance(start, str)
-            and bool(_SESSION_DATE_RE.fullmatch(start.strip()))
             and isinstance(end, str)
             and bool(_SESSION_DATE_RE.fullmatch(end.strip()))
+            and (
+                start is None
+                or (isinstance(start, str) and bool(_SESSION_DATE_RE.fullmatch(start.strip())))
+            )
         )
         if is_session:
             frame = self._market_store.read_factor_values(
@@ -512,7 +524,7 @@ class FactorLoader:
                 slot_id=self.slot_id,
                 session_view=self.session_view,
                 instruments=list(dict.fromkeys(stock_list)) or None,
-                start_utc=self._parse_utc_key(str(start)),
+                start_utc=None if start is None else self._parse_utc_key(str(start)),
                 end_utc=self._parse_utc_key(str(end)),
             )
             utc_axis = True if use_utc_index is None else bool(use_utc_index)
@@ -533,11 +545,14 @@ class FactorLoader:
             if sub.empty:
                 panels[name] = pd.DataFrame(columns=stock_list, dtype=float)
                 continue
-            wide = sub.pivot_table(
-                index=index_col,
-                columns="instrument_id",
-                values="factor_value",
-                aggfunc="last",
-            ).sort_index()
+            wide = (
+                sub.drop_duplicates(subset=[index_col, "instrument_id"], keep="last")
+                .pivot(
+                    index=index_col,
+                    columns="instrument_id",
+                    values="factor_value",
+                )
+                .sort_index()
+            )
             panels[name] = wide.reindex(columns=stock_list)
         return panels

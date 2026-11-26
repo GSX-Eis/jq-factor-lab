@@ -12,6 +12,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
+import inspect
 import logging
 import math
 from numbers import Real
@@ -241,9 +242,38 @@ def _resolve_bar_utc_index(
     return pd.DatetimeIndex(mapped, tz="UTC").as_unit("ns"), session_to_utc
 
 
-def _try_resolve_active(slot: MarketSlot, instrument_id: str, as_of_utc: datetime) -> Optional[str]:
+def _resolver_accepts_session_date(resolver: Any) -> bool:
     try:
-        return slot.universe.resolve_active_contract(instrument_id, as_of_utc=as_of_utc)
+        params = inspect.signature(resolver).parameters
+    except (TypeError, ValueError):
+        return False
+    return "session_date" in params or any(
+        p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
+    )
+
+
+def _try_resolve_active(
+    slot: MarketSlot,
+    instrument_id: str,
+    as_of_utc: datetime,
+    *,
+    session_date: Optional[str] = None,
+    accepts_session_date: Optional[bool] = None,
+) -> Optional[str]:
+    resolver = slot.universe.resolve_active_contract
+    use_session_date = session_date is not None and (
+        accepts_session_date
+        if accepts_session_date is not None
+        else _resolver_accepts_session_date(resolver)
+    )
+    try:
+        if use_session_date:
+            return resolver(
+                instrument_id,
+                as_of_utc=as_of_utc,
+                session_date=session_date,
+            )
+        return resolver(instrument_id, as_of_utc=as_of_utc)
     except Exception:
         return None
 
@@ -648,8 +678,8 @@ class _FuturesOrderValidator:
         self._intraday_grid_cache: Dict[
             Tuple[Optional[str], str], Tuple[pd.DatetimeIndex, pd.DatetimeIndex]
         ] = {}
-        self._exec_ts_cache: Dict[Tuple[int, str, str], pd.Timestamp] = {}
-        self._mask_cache: Dict[Tuple[int, str, str, str], bool] = {}
+        self._exec_context_cache: Dict[Tuple[int, str, str], Tuple[pd.Timestamp, str]] = {}
+        self._mask_cache: Dict[Tuple[int, str, str, str, str], bool] = {}
 
     @property
     def default_execution_price_field(self) -> Literal["open", "close"]:
@@ -743,7 +773,7 @@ class _FuturesOrderValidator:
         session_id: str,
         inst: str,
         execution_price_field: str,
-    ) -> Optional[pd.Timestamp]:
+    ) -> Optional[Tuple[pd.Timestamp, str]]:
         strategy = self._resolve_bucket_strategy(inst)
         schedule = self._schedule_cache.get(strategy)
         if schedule is None:
@@ -771,12 +801,13 @@ class _FuturesOrderValidator:
                 except Exception:
                     week = []
                 if week:
-                    target = (
-                        week[0].segments[0][0]
+                    target_session = week[0] if execution_price_field == "open" else week[-1]
+                    target_ts = (
+                        target_session.segments[0][0]
                         if execution_price_field == "open"
-                        else week[-1].segments[-1][1]
+                        else target_session.segments[-1][1]
                     )
-                    return _normalize_utc_timestamp(target)
+                    return _normalize_utc_timestamp(target_ts), str(target_session.session_date)
             return None
 
         if self._freq_obj.kind == "intraday":
@@ -788,10 +819,30 @@ class _FuturesOrderValidator:
             if len(matches) == 0:
                 return None
             row_idx = int(matches[0])
-            return starts[row_idx] if execution_price_field == "open" else ends[row_idx]
+            exec_ts = starts[row_idx] if execution_price_field == "open" else ends[row_idx]
+            slot_sid = str(slots["session_id"].iloc[row_idx])
+            if execution_price_field == "open":
+                sess = self._call_session_at(cal, exec_ts)
+                if sess is not None and getattr(sess, "session_date", None):
+                    return exec_ts, str(sess.session_date)
+            return exec_ts, slot_sid
 
         col = "start_utc" if execution_price_field == "open" else "end_utc"
-        return _normalize_utc_timestamp(slots[col].iloc[0])
+        exec_ts = _normalize_utc_timestamp(slots[col].iloc[0])
+        slot_sid = str(slots["session_id"].iloc[0])
+        if self._freq_obj.kind == "week":
+            try:
+                week = cal._week_on(session_id, self._view)
+            except Exception:
+                week = []
+            if week:
+                target_session = week[0] if execution_price_field == "open" else week[-1]
+                return exec_ts, str(target_session.session_date)
+        if execution_price_field == "open":
+            sess = self._call_session_at(cal, exec_ts)
+            if sess is not None and getattr(sess, "session_date", None):
+                return exec_ts, str(sess.session_date)
+        return exec_ts, slot_sid
 
     def _resolve_from_calendar_protocol(
         self,
@@ -801,7 +852,7 @@ class _FuturesOrderValidator:
         session_id: str,
         inst: str,
         execution_price_field: str,
-    ) -> Optional[pd.Timestamp]:
+    ) -> Optional[Tuple[pd.Timestamp, str]]:
         session = self._call_session_at(cal, bar_ts, frequency=self._freq_obj)
         if session is None and self._freq_obj.kind in ("session", "week"):
             anchor_grid = self._call_bar_grid(
@@ -814,7 +865,8 @@ class _FuturesOrderValidator:
                     session = self._call_session_at(cal, anchor_ts, frequency=self._freq_obj)
         if session is None or not getattr(session, "segments", None):
             return None
-        if str(getattr(session, "session_date", session_id)) != str(session_id):
+        resolved_sid = str(getattr(session, "session_date", session_id))
+        if resolved_sid != str(session_id):
             return None
 
         if self._freq_obj.kind == "intraday":
@@ -857,11 +909,12 @@ class _FuturesOrderValidator:
             if len(matches) == 0:
                 return None
             row_idx = int(matches[0])
-            return opens[row_idx] if execution_price_field == "open" else closes[row_idx]
+            exec_ts = opens[row_idx] if execution_price_field == "open" else closes[row_idx]
+            return exec_ts, resolved_sid
 
         if self._freq_obj.kind == "week":
             if execution_price_field == "close":
-                return _normalize_utc_timestamp(session.segments[-1][1])
+                return _normalize_utc_timestamp(session.segments[-1][1]), resolved_sid
             if self._weekly_first_in_week is None:
                 daily = self._call_bar_grid(cal, "1d")
                 if daily is None or daily.empty:
@@ -875,14 +928,73 @@ class _FuturesOrderValidator:
             opening_session = self._call_session_at(cal, day_key, frequency="1d")
             if opening_session is None or not getattr(opening_session, "segments", None):
                 return None
-            return _normalize_utc_timestamp(opening_session.segments[0][0])
+            exec_ts = _normalize_utc_timestamp(opening_session.segments[0][0])
+            open_sid = getattr(opening_session, "session_date", None)
+            if open_sid:
+                return exec_ts, str(open_sid)
+            fallback_sess = self._call_session_at(cal, exec_ts)
+            if fallback_sess is not None and getattr(fallback_sess, "session_date", None):
+                return exec_ts, str(fallback_sess.session_date)
+            return exec_ts, resolved_sid
 
         target = (
             session.segments[0][0]
             if execution_price_field == "open"
             else session.segments[-1][1]
         )
-        return _normalize_utc_timestamp(target)
+        return _normalize_utc_timestamp(target), resolved_sid
+
+    def _resolve_execution_context(
+        self,
+        *,
+        bar_idx: int,
+        inst: str,
+        execution_price_field: str,
+    ) -> Tuple[pd.Timestamp, str]:
+        """Resolve authoritative ``(exec_ts_utc, exec_session_id)`` for an order."""
+        cache_key = (bar_idx, inst, execution_price_field)
+        cached = self._exec_context_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        bar_ts = _normalize_utc_timestamp(self._bar_utc_index[bar_idx])
+        bar_session_id = str(self._session_ids.get((bar_idx, inst), bar_ts.strftime("%Y-%m-%d")))
+        if self._slot is None:
+            out = (bar_ts, bar_session_id)
+            self._exec_context_cache[cache_key] = out
+            return out
+
+        cal = self._slot.calendar
+        if isinstance(cal, SessionCalendar) and hasattr(cal, "_intervals"):
+            resolved = self._resolve_from_session_calendar(
+                cal=cal,
+                bar_ts=bar_ts,
+                session_id=bar_session_id,
+                inst=inst,
+                execution_price_field=execution_price_field,
+            )
+        else:
+            resolved = self._resolve_from_calendar_protocol(
+                cal=cal,
+                bar_ts=bar_ts,
+                session_id=bar_session_id,
+                inst=inst,
+                execution_price_field=execution_price_field,
+            )
+
+        if resolved is not None:
+            out = resolved
+        else:
+            fallback_sess = (
+                self._call_session_at(cal, bar_ts, frequency=self._freq_obj)
+                or self._call_session_at(cal, bar_ts)
+            )
+            if fallback_sess is not None and getattr(fallback_sess, "session_date", None):
+                out = (bar_ts, str(fallback_sess.session_date))
+            else:
+                out = (bar_ts, bar_session_id)
+        self._exec_context_cache[cache_key] = out
+        return out
 
     def _resolve_execution_timestamp(
         self,
@@ -891,38 +1003,12 @@ class _FuturesOrderValidator:
         inst: str,
         execution_price_field: str,
     ) -> pd.Timestamp:
-        cache_key = (bar_idx, inst, execution_price_field)
-        cached = self._exec_ts_cache.get(cache_key)
-        if cached is not None:
-            return cached
-
-        bar_ts = _normalize_utc_timestamp(self._bar_utc_index[bar_idx])
-        if self._slot is None:
-            self._exec_ts_cache[cache_key] = bar_ts
-            return bar_ts
-
-        cal = self._slot.calendar
-        session_id = self._session_ids.get((bar_idx, inst), bar_ts.strftime("%Y-%m-%d"))
-        if isinstance(cal, SessionCalendar) and hasattr(cal, "_intervals"):
-            resolved = self._resolve_from_session_calendar(
-                cal=cal,
-                bar_ts=bar_ts,
-                session_id=session_id,
-                inst=inst,
-                execution_price_field=execution_price_field,
-            )
-        else:
-            resolved = self._resolve_from_calendar_protocol(
-                cal=cal,
-                bar_ts=bar_ts,
-                session_id=session_id,
-                inst=inst,
-                execution_price_field=execution_price_field,
-            )
-
-        out = resolved if resolved is not None else bar_ts
-        self._exec_ts_cache[cache_key] = out
-        return out
+        exec_ts, _ = self._resolve_execution_context(
+            bar_idx=bar_idx,
+            inst=inst,
+            execution_price_field=execution_price_field,
+        )
+        return exec_ts
 
     def is_mask_tradable(
         self,
@@ -957,14 +1043,13 @@ class _FuturesOrderValidator:
                 execution_price_field=price_field,
             )
 
-        cache_key = (bar_idx, contract, side, price_field)
+        cache_key = (bar_idx, inst, contract, side, price_field)
         if cache_key in self._mask_cache:
             return self._mask_cache[cache_key]
 
-        exec_ts = self._resolve_execution_timestamp(
+        exec_ts, session_id = self._resolve_execution_context(
             bar_idx=bar_idx, inst=inst, execution_price_field=price_field
         )
-        session_id = self._session_ids.get((bar_idx, inst), exec_ts.strftime("%Y-%m-%d"))
 
         grid_data: Dict[str, Any] = {
             "instrument_id": [contract],
@@ -1337,15 +1422,6 @@ def simulate_futures_contract_portfolio(
         bar_py_dt = bar_ts.to_pydatetime()
         for inst in instruments:
             rec = bar_row_lookup.get((pos, inst))
-            c_id: Optional[str] = None
-            if rec is not None and pd.notna(rec.get("concrete_instrument_id")):
-                c_id = str(rec["concrete_instrument_id"])
-            elif slot is not None:
-                c_id = _try_resolve_active(slot, inst, bar_py_dt)
-            if not c_id:
-                c_id = active_contract[(pos - 1, inst)] if pos > 0 else inst
-            active_contract[(pos, inst)] = c_id
-
             if rec is not None and pd.notna(rec.get("session_id")):
                 session_ids[(pos, inst)] = str(rec["session_id"])
             elif freq_obj.kind == "session" and dt.tzinfo is None:
@@ -1364,10 +1440,141 @@ def simulate_futures_contract_portfolio(
             else:
                 session_ids[(pos, inst)] = pd.Timestamp(bar_ts).strftime("%Y-%m-%d")
 
+    default_execution_price_field: Literal["open", "close"] = "open" if use_open else "close"
+    validator = _FuturesOrderValidator(
+        slot=slot,
+        bar_utc_index=bar_utc_index,
+        session_ids=session_ids,
+        frequency=freq_obj,
+        default_execution_price_field=default_execution_price_field,
+    )
+
+    contract_bar_cache: Dict[Tuple[int, str], Optional[Dict[str, Any]]] = {}
+    roll_close_cache: Dict[Tuple[int, str, str], Optional[float]] = {}
+    roll_close_errors: Dict[Tuple[int, str, str], Exception] = {}
+
+    def _read_contract_bar(
+        pos: int,
+        contract_id: str,
+        *,
+        error_field: Optional[str] = None,
+        exec_ts_hint: Optional[pd.Timestamp] = None,
+    ) -> Optional[Dict[str, Any]]:
+        key = (pos, contract_id)
+        if key in contract_bar_cache:
+            return contract_bar_cache[key]
+        if slot is None:
+            contract_bar_cache[key] = None
+            return None
+        bar_ts = bar_utc_index[pos]
+        start_dt = (
+            min(bar_ts, exec_ts_hint).to_pydatetime()
+            if exec_ts_hint is not None
+            else bar_ts.to_pydatetime()
+        )
+        end_dt = (
+            max(bar_ts, exec_ts_hint).to_pydatetime()
+            if exec_ts_hint is not None
+            else bar_ts.to_pydatetime()
+        )
+        matched_rec: Optional[Dict[str, Any]] = None
+        try:
+            bars_df = slot.bar_feed.read_execution_bars(
+                [contract_id],
+                freq_obj,
+                start_utc=start_dt,
+                end_utc=end_dt,
+            )
+            if bars_df is not None and not bars_df.empty:
+                if (
+                    session_to_utc is not None
+                    and "session_id" in bars_df.columns
+                    and bars_df["session_id"].notna().all()
+                ):
+                    matched_utc = (
+                        pd.to_datetime(bars_df["session_id"]).dt.normalize().map(session_to_utc)
+                    )
+                    bars_df = bars_df.loc[matched_utc == bar_ts]
+                elif "timestamp_utc" in bars_df.columns:
+                    matched_utc = pd.to_datetime(bars_df["timestamp_utc"], utc=True).dt.as_unit("ns")
+                    mask_ts = matched_utc == bar_ts
+                    if not mask_ts.any() and exec_ts_hint is not None:
+                        mask_ts = matched_utc == exec_ts_hint
+                    bars_df = bars_df.loc[mask_ts]
+            if bars_df is not None and not bars_df.empty:
+                matched_rec = bars_df.iloc[-1].to_dict()
+        except Exception as exc:
+            if error_field is not None:
+                roll_close_errors[(pos, contract_id, error_field)] = exc
+            log.debug(
+                f"[FuturesExec] Could not read bar for {contract_id} at {bar_ts}: {exc}"
+            )
+            return None
+        contract_bar_cache[key] = matched_rec
+        return matched_rec
+
+    resolver_accepts_session_date = (
+        _resolver_accepts_session_date(slot.universe.resolve_active_contract)
+        if slot is not None
+        else False
+    )
+    for pos, bar_ts in enumerate(bar_utc_index):
+        dt = all_dates[pos]
+        for inst in instruments:
+            rec = bar_row_lookup.get((pos, inst))
+            rec_cid = (
+                str(rec["concrete_instrument_id"])
+                if (rec is not None and pd.notna(rec.get("concrete_instrument_id")))
+                else None
+            )
+            exec_ts, exec_session_id = validator._resolve_execution_context(
+                bar_idx=pos,
+                inst=inst,
+                execution_price_field=default_execution_price_field,
+            )
+            resolved_exec = (
+                _try_resolve_active(
+                    slot,
+                    inst,
+                    exec_ts.to_pydatetime(),
+                    session_date=exec_session_id,
+                    accepts_session_date=resolver_accepts_session_date,
+                )
+                if slot is not None
+                else None
+            )
+            binding_missing = slot is not None and (
+                resolved_exec is None or str(resolved_exec).strip() == ""
+            )
+            if binding_missing:
+                c_id = active_contract[(pos - 1, inst)] if pos > 0 else inst
+            elif rec_cid is not None:
+                if (
+                    resolved_exec is not None
+                    and resolved_exec != inst
+                    and resolved_exec != rec_cid
+                ):
+                    c_id = resolved_exec
+                else:
+                    c_id = rec_cid
+            elif resolved_exec is not None:
+                c_id = resolved_exec
+            else:
+                c_id = active_contract[(pos - 1, inst)] if pos > 0 else inst
+            active_contract[(pos, inst)] = c_id
+
             if slot is not None:
                 # Never fall back to spliced/adjusted price_aligned or open_aligned when a slot feed is present.
-                c_px = _valid_positive(rec.get("close")) if rec is not None else None
-                o_px = _valid_positive(rec.get("open")) if rec is not None else None
+                c_rec: Optional[Dict[str, Any]] = None
+                if not binding_missing:
+                    if rec is not None and rec_cid == c_id:
+                        c_rec = rec
+                    elif c_id != inst:
+                        c_rec = _read_contract_bar(pos, c_id, exec_ts_hint=exec_ts)
+                    elif rec is not None and rec_cid is None:
+                        c_rec = rec
+                c_px = _valid_positive(c_rec.get("close")) if c_rec is not None else None
+                o_px = _valid_positive(c_rec.get("open")) if c_rec is not None else None
                 concrete_close[(pos, inst)] = c_px
                 concrete_open[(pos, inst)] = o_px
             else:
@@ -1384,15 +1591,6 @@ def simulate_futures_contract_portfolio(
                 concrete_close[(pos, inst)] = c_px
                 concrete_open[(pos, inst)] = o_px if o_px is not None else c_px
 
-    default_execution_price_field: Literal["open", "close"] = "open" if use_open else "close"
-    validator = _FuturesOrderValidator(
-        slot=slot,
-        bar_utc_index=bar_utc_index,
-        session_ids=session_ids,
-        frequency=freq_obj,
-        default_execution_price_field=default_execution_price_field,
-    )
-
     spec_cache: Dict[str, InstrumentSpec] = {}
 
     def _get_spec(contract_id: str) -> InstrumentSpec:
@@ -1407,9 +1605,6 @@ def simulate_futures_contract_portfolio(
         spec_cache[contract_id] = spec
         return spec
 
-    roll_close_cache: Dict[Tuple[int, str, str], Optional[float]] = {}
-    roll_close_errors: Dict[Tuple[int, str, str], Exception] = {}
-
     def _resolve_roll_close_price(
         pos: int, contract_id: str, field_override: Optional[str] = None
     ) -> Optional[float]:
@@ -1419,34 +1614,9 @@ def simulate_futures_contract_portfolio(
             return roll_close_cache[key]
         price_val: Optional[float] = None
         if slot is not None:
-            bar_dt = bar_utc_index[pos].to_pydatetime()
-            try:
-                old_bar = slot.bar_feed.read_execution_bars(
-                    [contract_id],
-                    freq_obj,
-                    start_utc=bar_dt,
-                    end_utc=bar_dt,
-                )
-                if old_bar is not None and not old_bar.empty:
-                    if (
-                        session_to_utc is not None
-                        and "session_id" in old_bar.columns
-                        and old_bar["session_id"].notna().all()
-                    ):
-                        matched_utc = (
-                            pd.to_datetime(old_bar["session_id"]).dt.normalize().map(session_to_utc)
-                        )
-                        old_bar = old_bar.loc[matched_utc == bar_utc_index[pos]]
-                    elif "timestamp_utc" in old_bar.columns:
-                        matched_utc = pd.to_datetime(old_bar["timestamp_utc"], utc=True).dt.as_unit("ns")
-                        old_bar = old_bar.loc[matched_utc == bar_utc_index[pos]]
-                if old_bar is not None and not old_bar.empty and field in old_bar.columns:
-                    price_val = _valid_positive(old_bar[field].iloc[-1])
-            except Exception as exc:
-                roll_close_errors[key] = exc
-                log.debug(
-                    f"[FuturesExec] Could not read roll exit bar for {contract_id} at {bar_dt}: {exc}"
-                )
+            bar_rec = _read_contract_bar(pos, contract_id, error_field=field)
+            if bar_rec is not None and field in bar_rec:
+                price_val = _valid_positive(bar_rec[field])
         roll_close_cache[key] = price_val
         return price_val
 
@@ -1674,8 +1844,7 @@ def simulate_futures_contract_portfolio(
         if slot is not None:
             for inst in instruments:
                 exec_px = _exec_price(bar_idx, inst)
-                close_px = concrete_close[(bar_idx, inst)]
-                if exec_px is not None and close_px is not None:
+                if exec_px is not None:
                     continue
                 has_pos = inst in positions
                 if w_row is not None:
@@ -1697,14 +1866,13 @@ def simulate_futures_contract_portfolio(
                 c_id = active_contract[(bar_idx, inst)]
                 # If microstructure explicitly marks the bar non-tradable, do not fail
                 # missing-execution-bar validation; let order validation block/defer it.
-                missing_field = default_execution_price_field if exec_px is None else "close"
                 if not validator.is_mask_tradable(
                     bar_idx=bar_idx,
                     inst=inst,
                     contract=c_id,
                     side="hold",
                     price=exec_px,
-                    execution_price_field=missing_field,
+                    execution_price_field=default_execution_price_field,
                 ):
                     missing_bar_insts.add(inst)
                     continue
@@ -2064,6 +2232,18 @@ def simulate_futures_contract_portfolio(
                         ):
                             c_cur_out = active_contract[(bar_idx, inst)]
                             target_val /= config.margin_rate_for(inst, c_cur_out)
+                        elif (
+                            decision.kind == "branch_overlay"
+                            and config.target_weight_basis == "margin"
+                            and inst in decision.target_weights
+                            and inst not in decision.sell_instruments
+                        ):
+                            c_cur_out = active_contract[(bar_idx, inst)]
+                            target_val = (
+                                float(decision.target_weights[inst])
+                                * max(equity, 0.0)
+                                / config.margin_rate_for(inst, c_cur_out)
+                            ) * config.leverage
                         target_weights_out.loc[dt, inst] = target_val
                     elif inst in roll_completed_exits:
                         target_weights_out.loc[dt, inst] = 0.0
@@ -2553,6 +2733,26 @@ def simulate_futures_contract_portfolio(
                 )
             else:
                 close_px = None if inst in missing_bar_insts else concrete_close[(bar_idx, inst)]
+                if (
+                    close_px is None
+                    and slot is not None
+                    and inst not in missing_bar_insts
+                    and use_open
+                    and validator.is_mask_tradable(
+                        bar_idx=bar_idx,
+                        inst=inst,
+                        contract=pos_obj.concrete_instrument_id,
+                        side="hold",
+                        price=None,
+                        execution_price_field="close",
+                    )
+                ):
+                    missing_execution_bar_count += 1
+                    if config.missing_execution_bar_policy == "raise":
+                        raise FuturesExecutionError(
+                            f"Missing physical close mark bar for instrument={inst!r}, "
+                            f"contract={pos_obj.concrete_instrument_id!r}, bar={dt} (use_open={use_open})"
+                        )
             if close_px is not None:
                 equity += float(pos_obj.lots) * (close_px - pos_obj.last_mark_price) * pos_obj.multiplier
                 pos_obj.last_mark_price = close_px

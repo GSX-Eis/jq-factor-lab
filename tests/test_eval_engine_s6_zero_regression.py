@@ -154,7 +154,9 @@ def test_joinquant_bundle_matches_stage6_sha256(tmp_path, monkeypatch):
     # attrs and Real check in apply_pit_adjustment; local factor scaling moved to utils/price_adjustment.py).
     # NERE-1401 changes the digest (2c9789cc...) solely through inlined utils/strategy_kernel.py
     # (added rank preprocessing, explicit "none" handling, and shared preprocessing helpers).
-    assert sha256(artifact).hexdigest() == "2c9789cc904ef89598b8b0f38fa655d56d000889e07b39110d1e15ad567a9338"
+    # NERE-1429 changes the digest (3f380aa2...) solely through inlined utils/strategy_kernel.py
+    # (shared factor validity mask, degenerate cross-section NaN preservation, and causal time-series standardization).
+    assert sha256(artifact).hexdigest() == "3f380aa2e23616cfd7547ab3c657d61851f296dc1c1549810189700e977aa2b6"
 
 
 def test_daily_adapter_has_no_alphalens_import():

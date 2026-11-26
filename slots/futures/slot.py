@@ -261,8 +261,11 @@ class _FuturesData:
         day = pd.Timestamp(self._session_date(as_of_utc)).date()
         return tuple(contract for contract, spec in self.specs.items() if spec.expiry_date >= day)
 
-    def resolve_active_contract(self, instrument_id: str, *, as_of_utc: datetime) -> str:
-        day = pd.Timestamp(self._session_date(as_of_utc)).date()
+    def _resolve_active_contract(
+        self, instrument_id: str, *, as_of_utc: datetime, session_date: str | None = None
+    ) -> str:
+        resolved_session = session_date if session_date is not None else self._session_date(as_of_utc)
+        day = pd.Timestamp(resolved_session).date()
         contract = instrument_id
         if instrument_id == self.root:
             position = bisect_right(self.opens, as_of_utc) - 1
@@ -274,6 +277,11 @@ class _FuturesData:
         if self.instrument_spec(contract).expiry_date < day:
             raise MissingBarDataError(f'Expired futures contract {contract} at {as_of_utc}')
         return contract
+
+    def resolve_active_contract(
+        self, instrument_id: str, *, as_of_utc: datetime, session_date: str | None = None
+    ) -> str:
+        return self._resolve_active_contract(instrument_id, as_of_utc=as_of_utc, session_date=session_date)
 
     def _session_before_coverage(self) -> Session | None:
         metadata = next(iter(self.metadata.values()))
@@ -334,13 +342,26 @@ class _FuturesData:
         return data.assign(**values, available_at_utc=pd.to_datetime(available, utc=True))
 
     def tradability_mask(self, grid: pd.DataFrame, *, instrument_id: str) -> pd.Series:
-        def eligible(ts: pd.Timestamp, session_id: str) -> bool:
-            session = (self.calendar.session_at(ts, self.view) or
-                       self.calendar.session_at(ts, self.view, frequency='1d'))
-            if session is None or session.session_date != str(session_id):
+        def eligible(ts: pd.Timestamp, session_id: str, price_field: str) -> bool:
+            _utc(ts, 'timestamp_utc')
+            ts_norm = pd.Timestamp(ts)
+            session = self.calendar.session_on(str(session_id), self.view)
+            if session is None or not session.segments:
+                return False
+            if price_field == 'close':
+                in_session = any(left <= ts_norm < right or ts_norm == right
+                                 for left, right in session.segments)
+            elif price_field == 'open':
+                in_session = any(left <= ts_norm < right for left, right in session.segments)
+            else:
+                in_session = (any(left <= ts_norm < right for left, right in session.segments)
+                              or ts_norm == session.segments[-1][1])
+            if not in_session:
                 return False
             try:
-                contract = self.resolve_active_contract(instrument_id, as_of_utc=ts)
+                contract = self._resolve_active_contract(
+                    instrument_id, as_of_utc=ts_norm, session_date=session.session_date
+                )
             except MissingBarDataError:
                 return False
             day = pd.Timestamp(session.session_date).date()
@@ -349,8 +370,12 @@ class _FuturesData:
             return day < expiry and (not self.exclude_delivery_month or
                                      session.session_date[:7] != delivery_month)
 
-        return pd.Series([eligible(ts, day) for ts, day in zip(grid.timestamp_utc, grid.session_id)],
-                         index=grid.index, dtype=bool, name='tradable')
+        raw_fields = grid.get('execution_price_field', pd.Series('', index=grid.index))
+        price_fields = ['' if pd.isna(v) else str(v) for v in raw_fields]
+        return pd.Series(
+            [eligible(ts, day, field)
+             for ts, day, field in zip(grid.timestamp_utc, grid.session_id, price_fields)],
+            index=grid.index, dtype=bool, name='tradable')
 
 
 def build_futures_slot(connection: duckdb.DuckDBPyConnection, *, provider: str, slot_id: str,

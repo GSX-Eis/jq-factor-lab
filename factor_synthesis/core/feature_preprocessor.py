@@ -16,7 +16,11 @@ Updated: 2026-02-04 - Added binning and winsorize_zscore
 Updated: 2026-02-11 - Added cross_sectional_zscore (winsorize + zscore)
 """
 
-from utils.strategy_kernel import preprocess_series
+from utils.strategy_kernel import (
+    TIME_SERIES_METHODS,
+    preprocess_series,
+    time_series_standardize,
+)
 import logging
 from typing import Union
 
@@ -252,43 +256,3 @@ def cross_sectional_zscore(
     except Exception as e:
         logger.error(f"横截面 Z-Score (去极值+标准化) 失败: {e}")
         raise
-
-
-TIME_SERIES_METHODS = {"time_series_zscore", "time_series_rank"}
-
-
-def time_series_standardize(
-    values: pd.Series, method: str, *, window: int, min_periods: int | None = None,
-) -> pd.Series:
-    """Compare each observation with only its instrument's preceding observations."""
-    from numbers import Integral
-
-    minimum = window if min_periods is None else min_periods
-    if any(isinstance(n, bool) or not isinstance(n, Integral) for n in (window, minimum)):
-        raise ValueError("Time-series window and min_periods must be integers")
-    if not 2 <= minimum <= window:
-        raise ValueError("Time-series preprocessing requires 2 <= min_periods <= window")
-    if method not in TIME_SERIES_METHODS:
-        raise ValueError(f"Unknown time-series preprocessing method: {method}")
-    if not values.index.is_unique:
-        raise ValueError("Time-series preprocessing requires unique date and instrument keys")
-
-    def normalize(group: pd.Series) -> pd.Series:
-        if method == "time_series_zscore":
-            history = group.shift(1).rolling(window, min_periods=minimum)
-            std = history.std(ddof=0)
-            return ((group - history.mean()) / std.where(std > 0)).mask(std.eq(0) & group.notna(), 0.0)
-
-        def percentile(sample):
-            current = sample[-1]
-            history = sample[:-1]
-            if np.isnan(current):
-                return np.nan
-            below = np.count_nonzero(history < current)
-            ties = np.count_nonzero(history == current)
-            return (below + 0.5 * ties) / np.count_nonzero(~np.isnan(history))
-
-        return group.rolling(window + 1, min_periods=minimum + 1).apply(percentile, raw=True)
-
-    ordered = values.replace([np.inf, -np.inf], np.nan).sort_index(level="date")
-    return ordered.groupby(level="stock_code", sort=False).transform(normalize).reindex(values.index)

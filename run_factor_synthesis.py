@@ -3797,21 +3797,26 @@ class FactorSynthesizer:
 
         # [自动扩展] 向前扩展 train_window_days + buffer 以满足第一个训练窗口的数据需求
         # start_date 是合成输出的起始日期，第一个训练窗口为 [start_date - train_window_days, start_date]
+        ws_ts_window: Optional[int] = None
         if method == "weighted_sum":
-            from factor_synthesis.core.feature_preprocessor import TIME_SERIES_METHODS
-            from utils.strategy_kernel import resolve_preprocess_method
+            from utils.strategy_kernel import (
+                TIME_SERIES_METHODS,
+                resolve_preprocess_method,
+                resolve_time_series_params,
+            )
 
             preprocess_cfg = synthesis_config.get("preprocess") or {}
+            standardize = bool(synthesis_config.get("standardize", True))
             default_mode = resolve_preprocess_method(preprocess_cfg, "ALL", default="none")
-            uses_ts = any(
+            uses_ts = standardize and any(
                 resolve_preprocess_method(preprocess_cfg, f, default=default_mode)
                 in TIME_SERIES_METHODS
                 for f in all_factor_names
             )
             train_window_days = 0
             if uses_ts:
-                ts_window = int(preprocess_cfg.get("_ts_window", 20))
-                _buffer_days = max(30, ts_window * 2 + 15)
+                ws_ts_window, _ = resolve_time_series_params(preprocess_cfg)
+                _buffer_days = max(30, int(ws_ts_window) * 2 + 15)
             else:
                 _buffer_days = 30  # buffer 用于 shift(1) 和交易日历对齐
         else:
@@ -3858,6 +3863,102 @@ class FactorSynthesizer:
                 frame.attrs["market_factor_inputs"] = market_factor_inputs
             if panel_date_alignment is not None:
                 frame.attrs["panel_date_alignment"] = panel_date_alignment
+            if method == "weighted_sum" and ws_ts_window is not None and not frame.empty:
+                weights_cfg = synthesis_config.get("weights") or {}
+                used_cols = [
+                    f
+                    for f in all_factor_names
+                    if f in frame.columns and abs(float(weights_cfg.get(f, 0.0))) > 0.0
+                ] or [f for f in all_factor_names if f in frame.columns]
+                active_rows = frame[used_cols].dropna(how="all")
+                if not active_rows.empty:
+                    dates_idx = pd.DatetimeIndex(active_rows.index.get_level_values("date"))
+                    start_ts = pd.Timestamp(start_date)
+                    if dates_idx.tz is not None:
+                        start_ts = (
+                            start_ts.tz_localize(dates_idx.tz)
+                            if start_ts.tz is None
+                            else start_ts.tz_convert(dates_idx.tz)
+                        )
+                    eval_rows = active_rows.loc[dates_idx >= start_ts]
+                    if not eval_rows.empty:
+                        first_eval_by_stock = (
+                            pd.Series(
+                                eval_rows.index.get_level_values("date"),
+                                index=eval_rows.index.get_level_values("stock_code"),
+                            )
+                            .groupby(level=0)
+                            .min()
+                        )
+                        stock_codes = active_rows.index.get_level_values("stock_code")
+                        first_eval_aligned = stock_codes.map(first_eval_by_stock)
+                        prior_mask = dates_idx < pd.DatetimeIndex(first_eval_aligned)
+                        prior_counts = stock_codes[prior_mask].value_counts()
+                        deficit_stocks = [
+                            stock
+                            for stock in first_eval_by_stock.index
+                            if int(prior_counts.get(stock, 0)) < int(ws_ts_window)
+                        ]
+                        if deficit_stocks:
+                            earliest_start: Optional[str] = None
+                            if active_slot is not None:
+                                earliest_start = pd.Timestamp(
+                                    active_slot.calendar.start
+                                ).strftime("%Y-%m-%d")
+                            else:
+                                try:
+                                    from utils.trading_calendar import load_trading_calendar
+
+                                    cal = load_trading_calendar(self._get_price_conn())
+                                    earliest_start = pd.Timestamp(cal.start).strftime("%Y-%m-%d")
+                                except Exception as exc:
+                                    self.logger.warning(
+                                        "time-series backfill skipped: trading calendar unavailable (%s)",
+                                        exc,
+                                    )
+                                    earliest_start = None
+                            if earliest_start is not None and earliest_start < data_start_date:
+                                neu_enabled = bool(
+                                    (synthesis_config.get("neutralization") or {}).get("enabled", False)
+                                )
+                                if neu_enabled and self.config.get("stock_pool", {}).get(
+                                    "use_dynamic_pools", False
+                                ):
+                                    backfill_filter = self._get_all_pool_stocks(
+                                        earliest_start, end_date
+                                    )
+                                else:
+                                    backfill_filter = (
+                                        all_pool_stocks if neu_enabled else set(deficit_stocks)
+                                    )
+                                backfill = self.load_factor_data(
+                                    all_factor_names,
+                                    earliest_start,
+                                    end_date,
+                                    stock_filter=backfill_filter,
+                                    neutralization_config=synthesis_config.get("neutralization"),
+                                )
+                                backfill = self._apply_dynamic_stock_pool_filter(
+                                    backfill, start_date=earliest_start, end_date=end_date
+                                ).sort_index()
+                                if getattr(self, "skip_months_training", False) and getattr(
+                                    self, "skip_months", None
+                                ):
+                                    backfill = self._apply_skip_months(backfill)
+                                if not backfill.empty:
+                                    if neu_enabled:
+                                        frame = backfill
+                                    else:
+                                        keep_mask = ~frame.index.get_level_values("stock_code").isin(
+                                            deficit_stocks
+                                        )
+                                        frame = pd.concat(
+                                            [frame.loc[keep_mask], backfill], axis=0
+                                        ).sort_index()
+                                    if market_factor_inputs is not None:
+                                        frame.attrs["market_factor_inputs"] = market_factor_inputs
+                                    if panel_date_alignment is not None:
+                                        frame.attrs["panel_date_alignment"] = panel_date_alignment
             return frame
 
         prepared_panel = None

@@ -37,19 +37,283 @@ def preprocess_series(
         raise ValueError("unsupported_preprocessing: " + str(method))
     mean, std = values.mean(), values.std()
     if pd.isna(std) or std == 0 or (not zero_degenerate and std < 1e-8):
-        return pd.Series(0.0, index=series.index) if zero_degenerate else values - mean
+        return values.where(values.isna(), 0.0) if zero_degenerate else values - mean
     return (values - mean) / std
+
+
+TIME_SERIES_METHODS = frozenset(["time_series_zscore", "time_series_rank"])
 
 
 def resolve_preprocess_method(methods, name, default="zscore"):
     cfg = methods if hasattr(methods, "get") else {}
-    fallback = cfg.get("ALL", default)
-    if fallback in (None, ""):
-        fallback = default
-    mode = cfg.get(name)
-    if mode in (None, ""):
-        return fallback
-    return mode
+    sentinel = object()
+    mode = cfg.get(name, sentinel)
+    if mode is not sentinel:
+        return "none" if mode in (None, "") else mode
+    fallback = cfg.get("ALL", sentinel)
+    if fallback is not sentinel:
+        return "none" if fallback in (None, "") else fallback
+    return default
+
+
+def resolve_time_series_params(methods=None):
+    cfg = methods if hasattr(methods, "get") else {}
+    window = cfg.get("_ts_window", 20)
+    if window is None:
+        window = 20
+    min_periods = cfg.get("_ts_min_periods", None)
+    if min_periods is None:
+        min_periods = window
+    return window, min_periods
+
+
+def _validate_time_series_params(method, window, min_periods):
+    from numbers import Integral
+
+    minimum = window if min_periods is None else min_periods
+    if any(isinstance(n, bool) or not isinstance(n, Integral) for n in (window, minimum)):
+        raise ValueError("Time-series window and min_periods must be integers")
+    if not 2 <= minimum <= window:
+        raise ValueError("Time-series preprocessing requires 2 <= min_periods <= window")
+    if method not in TIME_SERIES_METHODS:
+        raise ValueError("Unknown time-series preprocessing method: " + str(method))
+    return int(window), int(minimum)
+
+
+def time_series_standardize(values, method, window=20, min_periods=None):
+    """Compare each observation with only its instrument's preceding observations."""
+    window, minimum = _validate_time_series_params(method, window, min_periods)
+    if not values.index.is_unique:
+        raise ValueError("Time-series preprocessing requires unique date and instrument keys")
+
+    def normalize(group):
+        if method == "time_series_zscore":
+            history = group.shift(1).rolling(window, min_periods=minimum)
+            std = history.std(ddof=0)
+            return ((group - history.mean()) / std.where(std > 0)).mask(
+                std.eq(0) & group.notna(), 0.0
+            )
+
+        def percentile(sample):
+            current = sample[-1]
+            history = sample[:-1]
+            if np.isnan(current):
+                return np.nan
+            below = np.count_nonzero(history < current)
+            ties = np.count_nonzero(history == current)
+            return (below + 0.5 * ties) / np.count_nonzero(~np.isnan(history))
+
+        return group.rolling(window + 1, min_periods=minimum + 1).apply(
+            percentile, raw=True
+        )
+
+    cleaned = values.replace([np.inf, -np.inf], np.nan)
+    if isinstance(cleaned, pd.DataFrame):
+        ordered = cleaned.sort_index()
+        return ordered.apply(normalize).reindex(values.index)
+    if isinstance(cleaned.index, pd.MultiIndex):
+        ordered = cleaned.sort_index(level="date")
+        return ordered.groupby(level="stock_code", sort=False).transform(normalize).reindex(values.index)
+    ordered = cleaned.sort_index()
+    return normalize(ordered).reindex(values.index)
+
+
+def _align_timestamp_to_index(ts, index):
+    target = pd.Timestamp(ts)
+    if hasattr(index, "tz") and index.tz is not None:
+        if target.tzinfo is None:
+            return target.tz_localize(index.tz)
+        return target.tz_convert(index.tz)
+    if target.tzinfo is not None:
+        return target.tz_convert("UTC").tz_localize(None)
+    return target
+
+
+def _normalize_ts_history_panel(history, factor_names, stocks, asof=None):
+    """Canonicalize MultiIndex or wide-dict history to sparse (date, stock_code) <= asof."""
+    if isinstance(history, pd.DataFrame) and isinstance(history.index, pd.MultiIndex):
+        active_cols = (
+            [c for c in factor_names if c in history.columns]
+            if factor_names is not None
+            else list(history.columns)
+        )
+        date_level = "date" if "date" in history.index.names else 0
+        stock_level = "stock_code" if "stock_code" in history.index.names else 1
+        date_vals = pd.DatetimeIndex(history.index.get_level_values(date_level))
+        stock_vals = history.index.get_level_values(stock_level)
+        if asof is not None:
+            asof_ts = _align_timestamp_to_index(asof, date_vals)
+        else:
+            if history.empty:
+                return (
+                    pd.DataFrame(
+                        columns=active_cols,
+                        index=pd.MultiIndex.from_tuples([], names=["date", "stock_code"]),
+                        dtype=float,
+                    ),
+                    None,
+                )
+            asof_ts = date_vals.max()
+        keep_mask = (date_vals <= asof_ts) & stock_vals.isin(stocks)
+        sub_idx = pd.MultiIndex.from_arrays(
+            [date_vals[keep_mask], stock_vals[keep_mask]],
+            names=["date", "stock_code"],
+        )
+        if not sub_idx.is_unique:
+            raise ValueError(
+                "Time-series preprocessing requires unique date and instrument keys"
+            )
+        if not len(sub_idx) or not active_cols:
+            return (
+                pd.DataFrame(
+                    columns=active_cols,
+                    index=pd.MultiIndex.from_tuples([], names=["date", "stock_code"]),
+                    dtype=float,
+                ),
+                asof_ts,
+            )
+        sub = history.loc[keep_mask]
+        frame = pd.DataFrame(
+            {
+                c: np.asarray(pd.to_numeric(sub[c], errors="coerce"), dtype=float)
+                for c in active_cols
+            },
+            index=sub_idx,
+        )
+        return frame.dropna(how="all").sort_index(), asof_ts
+
+    if hasattr(history, "get"):
+        active_cols = (
+            [c for c in factor_names if c in history]
+            if factor_names is not None
+            else sorted(k for k, v in history.items() if isinstance(v, pd.DataFrame))
+        )
+        parsed = {}
+        for col_name in active_cols:
+            wide = history[col_name]
+            if not isinstance(wide, pd.DataFrame):
+                raise ValueError("time_series_history_invalid: " + str(col_name))
+            wide_idx = pd.DatetimeIndex(wide.index)
+            if not wide_idx.is_unique:
+                raise ValueError(
+                    "Time-series preprocessing requires unique date and instrument keys"
+                )
+            parsed[col_name] = wide.set_axis(wide_idx, axis=0).sort_index()
+        if asof is not None:
+            ref_idx = next(
+                (w.index for w in parsed.values() if not w.empty),
+                next(
+                    (w.index for w in parsed.values()),
+                    pd.DatetimeIndex([]),
+                ),
+            )
+            asof_ts = _align_timestamp_to_index(asof, ref_idx)
+        else:
+            max_dates = [w.index.max() for w in parsed.values() if not w.empty]
+            if not max_dates:
+                return (
+                    pd.DataFrame(
+                        columns=active_cols,
+                        index=pd.MultiIndex.from_tuples([], names=["date", "stock_code"]),
+                        dtype=float,
+                    ),
+                    None,
+                )
+            asof_ts = max(max_dates)
+
+        series_map = {}
+        for col_name in active_cols:
+            wide = parsed[col_name]
+            col_asof = _align_timestamp_to_index(asof_ts, wide.index)
+            wide = wide.loc[wide.index <= col_asof]
+            if wide.empty:
+                continue
+            wide = wide.reindex(columns=stocks)
+            numeric = wide.apply(pd.to_numeric, errors="coerce")
+            arr = np.asarray(numeric.values, dtype=float)
+            rows_i, cols_j = np.nonzero(~np.isnan(arr))
+            if len(rows_i) == 0:
+                continue
+            idx = pd.MultiIndex.from_arrays(
+                [wide.index.take(rows_i), wide.columns.take(cols_j)],
+                names=["date", "stock_code"],
+            )
+            series_map[col_name] = pd.Series(arr[rows_i, cols_j], index=idx)
+
+        if series_map:
+            frame = pd.concat(series_map, axis=1).reindex(columns=active_cols).sort_index()
+            frame.index = frame.index.set_names(["date", "stock_code"])
+        else:
+            frame = pd.DataFrame(
+                columns=active_cols,
+                index=pd.MultiIndex.from_tuples([], names=["date", "stock_code"]),
+                dtype=float,
+            )
+        return frame, asof_ts
+
+    raise ValueError(
+        "time_series_history_invalid: expected MultiIndex DataFrame or factor-panel mapping"
+    )
+
+
+def time_series_standardize_at_asof(
+    raw_series, name, method, methods=None, history=None, asof=None, active_columns=None
+):
+    """Evaluate causal time-series standardization at ``asof`` from strict prior history."""
+    if history is None:
+        raise ValueError(
+            "time_series_history_required: " + str(name) + " (" + str(method) + ")"
+        )
+    window, min_periods = resolve_time_series_params(methods)
+    _validate_time_series_params(method, window, min_periods)
+    if raw_series.empty:
+        return raw_series.copy()
+    if not raw_series.index.is_unique:
+        raise ValueError("Time-series preprocessing requires unique instrument keys")
+    current_vals = np.asarray(pd.to_numeric(raw_series, errors="coerce"), dtype=float)
+
+    if isinstance(history, pd.DataFrame) and isinstance(history.index, pd.MultiIndex):
+        if name not in history.columns:
+            raise ValueError("model_features_missing: " + str(name))
+    elif hasattr(history, "get"):
+        if name not in history:
+            raise ValueError(
+                "time_series_history_required: " + str(name) + " (" + str(method) + ")"
+            )
+        if not isinstance(history[name], pd.DataFrame):
+            raise ValueError("time_series_history_invalid: " + str(name))
+    else:
+        raise ValueError(
+            "time_series_history_invalid: expected MultiIndex DataFrame or factor-panel mapping"
+        )
+
+    panel, asof_ts = _normalize_ts_history_panel(
+        history, active_columns, raw_series.index, asof=asof
+    )
+    if asof_ts is None:
+        return pd.Series(np.nan, index=raw_series.index, dtype=float)
+
+    if not panel.empty and name in panel.columns:
+        col = panel[name]
+        col_dates = pd.DatetimeIndex(col.index.get_level_values("date"))
+        asof_ts = _align_timestamp_to_index(asof_ts, col_dates)
+        prior_col = col.loc[col_dates < asof_ts]
+    else:
+        prior_col = pd.Series(
+            dtype=float,
+            index=pd.MultiIndex.from_tuples([], names=["date", "stock_code"]),
+        )
+
+    current_idx = pd.MultiIndex.from_arrays(
+        [pd.DatetimeIndex([asof_ts] * len(raw_series)), raw_series.index],
+        names=["date", "stock_code"],
+    )
+    current_col = pd.Series(current_vals, index=current_idx)
+    combined = current_col if prior_col.empty else pd.concat([prior_col, current_col])
+    standardized = time_series_standardize(
+        combined, method, window=window, min_periods=min_periods
+    )
+    return standardized.xs(asof_ts, level="date").reindex(raw_series.index)
 
 
 def preprocess_cross_section_series(series, method, methods=None):
@@ -67,9 +331,20 @@ def preprocess_cross_section_series(series, method, methods=None):
 
 
 def standardize_composite_scores(scores):
-    if len(scores) > 1:
-        return (scores - scores.mean()) / (scores.std() + 1e-8)
+    valid = scores.dropna()
+    if len(valid) > 1:
+        standardized = (valid - valid.mean()) / (valid.std() + 1e-8)
+        result = scores.copy()
+        result.loc[valid.index] = standardized
+        return result
     return scores
+
+
+def valid_factor_mask(values, factor_names):
+    cols = [name for name in factor_names if name in values.columns]
+    if not cols:
+        return pd.Series(False, index=values.index, dtype=bool)
+    return values.reindex(columns=cols).notna().any(axis=1)
 
 
 def model_for_date(models, asof, date_field="train_end", inclusive=False):
@@ -90,7 +365,18 @@ def weighted_score(values, weights):
     w = pd.Series(weights, dtype=float).sort_index()
     if not np.isfinite(w.values).all():
         raise ValueError("model_weights_nonfinite")
-    return values.reindex(columns=w.index).fillna(0.0).mul(w, axis=1).sum(axis=1)
+    if w.empty or values.empty:
+        return pd.Series(dtype=float, index=values.index[:0])
+    valid = valid_factor_mask(values, w.index)
+    if not valid.any():
+        return pd.Series(dtype=float, index=values.index[:0])
+    return (
+        values.loc[valid]
+        .reindex(columns=w.index)
+        .fillna(0.0)
+        .mul(w, axis=1)
+        .sum(axis=1)
+    )
 
 
 def rank_scores(scores):
@@ -134,8 +420,8 @@ def bin_series(series, n_bins=5):
     return bins / bins.max() if bins.max() > 0 else series.rank(pct=True)
 
 
-def linear_signal(raw, model, parent_scores=None):
-    """Frozen-model replay, using the local VectorBT cross-sectional semantics."""
+def linear_signal(raw, model, parent_scores=None, history=None, asof=None):
+    """Frozen-model replay, using unified local/VectorBT synthesis semantics."""
     weights = model.get("weights", {}) if not model.get("blend_only", False) else {}
     blend = model.get("blend_weights", {})
     ratio = float(model.get("blend_with_original_ratio", 0.0))
@@ -152,29 +438,75 @@ def linear_signal(raw, model, parent_scores=None):
     if missing:
         raise ValueError("model_features_missing: " + ",".join(sorted(missing)))
     methods = model.get("standardization_method", {})
-    processed = pd.DataFrame(index=raw.index)
+    pre_fill = pd.DataFrame(index=raw.index)
     standardize = model.get("standardize", True)
-    for name in sorted(needed):
+    needed_sorted = sorted(needed)
+    normalized_history = None
+    normalized_asof = asof
+    for name in needed_sorted:
         method = resolve_preprocess_method(methods, name, default="zscore")
         if not standardize:
             values = raw[name]
+        elif method in TIME_SERIES_METHODS:
+            if normalized_history is None and history is not None:
+                if (
+                    isinstance(history, pd.DataFrame)
+                    and isinstance(history.index, pd.MultiIndex)
+                    and name in history.columns
+                ) or (
+                    hasattr(history, "get")
+                    and name in history
+                    and isinstance(history[name], pd.DataFrame)
+                ):
+                    normalized_history, normalized_asof = _normalize_ts_history_panel(
+                        history, needed_sorted, raw.index, asof=asof
+                    )
+            ts_hist = (
+                normalized_history
+                if normalized_history is not None and name in normalized_history.columns
+                else history
+            )
+            ts_asof = normalized_asof if ts_hist is normalized_history else asof
+            values = time_series_standardize_at_asof(
+                raw[name],
+                name,
+                method,
+                methods,
+                history=ts_hist,
+                asof=ts_asof,
+                active_columns=needed_sorted,
+            )
         else:
             values = preprocess_cross_section_series(raw[name], method, methods)
-        processed[name] = values.fillna(0.0)
-    score = (
-        weighted_score(processed, weights)
-        if weights
-        else pd.Series(0.0, index=raw.index)
-    )
-    if weights and model.get("postprocess_cs_standardize", True):
-        score = standardize_composite_scores(score)
+        pre_fill[name] = values
+    valid_any = valid_factor_mask(pre_fill, needed)
+    processed = pre_fill.copy()
+    if valid_any.any():
+        processed.loc[valid_any] = processed.loc[valid_any].fillna(0.0)
+    if weights:
+        score = weighted_score(pre_fill, weights)
+        if model.get("postprocess_cs_standardize", True):
+            score = standardize_composite_scores(score)
+    else:
+        score = pd.Series(dtype=float, index=raw.index[:0])
     if ratio > 0 and parent_scores is not None:
-        parent = parent_scores.reindex(score.index).dropna()
+        parent = parent_scores.reindex(raw.index).dropna()
         if parent.empty:
             raise ValueError("parent baseline has no residual-score overlap")
-        score = score.loc[parent.index] * (1 - ratio) + parent * ratio
+        score = score.reindex(parent.index).fillna(0.0) * (1 - ratio) + parent * ratio
     elif ratio > 0 and blend:
-        score = score * (1 - ratio) + weighted_score(processed, blend) * ratio
+        blend_score = weighted_score(pre_fill, blend)
+        if weights:
+            combined_idx = raw.index[
+                valid_factor_mask(pre_fill, weights)
+                | valid_factor_mask(pre_fill, blend)
+            ]
+            score = (
+                score.reindex(combined_idx).fillna(0.0) * (1 - ratio)
+                + blend_score.reindex(combined_idx).fillna(0.0) * ratio
+            )
+        else:
+            score = blend_score * ratio
     return score, processed
 
 
