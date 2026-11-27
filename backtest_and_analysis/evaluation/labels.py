@@ -656,30 +656,53 @@ class UnifiedReturnLabeler:
                 reasons.iloc[eligible[rejected == "entry_not_tradable"]] = "entry_not_tradable"
                 reasons.iloc[eligible[rejected == "exit_not_tradable"]] = "exit_not_tradable"
             valid = reasons.isna().to_numpy()
-            result = pd.DataFrame({
+            n_rows = len(positions)
+            ent_ts = entry_times.take(entry)
+            exb_ts = axis.keys.take(exit)
+            ext_ts = exit_times.take(exit)
+            sched_exit = ext_ts.where(~boundary) if include_scheduled_exit else None
+            if not valid.all():
+                nat = pd.NaT.value
+                ent_arr = ent_ts.as_unit("ns").asi8.copy()
+                exb_arr = exb_ts.as_unit("ns").asi8.copy()
+                ext_arr = ext_ts.as_unit("ns").asi8.copy()
+                ent_arr[~valid] = nat
+                exb_arr[~valid] = nat
+                ext_arr[~valid] = nat
+                ent_ts = pd.DatetimeIndex(ent_arr, tz="UTC")
+                exb_ts = pd.DatetimeIndex(exb_arr, tz="UTC")
+                ext_ts = pd.DatetimeIndex(ext_arr, tz="UTC")
+            entry_px = np.full(n_rows, np.nan, dtype=float)
+            exit_px = np.full(n_rows, np.nan, dtype=float)
+            chg_pts = np.full(n_rows, np.nan, dtype=float)
+            ret_pct = np.full(n_rows, np.nan, dtype=float)
+            if valid.any():
+                ev, xv = entry[valid], exit[valid]
+                op_v, cl_v = opening[ev], closing[xv]
+                entry_px[valid] = op_v
+                exit_px[valid] = cl_v
+                chg_pts[valid] = cl_v - op_v
+                ret_pct[valid] = _price_returns(adjusted_entry[ev], adjusted_exit[xv], profile.return_unit)
+            data = {
                 "instrument_id": instrument, "frequency": frequency,
                 "entry_offset_bars": lag, "horizon_bars": horizon,
                 "signal_timestamp": axis.keys.take(positions), "signal_available_at": axis.ends.take(positions),
-                "entry_timestamp": entry_times.take(entry), "exit_bar_timestamp": axis.keys.take(exit),
-                "exit_timestamp": exit_times.take(exit),
-                "status": np.where(valid, "valid", "excluded"), "exclusion_reason": reasons,
-            })
+                "entry_timestamp": ent_ts, "exit_bar_timestamp": exb_ts,
+                "exit_timestamp": ext_ts,
+                "status": np.where(valid, "valid", "excluded"), "exclusion_reason": reasons.to_numpy(),
+            }
             if include_scheduled_exit:
-                result["scheduled_exit_timestamp"] = result.exit_timestamp.where(~boundary)
-            result.loc[~valid, list(TIME_OUTPUTS)] = pd.NaT
-            result.loc[:, list(VALUE_OUTPUTS)] = np.nan
-            result.loc[valid, "entry_price"] = opening[entry[valid]]
-            result.loc[valid, "exit_price"] = closing[exit[valid]]
-            result.loc[valid, "price_change_points"] = closing[exit[valid]] - opening[entry[valid]]
-            returns = _price_returns(adjusted_entry[entry[valid]], adjusted_exit[exit[valid]], profile.return_unit)
-            result.loc[valid, "return_pct"] = returns
+                data["scheduled_exit_timestamp"] = sched_exit
+            data["entry_price"] = entry_px
+            data["exit_price"] = exit_px
+            data["price_change_points"] = chg_pts
+            data["forward_return" if is_slot else "return_pct"] = ret_pct
             if is_slot:
-                result = result.rename(columns={"return_pct": "forward_return"})
-                result["signal_session_id"] = axis.owners[positions]
-                result["return_unit"] = profile.return_unit
-                result["entry_return_price"] = np.where(valid, adjusted_entry[entry], np.nan)
-                result["exit_return_price"] = np.where(valid, adjusted_exit[exit], np.nan)
-            tables.append(result)
+                data["signal_session_id"] = axis.owners[positions]
+                data["return_unit"] = profile.return_unit
+                data["entry_return_price"] = np.where(valid, adjusted_entry[entry], np.nan)
+                data["exit_return_price"] = np.where(valid, adjusted_exit[exit], np.nan)
+            tables.append(pd.DataFrame(data))
         return tables
 
     def _untradable_endpoints(

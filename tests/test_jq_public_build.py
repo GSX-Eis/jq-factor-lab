@@ -261,6 +261,10 @@ def test_bundle_isolates_module_lambda_bindings_and_preserves_shadows(tmp_path, 
          'unsupported_class_binding_for_namespace_isolation'),
         ('offset = 10\nclass Factor:\n    value = offset\n    offset = 20\n',
          'unsupported_class_binding_for_namespace_isolation'),
+        ('EXPRESSION_CODE = "a"\nclass Factor:\n    EXPRESSION_CODE = EXPRESSION_CODE\n',
+         'unsupported_class_binding_for_namespace_isolation'),
+        ('EXPRESSION_CODE = "a"\nclass Factor:\n    value = EXPRESSION_CODE\n    EXPRESSION_CODE = "b"\n',
+         'unsupported_class_binding_for_namespace_isolation'),
     ],
 )
 def test_namespace_rewriter_rejects_ambiguous_bindings(source, message):

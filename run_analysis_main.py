@@ -443,6 +443,7 @@ def _persist_materialized_factor_values(
     writer: ResultWriter,
     start_date: str,
     end_date: str,
+    evidence: dict | None = None,
 ) -> bool:
     """Append the requested factor snapshot without running analysis."""
     try:
@@ -453,6 +454,10 @@ def _persist_materialized_factor_values(
         "Materialized factor values: factor=%s start_date=%s end_date=%s identity=%s inserted=%d skipped=%d",
         factor_name, start_date, end_date, receipt.factor_identity_hash, receipt.inserted, receipt.skipped,
     )
+    if evidence is not None:
+        evidence["materialized_rows"] = receipt.inserted + receipt.skipped
+        if evidence["materialized_rows"] < 1:
+            raise RuntimeError(f"No materialized rows for {factor_name}")
     return True
 
 
@@ -533,7 +538,42 @@ def _run_causal_gate_for_factor(factor: Any, config: Dict[str, Any]) -> Optional
     return report
 
 
-def analyze_factor_static(factor, price_fetcher, runner, writer, monthly_writer, config, forward_returns=None):
+def _summarize_numeric_frame(table: pd.DataFrame) -> Dict[str, Dict[str, Any]]:
+    summary: Dict[str, Dict[str, Any]] = {}
+    numeric = table.select_dtypes(include="number")
+    for col in numeric.columns:
+        arr = numeric[col].to_numpy(dtype=float, na_value=np.nan)
+        finite = arr[np.isfinite(arr)]
+        if finite.size:
+            summary[str(col)] = {
+                "sample_count": int(finite.size),
+                "mean": float(finite.mean()),
+            }
+    return summary
+
+
+def _record_analysis_statistics(evidence: dict | None, results: Dict[str, Any]) -> None:
+    if evidence is None:
+        return
+    stat_summary: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    count = 0
+    for key in ("ic", "ir", "quantile_returns", "alphalens_data"):
+        table = results.get(key)
+        if isinstance(table, pd.DataFrame) and not table.empty:
+            table_summary = _summarize_numeric_frame(table)
+            if table_summary:
+                stat_summary[key] = table_summary
+                count += sum(entry["sample_count"] for entry in table_summary.values())
+    if not stat_summary or not count:
+        raise RuntimeError(f"No finite analysis statistics for {results['factor_name']}")
+    evidence["stat_summary"] = stat_summary
+    evidence["finite_stat_count"] = count
+
+
+def analyze_factor_static(
+    factor, price_fetcher, runner, writer, monthly_writer, config, forward_returns=None, *,
+    evidence: dict | None = None,
+):
     """
     对单个因子进行静态股票池分析（保持向后兼容）
     
@@ -626,6 +666,7 @@ def analyze_factor_static(factor, price_fetcher, runner, writer, monthly_writer,
             else:
                 logger.warning(f"Unexpected alphalens_results type: {type(alphalens_results)} for factor {factor_name}")
         
+        _record_analysis_statistics(evidence, combined_results)
         _publish_daily_bar_evaluation(
             config, factor_name=factor_name, pool_name='static', factors=factor_df,
             pricing=pricing, price_fetcher=price_fetcher, runner=runner,
@@ -651,6 +692,8 @@ def analyze_factor_dynamic(
     writer,
     monthly_writer,
     monthly_stock_pools=None,
+    *,
+    evidence: dict | None = None,
 ):
     """
     使用动态股票池分析单个因子
@@ -821,6 +864,7 @@ def analyze_factor_dynamic(
                 writer=writer,
                 start_date=materialize_range[0],
                 end_date=materialize_range[1],
+                **({"evidence": evidence} if evidence is not None else {}),
             )
         
         # 获取价格数据 (支持 DuckDB 高性能后端)
@@ -881,6 +925,7 @@ def analyze_factor_dynamic(
                 'quantile_returns': pd.DataFrame(),
                 'performance_metrics': {**performance, 'mining_only': True},
             }
+            _record_analysis_statistics(evidence, combined_results)
             persisted = _persist_analysis_outputs(
                 factor=factor,
                 factor_name=factor_name,
@@ -957,6 +1002,7 @@ def analyze_factor_dynamic(
         if causal_gate_report is not None:
             combined_results['causal_gate'] = causal_gate_report
         persist_started = time.perf_counter()
+        _record_analysis_statistics(evidence, combined_results)
         _publish_daily_bar_evaluation(
             config, factor_name=factor_name, pool_name=pool_name, factors=factor_df,
             pricing=pricing, price_fetcher=price_fetcher, runner=runner,
@@ -1039,7 +1085,7 @@ def _validate_materialize_pool_contract(
             raise RuntimeError("materialize-only parsed filter count mismatch")
 
 
-def main(config: Dict, *, execution=None):
+def main(config: Dict, *, execution=None, metrics=None):
     """
     主程序入口，支持静态和动态股票池分析
     
@@ -1054,6 +1100,28 @@ def main(config: Dict, *, execution=None):
         raise ValueError("factor_class requires an explicit factor_file")
     materialize_only = bool(config.get('materialize_only'))
     mining_only = bool(config.get('mining_only'))
+
+    if metrics is not None:
+        metrics["analysis_items"] = []
+    mode = "materialize_only" if materialize_only else "mining_only" if mining_only else "evaluation"
+
+    def report_item(cls: type, pool: str | None) -> dict:
+        if metrics is None:
+            return {}
+        item = {
+            "factor_name": cls.__name__,
+            "factor_source": str(Path(inspect.getfile(cls)).resolve()),
+            "pool": pool,
+            "mode": mode,
+            "status": "failed",
+        }
+        metrics["analysis_items"].append(item)
+        return {"evidence": item}
+
+    def succeeded(item: dict) -> None:
+        if item:
+            item["evidence"]["status"] = "succeeded"
+
     if mining_only:
         if str(pd.Timestamp(config['end_date']).date()) > '2023-12-31':
             raise RuntimeError("mining-only cannot access post-2023 data")
@@ -1279,6 +1347,7 @@ def main(config: Dict, *, execution=None):
                 for pool_config in pool_configs:
                     pool_name = pool_config['name']
                     monthly_stock_pools = precalculated_pools.get(pool_name)
+                    item = report_item(factor_class, pool_name)
                     
                     if monthly_stock_pools is None:
                         logger.warning(f"跳过组合 {factor_class.__name__}_{pool_name} 因为股票池计算失败")
@@ -1293,15 +1362,17 @@ def main(config: Dict, *, execution=None):
                         engine,
                         writer,
                         monthly_writer,
-                        monthly_stock_pools  # 传递预计算的股票池
+                        monthly_stock_pools,
+                        **item,
                     )
-                    futures[future] = f"{factor_class.__name__}_{pool_config['name']}"
+                    futures[future] = (f"{factor_class.__name__}_{pool_name}", item)
             
             for future in concurrent.futures.as_completed(futures):
-                combination_name = futures[future]
+                combination_name, item = futures[future]
                 try:
                     success = future.result()
                     if success:
+                        succeeded(item)
                         success_count += 1
                     else:
                         execution['errors'].append({'item': combination_name, 'error': 'analysis returned False; see worker log'})
@@ -1390,16 +1461,22 @@ def main(config: Dict, *, execution=None):
         # 并行处理所有因子
         success_count = 0
         with concurrent.futures.ThreadPoolExecutor(max_workers=config.get('max_workers', 4)) as executor:
-            futures = {
-                executor.submit(analyze_factor_static, factor, price_fetcher, runner, writer, monthly_writer, config, forward_returns): factor.__class__.__name__
-                for factor in factors
-            }
+            futures = {}
+            for factor in factors:
+                cls = type(factor)
+                item = report_item(cls, None)
+                future = executor.submit(
+                    analyze_factor_static, factor, price_fetcher, runner, writer, monthly_writer,
+                    config, forward_returns, **item,
+                )
+                futures[future] = (cls.__name__, item)
             
             for future in concurrent.futures.as_completed(futures):
-                factor_name = futures[future]
+                factor_name, item = futures[future]
                 try:
                     success = future.result()
                     if success:
+                        succeeded(item)
                         success_count += 1
                     else:
                         execution['errors'].append({'item': factor_name, 'error': 'analysis returned False; see worker log'})
@@ -1414,7 +1491,7 @@ def main(config: Dict, *, execution=None):
         if forward_returns is not None:
             logger.info("🎯 性能优化生效：使用了预计算的前瞻收益率")
 
-if __name__ == "__main__":
+def cli_main(argv: Optional[List[str]] = None) -> None:
     parser = argparse.ArgumentParser(description='Enhanced Factor Analysis Program with Dynamic Stock Pool Support')
     parser.add_argument('--config', type=str, help='Path to config file (JSON format for dynamic pools)')
     parser.add_argument('--factor', type=str, default=None,
@@ -1431,7 +1508,7 @@ if __name__ == "__main__":
         help='Persist factor values and daily IC required by the IS mining gate only',
     )
     parser.add_argument('--pools', type=str, nargs='+', help='Specific pool names to analyze (for dynamic mode)')
-    
+
     parser.add_argument("--market-db", help="Database ID in QUANT_DATA_BINDINGS.market_dbs")
     parser.add_argument("--slot-config", help="SlotConfig YAML/JSON path or jq_ashare_local")
     parser.add_argument("--dry-run", action="store_true", help="Plan a --market-db Slot evaluation")
@@ -1445,7 +1522,7 @@ if __name__ == "__main__":
     parser.add_argument("--result-out", default="")
     parser.add_argument("--run-id", default="")
     parser.add_argument("--execution-id", default="")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if args.market_db is not None:
         from tools.agent_harness.cli import main as harness_main
 
@@ -1486,83 +1563,56 @@ if __name__ == "__main__":
         cache = Path(os.environ.get("QUANT_CACHE_DIR", Path(__file__).resolve().parent / "cache"))
         config.update(cache_dir=str(cache / "factor_values"), forward_returns_cache_dir=str(cache / "forward_returns"),
                       results_parquet_dir=str(attempt / "analysis_results_parquet"))
-    
-        # 如果提供了配置文件，从文件读取配置
+
+        from tools.agent_harness.result_content import resolve_effective_analysis_config
+
         if args.config:
             try:
-                import json
-                with open(args.config, 'r') as f:
+                with open(args.config, 'r', encoding='utf-8') as f:
                     raw_file_config = json.load(f)
-
                 if args.materialize_only:
                     _validate_materialize_pool_contract(raw_file_config)
-
-                has_dynamic_pool_config = (
-                    DYNAMIC_POOL_AVAILABLE
-                    and isinstance(raw_file_config.get('dynamic_pools'), dict)
-                    and bool(raw_file_config.get('dynamic_pools'))
+                config = resolve_effective_analysis_config(
+                    raw_file_config,
+                    config_path=args.config,
+                    factor=args.factor,
+                    pools=args.pools or (),
+                    use_dynamic=args.use_dynamic,
+                    materialize_only=args.materialize_only,
+                    mining_only=args.mining_only,
+                    causal_gate_policy=getattr(args, 'causal_gate_policy', None),
+                    filter_pools=True,
+                    dynamic_pool_available=DYNAMIC_POOL_AVAILABLE,
+                    parse_pool_filters=True,
                 )
-
-                if has_dynamic_pool_config or 'database' in raw_file_config:
-                    # Nested database configs also support static stock pools.
-                    db_config, analysis_config, pool_configs = load_and_parse_config(args.config)
-                
-                    # 更新配置 - 正确映射数据库配置
-                    # 主数据库配置
-                    config['factor_table'] = db_config.get('factor_table', config.get('factor_table'))
-                    config['price_table'] = db_config.get('price_table', config.get('price_table'))
-                    config['fundamental_table'] = db_config.get('fundamental_table', config.get('fundamental_table'))
-                
-                    # DuckDB 高性能后端配置
-                    config['db_backend'] = db_config.get('db_backend', 'auto')
-                    config['duckdb_path'] = db_config.get('duckdb_path')
-                    config['parquet_dir'] = db_config.get('parquet_dir')
-                    config['use_duckdb_cache'] = db_config.get('use_duckdb_cache', True)
-                    config['duckdb_cache_size_mb'] = db_config.get('duckdb_cache_size_mb', 2000)
-                
-                    # 分析配置
-                    config.update(analysis_config)
-                    config['dynamic_pools'] = pool_configs
-                    config['use_dynamic_pools'] = has_dynamic_pool_config
-                    if args.materialize_only:
-                        _validate_materialize_pool_contract(raw_file_config, pool_configs)
-                
-                    logger.info("从JSON配置文件加载数据库与股票池配置")
-                else:
-                    # 传统配置文件
-                    config.update(raw_file_config)
-                    if config.get('data_config_path'):
-                        config['data_config_path'] = str((Path(args.config).resolve().parent /
-                            Path(config['data_config_path']).expanduser()).resolve())
-                    
-                    logger.info("从配置文件加载传统配置")
+                if args.materialize_only and config.get('use_dynamic_pools'):
+                    _validate_materialize_pool_contract(raw_file_config, config.get('dynamic_pools'))
             except Exception as e:
                 logger.error(f"加载配置文件失败: {e}")
                 sys.exit(1)
-    
-        # 命令行参数覆盖
+        else:
+            config = resolve_effective_analysis_config(
+                None,
+                factor=args.factor,
+                pools=args.pools or (),
+                use_dynamic=args.use_dynamic,
+                materialize_only=args.materialize_only,
+                mining_only=args.mining_only,
+                causal_gate_policy=getattr(args, 'causal_gate_policy', None),
+                filter_pools=True,
+                dynamic_pool_available=DYNAMIC_POOL_AVAILABLE,
+                parse_pool_filters=True,
+            )
+        config.update(
+            cache_dir=str(cache / "factor_values"),
+            forward_returns_cache_dir=str(cache / "forward_returns"),
+            results_parquet_dir=str(attempt / "analysis_results_parquet"),
+        )
         if args.factor:
-            config['factor_file'] = args.factor
             logger.info(f"指定分析单个因子文件: {args.factor}")
-        if args.use_dynamic:
-            config['use_dynamic_pools'] = True
-        if args.materialize_only:
-            config['materialize_only'] = True
-        if args.mining_only:
-            config['mining_only'] = True
-        if getattr(args, 'causal_gate_policy', None):
-            config['causal_gate_policy'] = args.causal_gate_policy
-    
-        # 如果指定了特定的股票池
         if args.pools and config.get('dynamic_pools'):
-            # 只保留指定的股票池
-            filtered_pools = {
-                name: settings for name, settings in config['dynamic_pools'].items()
-                if name in args.pools
-            }
-            config['dynamic_pools'] = filtered_pools
             logger.info(f"仅分析指定的股票池: {args.pools}")
-    
+
         evaluation_db = args.bar_results_db
         config['_bar_evaluation_directory'] = directory / "bar-evaluations" if evaluation_db is not None else None
         if evaluation_db is not None:
@@ -1574,7 +1624,7 @@ if __name__ == "__main__":
         # 确保必要的目录存在
         if config.get('cache_dir'):
             os.makedirs(config['cache_dir'], exist_ok=True)
-    
+
         from tools.agent_harness.run_result import execution_result
 
         causal_gate_rejected = False
@@ -1585,7 +1635,7 @@ if __name__ == "__main__":
                                       os.path.dirname(__file__), "backtest_and_analysis", "config.py"
                                   )) as result:
                 try:
-                    main(config, execution=result["execution"])
+                    main(config, execution=result["execution"], metrics=result["metrics"])
                 finally:
                     gate_reports = config.get("_causal_gate_reports") or []
                     if gate_reports:
@@ -1621,3 +1671,7 @@ if __name__ == "__main__":
             if causal_gate_rejected:
                 raise SystemExit(4)
             raise
+
+
+if __name__ == "__main__":
+    cli_main()

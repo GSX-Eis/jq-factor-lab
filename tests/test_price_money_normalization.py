@@ -236,3 +236,236 @@ def test_declarative_csv_signal_bars_normalize_paused_money(tmp_path):
     assert 'paused' not in execution.columns
     np.testing.assert_allclose(signal['money'].to_numpy(dtype=float), [100., np.nan, 0.], equal_nan=True)
     np.testing.assert_allclose(execution['money'].to_numpy(dtype=float), [100., 0., 0.])
+
+
+class _ConfigurableMoneyMeanFactor(FactorBase):
+    def __init__(self, *args, fields=('money',), date_field='date', code_field='stock_code',
+                 additional_condition='', **kwargs):
+        self._probe_fields = list(fields)
+        self._probe_date_field = date_field
+        self._probe_code_field = code_field
+        self._probe_additional_condition = additional_condition
+        super().__init__(*args, **kwargs)
+
+    def _get_raw_data_for_factor(self) -> pd.DataFrame:
+        return self._fetch_raw_data(
+            self._probe_fields,
+            date_field=self._probe_date_field,
+            code_field=self._probe_code_field,
+            table_name='price_data',
+            additional_condition=self._probe_additional_condition,
+        )
+
+    def calculate_factor(self, data: pd.DataFrame) -> pd.DataFrame:
+        wide = data.pivot(index='date', columns='code', values='money').sort_index()
+        return wide.rolling(2, min_periods=1).mean()
+
+
+@pytest.mark.parametrize('pit_enabled', [True, False])
+@pytest.mark.parametrize('use_adapter', [False, True])
+def test_invariance_nonfiltering_additional_condition_preserves_paused_money_normalization(
+    tmp_path, pit_enabled, use_adapter,
+):
+    path = tmp_path / 'cond_money.duckdb'
+    with duckdb.connect(str(path)) as conn:
+        declare_market_db(conn, 'cn_equity')
+        conn.execute("""CREATE TABLE price_data_daily AS SELECT * FROM (VALUES
+            ('A', DATE '2022-03-07', 1., 10., 10., 100., 0),
+            ('A', DATE '2022-03-08', 1., 10., 0., 0., 1),
+            ('A', DATE '2022-03-09', 1., 10., 20., 200., 0)
+        ) p(stock_code, date, factor, close, volume, money, paused)""")
+
+    with duckdb.connect(str(path), read_only=True) as borrowed:
+        common = dict(
+            start_date='2022-03-07',
+            end_date='2022-03-09',
+            stock_pool=['A'],
+            data_frequency='daily',
+            pit_enabled=pit_enabled,
+        )
+        if use_adapter:
+            baseline = _ConfigurableMoneyMeanFactor(
+                None, 'CondBaseAdapter', duckdb_path=str(path), additional_condition='', **common,
+            )
+            filtered = _ConfigurableMoneyMeanFactor(
+                None, 'CondFilteredAdapter', duckdb_path=str(path), additional_condition='AND close > 0', **common,
+            )
+        else:
+            baseline = _ConfigurableMoneyMeanFactor(
+                borrowed, 'CondBaseBorrowed', additional_condition='', **common,
+            )
+            filtered = _ConfigurableMoneyMeanFactor(
+                borrowed, 'CondFilteredBorrowed', additional_condition='AND close > 0', **common,
+            )
+        try:
+            base_values = baseline.get_factor_values()
+            filtered_values = filtered.get_factor_values()
+            assert 'paused' not in baseline.last_raw_data.columns
+            assert 'paused' not in filtered.last_raw_data.columns
+            np.testing.assert_allclose(base_values['A'].to_numpy(), [100.0, 100.0, 200.0], rtol=0, atol=1e-12)
+            pd.testing.assert_frame_equal(filtered_values, base_values, check_exact=True)
+            pd.testing.assert_series_equal(
+                filtered.last_raw_data['money'], baseline.last_raw_data['money'], check_exact=True,
+            )
+        finally:
+            baseline.close()
+            filtered.close()
+
+
+def test_nondefault_date_code_columns_normalize_paused_money_and_keep_unpaused_zero(tmp_path):
+    path = tmp_path / 'custom_cols.duckdb'
+    with duckdb.connect(str(path)) as conn:
+        declare_market_db(conn, 'cn_equity')
+        conn.execute("""CREATE TABLE price_data_daily AS SELECT * FROM (VALUES
+            ('A', DATE '2022-03-07', 1., 10., 100., 0),
+            ('A', DATE '2022-03-08', 1., 10., 0., 1),
+            ('A', DATE '2022-03-09', 1., 10., 0., 0),
+            ('A', DATE '2022-03-10', 1., 10., 200., 0)
+        ) p(symbol, trade_date, factor, close, money, paused)""")
+
+    with duckdb.connect(str(path), read_only=True) as borrowed:
+        factor = _ConfigurableMoneyMeanFactor(
+            borrowed, 'CustomCols', '2022-03-07', '2022-03-10',
+            stock_pool=['A'], data_frequency='daily', pit_enabled=True,
+            fields=('money',), date_field='trade_date', code_field='symbol',
+            additional_condition='AND close > 0',
+        )
+        values = factor.get_factor_values()
+        assert 'paused' not in factor.last_raw_data.columns
+        np.testing.assert_allclose(
+            factor.last_raw_data['money'].to_numpy(dtype=float),
+            [100.0, np.nan, 0.0, 200.0],
+            equal_nan=True,
+        )
+        np.testing.assert_allclose(
+            values['A'].to_numpy(dtype=float),
+            [100.0, 100.0, 0.0, 100.0],
+            rtol=0, atol=1e-12,
+        )
+
+
+@pytest.mark.parametrize('data_frequency,table,timestamps', [
+    ('daily', 'price_data_daily', ('2022-03-07', '2022-03-08', '2022-03-09', '2022-03-10')),
+    ('5m', 'price_data_5m', (
+        '2022-03-07 09:35:00', '2022-03-07 09:40:00', '2022-03-07 09:45:00', '2022-03-07 09:50:00',
+    )),
+])
+@pytest.mark.parametrize('use_adapter', [False, True])
+def test_invariance_extra_unused_paused_field_does_not_alter_money(
+    tmp_path, data_frequency, table, timestamps, use_adapter,
+):
+    path = tmp_path / f'aux_field_{data_frequency}_{use_adapter}.duckdb'
+    with duckdb.connect(str(path)) as conn:
+        declare_market_db(conn, 'cn_equity')
+        conn.execute(f"""CREATE TABLE {table} (
+            stock_code VARCHAR, date TIMESTAMP, factor DOUBLE, close DOUBLE,
+            volume DOUBLE, money DOUBLE, paused INTEGER
+        )""")
+        conn.executemany(f'INSERT INTO {table} VALUES (?, ?, ?, ?, ?, ?, ?)', [
+            ('A', timestamps[0], 1., 10., 10., 100., 0),
+            ('A', timestamps[1], 1., 10., 0., 0., 1),
+            ('A', timestamps[2], 1., 10., 0., 0., 0),
+            ('A', timestamps[3], 1., 10., 20., 200., 0),
+        ])
+
+    with duckdb.connect(str(path), read_only=True) as borrowed:
+        common = dict(
+            start_date='2022-03-07',
+            end_date='2022-03-10',
+            stock_pool=['A'],
+            data_frequency=data_frequency,
+            pit_enabled=True,
+        )
+        if use_adapter:
+            money_only = _ConfigurableMoneyMeanFactor(
+                None, 'MoneyOnlyAdapter', duckdb_path=str(path), fields=('money',), **common,
+            )
+            with_paused = _ConfigurableMoneyMeanFactor(
+                None, 'MoneyPausedAdapter', duckdb_path=str(path), fields=('money', 'paused'), **common,
+            )
+            with_cond = _ConfigurableMoneyMeanFactor(
+                None, 'MoneyCondAdapter', duckdb_path=str(path), fields=('money',),
+                additional_condition='AND close > 0', **common,
+            )
+            with_paused_cond = _ConfigurableMoneyMeanFactor(
+                None, 'MoneyPausedCondAdapter', duckdb_path=str(path), fields=('money', 'paused'),
+                additional_condition='AND close > 0', **common,
+            )
+        else:
+            money_only = _ConfigurableMoneyMeanFactor(
+                borrowed, 'MoneyOnlyBorrowed', fields=('money',), **common,
+            )
+            with_paused = _ConfigurableMoneyMeanFactor(
+                borrowed, 'MoneyPausedBorrowed', fields=('money', 'paused'), **common,
+            )
+            with_cond = _ConfigurableMoneyMeanFactor(
+                borrowed, 'MoneyCondBorrowed', fields=('money',),
+                additional_condition='AND close > 0', **common,
+            )
+            with_paused_cond = _ConfigurableMoneyMeanFactor(
+                borrowed, 'MoneyPausedCondBorrowed', fields=('money', 'paused'),
+                additional_condition='AND close > 0', **common,
+            )
+        try:
+            only_values = money_only.get_factor_values()
+            paused_values = with_paused.get_factor_values()
+            cond_values = with_cond.get_factor_values()
+            paused_cond_values = with_paused_cond.get_factor_values()
+            assert 'paused' not in money_only.last_raw_data.columns
+            assert 'paused' in with_paused.last_raw_data.columns
+            assert 'paused' not in with_cond.last_raw_data.columns
+            assert 'paused' in with_paused_cond.last_raw_data.columns
+            np.testing.assert_allclose(
+                money_only.last_raw_data['money'].to_numpy(dtype=float),
+                [100.0, np.nan, 0.0, 200.0],
+                equal_nan=True,
+            )
+            np.testing.assert_allclose(only_values['A'].to_numpy(), [100.0, 100.0, 0.0, 100.0], rtol=0, atol=1e-12)
+            for other in (paused_values, cond_values, paused_cond_values):
+                pd.testing.assert_frame_equal(other, only_values, check_exact=True)
+            for other_factor in (with_paused, with_cond, with_paused_cond):
+                pd.testing.assert_series_equal(
+                    other_factor.last_raw_data['money'], money_only.last_raw_data['money'], check_exact=True,
+                )
+        finally:
+            money_only.close()
+            with_paused.close()
+            with_cond.close()
+            with_paused_cond.close()
+
+
+@pytest.mark.parametrize('use_adapter', [False, True])
+def test_minute_panel_without_paused_column_degrades_safely(tmp_path, use_adapter):
+    path = tmp_path / f'min_no_paused_{use_adapter}.duckdb'
+    with duckdb.connect(str(path)) as conn:
+        declare_market_db(conn, 'cn_equity')
+        conn.execute("""CREATE TABLE price_data_5m (
+            stock_code VARCHAR, date TIMESTAMP, factor DOUBLE, close DOUBLE, money DOUBLE
+        )""")
+        conn.executemany('INSERT INTO price_data_5m VALUES (?, ?, ?, ?, ?)', [
+            ('A', '2022-03-07 09:35:00', 1., 10., 100.),
+            ('A', '2022-03-07 09:40:00', 1., 10., 0.),
+            ('A', '2022-03-07 09:45:00', 1., 10., 200.),
+        ])
+
+    with duckdb.connect(str(path), read_only=True) as borrowed:
+        common = dict(
+            start_date='2022-03-07',
+            end_date='2022-03-07',
+            stock_pool=['A'],
+            data_frequency='5m',
+            pit_enabled=True,
+            fields=('money',),
+        )
+        factor = (
+            _ConfigurableMoneyMeanFactor(None, 'MinNoPausedAdapter', duckdb_path=str(path), **common)
+            if use_adapter
+            else _ConfigurableMoneyMeanFactor(borrowed, 'MinNoPausedBorrowed', **common)
+        )
+        try:
+            values = factor.get_factor_values()
+            assert 'paused' not in factor.last_raw_data.columns
+            np.testing.assert_allclose(factor.last_raw_data['money'].to_numpy(), [100.0, 0.0, 200.0])
+            np.testing.assert_allclose(values['A'].to_numpy(), [100.0, 50.0, 100.0], rtol=0, atol=1e-12)
+        finally:
+            factor.close()

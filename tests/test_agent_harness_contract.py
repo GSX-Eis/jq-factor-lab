@@ -176,7 +176,7 @@ def test_factor_synthesis_resolves_relative_config_from_repo_root(
     repo_root = tmp_path / "execution_repo"
     config_path = repo_root / "config" / "test_factor_synthesis.json"
     config_path.parent.mkdir(parents=True, exist_ok=True)
-    config_path.write_text("{}", encoding="utf-8")
+    config_path.write_text('{"synthesis_methods": {"demo": {"method": "weighted_sum"}}}', encoding="utf-8")
 
     monkeypatch.setattr(harness_cli, "REPO_ROOT", repo_root)
     monkeypatch.setattr(
@@ -248,6 +248,9 @@ def test_factor_synthesis_resolves_relative_config_from_repo_root(
     with execution_result(command[-3], command="factor-synthesis", run_id=captured["output_dir"].name,
                           execution_id=command[-1], config_path=config_path) as payload:
         payload["execution"].update(expected=1, completed=1)
+        payload["metrics"]["ic_summaries"] = [
+            dict(synthesis_name="demo", factor_name="demo", status="succeeded", overall_ic=0.1),
+        ]
     metrics = captured["success_metrics_builder"]("", "")
     assert metrics["execution"]["completed"] == 1
 

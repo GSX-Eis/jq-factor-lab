@@ -251,7 +251,7 @@ def _bar_command(argv: list[str]) -> dict[str, Any]:
     args = build_parser(public_bar_cli=True, parser_class=JsonArgumentParser).parse_args(argv)
     if args.command == "time-series-analysis":
         with ExitStack() as output:
-            result = _handle_time_series_analysis(args, public_output=output)
+            result = _handle_time_series_analysis(args, public_output=output, write_dry_run=False)
     else:
         result = _handle_read_bar_evaluations(args, public_read=True)
 

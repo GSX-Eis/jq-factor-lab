@@ -16,17 +16,21 @@ from backtest_and_analysis.evaluation.panel import EvaluationPanel
 from backtest_and_analysis.time_series.factor_bridge import read_slot_factor_values
 from factor_synthesis.core.factor_ops import neutralize_market_features
 from factor_synthesis.core.feature_preprocessor import cross_sectional_winsorize_zscore, cross_sectional_zscore
-from factor_synthesis.factor_reader import FactorReader, plan_market_factor_values
+from factor_synthesis.factor_reader import FactorReader, plan_market_factor_values, read_market_factor_values
 from factor_synthesis.strategy_bundle import StrategyBundle
 from factor_synthesis.vectorbt_adapter.backtest_runner import VectorBTBacktestRunner
 from factor_synthesis.vectorbt_adapter.factor_loader import FactorLoader
 from factor_synthesis.vectorbt_adapter.slot_provider import SlotDataProvider
+from market_db_samples import declare_market_db, market_profile
+from slots.jq_ashare_local import build_jq_ashare_local
 from tools.agent_harness import cli
 from utils.bar_evaluation_store import query_bar_evaluation_detail
 from utils.factor_base import FactorBase
-from utils.market_db import adopt_market_db_sidecar, init_market_db, load_market_db_profile_yaml
-from utils.market_db.identity import market_db_identity
+from utils.market_db import MarketDbProfileError, adopt_market_db_sidecar, init_market_db, load_market_db_profile_yaml
+from utils.market_db.identity import market_db_identity, slot_market_db_identity
 from utils.market_db.research import open_research_slot
+from utils.market_factor import save_bar_factor_values as public_save_bar_factor_values
+from utils.market_factor import save_factor_values as public_save_factor_values
 from utils.market_factor_store import MarketFactorValueStore, build_identity_record, compute_factor_identity_hash
 from utils.slots import ExecutionProfile, ProviderConfig, SlotConfig
 
@@ -443,3 +447,638 @@ def test_auto_vectorbt_slot_rejects_factor_identity_from_another_market_db(us_ma
             assert loader.market_db == provider.market_db_identity == market_db_identity(profile)
         finally:
             provider.close()
+
+
+class _AshareCloseFactor(FactorBase):
+    def _get_raw_data_for_factor(self):
+        return self._fetch_raw_data(["close"], table_name="price_data")
+
+    def calculate_factor(self, data):
+        return data.pivot(index="date", columns="code", values="close").sort_index()
+
+
+def _create_ashare_price_db(
+    db_path: Path,
+    *,
+    db_id: str = "cn_ashare_fixture",
+    calendar_coverage: str = "2026-01-01..2026-01-31",
+    sidecar: bool = False,
+):
+    start, end = "2026-01-05", "2026-01-07"
+    codes = ["000001.XSHE", "600000.XSHG"]
+    profile = market_profile("cn_equity", db_id=db_id, calendar_coverage=calendar_coverage)
+    with duckdb.connect(str(db_path)) as conn:
+        if not sidecar:
+            declare_market_db(conn, "cn_equity", db_id=db_id, calendar_coverage=calendar_coverage)
+        rows = pd.DataFrame({
+            "date": pd.to_datetime(["2026-01-05", "2026-01-06", "2026-01-07"] * 2),
+            "stock_code": ["000001.XSHE"] * 3 + ["600000.XSHG"] * 3,
+            "close": [10.0, 11.0, 12.0, 20.0, 21.0, 22.0],
+            "factor": [1.0] * 6,
+            "volume": [100.0] * 6,
+        })
+        conn.from_df(rows).create("price_data_daily")
+    if sidecar:
+        adopt_market_db_sidecar(db_path, profile)
+    return profile, start, end, codes
+
+
+@pytest.mark.parametrize("binding_mode", [
+    "duckdb_path",
+    "duckdb_path_bar_grid",
+    "duckdb_path_sidecar",
+    "db_connection",
+    "slot",
+])
+def test_ashare_factor_bindings_preserve_market_db_identity_and_synthesis_handoff(tmp_path, binding_mode):
+    sidecar = binding_mode == "duckdb_path_sidecar"
+    db_path = tmp_path / "market.duckdb"
+    profile, start, end, codes = _create_ashare_price_db(db_path, sidecar=sidecar)
+    expected_identity = market_db_identity(profile)
+    store = MarketFactorValueStore(tmp_path / "factors")
+
+    native_conn = duckdb.connect(str(db_path), read_only=True)
+    try:
+        native_slot = build_jq_ashare_local(native_conn, start=start, end=end)
+        kwargs = {}
+        conn_arg = None
+        if binding_mode == "duckdb_path":
+            kwargs["duckdb_path"] = str(db_path)
+            kwargs["data_bindings"] = {}
+        elif binding_mode == "duckdb_path_bar_grid":
+            kwargs["duckdb_path"] = str(db_path)
+            kwargs["data_bindings"] = {}
+            kwargs["data_frequency"] = "1d"
+            kwargs["analysis_mode"] = "cross_sectional"
+        elif binding_mode == "duckdb_path_sidecar":
+            kwargs["duckdb_path"] = str(db_path)
+            kwargs["data_bindings"] = {}
+        elif binding_mode == "db_connection":
+            conn_arg = native_conn
+        else:
+            kwargs["slot"] = native_slot
+
+        factor = _AshareCloseFactor(
+            conn_arg, "close_alpha", start, end, stock_pool=codes, pit_enabled=False, **kwargs,
+        )
+        try:
+            if binding_mode in ("duckdb_path", "duckdb_path_sidecar"):
+                assert factor._duckdb_adapter._conn is None
+            assert factor.slot.market_db_profile == profile
+            assert factor.slot.bar_feed.profile == profile
+            assert slot_market_db_identity(factor.slot) == expected_identity
+
+            values = factor.get_factor_values(force_recalculate=True)
+            receipt = factor.save_factor_values(store, factor_values=values)
+        finally:
+            factor.close()
+
+        identities = store.list_identities(factor_identity_hash=receipt.factor_identity_hash)
+        assert len(identities) == 1
+        payload = json.loads(identities.iloc[0].identity_payload_json)
+        assert market_db_identity(payload) == expected_identity
+
+        # Hand off to plan_market_factor_values (both pinned and unpinned) and FactorReader synthesis readback.
+        for pinned in ({}, {"close_alpha": receipt.factor_identity_hash}):
+            selected, plan = plan_market_factor_values(
+                store, ["close_alpha"], pinned, start, end, codes, slot=native_slot,
+            )
+            assert selected == {"close_alpha": receipt.factor_identity_hash}
+            assert plan is not None
+            planned_frame = read_market_factor_values(plan, "1d")
+            pivoted = planned_frame.pivot(index="date", columns="stock_code", values="factor_value").sort_index()
+            expected_panel = values.copy()
+            if expected_panel.index.tz is not None:
+                expected_panel.index = expected_panel.index.tz_convert("Asia/Shanghai").tz_localize(None).normalize()
+            expected_panel.index.name = "date"
+            expected_panel.columns.name = "stock_code"
+            pd.testing.assert_frame_equal(pivoted, expected_panel, check_exact=False, rtol=0, atol=1e-12)
+
+        reader = FactorReader(str(tmp_path / "results.duckdb"), factor_values_store=store, slot=native_slot)
+        assert reader.get_available_factors() == ["close_alpha"]
+        read_back = reader.get_factor_values("close_alpha", start, end)
+        assert read_back["000001.XSHE"].tolist() == [10.0, 11.0, 12.0]
+        assert read_back["600000.XSHG"].tolist() == [20.0, 21.0, 22.0]
+        loader = FactorLoader(factor_values_store=store, slot_id=native_slot.slot_id, market_db=expected_identity)
+        assert loader._resolve_market_identities(["close_alpha"]) == {"close_alpha": receipt.factor_identity_hash}
+    finally:
+        native_conn.close()
+
+
+def test_ashare_duckdb_path_cross_db_and_slot_mismatch_rejections(tmp_path):
+    db_a = tmp_path / "cn_a.duckdb"
+    db_b = tmp_path / "cn_b.duckdb"
+    profile_a, start, end, codes = _create_ashare_price_db(db_a, db_id="cn_a")
+    profile_b, _, _, _ = _create_ashare_price_db(db_b, db_id="cn_b")
+    store = MarketFactorValueStore(tmp_path / "factors")
+
+    factor_a = _AshareCloseFactor(
+        None, "alpha_a", start, end, stock_pool=codes, duckdb_path=str(db_a), data_bindings={}, pit_enabled=False,
+    )
+    try:
+        receipt_a = factor_a.save_factor_values(store, factor_values=factor_a.get_factor_values(force_recalculate=True))
+    finally:
+        factor_a.close()
+
+    with duckdb.connect(str(db_b), read_only=True) as conn_b:
+        slot_b = build_jq_ashare_local(conn_b, start=start, end=end)
+        with pytest.raises(ValueError, match=r"Matching hashes: \[\]"):
+            plan_market_factor_values(
+                store, ["alpha_a"], {"alpha_a": receipt_a.factor_identity_hash}, start, end, codes, slot=slot_b,
+            )
+        assert FactorReader(str(tmp_path / "r.duckdb"), factor_values_store=store, slot=slot_b).get_available_factors() == []
+
+        factor_b = _AshareCloseFactor(
+            None, "alpha_b", start, end, stock_pool=codes, duckdb_path=str(db_b), data_bindings={}, pit_enabled=False,
+        )
+        try:
+            receipt_b = factor_b.save_factor_values(store, factor_values=factor_b.get_factor_values(force_recalculate=True))
+        finally:
+            factor_b.close()
+
+        with pytest.raises(ValueError, match="multiple market databases"):
+            plan_market_factor_values(
+                store,
+                ["alpha_a", "alpha_b"],
+                {"alpha_a": receipt_a.factor_identity_hash, "alpha_b": receipt_b.factor_identity_hash},
+                start,
+                end,
+                codes,
+                slot_id="jq_ashare_local",
+            )
+
+        with pytest.raises(MarketDbProfileError, match="MARKET_DB_PROFILE_HASH_MISMATCH"):
+            _AshareCloseFactor(
+                None, "mismatch", start, end, stock_pool=codes, slot=slot_b, duckdb_path=str(db_a), data_bindings={},
+            )
+        with pytest.raises(MarketDbProfileError, match="MARKET_DB_PROFILE_HASH_MISMATCH"):
+            _AshareCloseFactor(
+                None, "mismatch_factor_slot", start, end, stock_pool=codes, slot=factor_a.slot,
+                duckdb_path=str(db_b), data_bindings={},
+            )
+        with pytest.raises(MarketDbProfileError, match="MARKET_DB_PROFILE_HASH_MISMATCH"):
+            _AshareCloseFactor(
+                conn_b, "mismatch_conn", start, end, stock_pool=codes, duckdb_path=str(db_a), data_bindings={},
+            )
+
+    # Same db_id but mismatched profile_hash (different calendar_coverage) is also rejected.
+    db_same_id_diff_hash = tmp_path / "cn_a_other_hash.duckdb"
+    _create_ashare_price_db(db_same_id_diff_hash, db_id="cn_a", calendar_coverage="2026-01-01..2026-02-28")
+    with duckdb.connect(str(db_same_id_diff_hash), read_only=True) as conn_other_hash:
+        slot_other_hash = build_jq_ashare_local(conn_other_hash, start=start, end=end)
+        with pytest.raises(ValueError, match=r"Matching hashes: \[\]"):
+            plan_market_factor_values(
+                store, ["alpha_a"], {"alpha_a": receipt_a.factor_identity_hash}, start, end, codes,
+                slot=slot_other_hash,
+            )
+        with pytest.raises(MarketDbProfileError, match="MARKET_DB_PROFILE_HASH_MISMATCH"):
+            _AshareCloseFactor(
+                None, "mismatch_profile_hash", start, end, stock_pool=codes, slot=slot_other_hash,
+                duckdb_path=str(db_a), data_bindings={},
+            )
+
+
+def test_ashare_slot_binding_keeps_legacy_and_nonfile_compat(tmp_path, monkeypatch):
+    start, end, codes = "2026-01-05", "2026-01-07", ["000001.XSHE"]
+    store = MarketFactorValueStore(tmp_path / "factors")
+
+    # 1. Unprofiled in-memory DB remains compatible at init, compute, and save.
+    with duckdb.connect(":memory:") as mem:
+        mem.execute("""
+            CREATE TABLE price_data_daily AS
+            SELECT DATE '2026-01-05' + i::INT AS date, '000001.XSHE' AS stock_code, 10.0 + i AS close
+            FROM range(3) t(i)
+        """)
+        mem_factor = _AshareCloseFactor(mem, "mem_alpha", start, end, stock_pool=codes, pit_enabled=False)
+        assert mem_factor.slot.market_db_profile is None
+        mem_receipt = mem_factor.save_factor_values(store, factor_values=mem_factor.get_factor_values(force_recalculate=True))
+        assert mem_receipt.inserted == 3
+
+    # 2. Unprofiled duckdb_path stays compatible at init and is still rejected on panel read.
+    unprofiled = tmp_path / "unprofiled.duckdb"
+    with duckdb.connect(str(unprofiled)) as conn:
+        conn.execute("CREATE TABLE price_data_daily AS SELECT DATE '2026-01-05' AS date, '000001.XSHE' AS stock_code, 10.0 AS close")
+    lazy_factor = _AshareCloseFactor(
+        None, "unprofiled", start, end, stock_pool=codes, duckdb_path=str(unprofiled), data_bindings={}, pit_enabled=False,
+    )
+    try:
+        assert lazy_factor._duckdb_adapter._conn is None
+        assert lazy_factor.slot.market_db_profile is None
+        with pytest.raises(MarketDbProfileError, match="MARKET_DB_PROFILE_MISSING"):
+            lazy_factor.get_price_data()
+    finally:
+        lazy_factor.close()
+
+    # 3. Same-file RW connection + slot + duckdb_path does not trigger RW/RO lock failure.
+    rw_db = tmp_path / "rw_same.duckdb"
+    _, _, _, _ = _create_ashare_price_db(rw_db, db_id="cn_rw")
+    with duckdb.connect(str(rw_db)) as rw_conn:
+        rw_slot = build_jq_ashare_local(rw_conn, start=start, end=end)
+        same_factor = _AshareCloseFactor(
+            None, "same_rw", start, end, stock_pool=codes, slot=rw_slot, duckdb_path=str(rw_db),
+            data_bindings={}, pit_enabled=False,
+        )
+        assert same_factor.slot.market_db_profile == rw_slot.market_db_profile
+        same_factor.close()
+
+    # 4. Parquet-only and cloud-mode constructions succeed with no local profile probing.
+    parquet_dir = tmp_path / "parquet"
+    parquet_dir.mkdir()
+    pq_factor = _AshareCloseFactor(
+        None, "pq_only", start, end, stock_pool=codes, parquet_dir=str(parquet_dir), data_bindings={}, pit_enabled=False,
+    )
+    try:
+        assert pq_factor.slot.market_db_profile is None
+    finally:
+        pq_factor.close()
+
+    monkeypatch.setenv("JQ_RUNNING", "1")
+    cloud_factor = _AshareCloseFactor(
+        None, "cloud", start, end, stock_pool=codes, duckdb_path=str(tmp_path / "missing_cloud.duckdb"),
+        data_bindings={}, pit_enabled=False,
+    )
+    assert cloud_factor.slot.market_db_profile is None
+
+
+@pytest.mark.parametrize("borrow_timing", ["rw_closed_before_borrow", "rw_closed_after_borrow_owner_reads_first"])
+def test_deferred_borrowed_slot_preserves_identity_and_synthesis_handoff(tmp_path, borrow_timing):
+    db_a = tmp_path / "cn_deferred_a.duckdb"
+    profile_a, start, end, _ = _create_ashare_price_db(db_a, db_id="cn_deferred_a")
+    codes = ["000001.XSHE"]
+    expected_identity = market_db_identity(profile_a)
+    store = MarketFactorValueStore(tmp_path / "factors")
+
+    rw_conn = duckdb.connect(str(db_a))
+    try:
+        owner = _AshareCloseFactor(
+            None, "owner", start, end, stock_pool=codes, duckdb_path=str(db_a),
+            data_bindings={}, pit_enabled=False,
+        )
+        assert owner.slot.market_db_profile is None
+        if borrow_timing == "rw_closed_after_borrow_owner_reads_first":
+            borrower = _AshareCloseFactor(
+                None, "borrower", start, end, stock_pool=codes, slot=owner.slot,
+                data_bindings={}, pit_enabled=False,
+            )
+    finally:
+        rw_conn.close()
+
+    try:
+        if borrow_timing == "rw_closed_before_borrow":
+            borrower = _AshareCloseFactor(
+                None, "borrower", start, end, stock_pool=codes, slot=owner.slot,
+                data_bindings={}, pit_enabled=False,
+            )
+            values = borrower.get_factor_values(force_recalculate=True)
+            assert values.to_numpy().tolist() == [[10.0], [11.0], [12.0]]
+            receipt = borrower.save_factor_values(store, factor_values=values)
+        else:
+            owner_values = owner.get_factor_values(force_recalculate=True)
+            assert owner_values.to_numpy().tolist() == [[10.0], [11.0], [12.0]]
+            precomputed = owner_values.copy()
+            receipt = borrower.save_factor_values(store, factor_values=precomputed)
+
+        assert owner.slot.market_db_profile == profile_a
+        assert borrower.slot.market_db_profile == profile_a
+        assert borrower.slot.bar_feed.profile == profile_a
+        assert slot_market_db_identity(borrower.slot) == expected_identity
+
+        identities = store.list_identities(factor_identity_hash=receipt.factor_identity_hash)
+        assert len(identities) == 1
+        payload = json.loads(identities.iloc[0].identity_payload_json)
+        assert market_db_identity(payload) == expected_identity
+
+        borrower.close()
+        owner_read = owner.get_factor_values(force_recalculate=True)
+        assert owner_read.to_numpy().tolist() == [[10.0], [11.0], [12.0]]
+        assert owner._duckdb_adapter._conn is not None
+        assert owner._duckdb_adapter._conn.execute("SELECT 1").fetchone() == (1,)
+    finally:
+        owner.close()
+
+    with duckdb.connect(str(db_a), read_only=True) as conn_a:
+        formal_slot = build_jq_ashare_local(conn_a, start=start, end=end)
+        selected, plan = plan_market_factor_values(
+            store, ["borrower"], {"borrower": receipt.factor_identity_hash}, start, end, codes,
+            slot=formal_slot,
+        )
+        assert selected == {"borrower": receipt.factor_identity_hash}
+        assert plan is not None
+        read_back = FactorReader(str(tmp_path / "results.duckdb"), factor_values_store=store, slot=formal_slot).get_factor_values(
+            "borrower", start, end,
+        )
+        assert read_back["000001.XSHE"].tolist() == [10.0, 11.0, 12.0]
+
+
+def test_deferred_borrowed_slot_rejects_cross_db_without_polluting_owner(tmp_path):
+    db_a = tmp_path / "cn_owner_a.duckdb"
+    db_b = tmp_path / "cn_borrower_b.duckdb"
+    profile_a, start, end, _ = _create_ashare_price_db(db_a, db_id="cn_owner_a")
+    _create_ashare_price_db(db_b, db_id="cn_borrower_b")
+    codes = ["000001.XSHE"]
+    store = MarketFactorValueStore(tmp_path / "factors")
+
+    rw_conn = duckdb.connect(str(db_a))
+    try:
+        owner = _AshareCloseFactor(
+            None, "owner_a", start, end, stock_pool=codes, duckdb_path=str(db_a),
+            data_bindings={}, pit_enabled=False,
+        )
+        assert owner.slot.market_db_profile is None
+        with pytest.raises((MarketDbProfileError, duckdb.ConnectionException)):
+            _AshareCloseFactor(
+                None, "borrower_while_locked", start, end, stock_pool=codes, slot=owner.slot,
+                duckdb_path=str(db_b), data_bindings={}, pit_enabled=False,
+            )
+        assert owner.slot.market_db_profile is None
+        assert owner.slot.bar_feed.profile is None
+    finally:
+        rw_conn.close()
+
+    try:
+        with pytest.raises(MarketDbProfileError, match="MARKET_DB_PROFILE_HASH_MISMATCH"):
+            _AshareCloseFactor(
+                None, "borrower_b", start, end, stock_pool=codes, slot=owner.slot,
+                duckdb_path=str(db_b), data_bindings={}, pit_enabled=False,
+            )
+        assert owner.slot.market_db_profile is None
+        assert owner.slot.bar_feed.profile is None
+
+        owner_values = owner.get_factor_values(force_recalculate=True)
+        assert owner_values.to_numpy().tolist() == [[10.0], [11.0], [12.0]]
+        assert owner.slot.market_db_profile == profile_a
+        receipt = owner.save_factor_values(store, factor_values=owner_values)
+        payload = json.loads(
+            store.list_identities(factor_identity_hash=receipt.factor_identity_hash).iloc[0].identity_payload_json,
+        )
+        assert market_db_identity(payload) == market_db_identity(profile_a)
+    finally:
+        owner.close()
+
+
+@pytest.mark.parametrize("save_fn", [public_save_factor_values, public_save_bar_factor_values])
+@pytest.mark.parametrize("pass_precomputed", [False, True])
+def test_public_save_factor_values_resolves_deferred_duckdb_path_identity(tmp_path, save_fn, pass_precomputed):
+    db_a = tmp_path / "cn_public_save.duckdb"
+    profile_a, start, end, _ = _create_ashare_price_db(db_a, db_id="cn_public_save")
+    codes = ["000001.XSHE"]
+    expected_identity = market_db_identity(profile_a)
+    store = MarketFactorValueStore(tmp_path / "factors")
+
+    rw_conn = duckdb.connect(str(db_a))
+    try:
+        factor = _AshareCloseFactor(
+            None, "public_alpha", start, end, stock_pool=codes, duckdb_path=str(db_a),
+            data_bindings={}, pit_enabled=False,
+        )
+        assert factor.slot.market_db_profile is None
+    finally:
+        rw_conn.close()
+
+    try:
+        if pass_precomputed:
+            precomputed = pd.DataFrame(
+                {"000001.XSHE": [10.0, 11.0, 12.0]},
+                index=pd.to_datetime(["2026-01-05", "2026-01-06", "2026-01-07"]),
+            )
+            receipt = save_fn(factor, store, factor_values=precomputed)
+        else:
+            receipt = save_fn(factor, store)
+
+        assert factor.slot.market_db_profile == profile_a
+        identities = store.list_identities(factor_identity_hash=receipt.factor_identity_hash)
+        assert len(identities) == 1
+        payload = json.loads(identities.iloc[0].identity_payload_json)
+        assert market_db_identity(payload) == expected_identity
+    finally:
+        factor.close()
+
+    with duckdb.connect(str(db_a), read_only=True) as conn_a:
+        formal_slot = build_jq_ashare_local(conn_a, start=start, end=end)
+        selected, _ = plan_market_factor_values(
+            store, ["public_alpha"], {"public_alpha": receipt.factor_identity_hash}, start, end, codes,
+            slot=formal_slot,
+        )
+        assert selected == {"public_alpha": receipt.factor_identity_hash}
+        read_back = FactorReader(str(tmp_path / "results.duckdb"), factor_values_store=store, slot=formal_slot).get_factor_values(
+            "public_alpha", start, end,
+        )
+        assert read_back["000001.XSHE"].tolist() == [10.0, 11.0, 12.0]
+
+    # Unprofiled in-memory DB stays compatible via public save_factor_values / save_bar_factor_values.
+    mem_store = MarketFactorValueStore(tmp_path / "mem_factors")
+    with duckdb.connect(":memory:") as mem:
+        mem.execute("""
+            CREATE TABLE price_data_daily AS
+            SELECT DATE '2026-01-05' + i::INT AS date, '000001.XSHE' AS stock_code, 10.0 + i AS close
+            FROM range(3) t(i)
+        """)
+        mem_factor = _AshareCloseFactor(mem, "mem_public", start, end, stock_pool=codes, pit_enabled=False)
+        mem_receipt = save_fn(mem_factor, mem_store)
+        mem_payload = json.loads(
+            mem_store.list_identities(factor_identity_hash=mem_receipt.factor_identity_hash).iloc[0].identity_payload_json,
+        )
+        assert market_db_identity(mem_payload) == {}
+
+
+def test_parquet_only_slot_rejects_foreign_duckdb_borrower_without_polluting_owner(tmp_path):
+    parquet_dir = tmp_path / "pq_root"
+    part_dir = parquet_dir / "price_data_daily" / "year=2026" / "month=1"
+    part_dir.mkdir(parents=True)
+    pd.DataFrame({
+        "date": pd.to_datetime(["2026-01-05", "2026-01-06", "2026-01-07"]),
+        "stock_code": ["000001.XSHE"] * 3,
+        "close": [90.0, 91.0, 92.0],
+        "factor": [1.0, 1.0, 1.0],
+        "volume": [100.0, 100.0, 100.0],
+    }).to_parquet(part_dir / "prices.parquet", index=False)
+
+    db_b = tmp_path / "probe_b.duckdb"
+    _, start, end, _ = _create_ashare_price_db(db_b, db_id="probe_b")
+    codes = ["000001.XSHE"]
+    store = MarketFactorValueStore(tmp_path / "factors")
+
+    pq_owner = _AshareCloseFactor(
+        None, "pq_owner", start, end, stock_pool=codes, parquet_dir=str(parquet_dir),
+        data_bindings={}, pit_enabled=False,
+    )
+    pq_borrower = None
+    try:
+        owner_vals = pq_owner.get_factor_values(force_recalculate=True)
+        assert owner_vals.to_numpy().tolist() == [[90.0], [91.0], [92.0]]
+        assert pq_owner.slot.market_db_profile is None
+        assert pq_owner.slot.bar_feed.profile is None
+
+        # Borrowing without a foreign DB source keeps working on the same Parquet feed.
+        pq_borrower = _AshareCloseFactor(
+            None, "pq_borrower", start, end, stock_pool=codes, slot=pq_owner.slot,
+            data_bindings={}, pit_enabled=False,
+        )
+        assert pq_borrower.get_factor_values(force_recalculate=True).to_numpy().tolist() == [[90.0], [91.0], [92.0]]
+        assert pq_borrower.slot.market_db_profile is None
+
+        with pytest.raises(MarketDbProfileError):
+            _AshareCloseFactor(
+                None, "pq_cross_b", start, end, stock_pool=codes, slot=pq_owner.slot,
+                duckdb_path=str(db_b), data_bindings={}, pit_enabled=False,
+            )
+
+        assert pq_owner.slot.market_db_profile is None
+        assert pq_owner.slot.bar_feed.profile is None
+
+        recomputed = pq_owner.get_factor_values(force_recalculate=True)
+        assert recomputed.to_numpy().tolist() == [[90.0], [91.0], [92.0]]
+        receipt = pq_owner.save_factor_values(store, factor_values=recomputed)
+        payload = json.loads(
+            store.list_identities(factor_identity_hash=receipt.factor_identity_hash).iloc[0].identity_payload_json,
+        )
+        assert market_db_identity(payload) == {}
+
+        with duckdb.connect(str(db_b), read_only=True) as conn_b:
+            slot_b = build_jq_ashare_local(conn_b, start=start, end=end)
+            with pytest.raises(ValueError, match=r"Matching hashes: \[\]"):
+                plan_market_factor_values(
+                    store, ["pq_owner"], {"pq_owner": receipt.factor_identity_hash}, start, end, codes,
+                    slot=slot_b,
+                )
+    finally:
+        if pq_borrower is not None:
+            pq_borrower.close()
+        pq_owner.close()
+
+
+def test_uncreated_duckdb_path_slot_rejects_foreign_duckdb_borrower_without_polluting_owner(tmp_path):
+    db_a = tmp_path / "future_a.duckdb"
+    db_b = tmp_path / "probe_b.duckdb"
+    _create_ashare_price_db(db_b, db_id="probe_b")
+    start, end = "2026-01-05", "2026-01-07"
+    codes = ["000001.XSHE"]
+
+    future_owner = _AshareCloseFactor(
+        None, "future_owner", start, end, stock_pool=codes, duckdb_path=str(db_a),
+        data_frequency="60min", analysis_mode="cross_sectional", data_bindings={}, pit_enabled=False,
+    )
+    assert future_owner.slot.market_db_profile is None
+    assert future_owner.slot.bar_feed.profile is None
+    assert not db_a.exists()
+
+    # Legitimate borrowing without attaching a foreign source still defers cleanly.
+    future_borrower = _AshareCloseFactor(
+        None, "future_borrower", start, end, stock_pool=codes, slot=future_owner.slot,
+        data_frequency="60min", analysis_mode="cross_sectional", data_bindings={}, pit_enabled=False,
+    )
+    assert future_borrower.slot.market_db_profile is None
+
+    with pytest.raises(MarketDbProfileError):
+        _AshareCloseFactor(
+            None, "borrower_b", start, end, stock_pool=codes, slot=future_owner.slot,
+            duckdb_path=str(db_b), data_bindings={}, pit_enabled=False,
+        )
+
+    assert future_owner.slot.market_db_profile is None
+    assert future_owner.slot.bar_feed.profile is None
+    assert future_borrower.slot.market_db_profile is None
+
+    profile_a, _, _, _ = _create_ashare_price_db(db_a, db_id="future_a")
+    with future_owner.slot.bar_feed._reader() as reader:
+        assert reader.market_db_profile == profile_a
+    assert future_owner.slot.market_db_profile == profile_a
+    assert future_borrower.slot.market_db_profile == profile_a
+    assert future_owner.slot.bar_feed.profile == profile_a
+
+
+def test_dual_duckdb_and_parquet_slot_allows_same_binding_and_rejects_mismatched_parquet(tmp_path):
+    db_a = tmp_path / "cn_dual_a.duckdb"
+    profile_a, start, end, codes = _create_ashare_price_db(db_a, db_id="cn_dual_a")
+    pq_a = tmp_path / "pq_a"
+    pq_other = tmp_path / "pq_other"
+    pq_a.mkdir()
+    pq_other.mkdir()
+
+    options = dict(
+        duckdb_path=str(db_a),
+        parquet_dir=str(pq_a),
+        source_policy="duckdb_then_parquet_on_empty",
+        data_bindings={},
+        stock_pool=codes,
+        pit_enabled=False,
+    )
+    owner = _AshareCloseFactor(None, "dual_owner", start, end, **options)
+    borrower = None
+    duckdb_only_owner = None
+    try:
+        borrower = _AshareCloseFactor(None, "dual_borrower", start, end, slot=owner.slot, **options)
+        assert owner.slot.market_db_profile == profile_a
+        assert borrower.slot.market_db_profile == profile_a
+        expected = [[10.0, 20.0], [11.0, 21.0], [12.0, 22.0]]
+        assert owner.get_factor_values(force_recalculate=True).to_numpy().tolist() == expected
+        assert borrower.get_factor_values(force_recalculate=True).to_numpy().tolist() == expected
+
+        with pytest.raises(MarketDbProfileError):
+            _AshareCloseFactor(
+                None, "dual_wrong_pq", start, end, slot=owner.slot,
+                **{**options, "parquet_dir": str(pq_other)},
+            )
+
+        duckdb_only_owner = _AshareCloseFactor(
+            None, "duckdb_only", start, end, stock_pool=codes, duckdb_path=str(db_a),
+            data_bindings={}, pit_enabled=False,
+        )
+        with pytest.raises(MarketDbProfileError):
+            _AshareCloseFactor(None, "add_pq_to_duckdb", start, end, slot=duckdb_only_owner.slot, **options)
+    finally:
+        if duckdb_only_owner is not None:
+            duckdb_only_owner.close()
+        if borrower is not None:
+            borrower.close()
+        owner.close()
+
+
+def test_unprofiled_same_file_dual_readonly_connections_preserve_init_compat_and_reject_distinct_sources(tmp_path):
+    start, end = "2026-01-05", "2026-01-07"
+    codes = ["000001.XSHE"]
+    unprof_a = tmp_path / "unprof_a.duckdb"
+    unprof_b = tmp_path / "unprof_b.duckdb"
+    for path in (unprof_a, unprof_b):
+        with duckdb.connect(str(path)) as conn:
+            conn.execute(
+                "CREATE TABLE price_data_daily AS "
+                "SELECT DATE '2026-01-05' + i::INT AS date, '000001.XSHE' AS stock_code, 10.0 + i AS close "
+                "FROM range(3) t(i)"
+            )
+
+    with (
+        duckdb.connect(str(unprof_a), read_only=True) as conn1,
+        duckdb.connect(str(unprof_a), read_only=True) as conn2,
+        duckdb.connect(str(unprof_b), read_only=True) as conn_b,
+        duckdb.connect(":memory:") as mem1,
+        duckdb.connect(":memory:") as mem2,
+    ):
+        owner = _AshareCloseFactor(conn1, "ro_owner", start, end, stock_pool=codes, data_bindings={}, pit_enabled=False)
+        borrower = _AshareCloseFactor(
+            conn2, "ro_borrower", start, end, stock_pool=codes, slot=owner.slot, data_bindings={}, pit_enabled=False,
+        )
+        assert owner.slot.market_db_profile is None
+        assert borrower.slot.market_db_profile is None
+        assert borrower.get_price_data()["000001.XSHE"].tolist() == [10.0, 11.0, 12.0]
+        with pytest.raises(MarketDbProfileError, match="MARKET_DB_PROFILE_MISSING"):
+            borrower.slot.bar_feed.instrument_metadata(codes)
+
+        with pytest.raises(MarketDbProfileError):
+            _AshareCloseFactor(
+                conn_b, "ro_diff_file", start, end, stock_pool=codes, slot=owner.slot, data_bindings={}, pit_enabled=False,
+            )
+
+        mem1.execute(
+            "CREATE TABLE price_data_daily AS "
+            "SELECT DATE '2026-01-05' + i::INT AS date, '000001.XSHE' AS stock_code, 10.0 + i AS close "
+            "FROM range(3) t(i)"
+        )
+        mem2.execute(
+            "CREATE TABLE price_data_daily AS "
+            "SELECT DATE '2026-01-05' + i::INT AS date, '000001.XSHE' AS stock_code, 20.0 + i AS close "
+            "FROM range(3) t(i)"
+        )
+        mem_owner = _AshareCloseFactor(mem1, "mem_owner", start, end, stock_pool=codes, pit_enabled=False)
+        with pytest.raises(MarketDbProfileError):
+            _AshareCloseFactor(mem2, "mem_other", start, end, stock_pool=codes, slot=mem_owner.slot, pit_enabled=False)

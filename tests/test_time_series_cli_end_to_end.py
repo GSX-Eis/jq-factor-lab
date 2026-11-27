@@ -590,3 +590,234 @@ def test_nested_calendar_choice_overrides_top_level_alternative(tmp_path, nested
     assert alternative not in summary['config']
     assert summary['calendar_identity']['calendar_id'] == (
         'CME Globex Equity' if nested_calendar == 'calendar' else 'per_instrument')
+
+
+def _build_private_slot_fixture(tmp_path: Path) -> tuple[Path, Path, Path]:
+    from dataclasses import replace
+    from utils.session_calendar import SessionCalendar
+    from utils.slots import ExecutionProfile, ProviderConfig, load_slot_config
+    from utils.time_axis import BarSchedule
+
+    slot_dir = tmp_path / 'slot_fixture'
+    slot_dir.mkdir(parents=True, exist_ok=True)
+    example = load_slot_config(ROOT / 'examples' / 'declarative_crypto' / 'slot.yaml')
+    days = ('2026-01-05', '2026-01-06')
+    cal = SessionCalendar('crypto_utc', days[0], days[1], custom_sessions=example.calendar.options['custom_sessions'])
+    sched = BarSchedule(cal, '60min', view='ETH', bucket_strategy='segment_anchored')
+    rows = []
+    for inst_idx, inst in enumerate(('BTC-USD', 'ETH-USD')):
+        step = 0
+        for day in cal.sessions():
+            for ts in sched.for_session(day.strftime('%Y-%m-%d'))['start_utc']:
+                step += 1
+                base = 100.0 + 15.0 * inst_idx + 0.4 * step
+                rows.append({
+                    'time': ts.strftime('%Y-%m-%dT%H:%M:%SZ'),
+                    'instrument_id': inst,
+                    'open': base,
+                    'high': base + 1.0,
+                    'low': base - 1.0,
+                    'close': base + 0.2,
+                    'volume': 50.0 + step,
+                })
+    pd.DataFrame(rows).to_csv(slot_dir / 'bars.csv', index=False)
+    universe_opts = dict(example.universe.options)
+    universe_opts['instruments'] = {
+        inst: {'asset_class': 'crypto', 'currency': 'USD', 'lot_size': 1, 'contract_multiplier': 1.0}
+        for inst in ('BTC-USD', 'ETH-USD')
+    }
+    universe_opts['universes'] = {'spot': ['BTC-USD', 'ETH-USD']}
+    bar_opts = {
+        **example.bar_feed.options,
+        'frequency': '60min',
+        'timestamp_anchor': 'bar_start',
+        'column_mapping': {
+            'time': 'timestamp', 'instrument_id': 'instrument_id',
+            'open': 'open', 'high': 'high', 'low': 'low', 'close': 'close', 'volume': 'volume',
+        },
+        'paths': ['bars.csv'],
+    }
+    slot_cfg = replace(
+        example,
+        calendar=replace(example.calendar, options={**example.calendar.options, 'start': days[0], 'end': days[1]}),
+        bar_feed=ProviderConfig('csv_files', bar_opts),
+        universe=ProviderConfig('static', universe_opts),
+        aux_features=ProviderConfig('none', {}),
+        execution_profile=ExecutionProfile('open', 'close', 1, -1, 'decimal', 'endpoints_only', 'cross_session'),
+    )
+    slot_path = slot_dir / 'slot.json'
+    slot_path.write_text(json.dumps(slot_cfg.as_dict(), indent=2), encoding='utf-8')
+    factor_path = slot_dir / 'probe_factor.py'
+    factor_path.write_text(
+        'import pandas as pd\n'
+        'from utils.factor_base import FactorBase\n\n'
+        'class PrivateProbeFactor(FactorBase):\n'
+        '    CAUSAL_VECTORIZED = True\n\n'
+        '    def calculate_factor(self, data: pd.DataFrame) -> pd.DataFrame:\n'
+        '        vals = self.session_rolling(data, "close", 3, min_periods=1, within_session=False)\n'
+        '        return data[["timestamp_utc", "instrument_id"]].assign(factor_value=vals)\n',
+        encoding='utf-8',
+    )
+    return slot_dir, slot_path, factor_path
+
+
+@pytest.mark.parametrize('variant', ['cli_file_slot', 'inline_slot', 'inline_slot_no_output_dir'])
+def test_private_slot_dry_run_and_live_execution_parity(tmp_path: Path, variant: str) -> None:
+    slot_dir, slot_path, factor_path = _build_private_slot_fixture(tmp_path)
+    config: dict = {
+        'analysis_mode': 'time_series',
+        'start_date': '2026-01-05',
+        'end_date': '2026-01-06',
+        'frequency': '60min',
+        'horizons': [1, 2],
+        'n_quantiles': 2,
+        'min_ic_samples': 2,
+        'min_cross_section_size': 2,
+    }
+    eval_dir = tmp_path / 'slot_eval'
+    results_db = tmp_path / 'slot_results.duckdb'
+    json_out = tmp_path / 'dry_plan.json'
+    if variant == 'cli_file_slot':
+        extra = [
+            '--slot', str(slot_path),
+            '--factor', str(factor_path),
+            '--output-dir', str(eval_dir),
+            '--json-out', str(json_out),
+            '--results-db', str(results_db),
+        ]
+        expect_outputs = True
+    elif variant == 'inline_slot':
+        config.update(
+            slot=json.loads(slot_path.read_text(encoding='utf-8')),
+            slot_base_dir=str(slot_dir),
+            factor_file=str(factor_path),
+        )
+        extra = [
+            '--output-dir', str(eval_dir),
+            '--json-out', str(json_out),
+            '--results-db', str(results_db),
+        ]
+        expect_outputs = True
+    else:
+        config.update(
+            slot=json.loads(slot_path.read_text(encoding='utf-8')),
+            slot_base_dir=str(slot_dir),
+            factor_file=str(factor_path),
+        )
+        extra = []
+        expect_outputs = False
+
+    dry_payload = run_cli(tmp_path, config, '--dry-run', *extra)
+    assert dry_payload['ok'] is True
+    assert dry_payload['exit_code'] == 0
+    assert dry_payload['command']['mode'] == 'dry_run'
+    assert dry_payload['summary']['reason'] == 'dry_run'
+    assert not eval_dir.exists()
+    assert not results_db.exists()
+    if expect_outputs:
+        assert json.loads(json_out.read_text(encoding='utf-8')) == dry_payload
+        assert dry_payload['metrics']['planned_results_db'] == str(results_db.resolve())
+
+    live_payload = run_cli(tmp_path, config, *extra)
+    _, _, _, summary = read_outputs(live_payload)
+    assert summary['analysis_mode'] == 'time_series'
+    if expect_outputs:
+        assert live_payload['metrics']['results_db']['status'] == 'inserted'
+        assert (eval_dir / 'summary.json').is_file()
+        assert results_db.is_file()
+
+
+def test_private_market_db_slot_dry_run_and_live_parity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import duckdb
+    from utils.market_db import init_market_db, load_market_db_profile_yaml
+    from utils.market_db.identity import market_db_identity
+    from utils.market_db.research import open_research_slot
+    from utils.market_factor_store import (
+        MarketFactorValueStore, build_identity_record, compute_factor_identity_hash,
+    )
+    from utils.slots import ExecutionProfile, ProviderConfig, SlotConfig
+
+    profile = load_market_db_profile_yaml(ROOT / 'config/market_databases/us_equity.yaml')
+    db_path = tmp_path / 'market.duckdb'
+    init_market_db(db_path, profile)
+    with duckdb.connect(str(db_path)) as conn:
+        conn.execute("""
+            CREATE TABLE bars AS
+            SELECT DATE '2026-01-05' + i::INT + INTERVAL '16 hours' AS timestamp,
+                   'AAPL.XNYS' AS instrument_id, 10.0+i AS open, 11.0+i AS high,
+                   9.0+i AS low, 10.5+i AS close, 100 AS volume
+            FROM range(5) data(i)
+        """)
+    monkeypatch.setenv('QUANT_DATA_BINDINGS', json.dumps({'market_dbs': {profile.db_id: str(db_path)}}))
+    slot_cfg = SlotConfig(
+        1, 'ny_private_fixture',
+        ProviderConfig('pmc', {'calendar_id': 'XNYS', 'start': '2026-01-05', 'end': '2026-01-09'}),
+        ProviderConfig('duckdb_table', {
+            'table': 'bars', 'frequency': '1d', 'timestamp_anchor': 'bar_end',
+            'source_timezone': 'America/New_York', 'volume_mode': 'interval', 'data_version': 'fixture',
+            'column_mapping': {name: name for name in (
+                'instrument_id', 'timestamp', 'open', 'high', 'low', 'close', 'volume',
+            )},
+        }),
+        ProviderConfig('static', {'instruments': {'AAPL.XNYS': {'asset_class': 'equity', 'currency': 'USD'}}}),
+        ProviderConfig('none'), ProviderConfig('open'),
+        ExecutionProfile('close', 'close', 0, 0, 'decimal', 'endpoints_only', 'cross_session'),
+    )
+    slot_path = tmp_path / 'slot.json'
+    slot_path.write_text(json.dumps(slot_cfg.as_dict()), encoding='utf-8')
+    store_root = tmp_path / 'factors'
+    with open_research_slot(profile.db_id, slot_cfg, tmp_path) as (slot, _):
+        identity_hash, payload = compute_factor_identity_hash(
+            factor_id='alpha', factor_class='tests.PrivateMarketFactor', source_sha256='a' * 64, params={},
+            frequency='1d', session_view='ETH', analysis_mode='cross_sectional', bucket_strategy='session',
+            calendar_hash=slot.calendar.calendar_hash, code_version='test', slot_id=slot.slot_id,
+            slot_config_hash=slot.slot_config_hash, adjustment_policy='none',
+            slot_data_fingerprint=slot.slot_data_fingerprint,
+        )
+        record = build_identity_record(factor_identity_hash=identity_hash, payload=payload, code_version_source='test')
+        grid = slot.calendar.bar_grid('1d')
+        rows = grid[['timestamp_utc', 'session_id']].assign(
+            factor_id='alpha', factor_identity_hash=identity_hash, frequency='1d', session_view='ETH',
+            instrument_id='AAPL.XNYS', factor_value=np.arange(len(grid), dtype=float), source_build_id='test-build',
+            calendar_hash=slot.calendar.calendar_hash, code_version='test',
+            created_at=pd.Timestamp('2026-02-01T00:00:00Z'), batch_id=identity_hash[:24],
+        )
+        MarketFactorValueStore(store_root).append_factor_values(rows, identity_record=record, calendar=slot.calendar)
+
+    eval_dir = tmp_path / 'market_eval'
+    results_db = tmp_path / 'market_results.duckdb'
+    json_out = tmp_path / 'market_dry.json'
+    config = {
+        'slot': str(slot_path),
+        'slot_db': str(db_path),
+        'factor_store_root': str(store_root),
+        'factor_id': 'alpha',
+        'analysis_mode': 'time_series',
+        'frequency': '1d',
+        'horizons': [1],
+        'start_date': '2026-01-05',
+        'end_date': '2026-01-09',
+    }
+    extra = [
+        '--market-db', profile.db_id,
+        '--output-dir', str(eval_dir),
+        '--json-out', str(json_out),
+        '--results-db', str(results_db),
+    ]
+    dry_payload = run_cli(tmp_path, config, '--dry-run', *extra)
+    assert dry_payload['ok'] is True
+    assert dry_payload['exit_code'] == 0
+    assert dry_payload['command']['mode'] == 'dry_run'
+    assert dry_payload['metrics']['market_db'] == market_db_identity(profile)
+    assert dry_payload['metrics']['planned_results_db'] == str(results_db.resolve())
+    assert json.loads(json_out.read_text(encoding='utf-8')) == dry_payload
+    assert not eval_dir.exists()
+    assert not results_db.exists()
+
+    live_payload = run_cli(tmp_path, config, *extra)
+    read_outputs(live_payload)
+    assert live_payload['metrics']['results_db']['status'] == 'inserted'
+    assert (eval_dir / 'summary.json').is_file()
+    assert results_db.is_file()

@@ -27,22 +27,34 @@ Qlib适配器模块
     >>> y = apply_target_cs_preprocessing(y, cs_demean=True, cs_rank=True)
 """
 
-# 导出适配器组件
-from .data_converter import DataConverter
-from .qlib_lgb_model import QlibLGBWrapper
-from .qlib_linear_model import QlibLinearWrapper
-from .quantile_elasticnet import QuantileElasticNet, QuantileElasticNetCV
+import importlib
 
-# 导出Qlib处理器组件
-from .processors import (
-    PerFactorPreprocessor,
-    TargetCSProcessor,
-    SampleWeightProcessor,
-)
+_EXPORTS = {
+    'DataConverter': '.data_converter',
+    'QlibLGBWrapper': '.qlib_lgb_model',
+    'QlibLinearWrapper': '.qlib_linear_model',
+    'QuantileElasticNet': '.quantile_elasticnet',
+    'QuantileElasticNetCV': '.quantile_elasticnet',
+    'PerFactorPreprocessor': '.processors',
+    'TargetCSProcessor': '.processors',
+    'SampleWeightProcessor': '.processors',
+    'QlibCustomObjectives': '.custom_objectives',
+    'CVMetricEvaluator': '.cv_metrics',
+}
 
-# 导出自定义目标函数和CV指标
-from .custom_objectives import QlibCustomObjectives
-from .cv_metrics import CVMetricEvaluator
+
+def __getattr__(name: str):
+    module_name = _EXPORTS.get(name)
+    if module_name is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    module = importlib.import_module(module_name, __name__)
+    value = getattr(module, name)
+    globals()[name] = value
+    return value
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | set(__all__))
 
 __all__ = [
     # Core components

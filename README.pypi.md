@@ -4,19 +4,19 @@
 
 **An AI-native quantitative research harness for multi-factor computation and synthesis, backtesting, and anti-overfitting statistical evaluation through CLI and MCP.**
 
-English · [简体中文](https://github.com/GSX-Eis/jq-factor-lab/blob/v0.1.0/README.zh-CN.md)
+English · [简体中文](https://github.com/GSX-Eis/jq-factor-lab/blob/v0.2.0/README.zh-CN.md)
 
 [![CI](https://img.shields.io/github/actions/workflow/status/GSX-Eis/jq-factor-lab/ci.yml?branch=main&label=CI)](https://github.com/GSX-Eis/jq-factor-lab/actions/workflows/ci.yml?query=branch%3Amain)
-[![Version](https://img.shields.io/badge/dynamic/toml?url=https%3A%2F%2Fraw.githubusercontent.com%2FGSX-Eis%2Fjq-factor-lab%2Fmain%2Fpyproject.toml&query=%24.project.version&label=version&prefix=v&color=blue)](https://github.com/GSX-Eis/jq-factor-lab/blob/v0.1.0/CHANGELOG.md)
+[![Version](https://img.shields.io/badge/dynamic/toml?url=https%3A%2F%2Fraw.githubusercontent.com%2FGSX-Eis%2Fjq-factor-lab%2Fmain%2Fpyproject.toml&query=%24.project.version&label=version&prefix=v&color=blue)](https://github.com/GSX-Eis/jq-factor-lab/blob/v0.2.0/CHANGELOG.md)
 ![Python 3.11–3.12](https://img.shields.io/badge/python-3.11%20%7C%203.12-blue)
-[![Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](https://github.com/GSX-Eis/jq-factor-lab/blob/v0.1.0/LICENSE)
+[![Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](https://github.com/GSX-Eis/jq-factor-lab/blob/v0.2.0/LICENSE)
 
 </div>
 
 <div align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://github.com/GSX-Eis/jq-factor-lab/raw/v0.1.0/docs/assets/architecture-dark.svg">
-    <img src="https://github.com/GSX-Eis/jq-factor-lab/raw/v0.1.0/docs/assets/architecture-light.svg" width="100%" alt="JQ Factor Lab architecture from AI agents through the CLI and quantitative core to local evidence and a read-only dashboard">
+    <source media="(prefers-color-scheme: dark)" srcset="https://github.com/GSX-Eis/jq-factor-lab/raw/v0.2.0/docs/assets/architecture-dark.svg">
+    <img src="https://github.com/GSX-Eis/jq-factor-lab/raw/v0.2.0/docs/assets/architecture-light.svg" width="100%" alt="JQ Factor Lab architecture from AI agents through the CLI and quantitative core to local evidence and a read-only dashboard">
   </picture>
 </div>
 
@@ -88,13 +88,13 @@ The Bar response includes this diagnostic for the 1-Bar horizon, excerpted from 
 }
 ```
 
-The [AI workflow showcase](https://github.com/GSX-Eis/jq-factor-lab/blob/v0.1.0/docs/AI_WORKFLOW_SHOWCASE.md) follows several candidates through preflight, calibration and trial gates, synthesis, a toy backtest and DuckDB read-back.
+The [AI workflow showcase](https://github.com/GSX-Eis/jq-factor-lab/blob/v0.2.0/docs/AI_WORKFLOW_SHOWCASE.md) follows several candidates through preflight, calibration and trial gates, synthesis, a toy backtest and DuckDB read-back.
 
 ## Plug into your AI agent
 
 ### Agent Skill or Claude Code plugin
 
-Copy the entire [Factor Research Skill](https://github.com/GSX-Eis/jq-factor-lab/blob/v0.1.0/skills/factor-research/SKILL.md) directory, including its references, into your client's skills directory. With Claude Code, run `claude --plugin-dir .` from the checkout to load the [plugin manifest](https://github.com/GSX-Eis/jq-factor-lab/blob/v0.1.0/.claude-plugin/plugin.json) and invoke `/jq-factor-lab:factor-research`. See [AGENTS.md](https://github.com/GSX-Eis/jq-factor-lab/blob/v0.1.0/AGENTS.md) or [CLAUDE.md](https://github.com/GSX-Eis/jq-factor-lab/blob/v0.1.0/CLAUDE.md) for project instructions.
+Copy the entire [Factor Research Skill](https://github.com/GSX-Eis/jq-factor-lab/blob/v0.2.0/skills/factor-research/SKILL.md) directory, including its references, into your client's skills directory. With Claude Code, run `claude --plugin-dir .` from the checkout to load the [plugin manifest](https://github.com/GSX-Eis/jq-factor-lab/blob/v0.2.0/.claude-plugin/plugin.json) and invoke `/jq-factor-lab:factor-research`. See [AGENTS.md](https://github.com/GSX-Eis/jq-factor-lab/blob/v0.2.0/AGENTS.md) or [CLAUDE.md](https://github.com/GSX-Eis/jq-factor-lab/blob/v0.2.0/CLAUDE.md) for project instructions.
 
 ### Stdio MCP server
 
@@ -111,7 +111,7 @@ With `uvx` on the MCP client's PATH, add this entry to `mcpServers` in Claude De
 }
 ```
 
-The server runs locally. Use absolute paths for tool inputs. See the [CLI and MCP mapping](https://github.com/GSX-Eis/jq-factor-lab/blob/v0.1.0/skills/factor-research/references/cli_contract.md).
+The server runs locally. Use absolute paths for tool inputs. See the [CLI and MCP mapping](https://github.com/GSX-Eis/jq-factor-lab/blob/v0.2.0/skills/factor-research/references/cli_contract.md).
 
 ### Copy a research prompt
 
@@ -127,10 +127,10 @@ candidates, artifact paths, and whether the evidence permits a significance clai
 
 ## Bring your own data
 
-Use local [CSV, Parquet or DuckDB](https://github.com/GSX-Eis/jq-factor-lab/blob/v0.1.0/docs/DATA_IMPORT.md), the [factor interface](https://github.com/GSX-Eis/jq-factor-lab/blob/v0.1.0/docs/FACTOR_INTERFACE.md), the [Bar contract](https://github.com/GSX-Eis/jq-factor-lab/blob/v0.1.0/docs/TIME_SERIES_CONTRACT.md), and a verified [trading calendar](https://github.com/GSX-Eis/jq-factor-lab/blob/v0.1.0/docs/TRADING_CALENDAR.md) such as XSHG, CME or NYSE. See the [local workflow](https://github.com/GSX-Eis/jq-factor-lab/blob/v0.1.0/docs/LOCAL_WORKFLOW.md) and [synthesis guide](https://github.com/GSX-Eis/jq-factor-lab/blob/v0.1.0/docs/SYNTHESIS.md) for configuration and label isolation. [JoinQuant single-file packaging](https://github.com/GSX-Eis/jq-factor-lab/blob/v0.1.0/docs/JOINQUANT.md) is an optional offline deployment adapter.
+Use local [CSV, Parquet or DuckDB](https://github.com/GSX-Eis/jq-factor-lab/blob/v0.2.0/docs/DATA_IMPORT.md), the [factor interface](https://github.com/GSX-Eis/jq-factor-lab/blob/v0.2.0/docs/FACTOR_INTERFACE.md), the [Bar contract](https://github.com/GSX-Eis/jq-factor-lab/blob/v0.2.0/docs/TIME_SERIES_CONTRACT.md), and a verified [trading calendar](https://github.com/GSX-Eis/jq-factor-lab/blob/v0.2.0/docs/TRADING_CALENDAR.md) such as XSHG, CME or NYSE. See the [local workflow](https://github.com/GSX-Eis/jq-factor-lab/blob/v0.2.0/docs/LOCAL_WORKFLOW.md) and [synthesis guide](https://github.com/GSX-Eis/jq-factor-lab/blob/v0.2.0/docs/SYNTHESIS.md) for configuration and label isolation. [JoinQuant single-file packaging](https://github.com/GSX-Eis/jq-factor-lab/blob/v0.2.0/docs/JOINQUANT.md) is an optional offline deployment adapter.
 
 ## Feedback & Community
 
-[Open an issue](https://github.com/GSX-Eis/jq-factor-lab/issues/new/choose) to report a bug, request a market calendar or data contract, or share an AI workflow. Share synthetic or sanitized examples. See [contributing](https://github.com/GSX-Eis/jq-factor-lab/blob/v0.1.0/CONTRIBUTING.md), [security](https://github.com/GSX-Eis/jq-factor-lab/blob/v0.1.0/SECURITY.md), and the [changelog](https://github.com/GSX-Eis/jq-factor-lab/blob/v0.1.0/CHANGELOG.md).
+[Open an issue](https://github.com/GSX-Eis/jq-factor-lab/issues/new/choose) to report a bug, request a market calendar or data contract, or share an AI workflow. Share synthetic or sanitized examples. See [contributing](https://github.com/GSX-Eis/jq-factor-lab/blob/v0.2.0/CONTRIBUTING.md), [security](https://github.com/GSX-Eis/jq-factor-lab/blob/v0.2.0/SECURITY.md), and the [changelog](https://github.com/GSX-Eis/jq-factor-lab/blob/v0.2.0/CHANGELOG.md).
 
-Licensed under the [Apache License 2.0](https://github.com/GSX-Eis/jq-factor-lab/blob/v0.1.0/LICENSE). See [NOTICE](https://github.com/GSX-Eis/jq-factor-lab/blob/v0.1.0/NOTICE) for attribution.
+Licensed under the [Apache License 2.0](https://github.com/GSX-Eis/jq-factor-lab/blob/v0.2.0/LICENSE). See [NOTICE](https://github.com/GSX-Eis/jq-factor-lab/blob/v0.2.0/NOTICE) for attribution.

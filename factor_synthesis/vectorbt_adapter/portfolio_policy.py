@@ -36,6 +36,10 @@ class PolicyAccountView(Protocol):
 
     def held_notional(self, instrument: str) -> float: ...
 
+    def held_budget_value(self, instrument: str) -> float: ...
+
+    def target_margin_rate(self, instrument: str) -> float: ...
+
     def nav(self) -> float: ...
 
     def prev_weight_map(self) -> Dict[str, float]: ...
@@ -92,6 +96,8 @@ class BarPolicyDecision:
     # Per-instrument target weight fraction relative to account equity/NAV
     # (used by futures single-account sizing where leverage/margin_rate apply).
     target_weights: Dict[str, float] = field(default_factory=dict)
+    # Hard notional limits for futures targets, including execution lot rounding.
+    notional_caps: Dict[str, float] = field(default_factory=dict)
     # Instruments whose pending exit was cancelled because they were re-selected.
     cancelled_exits: Set[str] = field(default_factory=set)
     # Instruments whose exit was blocked by tradability or missing exec price.
@@ -584,7 +590,7 @@ class SharedPortfolioPolicy:
                 px = account.execution_price(stock)
                 cur_val = account.held_notional(stock)
                 w = float(target_map.get(stock, 0.0))
-                tgt_val = w * base_cap
+                tgt_val = w * base_cap / account.target_margin_rate(stock)
                 if px is None:
                     hold_instruments.add(stock)
                     if stock not in target_set and stock in held_set:
@@ -665,15 +671,45 @@ class SharedPortfolioPolicy:
                 weight_map = runner._blend_partial_rebalance(weight_map, prev_weight_map)
                 target_set = set(weight_map)
             liq_as_of_str = prev_date_str
+            base_capital = account.base_capital(exposure)
+            margin_basis = (
+                runner.execution_mode == "futures_contract"
+                and runner.futures_execution_config.target_weight_basis == "margin"
+            )
+            margin_rates = (
+                {stock: account.target_margin_rate(stock) for stock in target_set}
+                if margin_basis else {}
+            )
+            notional_caps: Dict[str, float] = {}
+            budget_caps: Dict[str, float] = {}
             if runner.overlay["liquidity_cap"]["enabled"]:
                 liq_as_of_str = runner._slot_provider.liquidity_as_of_key(
                     prev_date_str, runner.price_db_conn, runner.price_db_path
                 )
-                weight_map = runner._apply_liquidity_cap(
-                    weight_map,
-                    liq_as_of_str,
-                    account.deployed_capital_for_liquidity(exposure),
-                )
+                if margin_basis:
+                    notional_caps = runner._liquidity_caps(target_set, liq_as_of_str, 1.0)
+                    reference_capital = float(
+                        runner.overlay["liquidity_cap"].get("capital_base") or 0.0
+                    )
+                    if not np.isfinite(reference_capital):
+                        raise ValueError("liquidity_cap.capital_base must be finite")
+                    # An explicit notional reference can tighten the cap. The live
+                    # per-contract notional budget keeps it from relaxing the cap.
+                    if base_capital > 0:
+                        weight_caps = {
+                            stock: cap / max(base_capital / margin_rates[stock], reference_capital)
+                            for stock, cap in notional_caps.items()
+                        }
+                        budget_caps = {
+                            stock: cap * base_capital for stock, cap in weight_caps.items()
+                        }
+                        weight_map = apply_magnitude_caps(weight_map, weight_caps)
+                else:
+                    weight_map = runner._apply_liquidity_cap(
+                        weight_map,
+                        liq_as_of_str,
+                        account.deployed_capital_for_liquidity(exposure),
+                    )
 
             order_names = sorted(held_set | target_set)
             held_list = sorted(held_set)
@@ -741,15 +777,13 @@ class SharedPortfolioPolicy:
                 if px is not None:
                     current_values[stock] = account.held_notional(stock)
 
-            base_capital = account.base_capital(exposure)
-            dollar_caps: Dict[str, float] = {}
-            if runner.overlay["liquidity_cap"]["enabled"]:
+            if runner.overlay["liquidity_cap"]["enabled"] and not margin_basis:
                 liq_caps = runner._liquidity_weight_caps(
                     target_set,
                     liq_as_of_str,
                     account.deployed_capital_for_liquidity(exposure),
                 )
-                dollar_caps = {
+                budget_caps = {
                     stock: cap * base_capital for stock, cap in liq_caps.items()
                 }
             desired = {
@@ -766,7 +800,7 @@ class SharedPortfolioPolicy:
                     if stock in forced:
                         continue
                     current = current_values.get(stock, 0.0)
-                    target = desired.get(stock, 0.0)
+                    target = desired.get(stock, 0.0) / margin_rates.get(stock, 1.0)
                     if stock not in target_set:
                         exit_ok = (
                             (stock in buyable_close)
@@ -799,9 +833,11 @@ class SharedPortfolioPolicy:
                     break
                 flexible_targets = [s for s in target_set if s not in forced]
                 gross_budget = min(base_capital, initial_gross)
-                available = max(
-                    0.0, gross_budget - sum(abs(v) for v in forced.values())
+                forced_budget = (
+                    sum(abs(account.held_budget_value(s)) for s in forced)
+                    if margin_basis else sum(abs(v) for v in forced.values())
                 )
+                available = max(0.0, gross_budget - forced_budget)
                 flexible_weight = sum(
                     abs(weight_map.get(s, 0.0)) for s in flexible_targets
                 )
@@ -811,9 +847,9 @@ class SharedPortfolioPolicy:
                     stock: available * weight_map.get(stock, 0.0) / flexible_weight
                     for stock in flexible_targets
                 }
-                if dollar_caps:
+                if budget_caps:
                     new_desired = apply_magnitude_caps(
-                        new_desired, dollar_caps, tol=1e-9
+                        new_desired, budget_caps, tol=1e-9
                     )
                 changed = any(
                     abs(new_desired[stock] - desired.get(stock, 0.0)) > 1e-12
@@ -840,7 +876,11 @@ class SharedPortfolioPolicy:
                     hold_instruments.add(stock)
                     continue
                 current = current_values.get(stock, 0.0)
-                target = desired.get(stock, 0.0)
+                budget = desired.get(stock, 0.0)
+                target = budget / margin_rates.get(stock, 1.0)
+                if stock in notional_caps:
+                    cap = notional_caps[stock]
+                    target = min(max(-cap, target), cap)
                 if target < current - 1e-12:
                     order_fees[stock] = float(runner.sell_cost_rate)
                 elif target > current + 1e-12:
@@ -850,7 +890,7 @@ class SharedPortfolioPolicy:
                     target_weights[stock] = 0.0
                     sell_instruments.add(stock)
                 elif base_capital > 0:
-                    target_weights[stock] = (target / base_capital) * exposure
+                    target_weights[stock] = (budget / base_capital) * exposure
                 else:
                     target_weights[stock] = 0.0
 
@@ -865,7 +905,9 @@ class SharedPortfolioPolicy:
                     "composite_scores": score_series,
                     "target_holdings": [s for s in top_k_stocks if s in target_set],
                     "target_values": {
-                        s: forced.get(s, desired.get(s, 0.0))
+                        s: forced.get(
+                            s, target_values.get(s, desired.get(s, 0.0) / margin_rates.get(s, 1.0))
+                        )
                         for s in sorted(target_set | set(forced))
                     },
                     "pool_size": len(valid_stocks),
@@ -881,6 +923,7 @@ class SharedPortfolioPolicy:
                 is_skip=False,
                 target_values=target_values,
                 target_weights=target_weights,
+                notional_caps=notional_caps,
                 cancelled_exits=set(target_set),
                 blocked_exits=blocked_exits,
                 sell_instruments=sell_instruments,

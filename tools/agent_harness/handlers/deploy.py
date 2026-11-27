@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from tools.agent_harness import runner
+from tools.agent_harness.result_content import validate_deploy_content
 from tools.agent_harness.run_result import config_sha256, execution_result
 
 if TYPE_CHECKING:
@@ -136,6 +137,7 @@ def handle_deploy(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                     raise DeployTargetError(str(exc), code=TARGET_BUNDLE_INVALID) from exc
                 payload["metrics"]["bundle_hash"] = bundle.bundle_hash
                 target = build_default_target_registry().get(args.target)
+                completed = 1
                 if action == "export-strategy":
                     _export(args, target, bundle, payload)
                 else:
@@ -145,6 +147,11 @@ def handle_deploy(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                         exit_code = runner.EXIT_QUALITY_GATE
                         failure = next(check for check in report.checks if not check.passed)
                         raise DeployTargetError(failure.reason, code=report.error_code)
+                    completed = len(report.checks)
+                validate_deploy_content(
+                    action, payload["metrics"], completed,
+                    expected_target=args.target, expected_bundle_hash=bundle.bundle_hash,
+                )
             except Exception as exc:
                 payload["execution"]["failed"] = 1
                 payload["metrics"]["error_code"] = getattr(exc, "code", "DEPLOY_TARGET_REQUEST_FAILED")
@@ -152,7 +159,7 @@ def handle_deploy(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                     exit_code = (runner.EXIT_PRECONDITION if isinstance(exc, (ValueError, OSError))
                                  else runner.EXIT_EXECUTION)
                 raise
-            payload["execution"]["completed"] = 1
+            payload["execution"].update(expected=completed, completed=completed)
     except Exception:
         if exit_code == runner.EXIT_SUCCESS or not result.is_file():
             raise

@@ -156,6 +156,11 @@ def save_factor_values(
 
     slot = factor.slot
     feed = slot.bar_feed
+    ensure_profile = getattr(feed, "ensure_profile", None)
+    if callable(ensure_profile):
+        ensure_profile(factor)
+        slot = factor.slot
+        feed = slot.bar_feed
     view = factor.session_view
     input_frequency = Frequency.parse(factor.data_frequency)
     output_frequency = Frequency.parse(factor.output_frequency)
@@ -178,9 +183,15 @@ def save_factor_values(
         if bar_grid is None:
             bar_grid = factor._fetch_market_bars()
 
+    slot = factor.slot
+    feed = slot.bar_feed
     provenance = (getattr(feed, "factor_write_provenance", None)
                   if factor._frequency_route.bar_grid or identity_scope == "incremental" else None)
     entries, builds = provenance(input_frequency, instruments) if provenance is not None else ({}, {})
+    if callable(ensure_profile := getattr(feed, "ensure_profile", None)):
+        ensure_profile(factor)
+    slot = factor.slot
+    feed = slot.bar_feed
     strategies = {
         bucket_strategy or getattr(entries.get(inst), "bucket_strategy", None)
         or _bucket_strategy(feed, input_frequency, inst) or "segment_anchored"

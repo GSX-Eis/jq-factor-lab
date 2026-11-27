@@ -1624,10 +1624,17 @@ class VectorBTBacktestRunner:
     ) -> Dict[str, float]:
         """Compute per-name absolute weight caps implied by ADV/ABV participation limits."""
         liq = self.overlay["liquidity_cap"]
-        raw_liq = (self.config.get("top_k_strategy") or {}).get("liquidity_cap") or self.config.get("liquidity_cap")
-        stock_list = sorted(set(stocks))
         capital_base = liq.get("capital_base")
         capital = float(capital_base) if capital_base else float(deployed_capital)
+        return self._liquidity_caps(stocks, as_of_date_str, capital)
+
+    def _liquidity_caps(
+        self, stocks: Iterable[str], as_of_date_str: str, capital: float
+    ) -> Dict[str, float]:
+        """Return absolute caps in notional units when capital is one."""
+        liq = self.overlay["liquidity_cap"]
+        raw_liq = (self.config.get("top_k_strategy") or {}).get("liquidity_cap") or self.config.get("liquidity_cap")
+        stock_list = sorted(set(stocks))
         if not stock_list or capital <= 0:
             return {}
         return self._slot_provider.liquidity_weight_caps(
@@ -2925,6 +2932,12 @@ class VectorBTBacktestRunner:
                 else:
                     px = mark_price(self._date, instrument)
                 return float(shares * px) if px is not None else 0.0
+
+            def held_budget_value(self, instrument: str) -> float:
+                return self.held_notional(instrument)
+
+            def target_margin_rate(self, instrument: str) -> float:
+                return 1.0
 
             def allow_short_only_exec(self) -> bool:
                 return bool(runner_ref.allow_short and not runner_ref.overlay_active)

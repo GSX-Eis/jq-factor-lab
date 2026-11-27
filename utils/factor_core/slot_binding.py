@@ -3,6 +3,7 @@ from contextlib import ExitStack, contextmanager
 from dataclasses import asdict, replace
 from functools import cached_property, lru_cache
 from typing import TYPE_CHECKING, Any, Callable, Iterator, Sequence
+import weakref
 
 import duckdb
 import pandas as pd
@@ -10,13 +11,14 @@ import pandas as pd
 from slots.jq_ashare_local.aux import AShareAuxFeatures
 from slots.jq_ashare_local.feed import AShareBarFeed
 from slots.jq_ashare_local.microstructure import AShareMicrostructure
-from slots.jq_ashare_local.panel import ASharePanelReader, LEGACY_CALENDAR_ID, require_ashare_panel_profile
+from slots.jq_ashare_local.panel import (
+    ASharePanelReader, LEGACY_CALENDAR_ID, require_ashare_panel_profile, resolve_ashare_slot_profile,
+)
 from slots.jq_ashare_local.universe import AShareUniverse
 from utils.bars.catalog import table_exists
 from utils.data_store import connect_input, digest
-from utils.market_db import MarketDbProfile, MarketDbProfileError
-from utils.market_db.errors import MARKET_DB_PROFILE_MISSING
-from utils.market_db.storage import _require_same_hash, is_file_backed_market_db
+from utils.market_db import MarketDbProfile
+from utils.market_db.storage import is_file_backed_market_db
 from utils.market_db.validation import (
     calendar_key, market_db_calendar_bounds, require_market_db_profile, validate_market_db_provider,
 )
@@ -92,11 +94,27 @@ class AShareFactorCalendar:
 
 class AShareFactorFeed:
     def __init__(self, connection, adapter, path, config, view, *, bindings: dict | None = None,
-                 profile: MarketDbProfile | None = None):
+                 profile: MarketDbProfile | None = None,
+                 on_profile: Callable[[MarketDbProfile], None] | None = None):
         self.connection, self.adapter, self.path = connection, adapter, path
         self.config, self.view = config, view
         self.bindings, self.profile = bindings, profile
+        self._profile_listeners: list[Callable[[MarketDbProfile], None]] = []
+        if on_profile is not None:
+            self._profile_listeners.append(on_profile)
         self._verified_input: tuple[duckdb.DuckDBPyConnection, MarketDbProfile] | None = None
+
+    def add_profile_listener(self, callback: Callable[[MarketDbProfile], None]) -> None:
+        if self.profile is None and callback not in self._profile_listeners:
+            self._profile_listeners.append(callback)
+
+    def _bind_profile(self, profile: MarketDbProfile) -> MarketDbProfile:
+        if self.profile is None:
+            self.profile = profile
+            listeners, self._profile_listeners = self._profile_listeners, []
+            for listener in listeners:
+                listener(profile)
+        return profile
 
     def _check_input_profile(self, connection: duckdb.DuckDBPyConnection) -> MarketDbProfile:
         # A read-only adapter can be reused across panels or reopened on a different file.
@@ -105,6 +123,22 @@ class AShareFactorFeed:
             return verified[1]
         profile = require_ashare_panel_profile(connection, expected=self.profile)
         self._verified_input = connection, profile
+        return self._bind_profile(profile)
+
+    def ensure_profile(self, factor: Any = None) -> MarketDbProfile | None:
+        """Resolve and bind the physical MarketDbProfile for file-backed inputs when needed."""
+        profile = self.profile
+        if profile is None and self.connection is None:
+            adapter = (getattr(factor, '_duckdb_adapter', None) if factor is not None else None) or self.adapter
+            if adapter is not None and adapter.duckdb_path:
+                profile = self._check_input_profile(adapter._get_connection())
+            elif self.path:
+                with connect_input(self.path, bindings=self.bindings) as conn:
+                    profile = self._bind_profile(require_ashare_panel_profile(conn, expected=self.profile))
+        if factor is not None and profile is not None:
+            slot = getattr(factor, 'slot', None)
+            if slot is not None and getattr(slot, 'market_db_profile', None) is None:
+                factor.slot = replace(slot, market_db_profile=profile)
         return profile
 
     @contextmanager
@@ -119,7 +153,7 @@ class AShareFactorFeed:
                         profile = self._check_input_profile(connection)
                 elif self.path:
                     connection = stack.enter_context(connect_input(self.path, bindings=self.bindings))
-                    profile = require_ashare_panel_profile(connection, expected=profile)
+                    profile = self._bind_profile(require_ashare_panel_profile(connection, expected=profile))
             with ASharePanelReader(connection, legacy_snapshot=True, config=self.reader_config,
                                    market_db_profile=profile) as reader:
                 yield reader
@@ -182,15 +216,7 @@ class AShareFactorFeed:
         optional = tuple(col for col in optional_fields if col not in selected)
         adapter = factor._duckdb_adapter or self.adapter
         config = adapter.data_config if adapter is not None else factor._get_local_data_config()
-        standard = date_field == 'date' and code_field == 'stock_code' and not additional_condition
-        normalize = standard
-        if (
-            normalize
-            and factor._frequency_route.frequency.kind == 'session'
-            and 'money' in selected
-            and 'paused' not in selected
-            and 'paused' not in optional
-        ):
+        if 'money' in selected and 'paused' not in selected and 'paused' not in optional:
             optional = (*optional, 'paused')
         check_profile = self._check_input_profile if adapter is not None and adapter.duckdb_path else None
 
@@ -201,7 +227,7 @@ class AShareFactorFeed:
             market_db_profile=self.profile, check_profile=check_profile,
             optional_fields=optional,
         )
-        if normalize:
+        if 'money' in selected:
             frequency = factor._frequency_route.frequency
             money_frequency = 'daily' if frequency.kind == 'session' else '1m' if frequency.minutes == 1 else '5m'
             frame = normalize_price_money(frame, source='local', frequency=money_frequency)
@@ -368,28 +394,29 @@ def bind_ashare_slot(factor, native: MarketSlot | None) -> MarketSlot:
     from functools import partial
     from utils.data_access_config import load_data_access_config
 
+    profile, feed_path = resolve_ashare_slot_profile(factor, native, AShareFactorFeed)
+    factor_ref = weakref.ref(factor)
+
+    def _sync_slot_profile(resolved_profile: MarketDbProfile) -> None:
+        owner = factor_ref()
+        slot = getattr(owner, 'slot', None) if owner is not None else None
+        if slot is not None and slot.market_db_profile is None:
+            owner.slot = replace(slot, market_db_profile=resolved_profile)
+
     if native is not None and isinstance(native.bar_feed, AShareFactorFeed):
-        return native
-    profile = native.market_db_profile if native is not None else None
-    connection = factor.db_connection
-    if connection is not None:
-        try:
-            actual = require_market_db_profile(connection)
-        except MarketDbProfileError as exc:
-            if profile is not None or exc.code != MARKET_DB_PROFILE_MISSING:
-                raise
+        if profile is not None:
+            if native.bar_feed.profile is None:
+                native.bar_feed._bind_profile(profile)
         else:
-            if profile is not None:
-                _require_same_hash(actual, profile, 'Factor database disagrees with its Slot')
-            if native is not None or factor.session_calendar is None:
-                validate_market_db_provider(actual, 'jq_ashare_local', domain='cn_equity')
-            profile = actual
-    override = factor.session_calendar
-    if override is None and native is not None:
-        override = native.calendar
-    feed = AShareFactorFeed(factor.db_connection, factor._duckdb_adapter, factor.duckdb_path,
-                           partial(load_data_access_config, factor.data_config_path), factor.session_view,
-                           bindings=factor.data_bindings, profile=profile)
+            native.bar_feed.add_profile_listener(_sync_slot_profile)
+        return replace(native, market_db_profile=profile) if profile != native.market_db_profile else native
+
+    override = factor.session_calendar if factor.session_calendar is not None or native is None else native.calendar
+    feed = AShareFactorFeed(
+        factor.db_connection, factor._duckdb_adapter, feed_path,
+        partial(load_data_access_config, factor.data_config_path), factor.session_view,
+        bindings=factor.data_bindings, profile=profile, on_profile=_sync_slot_profile,
+    )
     calendar = AShareFactorCalendar(factor.start_date, factor.end_date, override, load_profile=feed.calendar_profile)
     universe = AShareFactorUniverse(feed, calendar, native.universe if native else None)
     aux = native.aux_features if native is not None else None
@@ -397,11 +424,10 @@ def bind_ashare_slot(factor, native: MarketSlot | None) -> MarketSlot:
                        and aux.connection is native.bar_feed.connection and aux.calendar is native.calendar):
         aux = AShareFactorAux(feed, calendar)
     if native is not None:
-        return replace(native, calendar=calendar, bar_feed=feed, universe=universe, aux_features=aux)
-    return MarketSlot(
-        'jq_ashare_local', calendar, feed, universe, aux, AShareFactorMicrostructure(feed, calendar),
-        market_db_profile=profile,
-    )
+        return replace(native, calendar=calendar, bar_feed=feed, universe=universe,
+                       aux_features=aux, market_db_profile=profile)
+    return MarketSlot('jq_ashare_local', calendar, feed, universe, aux,
+                      AShareFactorMicrostructure(feed, calendar), market_db_profile=profile)
 
 
 def adjust_panel(factor, frame: pd.DataFrame) -> pd.DataFrame:

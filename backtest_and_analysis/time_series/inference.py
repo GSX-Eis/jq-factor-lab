@@ -168,17 +168,23 @@ def _bar_panel(labels: pd.DataFrame, labeler: BarReturnLabeler | _SlotEvaluation
     """Use Bar starts for single-instrument phases and availability for cross-sections."""
     streams = {}
     grid = pd.DatetimeIndex([], tz='UTC')
+    schedule_cache: dict[tuple[Any, ...], tuple[pd.DatetimeIndex, pd.DatetimeIndex]] = {}
+    is_slot_grid = isinstance(labeler, _SlotEvaluationGrid)
     for instrument, group in labels.groupby('instrument_id', sort=True):
         calendar = labeler.calendar[instrument] if isinstance(labeler.calendar, Mapping) else labeler.calendar
         first, last = group.signal_timestamp.min(), group.signal_timestamp.max()
-        if isinstance(labeler, _SlotEvaluationGrid):
-            starts, ends = labeler.between(frequency, first, last)
-        else:
-            starts, ends, _ = _grid(calendar, frequency, first, last, labeler.view, labeler.bucket_strategy)
-        keep = (starts >= first) & (starts <= last)
-        starts, ends = starts[keep], ends[keep]
+        cache_key = (id(calendar), first, last)
+        if cache_key not in schedule_cache:
+            if is_slot_grid:
+                starts, ends = labeler.between(frequency, first, last)
+            else:
+                starts, ends, _ = _grid(calendar, frequency, first, last, labeler.view, labeler.bucket_strategy)
+            keep = (starts >= first) & (starts <= last)
+            schedule_cache[cache_key] = (starts[keep], ends[keep])
+        starts, ends = schedule_cache[cache_key]
         signals = group.drop_duplicates('signal_timestamp').set_index('signal_timestamp')
-        positions = starts.get_indexer(signals.index)
+        positions = (np.arange(len(starts), dtype=np.intp)
+                     if starts.equals(signals.index) else starts.get_indexer(signals.index))
         if (positions < 0).any() or not ends.take(positions).equals(pd.DatetimeIndex(signals.signal_available_at)):
             raise ContractValidationError('Bar signal_available_at does not match the calendar grid')
         axis = ends if by_availability else starts
@@ -186,7 +192,10 @@ def _bar_panel(labels: pd.DataFrame, labeler: BarReturnLabeler | _SlotEvaluation
         if by_availability:
             values = values.set_axis(ends.take(positions))
         streams[instrument] = (group, values, axis, ends)
-        grid = grid.union(axis)
+        if grid.empty:
+            grid = axis
+        elif not axis.equals(grid):
+            grid = grid.union(axis)
 
     assets = pd.Index(list(streams))
     shape = (len(grid), len(assets))
@@ -200,22 +209,30 @@ def _bar_panel(labels: pd.DataFrame, labeler: BarReturnLabeler | _SlotEvaluation
     exits = {h: values.copy() for h, values in entries.items()}
     exit_field = 'scheduled_exit_timestamp' if scheduled_exits else 'exit_timestamp'
     row_field = 'signal_available_at' if by_availability else 'signal_timestamp'
+    single_horizon = len(returns) == 1
     for col, (group, values, axis, ends) in enumerate(streams.values()):
-        rows = grid.get_indexer(axis)
+        axis_aligned = axis.equals(grid)
+        values_aligned = values.index.equals(grid)
+        rows = slice(None) if axis_aligned else grid.get_indexer(axis)
         expected[rows, col] = True
         available[rows] = ends.as_unit('ns').asi8
-        signal_valid[:, col] = values.notna().reindex(grid, fill_value=False).to_numpy()
+        aligned_values = values if values_aligned else values.reindex(grid)
+        signal_valid[:, col] = aligned_values.notna().to_numpy()
         if pd.api.types.is_integer_dtype(values.dtype):
             dtype = getattr(values.dtype, 'numpy_dtype', values.dtype)
-            factors.append(values.reindex(grid, fill_value=0).to_numpy(dtype=dtype, na_value=0))
+            int_values = values if values_aligned else values.reindex(grid, fill_value=0)
+            factors.append(int_values.to_numpy(dtype=dtype, na_value=0))
         else:
-            factors.append(_numeric_column(values.reindex(grid)))
-        for h, rows_at_h in group.groupby('horizon_bars'):
-            rows = grid.get_indexer(rows_at_h[row_field])
-            returns[h][rows, col] = rows_at_h.return_pct.to_numpy(dtype=float)
-            valid[h][rows, col] = rows_at_h.status.eq('valid').to_numpy(dtype=bool)
-            entries[h][rows, col] = rows_at_h.entry_timestamp.to_numpy(dtype='datetime64[ns]')
-            exits[h][rows, col] = rows_at_h[exit_field].to_numpy(dtype='datetime64[ns]')
+            factors.append(_numeric_column(aligned_values))
+        horizon_items = ((next(iter(returns)), group),) if single_horizon else group.groupby('horizon_bars')
+        for h, rows_at_h in horizon_items:
+            h_rows = (slice(None) if (values_aligned and len(rows_at_h) == len(grid)
+                                      and pd.DatetimeIndex(rows_at_h[row_field]).equals(grid))
+                      else grid.get_indexer(rows_at_h[row_field]))
+            returns[h][h_rows, col] = rows_at_h.return_pct.to_numpy(dtype=float)
+            valid[h][h_rows, col] = rows_at_h.status.eq('valid').to_numpy(dtype=bool)
+            entries[h][h_rows, col] = rows_at_h.entry_timestamp.to_numpy(dtype='datetime64[ns]')
+            exits[h][h_rows, col] = rows_at_h[exit_field].to_numpy(dtype='datetime64[ns]')
 
     panel = EvaluationPanel(grid, assets, np.column_stack(factors), returns, valid,
                             pd.MultiIndex.from_product([grid, assets]), pd.Index(['factor', *returns]))

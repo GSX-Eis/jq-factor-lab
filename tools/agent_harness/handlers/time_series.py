@@ -70,8 +70,13 @@ def _resolve_public_config_paths(config: Dict[str, Any]) -> None:
 
 def _handle_time_series_analysis(
     args: argparse.Namespace, *, public_output: ExitStack | None = None,
+    write_dry_run: bool = True,
 ) -> HarnessResult:
-    from backtest_and_analysis.time_series.artifacts import validate_evaluation_output_dir
+    from backtest_and_analysis.time_series.artifacts import (
+        DIAGNOSTICS_CSV, DIAGNOSTICS_MARKDOWN, validate_evaluation_output_dir,
+    )
+    from backtest_and_analysis.time_series.contracts import sha256_file
+    from tools.agent_harness.result_content import validate_bar_content
     from tools.agent_harness.time_series_analysis import (
         BarEvaluationStoreFailure, load_config, resolve_slot_request, revoke_evaluation_completion,
     )
@@ -253,11 +258,17 @@ def _handle_time_series_analysis(
 
             plan = evaluate(config, None)
             plan.update(config=str(config_path) if args.config else None,
+                        planned_config=args.config,
                         output_dir=str(guarded_destination), output_root=str(output_root),
                         results_db=str(results_db_path) if results_db_path else None,
                         overwrite=args.overwrite, diagnostics_report=diagnostics_requested)
-            return cli._success_result(**common, mode='dry_run', reason='dry_run',
-                                       metrics=plan, artifacts=[])
+            if selection is not None:
+                plan['market_db'] = selection
+            if results_db_path is not None:
+                plan['planned_results_db'] = str(results_db_path)
+            dry_result = cli._success_result(**common, mode='dry_run', reason='dry_run',
+                                             metrics=plan, artifacts=[])
+            return dry_result if not write_dry_run else cli._complete_result(dry_result, args.json_out)
         output_dir.mkdir(parents=True, exist_ok=True)
         resolved_config = output_dir / "config" / "resolved.json"
         cli._write_json(resolved_config, config)
@@ -284,7 +295,39 @@ def _handle_time_series_analysis(
         elif proc.returncode != 0:
             raise RuntimeError(f"Bar evaluation worker exited {proc.returncode}: {proc.stderr}")
         else:
-            metrics_out = dict(payload["metrics"])
+            metrics_out = payload["metrics"]
+            validate_bar_content(metrics_out)
+            if metrics_out["analysis_mode"] != config.get("analysis_mode"):
+                raise ValueError("Bar evaluation mode differs from the request")
+            horizons = config.get("horizons")
+            if horizons is not None and {row["horizon_bars"] for row in metrics_out["ic_by_horizon"]} != set(horizons):
+                raise ValueError("Bar evaluation horizons differ from the request")
+            expected_files = {
+                "evaluation_summary": "summary.json", "per_bar_labels": "per_bar_labels.csv",
+                "ic_by_horizon": "ic_by_horizon.csv", "quantile_stats": "quantile_stats.csv",
+            }
+            if diagnostics_requested:
+                expected_files.update(diagnostics_report_csv=DIAGNOSTICS_CSV,
+                                      diagnostics_report_markdown=DIAGNOSTICS_MARKDOWN)
+            directory = destination.resolve()
+            for artifact in payload["artifacts"]:
+                kind = artifact["artifact_type"]
+                if kind not in expected_files:
+                    raise ValueError(f"unexpected or duplicate Bar evaluation artifact: {kind}")
+                path = directory / expected_files.pop(kind)
+                if (Path(artifact["path"]).resolve() != path or not path.is_file()
+                        or sha256_file(path) != artifact.get("sha256")):
+                    raise ValueError(f"missing or hash-mismatched Bar evaluation artifact: {kind}")
+            if expected_files:
+                raise ValueError(f"missing Bar evaluation artifacts: {sorted(expected_files)}")
+            published = json.loads((directory / "summary.json").read_text(encoding="utf-8"))
+            published.pop("config")
+            if published != {key: value for key, value in metrics_out.items() if key != "causal_gate"}:
+                raise ValueError("Bar worker metrics differ from the published evaluation summary")
+            if "causal_gate" in metrics_out:
+                from tools.agent_harness.causal_gate import validate_causal_gate_evidence
+
+                validate_causal_gate_evidence(metrics_out["causal_gate"])
             warnings_out: list[str] = []
             gate_report = metrics_out.get("causal_gate")
             if isinstance(gate_report, dict) and gate_report.get("status") == "failed_fallback":
@@ -333,9 +376,9 @@ def _handle_time_series_analysis(
                 metrics={"exception_type": type(exc).__name__, "error": str(exc)},
                 artifacts=cli._common_artifacts(output_dir))
             result.error["message"] = str(exc)
-    if args.dry_run:
+    if args.dry_run and not write_dry_run:
         return result
-    if not result.ok and phase != "results_db":
+    if not result.ok and phase != "results_db" and not args.dry_run:
         result.error["details"].update(revoke_evaluation_completion([destination]))
     return cli._complete_result(result, args.json_out)
 

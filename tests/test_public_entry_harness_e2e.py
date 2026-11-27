@@ -593,3 +593,188 @@ def test_public_entry_market_db_preflight_and_worker_share_slot_db_resolution(
     assert rejected.error["code"] == "market_db_precondition_failed"
     assert "Declared database conflicts" in rejected.error["message"]
     assert not (caller_dir / "out" / "unbound" / "summary.json").exists()
+
+
+@pytest.mark.parametrize(
+    "variant",
+    ["cli_file_slot", "config_file_slot", "inline_slot", "inline_slot_no_output_dir"],
+)
+def test_public_entry_valid_slot_dry_run_and_live_execution_parity(
+    tmp_path: Path, variant: str,
+) -> None:
+    caller_dir = _prepare_external_workspace(tmp_path)
+    base_cfg = json.loads((caller_dir / "config.json").read_text(encoding="utf-8"))
+    sub_slot = _write_declarative_slot(caller_dir / "slot_subdir", instruments=SUBDIR_INSTRUMENTS)
+    eval_dir = caller_dir / "out" / "eval"
+    results_db = caller_dir / "results" / "eval.duckdb"
+    json_out = caller_dir / "dry" / "plan.json"
+
+    if variant == "cli_file_slot":
+        cfg_name = "config.json"
+        cmd = [
+            "time-series-analysis",
+            "--config", cfg_name,
+            "--slot", "slot.json",
+            "--factor", "my_probe_factor.py",
+            "--output-dir", "out/eval",
+            "--json-out", "dry/plan.json",
+            "--results-db", "results/eval.duckdb",
+        ]
+        expect_output_dir = True
+        expect_results_db = True
+        expect_json_out = True
+    elif variant == "config_file_slot":
+        cfg_name = "config_file_slot.json"
+        (caller_dir / cfg_name).write_text(
+            json.dumps(
+                {
+                    **base_cfg,
+                    "slot": "slot.json",
+                    "factor_file": "factors/config_probe_factor.py",
+                    "output_dir": "out/eval",
+                    "results_db": "results/eval.duckdb",
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        cmd = [
+            "time-series-analysis",
+            "--config", cfg_name,
+            "--json-out", "dry/plan.json",
+        ]
+        expect_output_dir = True
+        expect_results_db = True
+        expect_json_out = True
+    elif variant == "inline_slot":
+        cfg_name = "config_inline_slot.json"
+        (caller_dir / cfg_name).write_text(
+            json.dumps(
+                {
+                    **base_cfg,
+                    "slot_base_dir": "slot_subdir",
+                    "slot": json.loads(sub_slot.read_text(encoding="utf-8")),
+                    "factor_file": "factors/config_probe_factor.py",
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        cmd = [
+            "time-series-analysis",
+            "--config", cfg_name,
+            "--output-dir", "out/eval",
+            "--json-out", "dry/plan.json",
+            "--results-db", "results/eval.duckdb",
+        ]
+        expect_output_dir = True
+        expect_results_db = True
+        expect_json_out = True
+    else:
+        cfg_name = "config_inline_minimal.json"
+        (caller_dir / cfg_name).write_text(
+            json.dumps(
+                {
+                    **base_cfg,
+                    "slot_base_dir": "slot_subdir",
+                    "slot": json.loads(sub_slot.read_text(encoding="utf-8")),
+                    "factor_file": "factors/config_probe_factor.py",
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        cmd = ["time-series-analysis", "--config", cfg_name]
+        expect_output_dir = False
+        expect_results_db = False
+        expect_json_out = False
+
+    dry_rc, dry_payload, dry_stderr = _run_public_cli(caller_dir, [*cmd, "--dry-run"])
+    assert dry_rc == 0, f"stderr={dry_stderr}\npayload={dry_payload}"
+    assert dry_payload["ok"] is True
+    assert dry_payload["command"]["mode"] == "dry_run"
+    assert dry_payload["summary"]["reason"] == "dry_run"
+    assert dry_payload["metrics"]["planned_config"] == cfg_name
+    assert "Traceback" not in dry_stderr
+    assert not eval_dir.exists()
+    assert not results_db.exists()
+    if expect_json_out:
+        assert json_out.is_file()
+        assert json.loads(json_out.read_text(encoding="utf-8")) == dry_payload
+    if variant in {"cli_file_slot", "inline_slot"}:
+        assert dry_payload["metrics"]["planned_results_db"] == str(results_db.resolve())
+
+    live_rc, live_payload, live_stderr = _run_public_cli(caller_dir, cmd)
+    assert live_rc == 0, f"stderr={live_stderr}\npayload={live_payload}"
+    assert live_payload["ok"] is True
+    assert live_payload["command"]["mode"] == "subprocess"
+    if expect_output_dir:
+        assert (eval_dir / "summary.json").is_file()
+        assert (eval_dir / "per_bar_labels.csv").is_file()
+    else:
+        eval_summary = Path(
+            next(
+                item["path"]
+                for item in live_payload["artifacts"]
+                if item["artifact_type"] == "evaluation_summary"
+            )
+        )
+        assert eval_summary.is_file()
+        assert json.loads(eval_summary.read_text(encoding="utf-8"))["config"]["slot_base_dir"] == str(
+            (caller_dir / "slot_subdir").resolve()
+        )
+    if expect_results_db:
+        assert live_payload["metrics"]["results_db"]["status"] == "inserted"
+        assert results_db.is_file()
+
+
+def test_public_entry_market_db_slot_dry_run_and_live_parity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from utils.market_db import load_market_db_profile_yaml
+    from utils.market_db.identity import market_db_identity
+
+    caller_dir, db_id = _write_market_db_workspace(tmp_path, monkeypatch)
+    profile = load_market_db_profile_yaml(REPO_ROOT / "config/market_databases/us_equity.yaml")
+    cfg = {
+        "slot": "sub/slot.json",
+        "slot_db": "sub/market.duckdb",
+        "factor_store_root": "factors",
+        "factor_id": "alpha",
+        "analysis_mode": "time_series",
+        "frequency": "1d",
+        "horizons": [1],
+        "start_date": "2026-01-05",
+        "end_date": "2026-01-09",
+    }
+    (caller_dir / "market_cfg.json").write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+    eval_dir = caller_dir / "out" / "market_eval"
+    results_db = caller_dir / "results" / "market_eval.duckdb"
+    json_out = caller_dir / "dry" / "market_plan.json"
+    cmd = [
+        "time-series-analysis",
+        "--config", "market_cfg.json",
+        "--market-db", db_id,
+        "--output-dir", "out/market_eval",
+        "--json-out", "dry/market_plan.json",
+        "--results-db", "results/market_eval.duckdb",
+    ]
+
+    dry_rc, dry_payload, dry_stderr = _run_public_cli(caller_dir, [*cmd, "--dry-run"])
+    assert dry_rc == 0, f"stderr={dry_stderr}\npayload={dry_payload}"
+    assert dry_payload["ok"] is True
+    assert dry_payload["command"]["mode"] == "dry_run"
+    assert dry_payload["summary"]["reason"] == "dry_run"
+    assert dry_payload["metrics"]["market_db"] == market_db_identity(profile)
+    assert dry_payload["metrics"]["planned_results_db"] == str(results_db.resolve())
+    assert json.loads(json_out.read_text(encoding="utf-8")) == dry_payload
+    assert not eval_dir.exists()
+    assert not results_db.exists()
+
+    live_rc, live_payload, live_stderr = _run_public_cli(caller_dir, cmd)
+    assert live_rc == 0, f"stderr={live_stderr}\npayload={live_payload}"
+    assert live_payload["ok"] is True
+    assert live_payload["command"]["mode"] == "subprocess"
+    assert live_payload["metrics"]["results_db"]["status"] == "inserted"
+    assert (eval_dir / "summary.json").is_file()
+    assert results_db.is_file()

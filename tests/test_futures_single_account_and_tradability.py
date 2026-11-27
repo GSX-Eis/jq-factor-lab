@@ -21,6 +21,7 @@ from factor_synthesis.vectorbt_adapter import (
 from factor_synthesis.vectorbt_adapter.futures_execution import (
     simulate_futures_contract_portfolio,
 )
+from factor_synthesis.vectorbt_adapter.portfolio_policy import SharedPortfolioPolicy
 from slots.cn_futures import build_cn_futures_slot
 from utils.slots.contracts import ExecutionProfile, InstrumentSpec, MarketSlot
 from utils.time_axis import Frequency
@@ -1907,6 +1908,147 @@ def test_p1_3_deferred_roll_old_contract_consistency_across_account_view_and_blo
     assert res["execution_diagnostics"]["blocked_exit_notional"] == pytest.approx(50_000.0)
 
 
+@pytest.mark.parametrize("lot_rounding", ["floor", "nearest"])
+def test_margin_liquidity_cap_uses_each_instruments_rate(
+    lot_rounding: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dates = pd.bdate_range("2026-01-05", periods=4)
+    prices = {inst: [100.0] * len(dates) for inst in ("A", "B")}
+    price_df = pd.DataFrame(prices, index=dates)
+    use_contract_override = lot_rounding == "nearest"
+    cap = 100_600.0 if use_contract_override else 100_000.0
+    margin_rates = {"A": 0.1, "B": 0.2}
+    contract_map = None
+    if use_contract_override:
+        margin_rates.update({"A": 0.4, "A_C1": 0.1})
+        contract_map = {(i, "A"): "A_C1" for i in range(len(dates))}
+    slot = _make_mock_futures_slot(
+        dates=dates,
+        instruments=list(prices),
+        open_panel=prices,
+        close_panel=prices,
+        volume_panel={inst: [cap / 10.0] * len(dates) for inst in prices},
+        contract_map=contract_map,
+        allow_short=use_contract_override,
+    )
+    scores = pd.DataFrame({"A": 2.0, "B": 1.0}, index=dates)
+    observed = []
+    original_evaluate = SharedPortfolioPolicy.evaluate_bar
+
+    def capture_decision(self, **kwargs):
+        decision = original_evaluate(self, **kwargs)
+        if decision.kind == "branch_overlay":
+            observed.append((decision.target_weights, decision.target_values))
+        return decision
+
+    monkeypatch.setattr(SharedPortfolioPolicy, "evaluate_bar", capture_decision)
+    lots = {}
+    for default_rate in (0.2, 0.1):
+        runner = VectorBTBacktestRunner(
+            {
+                "top_k_strategy": {
+                    "top_k": 2,
+                    "score_source": "input_factor",
+                    "holding_period": 1,
+                    "init_cash": 100_000.0,
+                    "execution_mode": "futures_contract",
+                    "target_weight_basis": "margin",
+                    "margin_rate": default_rate,
+                    "margin_rates": margin_rates,
+                    "allow_short": use_contract_override,
+                    "lot_rounding": lot_rounding,
+                    "liquidity_cap": {
+                        "enabled": True,
+                        "adv_lookback_days": 2,
+                        "max_participation": 0.1,
+                        "capital_base": 100_000.0 if use_contract_override else None,
+                    },
+                }
+            },
+            slot=slot,
+            frequency="1d",
+        )
+        try:
+            res = runner.run_backtest(
+                scores,
+                price_df,
+                open_df=price_df,
+                rebalance_dates=[dates[2].to_pydatetime()],
+            )
+        finally:
+            runner.close()
+        assert "error" not in res, res
+        lots[default_rate] = res["portfolio"].lots_history.loc[dates[2]].to_dict()
+
+    notionals = {
+        rate: {inst: abs(count) * 100.0 * 10.0 for inst, count in by_inst.items()}
+        for rate, by_inst in lots.items()
+    }
+    assert all(value <= cap for row in notionals.values() for value in row.values()), (lots, notionals)
+    sign_b = -1 if use_contract_override else 1
+    assert lots[0.2] == lots[0.1] == {"A": 100, "B": sign_b * 100}
+    assert len(observed) == 2
+    assert observed[0] == observed[1]
+    weights, targets = observed[0]
+    assert weights == pytest.approx({"A": cap * 0.1 / 100_000.0, "B": sign_b * cap * 0.2 / 100_000.0})
+    assert targets == pytest.approx({"A": cap, "B": sign_b * cap})
+
+
+def test_margin_liquidity_reallocation_charges_held_margin_for_blocked_exit() -> None:
+    dates = pd.bdate_range("2026-01-05", periods=5)
+    prices = {inst: [100.0] * len(dates) for inst in ("A", "B")}
+    price_df = pd.DataFrame(prices, index=dates)
+    blocked_date = dates[3].strftime("%Y-%m-%d")
+
+    def tradable(grid: pd.DataFrame, instrument_id: str) -> pd.Series:
+        if instrument_id == "A":
+            return grid["session_id"].astype(str) != blocked_date
+        return pd.Series(True, index=grid.index)
+
+    slot = _make_mock_futures_slot(
+        dates=dates,
+        instruments=list(prices),
+        open_panel=prices,
+        close_panel=prices,
+        volume_panel={inst: [10_000.0] * len(dates) for inst in prices},
+        tradability_fn=tradable,
+        allow_short=False,
+    )
+    scores = pd.DataFrame({"A": [2, 2, 1, 1, 1], "B": [1, 1, 2, 2, 2]}, index=dates)
+    runner = VectorBTBacktestRunner(
+        {
+            "top_k_strategy": {
+                "top_k": 1,
+                "score_source": "input_factor",
+                "holding_period": 1,
+                "init_cash": 100_000.0,
+                "execution_mode": "futures_contract",
+                "target_weight_basis": "margin",
+                "margin_rate": 0.2,
+                "margin_rates": {"A": 0.1, "B": 0.2},
+                "allow_short": False,
+                "liquidity_cap": {"enabled": True, "adv_lookback_days": 2, "max_participation": 0.1},
+            }
+        },
+        slot=slot,
+        frequency="1d",
+    )
+    try:
+        res = runner.run_backtest(
+            scores,
+            price_df,
+            open_df=price_df,
+            rebalance_dates=[dates[2].to_pydatetime(), dates[3].to_pydatetime()],
+        )
+    finally:
+        runner.close()
+    assert "error" not in res, res
+    lots = res["portfolio"].lots_history
+    assert lots.loc[dates[2]].to_dict() == {"A": 100, "B": 0}
+    # B's 20,000 margin budget has 10,000 left after A's blocked exit.
+    assert lots.loc[dates[3]].to_dict() == {"A": 100, "B": 50}
+
+
 def test_p1_5_branch_topk_margin_basis_respects_per_instrument_margin_rates() -> None:
     """[一-5] Standard Top-K under target_weight_basis='margin' allocates equal margin budgets using margin_rates."""
     dates = pd.bdate_range("2026-01-05", periods=4)
@@ -2045,7 +2187,7 @@ def test_p1_5_branch_topk_margin_basis_rotation_exposure_leverage_and_close_cost
     cfg = fut_exec_mod.FuturesExecutionConfig(
         execution_mode="futures_contract",
         margin_rate=0.2,
-        margin_rates={"A": 0.1, "C": 0.25},
+        margin_rates={"A": 0.1, "A_C2": 0.3, "C": 0.25},
         leverage=0.8,
         target_weight_basis="margin",
     )
@@ -2106,7 +2248,7 @@ def test_p1_5_branch_topk_margin_basis_rotation_exposure_leverage_and_close_cost
         },
         pending_rolls={},
         pending_liquidations=set(),
-        active_contract={(1, "A"): "A_C1", (1, "B"): "B_C1", (1, "C"): "C_C1"},
+        active_contract={(1, "A"): "A_C2", (1, "B"): "B_C1", (1, "C"): "C_C1"},
         missing_bar_insts=set(),
         exec_price_fn=lambda _b, _i: 100.0,
         last_contract_close={},
@@ -2117,6 +2259,10 @@ def test_p1_5_branch_topk_margin_basis_rotation_exposure_leverage_and_close_cost
         sell_cost_rate=0.001,
         slippage=0.0,
     )
+    assert held_view.target_margin_rate("A") == 0.3
+    assert held_view.target_margin_rate("B") == 0.2
+    assert held_view.target_margin_rate("C") == 0.25
+    assert held_view.held_budget_value("A") == pytest.approx(10_000.0)
     # B close cost = 100 * 100 * 10 * 0.001 = 100 -> post_sell_equity = 99,900.
     # A used_margin = 100 * 100 * 10 * 0.1 = 10,000.
     # free_margin(exposure=0.5, leverage=0.8) = 99,900 * 0.5 * 0.8 - 10,000 = 29,960.

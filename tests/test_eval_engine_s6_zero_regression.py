@@ -156,7 +156,9 @@ def test_joinquant_bundle_matches_stage6_sha256(tmp_path, monkeypatch):
     # (added rank preprocessing, explicit "none" handling, and shared preprocessing helpers).
     # NERE-1429 changes the digest (3f380aa2...) solely through inlined utils/strategy_kernel.py
     # (shared factor validity mask, degenerate cross-section NaN preservation, and causal time-series standardization).
-    assert sha256(artifact).hexdigest() == "3f380aa2e23616cfd7547ab3c657d61851f296dc1c1549810189700e977aa2b6"
+    # NERE-1471 changes the digest (c31905c2...) solely through inlined utils/strategy_kernel.py
+    # (added model intercept validation and addition in linear_signal).
+    assert sha256(artifact).hexdigest() == "c31905c2a946a555dfedb6b10dcd9ed067c4508fffc4d3f69bb5fb9e7e9a9f11"
 
 
 def test_daily_adapter_has_no_alphalens_import():

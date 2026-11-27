@@ -50,20 +50,60 @@ from utils.dynamic_stock_pool import (
     apply_date_level_pool_filter_to_long_df,
 )
 from utils.config_loader import load_pit_config
-from factor_synthesis.pipeline import (
-    run_lasso_synthesis,
-    run_lightgbm_synthesis,
-    run_pca_synthesis,
-    run_size_conditional_synthesis,
-    run_weighted_sum_synthesis,
-    write_size_conditional_diagnostics,
-)
-from factor_synthesis.pipeline.lasso_method import InsufficientSurvivingFactorsError
-from factor_synthesis.pipeline.size_conditional_method import (
-    load_or_build_size_conditional_snapshot,
-    prepare_size_conditional_panel,
-    size_conditional_snapshot_identity,
-)
+
+_LAZY_PIPELINE_IMPORTS: Dict[str, tuple[str, str]] = {
+    "run_lasso_synthesis": ("factor_synthesis.pipeline.lasso_method", "run_lasso_synthesis"),
+    "run_lightgbm_synthesis": ("factor_synthesis.pipeline.lightgbm_method", "run_lightgbm_synthesis"),
+    "run_pca_synthesis": ("factor_synthesis.pipeline.pca_method", "run_pca_synthesis"),
+    "run_size_conditional_synthesis": (
+        "factor_synthesis.pipeline.size_conditional_method",
+        "run_size_conditional_synthesis",
+    ),
+    "run_weighted_sum_synthesis": (
+        "factor_synthesis.pipeline.weighted_sum_method",
+        "run_weighted_sum_synthesis",
+    ),
+    "write_size_conditional_diagnostics": (
+        "factor_synthesis.pipeline.size_conditional_method",
+        "write_size_conditional_diagnostics",
+    ),
+    "InsufficientSurvivingFactorsError": (
+        "factor_synthesis.pipeline.lasso_method",
+        "InsufficientSurvivingFactorsError",
+    ),
+    "load_or_build_size_conditional_snapshot": (
+        "factor_synthesis.pipeline.size_conditional_method",
+        "load_or_build_size_conditional_snapshot",
+    ),
+    "prepare_size_conditional_panel": (
+        "factor_synthesis.pipeline.size_conditional_method",
+        "prepare_size_conditional_panel",
+    ),
+    "size_conditional_snapshot_identity": (
+        "factor_synthesis.pipeline.size_conditional_method",
+        "size_conditional_snapshot_identity",
+    ),
+}
+
+
+def _resolve_pipeline_symbol(name: str) -> Any:
+    """Resolve a lazily imported pipeline symbol while honoring module monkeypatches."""
+    if name in globals():
+        return globals()[name]
+    import importlib
+
+    module_name, attr_name = _LAZY_PIPELINE_IMPORTS[name]
+    return getattr(importlib.import_module(module_name), attr_name)
+
+
+def __getattr__(name: str) -> Any:
+    if name in _LAZY_PIPELINE_IMPORTS:
+        return _resolve_pipeline_symbol(name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | set(_LAZY_PIPELINE_IMPORTS))
 from factor_synthesis.research_split import apply_research_split
 from factor_synthesis.weighting import get_weight_strategy
 from factor_synthesis.vectorbt_adapter.benchmark_suite import (
@@ -495,7 +535,13 @@ def _build_lasso_bundle_model(
     selection = (
         _build_lasso_selection_record(info, dict(synthesis_config)) if info else None
     )
-    return {
+    raw_intercept = (info or {}).get("intercept", 0.0)
+    if isinstance(raw_intercept, bool):
+        raise ValueError("lasso intercept must be finite")
+    intercept = float(0.0 if raw_intercept is None else raw_intercept)
+    if not np.isfinite(intercept):
+        raise ValueError("lasso intercept must be finite")
+    model = {
         "train_end": str(train_end),
         "model_id": f"lasso_{str(train_end).replace('-', '_')}",
         "feature_names": list(clean_weights),
@@ -503,8 +549,9 @@ def _build_lasso_bundle_model(
         "blend_only": not clean_weights,
         "standardize": synthesis_config.get("standardize", True),
         "standardization_method": actual_preprocess,
-        "postprocess_cs_standardize": synthesis_config.get(
-            "postprocess_cs_standardize", True
+        "postprocess_cs_standardize": (info or {}).get(
+            "postprocess_cs_standardize",
+            synthesis_config.get("postprocess_cs_standardize", True),
         ),
         "blend_with_original_ratio": blend_ratio,
         "blend_weights": blend_weights,
@@ -512,6 +559,9 @@ def _build_lasso_bundle_model(
         "blend_info": blend_info,
         "selection": selection,
     }
+    if clean_weights:
+        model["intercept"] = intercept
+    return model
 
 
 def _finite_float(value: Any) -> Optional[float]:
@@ -1874,6 +1924,7 @@ class FactorSynthesizer:
         *,
         synthesis_name: Optional[str] = None,
         execution_lag: Optional[int] = None,
+        reuse_evidence: Optional[Dict[str, str]] = None,
     ):
         """直接分析合成因子而不保存到数据库 - 内存模式
 
@@ -2117,6 +2168,50 @@ class FactorSynthesizer:
                 self.logger.info(
                     f"[REUSE] 跳过 alphalens/IC 分析 (复用回放或非日频/单标的模式): {factor_name}"
                 )
+                if hasattr(self, "_execution_metrics"):
+                    if bool(pe_cfg.get("skip_alphalens_analysis", False)):
+                        skip_reason = "skip_alphalens_analysis"
+                    elif getattr(self, "frequency", "1d") != "1d":
+                        skip_reason = "non_daily_frequency"
+                    elif getattr(self, "result_writer", None) is None:
+                        skip_reason = "no_local_db"
+                    elif not bool(run_alphalens):
+                        skip_reason = "synthesis_reuse"
+                    else:
+                        skip_reason = "single_instrument"
+                    resolved_sname = self._resolve_active_synthesis_name(factor_name, synthesis_name)
+                    diagnostic = {
+                        "synthesis_name": resolved_sname,
+                        "factor_name": factor_name,
+                        "status": "succeeded",
+                        "evaluation_mode": "composite_only",
+                        "skip_reason": skip_reason,
+                        "frequency": getattr(self, "frequency", "1d"),
+                        "stock_count": len(stocks),
+                        "finite_score_count": int(np.isfinite(composite_series.to_numpy(dtype=float)).sum()),
+                    }
+                    if skip_reason == "synthesis_reuse" and reuse_evidence:
+                        diagnostic.update(reuse_evidence)
+                    if skip_reason == "single_instrument":
+                        diagnostic["instruments"] = [str(item) for item in stocks]
+                        exec_artifacts = getattr(self, "_execution_artifacts", None)
+                        exec_dir = getattr(self, "execution_dir", None)
+                        if exec_artifacts is not None and exec_dir is not None:
+                            safe_name = "".join(
+                                ch if ch.isalnum() or ch in {"-", "_"} else "_"
+                                for ch in f"{resolved_sname}_{factor_name}"
+                            ).strip("_") or "composite"
+                            scores_path = Path(exec_dir) / f"composite_scores_{safe_name}.csv"
+                            scores_path.parent.mkdir(parents=True, exist_ok=True)
+                            composite_series.rename("composite_value").to_frame().to_csv(scores_path)
+                            exec_artifacts.append({
+                                "artifact_type": "composite_scores",
+                                "synthesis_name": resolved_sname,
+                                "factor_name": factor_name,
+                                "path": str(scores_path.resolve()),
+                                "sha256": hashlib.sha256(scores_path.read_bytes()).hexdigest(),
+                            })
+                    self._execution_metrics["synthesis_diagnostics"].append(diagnostic)
                 return
 
             # 运行alphalens分析
@@ -3379,7 +3474,13 @@ class FactorSynthesizer:
             )
 
             if hasattr(self, "_execution_metrics"):
-                summary = {"factor_name": factor_name, "periods": {}, "ir_periods": {}}
+                summary = {
+                    "factor_name": factor_name,
+                    "synthesis_name": getattr(self, "_active_synthesis_name", None),
+                    "status": "succeeded",
+                    "periods": {},
+                    "ir_periods": {},
+                }
                 for key in ("overall_ic", "overall_ir"):
                     if key in quality_debug:
                         summary[key] = quality_debug[key]
@@ -3660,6 +3761,10 @@ class FactorSynthesizer:
                 composite_name,
                 run_alphalens=False,
                 synthesis_name=synthesis_name,
+                reuse_evidence={
+                    "reuse_bundle_sha256": hashlib.sha256(bundle_path.read_bytes()).hexdigest(),
+                    "reuse_cache_sha256": hashlib.sha256(cache_path.read_bytes()).hexdigest(),
+                },
             )
             return True
         except (FileNotFoundError, ValueError):
@@ -4000,7 +4105,10 @@ class FactorSynthesizer:
             for key in ("_label_exit_dates", "_label_trading_calendar", "_label_effective_period", "_label_calendar_source"):
                 snapshot_config.pop(key, None)
             snapshot_config["_effective_label_definition"] = dict(effective_label)
-            snapshot_identity = size_conditional_snapshot_identity(
+            load_snapshot_fn = _resolve_pipeline_symbol("load_or_build_size_conditional_snapshot")
+            prepare_panel_fn = _resolve_pipeline_symbol("prepare_size_conditional_panel")
+            snapshot_identity_fn = _resolve_pipeline_symbol("size_conditional_snapshot_identity")
+            snapshot_identity = snapshot_identity_fn(
                 self.config,
                 snapshot_config,
                 all_factor_names,
@@ -4024,7 +4132,7 @@ class FactorSynthesizer:
                     stock_filter=all_pool_stocks,
                     trading_calendar=market_cap_calendar,
                 )
-                return prepare_size_conditional_panel(
+                return prepare_panel_fn(
                     self, frame, returns, market_cap, snapshot_config
                 )
 
@@ -4034,7 +4142,7 @@ class FactorSynthesizer:
                     "cache_dir", "./cache/factor_data"
                 )
             )
-            prepared_panel, snapshot_info = load_or_build_size_conditional_snapshot(
+            prepared_panel, snapshot_info = load_snapshot_fn(
                 cache_root,
                 snapshot_identity,
                 _build_prepared_panel,
@@ -4074,7 +4182,9 @@ class FactorSynthesizer:
                 factor_df=factor_df,
                 model_artifact_files=[],
             )
-            run_weighted_sum_synthesis(
+            run_weighted_sum_fn = _resolve_pipeline_symbol("run_weighted_sum_synthesis")
+
+            run_weighted_sum_fn(
                 self, synthesis_name, synthesis_config, factor_df, **market_inputs_kwargs
             )
             weights_dir = self.config.get("output_settings", {}).get("weights_output_dir", "./results")
@@ -4190,6 +4300,8 @@ class FactorSynthesizer:
 
             # 执行合成
             if method == "lasso":
+                insufficient_error_cls = _resolve_pipeline_symbol("InsufficientSurvivingFactorsError")
+                run_lasso_fn = _resolve_pipeline_symbol("run_lasso_synthesis")
                 # 计算预测期的动态股票池（支持Blending）
                 predict_window_days = bounded_predict_window_days
                 daily_pools_for_predict = self._compute_predict_period_dynamic_pools(
@@ -4197,7 +4309,7 @@ class FactorSynthesizer:
                 )
 
                 try:
-                    composite_result, model_info = run_lasso_synthesis(
+                    composite_result, model_info = run_lasso_fn(
                         self,
                         factor_df,
                         forward_returns,
@@ -4207,7 +4319,7 @@ class FactorSynthesizer:
                         daily_pools=daily_pools_for_predict,
                         **market_inputs_kwargs,
                     )
-                except InsufficientSurvivingFactorsError as exc:
+                except insufficient_error_cls as exc:
                     training_window_audits.append(
                         {
                             "train_start": train_start_str,
@@ -4267,7 +4379,9 @@ class FactorSynthesizer:
                         self.logger.warning(f"记录LASSO权重失败: {e}")
 
             elif method == "pca":
-                composite_results, model_info = run_pca_synthesis(
+                run_pca_fn = _resolve_pipeline_symbol("run_pca_synthesis")
+
+                composite_results, model_info = run_pca_fn(
                     self,
                     factor_df,
                     forward_returns,
@@ -4282,6 +4396,8 @@ class FactorSynthesizer:
                     model_infos.append(model_info)
 
             elif method == "lightgbm":
+                insufficient_error_cls = _resolve_pipeline_symbol("InsufficientSurvivingFactorsError")
+                run_lightgbm_fn = _resolve_pipeline_symbol("run_lightgbm_synthesis")
                 # 计算预测期的动态股票池（与本地回测脚本对齐）
                 predict_window_days = bounded_predict_window_days
                 daily_pools_for_predict = self._compute_predict_period_dynamic_pools(
@@ -4289,7 +4405,7 @@ class FactorSynthesizer:
                 )
 
                 try:
-                    composite_result, model_info = run_lightgbm_synthesis(
+                    composite_result, model_info = run_lightgbm_fn(
                         self,
                         factor_df,
                         forward_returns,
@@ -4300,7 +4416,7 @@ class FactorSynthesizer:
                         daily_pools=daily_pools_for_predict,
                         **market_inputs_kwargs,
                     )
-                except InsufficientSurvivingFactorsError as exc:
+                except insufficient_error_cls as exc:
                     training_window_audits.append(
                         {
                             "train_start": train_start_str,
@@ -4337,6 +4453,9 @@ class FactorSynthesizer:
                     )
 
             elif method == "size_conditional_elasticnet":
+                insufficient_error_cls = _resolve_pipeline_symbol("InsufficientSurvivingFactorsError")
+                run_size_conditional_fn = _resolve_pipeline_symbol("run_size_conditional_synthesis")
+
                 predict_window_days = bounded_predict_window_days
                 daily_pools_for_predict = self._compute_predict_period_dynamic_pools(
                     train_end,
@@ -4344,7 +4463,7 @@ class FactorSynthesizer:
                     method_name="SizeConditionalElasticNet",
                 )
                 try:
-                    composite_result, model_info = run_size_conditional_synthesis(
+                    composite_result, model_info = run_size_conditional_fn(
                         self,
                         factor_df,
                         forward_returns,
@@ -4356,7 +4475,7 @@ class FactorSynthesizer:
                         prepared_panel=prepared_panel,
                         **market_inputs_kwargs,
                     )
-                except InsufficientSurvivingFactorsError as exc:
+                except insufficient_error_cls as exc:
                     training_window_audits.append(
                         {
                             "train_start": train_start_str,
@@ -4727,7 +4846,9 @@ class FactorSynthesizer:
                     raise ValueError(
                         "output_settings.diagnostics_output_dir is required for size_conditional_elasticnet"
                     )
-                diagnostic_paths = write_size_conditional_diagnostics(
+                write_diagnostics_fn = _resolve_pipeline_symbol("write_size_conditional_diagnostics")
+
+                diagnostic_paths = write_diagnostics_fn(
                     model_infos,
                     diagnostics_output_dir,
                     synthesis_name,
@@ -5077,10 +5198,15 @@ class FactorSynthesizer:
         """运行所有配置的因子合成"""
         self.logger.info("开始因子合成任务")
 
+        from tools.agent_harness.run_result import expected_synthesis_items
+
         synthesis_methods = self.config["synthesis_methods"]
+        expected_items = expected_synthesis_items(self.config)
         execution = execution if execution is not None else {}
-        execution.update(expected=len(synthesis_methods), completed=0, failed=0, errors=[])
+        execution.update(expected=len(expected_items), completed=0, failed=0, errors=[])
         self._execution_metrics = metrics if metrics is not None else {}
+        if not hasattr(self, "_execution_artifacts"):
+            self._execution_artifacts = None
         if getattr(self, "_market_db_identity", None):
             self._execution_metrics["market_db"] = self._market_db_identity
         self._vectorbt_result_summaries = []
@@ -5099,6 +5225,9 @@ class FactorSynthesizer:
         failures = []
 
         for synthesis_name, synthesis_config in synthesis_methods.items():
+            expected_count = sum(name == synthesis_name for name, _ in expected_items)
+            summary_count = len(self._execution_metrics["ic_summaries"])
+            diagnostic_count = len(self._execution_metrics["synthesis_diagnostics"])
             try:
                 self.logger.info(f"执行合成方法: {synthesis_name}")
                 summary_start = len(getattr(self, "_vectorbt_result_summaries", []))
@@ -5110,12 +5239,20 @@ class FactorSynthesizer:
                     new_summaries,
                     bundle_backtests=getattr(self, "_bundle_backtests", None),
                 )
-                execution["completed"] += 1
+                if synthesis_config.get("method") == "pca":
+                    produced = len(self._execution_metrics["ic_summaries"]) - summary_count
+                    produced += sum(
+                        row.get("evaluation_mode") == "composite_only"
+                        for row in self._execution_metrics["synthesis_diagnostics"][diagnostic_count:]
+                    )
+                    if produced != expected_count:
+                        raise RuntimeError(f"PCA output count mismatch: {produced} != {expected_count}")
+                execution["completed"] += expected_count
 
             except Exception as e:
                 self.logger.error(f"合成方法 {synthesis_name} 执行失败: {e}")
                 failures.append(e)
-                execution["failed"] += 1
+                execution["failed"] += expected_count
                 execution["errors"].append({"item": synthesis_name, "error": str(e)})
                 if isinstance(e, LabelIsolationError):
                     raise
@@ -6409,6 +6546,7 @@ def main():
             if args.frequency:
                 synth_kwargs["frequency"] = args.frequency
             synthesizer = FactorSynthesizer(config_path, **synth_kwargs)
+            synthesizer._execution_artifacts = result["artifacts"]
             synthesizer.run_synthesis(execution=result["execution"], metrics=result["metrics"])
 
         print("\n" + "=" * 60)

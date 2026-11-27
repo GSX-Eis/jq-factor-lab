@@ -485,6 +485,14 @@ def linear_signal(raw, model, parent_scores=None, history=None, asof=None):
         processed.loc[valid_any] = processed.loc[valid_any].fillna(0.0)
     if weights:
         score = weighted_score(pre_fill, weights)
+        raw_intercept = model.get("intercept", 0.0)
+        if isinstance(raw_intercept, bool):
+            raise ValueError("model_intercept_nonfinite")
+        intercept = float(0.0 if raw_intercept is None else raw_intercept)
+        if not np.isfinite(intercept):
+            raise ValueError("model_intercept_nonfinite")
+        if intercept != 0.0:
+            score = score + intercept
         if model.get("postprocess_cs_standardize", True):
             score = standardize_composite_scores(score)
     else:

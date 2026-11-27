@@ -608,8 +608,6 @@ def run_lightgbm_synthesis(
     # Phase 3: 预筛选（接收预处理后的因子！）
     # (Ported from lasso_method.py for architecture alignment)
     # =========================================================================
-    from factor_synthesis.preselection import get_preselection_strategy
-    
     # [NEW] 预筛选方法互斥检查
     _validate_preselection_exclusivity(config)
     
@@ -645,6 +643,7 @@ def run_lightgbm_synthesis(
     elif hierarchical_cfg.get('enabled', False):
         # 层次聚类预筛选 - 激进降维到15-20个因子
         logger.info("[层次聚类] 启用层次聚类预筛选（接收预处理后数据）")
+        from factor_synthesis.preselection import get_preselection_strategy
         
         strategy = get_preselection_strategy('hierarchical_clustering', hierarchical_cfg, logger)
         selected_features = strategy.select(X_preprocessed, y)
@@ -653,6 +652,7 @@ def run_lightgbm_synthesis(
         
     elif pre_sel_cfg.get('enabled', False):
         # 传统预筛选 (IC/IR/dCor)
+        from factor_synthesis.preselection import get_preselection_strategy
         strategy_name = pre_sel_cfg.get('strategy', 'ic_ir')
         strategy = get_preselection_strategy(strategy_name, pre_sel_cfg, logger)
         # [CHANGED] 传入预处理后的因子 X_preprocessed

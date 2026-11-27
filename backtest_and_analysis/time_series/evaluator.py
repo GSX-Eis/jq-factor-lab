@@ -824,21 +824,16 @@ def evaluate_bars(bars: pd.DataFrame, factors: pd.DataFrame | None = None,
     return result
 
 
-def evaluate_slot(
-    slot: MarketSlot, factors: pd.DataFrame, *, frequency: str, start_date: str, end_date: str,
-    instruments: Sequence[str], horizons: Sequence[int] | int, entry_offset_bars: int | None = None,
+def _prepare_slot_evaluation(
+    slot: MarketSlot, *, frequency: str, instruments: Sequence[str] | None,
+    horizons: Sequence[int] | int, entry_offset_bars: int | None = None,
     bucket_strategy: str | None = None, profile: ExecutionProfile | None = None,
-    apply_tradability_mask: bool = False, **options: Any,
-) -> EvaluationResult:
-    """Evaluate committed signal values against a Slot's execution bars and clock."""
+    apply_tradability_mask: bool = False,
+):
     from backtest_and_analysis.evaluation.labels import UnifiedReturnLabeler
     from slots.jq_ashare_local.feed import AShareBarFeed, AShareDailyEvaluationFeed
-    from utils.data_revision import frame_digest
     from utils.time_axis import Frequency
 
-    market_db = slot_market_db_identity(slot)
-    if options.get('analysis_mode') == 'cross_sectional':
-        require_single_market_db(factors, market_db)
     if slot.slot_config_hash is None:
         raise ContractValidationError('Slot evaluation requires a frozen slot_config_hash')
     parsed = Frequency.parse(frequency)
@@ -854,8 +849,40 @@ def evaluate_slot(
         entry_offset_bars = max(1, minimum_offset) if ashare_daily else minimum_offset
     elif isinstance(entry_offset_bars, Integral) and entry_offset_bars < minimum_offset:
         raise ContractValidationError(f'entry_offset_bars must be >= {minimum_offset}')
+    labeler.scheduler(entry_offset_bars)
     periods = _normalize_bar_horizons(horizons)
-    strategy = labeler.resolve_bucket_strategy(parsed, instruments, bucket_strategy)
+    strategy = (
+        labeler.resolve_bucket_strategy(parsed, instruments, bucket_strategy)
+        if instruments is not None
+        else bucket_strategy
+    )
+    view = getattr(slot.bar_feed, 'view', 'ETH')
+    grid = _SlotEvaluationGrid(slot.calendar, view, strategy, periods)
+    return slot, parsed, ashare_daily, labeler, profile, minimum_offset, entry_offset_bars, periods, strategy, view, grid
+
+
+def evaluate_slot(
+    slot: MarketSlot, factors: pd.DataFrame, *, frequency: str, start_date: str, end_date: str,
+    instruments: Sequence[str], horizons: Sequence[int] | int, entry_offset_bars: int | None = None,
+    bucket_strategy: str | None = None, profile: ExecutionProfile | None = None,
+    apply_tradability_mask: bool = False, **options: Any,
+) -> EvaluationResult:
+    """Evaluate committed signal values against a Slot's execution bars and clock."""
+    from backtest_and_analysis.evaluation.labels import UnifiedReturnLabeler
+    from slots.jq_ashare_local.feed import AShareBarFeed, AShareDailyEvaluationFeed
+    from utils.data_revision import frame_digest
+    from utils.time_axis import Frequency
+
+    market_db = slot_market_db_identity(slot)
+    if options.get('analysis_mode') == 'cross_sectional':
+        require_single_market_db(factors, market_db)
+    slot, parsed, ashare_daily, labeler, profile, minimum_offset, entry_offset_bars, periods, strategy, view, grid = (
+        _prepare_slot_evaluation(
+            slot, frequency=frequency, instruments=instruments, horizons=horizons,
+            entry_offset_bars=entry_offset_bars, bucket_strategy=bucket_strategy,
+            profile=profile, apply_tradability_mask=apply_tradability_mask,
+        )
+    )
     labels = labeler.label(
         instruments, parsed, start_date=start_date, end_date=end_date, horizons=periods,
         entry_offset_bars=entry_offset_bars, factors=factors, bucket_strategy=strategy, capture_data_identity=True,
@@ -864,8 +891,6 @@ def evaluate_slot(
     observed = labels[['signal_timestamp', 'instrument_id']].rename(columns={'signal_timestamp': 'timestamp_utc'})
     if labels.empty or not pd.MultiIndex.from_frame(factors[keys]).isin(pd.MultiIndex.from_frame(observed)).all():
         raise ContractValidationError('Factor values must match the requested Slot signal grid')
-    view = getattr(slot.bar_feed, 'view', 'ETH')
-    grid = _SlotEvaluationGrid(slot.calendar, view, strategy, periods)
     result = _evaluate_labels(
         labels.rename(columns={'forward_return': 'return_pct'}), factors, grid,
         minimum_offset=minimum_offset, publish_turnover=ashare_daily and options.get('analysis_mode') == 'cross_sectional',

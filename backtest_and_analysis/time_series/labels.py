@@ -149,7 +149,17 @@ class BarReturnLabeler:
             coverage = frame.groupby(['instrument_id', 'frequency']).timestamp_utc.max().to_dict()
         else:
             coverage = {key: bounds[1] for key, bounds in coverage.items()}
+        # Strip large coverage dicts from the internal frame copy so groupby/slice
+        # __finalize__ does not deepcopy thousands of Timestamps on every access.
+        for attr_key in (
+            'raw_coverage_start_utc',
+            'raw_coverage_end_utc',
+            'raw_coverage_by_instrument',
+            'raw_coverage_by_key',
+        ):
+            frame.attrs.pop(attr_key, None)
         tables = []
+        grid_cache: dict[tuple[Any, ...], tuple[pd.DatetimeIndex, pd.DatetimeIndex, np.ndarray]] = {}
         for (instrument, frequency), group in frame.groupby(['instrument_id', 'frequency'], sort=True):
             calendar = self.calendar.get(instrument) if isinstance(self.calendar, Mapping) else self.calendar
             if calendar is None:
@@ -161,7 +171,7 @@ class BarReturnLabeler:
                 raise ContractValidationError(f'Missing raw coverage for {key}')
             tables.extend(self._label_group(group, factor_index, signals, calendar,
                                             coverage.get(key, pd.NaT), instrument, frequency,
-                                            _incomplete_signals))
+                                            _incomplete_signals, grid_cache=grid_cache))
         scheduled = ('scheduled_exit_timestamp',) if self.include_scheduled_exit else ()
         columns = (*LABEL_COLUMNS, *scheduled)
         if not tables:
@@ -176,31 +186,45 @@ class BarReturnLabeler:
     def _label_group(self, group: pd.DataFrame, factors: pd.DataFrame | None,
                      signals: pd.DatetimeIndex | None, calendar: SessionCalendar,
                      coverage_end: pd.Timestamp, instrument: str, frequency: str,
-                     incomplete_signals: pd.DatetimeIndex | None) -> list[pd.DataFrame]:
+                     incomplete_signals: pd.DatetimeIndex | None,
+                     *, grid_cache: dict[tuple[Any, ...], tuple[pd.DatetimeIndex, pd.DatetimeIndex, np.ndarray]] | None = None,
+                     ) -> list[pd.DataFrame]:
         first, last = group.timestamp_utc.min(), group.timestamp_utc.max()
         calendar.session_at(first)
         calendar.session_at(last)
         grid_end = last if pd.isna(coverage_end) else max(last, coverage_end)
-        eth, _, _ = _grid(calendar, frequency, first, grid_end, 'ETH', self.bucket_strategy)
-        grid, ends, owners = _grid(calendar, frequency, first, grid_end, self.view, self.bucket_strategy)
+        if grid_cache is None:
+            grid_cache = {}
+        cal_key = (id(calendar), calendar.calendar_hash, frequency, first, grid_end, self.bucket_strategy)
+        eth_key = (*cal_key, 'ETH')
+        if eth_key not in grid_cache:
+            grid_cache[eth_key] = _grid(calendar, frequency, first, grid_end, 'ETH', self.bucket_strategy)
+        eth, _, _ = grid_cache[eth_key]
+        view_key = (*cal_key, self.view)
+        if view_key not in grid_cache:
+            grid_cache[view_key] = _grid(calendar, frequency, first, grid_end, self.view, self.bucket_strategy)
+        grid, ends, owners = grid_cache[view_key]
         if eth.empty or grid.empty:
             return []
         times = pd.DatetimeIndex(group.timestamp_utc)
-        positions = grid.get_indexer(times)
-        off_grid = (eth.get_indexer(times) < 0) & (positions < 0)
-        if off_grid.any() and any(calendar.session_at(t, 'ETH') is not None for t in times[off_grid]):
-            raise ContractValidationError('timestamp_utc is not on the expected Bar start grid')
+        if times.equals(grid):
+            positions = np.arange(len(grid), dtype=np.intp)
+        else:
+            positions = grid.get_indexer(times)
+            off_grid = (eth.get_indexer(times) < 0) & (positions < 0)
+            if off_grid.any() and any(calendar.session_at(t, 'ETH') is not None for t in times[off_grid]):
+                raise ContractValidationError('timestamp_utc is not on the expected Bar start grid')
         selected = positions >= 0
         if signals is not None:
             selected &= times.isin(signals)
         if self.factor_keys_only:
             signal_keys = pd.MultiIndex.from_frame(group[['timestamp_utc', 'instrument_id']])
             selected &= signal_keys.isin(factors.index)
-        candidates = group.loc[selected]
+        candidates = group if selected.all() else group.loc[selected]
         if candidates.empty:
             return []
-        positions = positions[selected]
-        signal_times = pd.DatetimeIndex(candidates.timestamp_utc)
+        positions = positions if selected.all() else positions[selected]
+        signal_times = times if selected.all() else pd.DatetimeIndex(candidates.timestamp_utc)
         # RTH can start inside an ETH bucket (e.g. CME 60m at 14:30).
         eth_positions = np.maximum(eth.searchsorted(signal_times, side='right') - 1, 0)
         if factors is None:
@@ -209,7 +233,10 @@ class BarReturnLabeler:
             keys = pd.MultiIndex.from_arrays([signal_times, candidates.instrument_id],
                                               names=['timestamp_utc', 'instrument_id'])
             factor_missing = factors.reindex(keys).factor_value.isna().to_numpy()
-        observed = group.set_index('timestamp_utc').reindex(grid)
+        if times.equals(grid):
+            observed = group.set_axis(grid, axis=0)
+        else:
+            observed = group.set_index('timestamp_utc').reindex(grid)
         # An already aligned external signal does not need the current Bar prices.
         incomplete_signal = False
         if factors is None and incomplete_signals is not None:

@@ -76,7 +76,7 @@ def test_cli_monitor_defaults_and_result_hooks(tmp_path: Path, monkeypatch: pyte
     db.touch()
     output_root = tmp_path / "reports"
     ts = "2026-01-01T00:00:00+00:00"
-    count = Mock(return_value={"available": True, "table_count": 17})
+    count = Mock(return_value={"available": True, "backend": "duckdb", "table_count": 17, "factor_count": 0})
     complete = Mock(side_effect=lambda result, **_: result)
     monkeypatch.delenv("QUANTATION_OUTPUTS_DIR", raising=False)
     monkeypatch.delenv("QUANT_DATA_BINDINGS", raising=False)
@@ -157,7 +157,9 @@ def test_cli_bar_worker_uses_patched_subprocess_run(
     result = cli._handle_time_series_analysis(args)
     assert len(calls) == 1
     assert result.output_dir == attempt
-    assert result.metrics == {"worker": "patched"}
+    assert not result.ok
+    assert result.reason == "time_series_execution_failed"
+    assert result.metrics["error"] == "invalid Bar evaluation schema or mode"
     assert json.loads((attempt / "summary.json").read_text()) == result.to_dict()
 
 

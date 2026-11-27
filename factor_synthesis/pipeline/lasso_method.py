@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-LASSO/ElasticNet Factor Synthesis - Qlib Adapter Only
+LASSO/ElasticNet Factor Synthesis
 
 This module provides LASSO/ElasticNet based factor synthesis using the Qlib adapter.
-All model training and prediction is delegated to QlibLinearWrapper.
+QlibLinearWrapper fits the model. Local prediction uses the bundle scoring kernel.
 """
 
 import hashlib
@@ -19,6 +19,17 @@ import pandas as pd
 
 # Qlib Adapter (required)
 from factor_synthesis.qlib_adapter import DataConverter, QlibLinearWrapper
+from utils.strategy_kernel import (
+    TIME_SERIES_METHODS,
+    _normalize_ts_history_panel,
+    linear_signal,
+    preprocess_cross_section_series,
+    resolve_preprocess_method,
+    standardize_composite_scores,
+    time_series_standardize_at_asof,
+    valid_factor_mask,
+    weighted_score,
+)
 
 # Dynamic blend module
 from .preprocessing import (
@@ -452,6 +463,87 @@ def _filter_by_pool_date_range(
     return valid_indices
 
 
+def _preprocess_lasso_panel(
+    raw_panel: pd.DataFrame,
+    cols: list[str],
+    preprocess_config: Optional[Mapping[str, Any]],
+    standardize: bool,
+    history: Optional[pd.DataFrame],
+) -> pd.DataFrame:
+    """Preprocess factor columns using kernel semantics when config is supplied."""
+    if not cols:
+        return pd.DataFrame(index=raw_panel.index)
+    if preprocess_config is None:
+        def _cs_zscore(series: pd.Series) -> pd.Series:
+            std = series.std()
+            if pd.isna(std) or std == 0:
+                return series.where(series.isna(), 0.0)
+            return (series - series.mean()) / (std + 1e-8)
+
+        return pd.DataFrame(
+            {
+                factor_name: (
+                    raw_panel[factor_name].groupby(level="date").transform(_cs_zscore)
+                )
+                for factor_name in cols
+            },
+            index=raw_panel.index,
+        )
+
+    methods = preprocess_config if isinstance(preprocess_config, Mapping) else {}
+    ordered_cols = sorted(cols)
+    daily_frames = []
+    for day, frame in raw_panel.groupby(level="date", sort=False):
+        day_raw = frame.droplevel("date")
+        day_out = pd.DataFrame(index=day_raw.index)
+        normalized_history = None
+        normalized_asof = day
+        for factor_name in ordered_cols:
+            method = resolve_preprocess_method(methods, factor_name, default="zscore")
+            if not standardize:
+                values = day_raw[factor_name]
+            elif method in TIME_SERIES_METHODS:
+                if normalized_history is None and history is not None:
+                    if (
+                        isinstance(history, pd.DataFrame)
+                        and isinstance(history.index, pd.MultiIndex)
+                        and factor_name in history.columns
+                    ) or (
+                        hasattr(history, "get")
+                        and factor_name in history
+                        and isinstance(history[factor_name], pd.DataFrame)
+                    ):
+                        normalized_history, normalized_asof = _normalize_ts_history_panel(
+                            history, ordered_cols, day_raw.index, asof=day
+                        )
+                ts_hist = (
+                    normalized_history
+                    if normalized_history is not None and factor_name in normalized_history.columns
+                    else history
+                )
+                ts_asof = normalized_asof if ts_hist is normalized_history else day
+                values = time_series_standardize_at_asof(
+                    day_raw[factor_name],
+                    factor_name,
+                    method,
+                    methods,
+                    history=ts_hist,
+                    asof=ts_asof,
+                    active_columns=ordered_cols,
+                )
+            else:
+                values = preprocess_cross_section_series(
+                    day_raw[factor_name], method, methods
+                )
+            day_out[factor_name] = values
+        day_out = day_out.reindex(columns=cols)
+        day_out.index = frame.index
+        daily_frames.append(day_out)
+    if not daily_frames:
+        return pd.DataFrame(columns=cols, index=raw_panel.index[:0], dtype=float)
+    return pd.concat(daily_frames).reindex(raw_panel.index)
+
+
 def _blend_with_original(
     predictions: pd.Series,
     factor_df: pd.DataFrame,
@@ -460,20 +552,17 @@ def _blend_with_original(
     logger,
     daily_pools: Optional[Dict] = None,
     original_composite: Optional[pd.Series] = None,
+    preprocess_config: Optional[Mapping[str, Any]] = None,
+    standardize: bool = True,
+    history: Optional[pd.DataFrame] = None,
+    precomputed_blend: Optional[pd.DataFrame] = None,
 ) -> pd.Series:
     """
     Blend model predictions with weighted original factor composite.
-    
-    Args:
-        predictions: Model predictions
-        factor_df: Original factor data
-        weights: Factor weights for blending
-        blend_ratio: Ratio of original factors (0-1)
-        logger: Logger instance
-        daily_pools: Optional dynamic pool dict
-        
-    Returns:
-        Blended predictions
+
+    Aligns missing-sample filtering with ``utils.strategy_kernel``: rows where
+    neither model predictions nor any active blend factor is valid are excluded,
+    and partial missingness on valid rows is filled with 0.0 after standardization.
     """
     if blend_ratio <= 0 or (not weights and original_composite is None):
         return predictions
@@ -483,41 +572,69 @@ def _blend_with_original(
         valid = parent.notna()
         if not valid.any():
             raise ValueError("parent baseline has no prediction-period overlap")
-        return predictions.loc[valid] * (1 - blend_ratio) + parent.loc[valid] * blend_ratio
+        return (
+            predictions.loc[valid].fillna(0.0) * (1 - blend_ratio)
+            + parent.loc[valid] * blend_ratio
+        )
 
     try:
-        original_composite = pd.Series(0.0, index=predictions.index)
-        
-        # [FIX] Cloud Alignment: Do NOT use daily_pools for blend factor zscore!
-        # Cloud (advanced_small_cap_factors_lasso.py lines 1373-1379) calculates
-        # zscore using valid_stocks (= predictions.index), not the full pool.
-        
-        for factor_name, weight in weights.items():
-            if factor_name in factor_df.columns:
-                factor_vals = factor_df[factor_name].reindex(predictions.index)
-                
-                # [CLOUD ALIGNED] Simple cross-sectional zscore on predictions.index
-                factor_vals = factor_vals.groupby(level="date").transform(
-                    lambda x: (x - x.mean()) / (x.std() + 1e-8)
+        active_weights = {
+            factor_name: float(weight)
+            for factor_name, weight in weights.items()
+            if factor_name in factor_df.columns
+        }
+        if active_weights:
+            if precomputed_blend is not None:
+                standardized = precomputed_blend.reindex(
+                    index=predictions.index, columns=list(active_weights)
                 )
-                
-                # [FIX] Fill NaN with 0 (mean value for z-scored data) to preserve stocks
-                nan_count = factor_vals.isna().sum()
-                if nan_count > 0:
-                    logger.debug(
-                        "[混合] 因子 %s 有 %d 个 NaN 值，填充为 0 (均值)",
-                        factor_name, nan_count
-                    )
-                    factor_vals = factor_vals.fillna(0.0)
-                
-                original_composite += factor_vals * weight
+            else:
+                raw_panel = factor_df.loc[:, list(active_weights)].reindex(predictions.index)
+                standardized = _preprocess_lasso_panel(
+                    raw_panel,
+                    list(active_weights),
+                    preprocess_config=preprocess_config,
+                    standardize=standardize,
+                    history=history if history is not None else factor_df,
+                )
+            blend_score = weighted_score(standardized, active_weights)
+        else:
+            blend_score = pd.Series(dtype=float, index=predictions.index[:0])
 
-        result = predictions * (1 - blend_ratio) + original_composite * blend_ratio
+        valid_pred = predictions.notna()
+        valid_blend = predictions.index.isin(blend_score.index)
+        combined_idx = predictions.index[valid_pred | valid_blend]
+        result = (
+            predictions.reindex(combined_idx).fillna(0.0) * (1 - blend_ratio)
+            + blend_score.reindex(combined_idx).fillna(0.0) * blend_ratio
+        ).rename(predictions.name)
         logger.info("[混合] Cloud-aligned blend_ratio=%.2f, 权重: %s", blend_ratio, weights)
         return result
     except Exception as e:
         logger.exception("[混合] 失败: %s", e)
         raise
+
+
+def _score_prediction_panel(
+    raw: pd.DataFrame,
+    model: Mapping[str, Any],
+    history: pd.DataFrame,
+    parent_scores: Optional[pd.Series] = None,
+) -> pd.Series:
+    """Score each prediction cross section against the same model used by replay."""
+    if raw.empty:
+        return pd.Series(dtype=float, index=raw.index[:0])
+    daily_scores = {}
+    for day, frame in raw.groupby(level="date", sort=False):
+        parent = (
+            parent_scores.reindex(frame.index).droplevel("date").dropna()
+            if parent_scores is not None else None
+        )
+        daily_scores[day], _ = linear_signal(
+            frame.droplevel("date"), model, parent_scores=parent, history=history, asof=day,
+        )
+    scores = pd.concat(daily_scores, names=raw.index.names)
+    return scores.reindex(raw.index.intersection(scores.index, sort=False))
 
 
 def _run_blend_only_mode(
@@ -567,91 +684,18 @@ def _run_blend_only_mode(
         )
         predict_factors = factor_df.loc[predict_mask]
     
-    if predict_factors.empty:
-        logger.warning("[Blend-Only] 预测期无数据")
-        return pd.Series(dtype=float), {}
-    
-    # Apply dynamic pool filter AND ensure all pool stocks are included
     if parent_composite is None and daily_pools and not predict_factors.empty:
-        # Get all (date, stock) pairs that SHOULD be in the prediction
-        from bisect import bisect_right
-        
-        pool_dates = sorted([pd.to_datetime(k) for k in daily_pools.keys()])
-        pool_date_to_key = {pd.to_datetime(k): k for k in daily_pools.keys()}
-        
-        # Build complete index based on pool membership
-        all_pool_indices = []
-        existing_factor_dates = predict_factors.index.get_level_values('date').unique()
-        
-        for date in existing_factor_dates:
-            date_dt = pd.to_datetime(date)
-            # Find applicable pool
-            pos = bisect_right(pool_dates, date_dt)
-            if pos == 0:
-                continue
-            applicable_date = pool_dates[pos - 1]
-            original_key = pool_date_to_key[applicable_date]
-            pool = daily_pools.get(original_key)
-            
-            if pool:
-                for stock in pool:
-                    all_pool_indices.append((date, stock))
-        
-        if all_pool_indices:
-            # Create a complete MultiIndex covering all pool stocks
-            complete_index = pd.MultiIndex.from_tuples(all_pool_indices, names=['date', 'stock_code'])
-            
-            # Reindex factor data to include all pool stocks (fill missing with NaN, then fillna(0))
-            input_row_count = len(predict_factors)
-            predict_factors = predict_factors.reindex(complete_index)
-            
-            logger.info(
-                "[Blend-Only] 动态池扩展: 因子数据 %d 行 -> 完整池 %d 行 (%d 行因子全缺失)",
-                input_row_count,
-                len(complete_index),
-                len(complete_index) - len(predict_factors.dropna(how='all'))
-            )
-        else:
-            # Fallback: filter existing indices
-            valid_indices = _filter_by_pool_date_range(
-                predict_factors.index, daily_pools, logger
-            )
-            predict_factors = predict_factors.loc[valid_indices]
-    
+        valid_indices = _filter_by_pool_date_range(predict_factors.index, daily_pools, logger)
+        predict_factors = predict_factors.loc[valid_indices]
+
     if predict_factors.empty:
         logger.warning("[Blend-Only] 过滤后预测期无数据")
         return pd.Series(dtype=float), {}
 
-    if parent_composite is not None:
-        composite_series = parent_composite
-    else:
-        methods = preprocess_config or config.get("preprocess", {})
-        blend_preprocess = {
-            factor: methods.get(factor, "zscore") for factor in blend_weights
-        }
-        processed_blend = synthesizer._apply_feature_preprocessing(
-            predict_factors[list(blend_weights)],
-            blend_preprocess,
-        )
-        predict_factors = predict_factors.copy()
-        predict_factors[list(blend_weights)] = processed_blend
-
-        model_prediction = pd.Series(0.0, index=predict_factors.index)
-        composite_series = _blend_with_original(
-            model_prediction, predict_factors, blend_weights, blend_ratio, logger, daily_pools
-        )
-    
-    # [NOTE] No post-process standardization here!
-    # Reason: We use "standardize first, then blend" pattern.
-    # - Model prediction is already zscore'd (zeros in blend-only mode)
-    # - Blend factors are already zscore'd inside _blend_with_original
-    # - Applying zscore AFTER blend would distort the blend_ratio semantics
-    #   (e.g., zscore(0.6 * DemoSignal1) == zscore(DemoSignal1), losing the 0.6 weight meaning)
-    
-    logger.info(
-        "[Blend-Only] 先标准化后混合模式: blend_ratio=%.2f, 保持权重语义", blend_ratio
+    methods = (
+        preprocess_config if preprocess_config is not None
+        else config.get("preprocess", config.get("preprocessing", {}))
     )
-    
     # Build model info with empty weights but valid metadata
     training_factor_names = list(config.get("_training_factor_names", []))
     model_info = {
@@ -667,12 +711,12 @@ def _run_blend_only_mode(
         "alpha": 0.0,
         "blend_only": True,  # Flag to indicate blend-only mode
         "standardize": config.get("standardize", True),
-        "standardization_method": config.get("preprocess", {}),
-        "postprocess_cs_standardize": config.get("postprocess_cs_standardize", True),
+        "standardization_method": methods,
+        "postprocess_cs_standardize": config.get("postprocess_cs_standardize", False),
         "blend_with_original_ratio": blend_ratio,
         "blend_weights": blend_weights,
         # Add preprocessing config for bundle export (from distribution analysis)
-        "preprocess_config": preprocess_config if preprocess_config else config.get("preprocess", {}),
+        "preprocess_config": methods,
         # Blend info for consistency with regular flow
         "blend_info": {
             "static_blend_ratio": blend_ratio,
@@ -682,6 +726,10 @@ def _run_blend_only_mode(
         },
     }
     
+    composite_series = (
+        parent_composite if parent_composite is not None
+        else _score_prediction_panel(predict_factors, model_info, factor_df)
+    )
     logger.info(
         "[Blend-Only] 使用纯 blend_weights 模式生成合成因子, 预测样本数: %d",
         len(composite_series)
@@ -705,7 +753,7 @@ def _run_lasso_with_qlib_adapter(
 ) -> Tuple[pd.Series, Dict]:
     """
     Run LASSO/ElasticNet training and prediction using Qlib adapter.
-    
+
     Args:
         synthesizer: FactorSynthesizer instance
         X: Preprocessed training features (MultiIndex: date, stock_code)
@@ -715,7 +763,7 @@ def _run_lasso_with_qlib_adapter(
         config: Synthesis configuration
         logger: Logger instance
         sample_weight: Optional sample weights
-        
+
     Returns:
         composite_series: Prediction Series
         model_info: Model information dict
@@ -730,28 +778,28 @@ def _run_lasso_with_qlib_adapter(
     train_end_adj = format_panel_time(train_keys.get_level_values("date").max())
     valid_start = format_panel_time(valid_keys.get_level_values("date").min())
     valid_end = format_panel_time(valid_keys.get_level_values("date").max())
-    
+
     # Prediction period dates
     predict_dates = predict_factors.index.get_level_values("date").unique().sort_values()
     test_start = format_panel_time(predict_dates[0]) if len(predict_dates) > 0 else valid_end
     test_end = format_panel_time(predict_dates[-1]) if len(predict_dates) > 0 else valid_end
-    
+
     logger.info(
         "[Qlib Adapter] 创建数据集: train=%s~%s, valid=%s~%s, test=%s~%s",
         train_start, train_end_adj, valid_start, valid_end, test_start, test_end
     )
-    
+
     # Merge training and prediction data
     all_factors = pd.concat([X, predict_factors], axis=0)
     all_factors = all_factors[~all_factors.index.duplicated(keep='first')]
-    
+
     neutralization_cfg = config.get("neutralization", {})
     if neutralization_cfg.get("enabled", False):
         logger.info("[中性化] 使用已加载的中性化输入")
-    
+
     # Labels
     all_labels = y.reindex(all_factors.index)
-    
+
     # Create Qlib-compatible dataset
     dataset = DataConverter.create_dataset_from_factors(
         factor_df=all_factors,
@@ -765,10 +813,8 @@ def _run_lasso_with_qlib_adapter(
         config=config,
         logger=logger
     )
-    
+
     # Attach raw returns for return-based sample weighting
-    # (weights must be computed from raw returns, not preprocessed labels)
-    # Must convert to Qlib index format (datetime, instrument) to match dataset
     if y_raw is not None:
         raw_aligned = y_raw.reindex(all_factors.index).dropna()
         if not raw_aligned.empty:
@@ -785,20 +831,40 @@ def _run_lasso_with_qlib_adapter(
             dataset.baseline_scores = pd.Series(
                 baseline_aligned.values, index=qlib_idx, name="baseline_scores"
             )
-    
+
     # Create and train model
     model = QlibLinearWrapper(config, logger)
     model_info = model.fit(dataset, sample_weight=sample_weight)
-    
+    if "intercept" not in model_info:
+        fitted_model = getattr(model, "model", None)
+        intercept_attr = getattr(fitted_model, "intercept_", None)
+        if intercept_attr is not None:
+            model_info["intercept"] = float(intercept_attr)
+        elif hasattr(fitted_model, "predict"):
+            n_feat = len(
+                getattr(model, "feature_names", None)
+                or model_info.get("coefficients", {})
+                or predict_factors.columns
+            )
+            if n_feat > 0:
+                zero_pred = fitted_model.predict(np.zeros((1, n_feat), dtype=float))
+                model_info["intercept"] = float(
+                    np.asarray(zero_pred, dtype=float).ravel()[0]
+                )
+            else:
+                model_info["intercept"] = 0.0
+        else:
+            model_info["intercept"] = 0.0
+
     # Predict
     predictions = model.predict(dataset, segment="test")
-    
+
     # Convert back to original format
     composite_series = DataConverter.convert_predictions_to_series(
         predictions, predict_factors.index
     )
     composite_series.name = "lasso_composite"
-    
+
     # Add model info
     model_info.update({
         "train_start": train_start,
@@ -811,7 +877,7 @@ def _run_lasso_with_qlib_adapter(
         ),
         "qlib_adapter": True,
     })
-    
+
     return composite_series, model_info
 
 
@@ -1073,8 +1139,6 @@ def run_lasso_synthesis(
     # =========================================================================
     # Phase 3: 预筛选（接收预处理后的因子！）
     # =========================================================================
-    from factor_synthesis.preselection import get_preselection_strategy
-    
     # [NEW] 预筛选方法互斥检查
     _validate_preselection_exclusivity(config)
     
@@ -1123,6 +1187,8 @@ def run_lasso_synthesis(
                 "selection_scope": "inner_train_only",
             }
         else:
+            from factor_synthesis.preselection import get_preselection_strategy
+
             strategy = get_preselection_strategy(
                 'hierarchical_clustering', hierarchical_cfg, logger
             )
@@ -1144,6 +1210,8 @@ def run_lasso_synthesis(
         
     elif pre_sel_cfg.get('enabled', False):
         # 传统预筛选 (IC/IR/dCor)
+        from factor_synthesis.preselection import get_preselection_strategy
+
         strategy_name = pre_sel_cfg.get('strategy', 'ic_ir')
         strategy = get_preselection_strategy(strategy_name, pre_sel_cfg, logger)
         if strategy_name == "portfolio_boundary_replacement":
@@ -1287,74 +1355,39 @@ def run_lasso_synthesis(
     logger.info("=" * 60)
     logger.info("[LASSO] 使用 Qlib 适配器模式")
     logger.info("=" * 60)
-    
+
     try:
-        predict_start, predict_end = prediction_bounds(
-            factor_df, train_end, synthesizer.config["rolling_window"]["predict_window_days"],
-        )
-        
-        predict_mask = (factor_df.index.get_level_values("date") >= predict_start) & (
-            factor_df.index.get_level_values("date") <= predict_end
-        )
-        predict_factors_raw = factor_df.loc[predict_mask]
-        
-        # [DEBUG] Check predict_factors_raw before filter
-        if '2023-03-14' in predict_factors_raw.index.get_level_values('date').strftime('%Y-%m-%d').values:
-            date_mask = predict_factors_raw.index.get_level_values('date').strftime('%Y-%m-%d') == '2023-03-14'
-            stocks_before = set(predict_factors_raw.loc[date_mask].index.get_level_values('stock_code'))
-            logger.info(f"[DEBUG] 2023-03-14 动态池过滤前: {len(stocks_before)} 只股票")
-            logger.info(f"[DEBUG] 002087.XSHE in predict_factors_raw: {'002087.XSHE' in stocks_before}")
-        
+        predict_factors_raw = factor_df.loc[prediction_index]
         if selected_features:
             predict_factors_raw = predict_factors_raw[selected_features]
-        
-        # Apply dynamic pool filter
-        if daily_pools and not predict_factors_raw.empty:
-            valid_indices = _filter_by_pool_date_range(
-                predict_factors_raw.index, daily_pools, logger
-            )
-            predict_factors_raw = predict_factors_raw.loc[valid_indices]
-            
-            # [DEBUG] Check predict_factors_raw after filter
-            if '2023-03-14' in predict_factors_raw.index.get_level_values('date').strftime('%Y-%m-%d').values:
-                date_mask = predict_factors_raw.index.get_level_values('date').strftime('%Y-%m-%d') == '2023-03-14'
-                stocks_after = set(predict_factors_raw.loc[date_mask].index.get_level_values('stock_code'))
-                logger.info(f"[DEBUG] 2023-03-14 动态池过滤后: {len(stocks_after)} 只股票")
-                logger.info(f"[DEBUG] 002087.XSHE after filter: {'002087.XSHE' in stocks_after}")
-            else:
-                logger.info("[DEBUG] 2023-03-14 不在过滤后的数据中!")
 
-        
-        # NOTE: neutralization.enabled loads precomputed market-cap-neutralized inputs.
-        
-        # =========================================================================
-        # 预测期预处理：使用与训练期相同的预处理配置 final_preprocess_cfg
-        # =========================================================================
-        if isinstance(final_preprocess_cfg, dict) and final_preprocess_cfg:
-            predict_factors_preprocessed = preprocess_synthesis_features(
-                synthesizer, predict_factors_raw, final_preprocess_cfg, history=factor_df,
-            )
-            logger.debug(f"[预测期预处理] 已对 {len(predict_factors_raw.columns)} 个因子执行预处理")
-        else:
-            predict_factors_preprocessed = predict_factors_raw.copy()
-        
-        # [REMOVED] rank_before_standardize 已在上面统一预处理中处理
-        predict_factors_processed = predict_factors_preprocessed
-        
-        # [Modified] Identify rows with NaN -> Fill with 0 instead of Drop
+        effective_preprocess = dict(final_preprocess_cfg or {})
+        if "ALL" not in effective_preprocess:
+            for name in predict_factors_raw.columns:
+                effective_preprocess.setdefault(name, "none")
+
+        predict_factors_processed = _preprocess_lasso_panel(
+            predict_factors_raw,
+            list(predict_factors_raw.columns),
+            preprocess_config=effective_preprocess,
+            standardize=config.get("standardize", True),
+            history=factor_df,
+        )
+        logger.debug(
+            f"[预测期预处理] 已对 {len(predict_factors_raw.columns)} 个因子执行预处理"
+        )
+
         nan_mask = predict_factors_processed.isna().any(axis=1)
         nan_count = nan_mask.sum()
-        
         if nan_count > 0:
             logger.info(
                 "[Fill-NaN] 预测数据: %d 行含缺失值 (%.2f%%), 填充为 0 (均值) 以保留样本",
                 nan_count, nan_count / len(predict_factors_processed) * 100
             )
-            # Fill NaNs with 0.0 (Mean value for Z-scored data)
             predict_factors = predict_factors_processed.fillna(0.0)
         else:
             predict_factors = predict_factors_processed
-        
+
         if len(predict_factors) == 0:
             logger.warning("[Qlib] 预测期无数据")
             return baseline_fallback(
@@ -1362,8 +1395,7 @@ def run_lasso_synthesis(
                 final_preprocess_cfg,
                 training_window_audit,
             )
-        
-        # Use Qlib adapter
+
         composite_series, model_info = _run_lasso_with_qlib_adapter(
             synthesizer=synthesizer,
             X=X,
@@ -1441,18 +1473,7 @@ def run_lasso_synthesis(
                 "[PooledOOF] 证据不足或纯父代胜出，预测期直接继承父代信号"
             )
             return composite_series, model_info
-        
-        # Post-processing
-        if config.get("postprocess_cs_standardize", False):
-            try:
-                composite_series = composite_series.groupby(level="date").transform(
-                    lambda x: (x - x.mean()) / (x.std() + 1e-8)
-                )
-                logger.info("[后处理] 应用截面标准化")
-            except Exception as e:
-                logger.exception("[后处理] 截面标准化失败: %s", e)
-                raise
-        
+
         # Blend with original factors
         configured_blend_ratio = float(config.get("blend_with_original_ratio", 0.0))
         static_blend_ratio = float(
@@ -1460,8 +1481,8 @@ def run_lasso_synthesis(
         )
         blend_weights = config.get("blend_weights", {})
         dynamic_blend_cfg = config.get("dynamic_blend", {})
-        parent_composite = _parent_baseline_scores(config, composite_series.index)
-        
+        parent_composite = _parent_baseline_scores(config, prediction_index)
+
         # Initialize blend info for model_info
         blend_info = {
             "static_blend_ratio": configured_blend_ratio,
@@ -1469,27 +1490,12 @@ def run_lasso_synthesis(
             "blend_ratio_used": static_blend_ratio,
             "selected_residual_gamma": model_info.get("selected_residual_gamma"),
         }
-        
-        if (static_blend_ratio > 0 or dynamic_blend_cfg.get("enabled", False)) and (
-            blend_weights or parent_composite is not None
-        ):
-            blend_preprocess = {
-                factor: config.get("preprocess", {}).get(factor, "zscore")
-                for factor in blend_weights
-            }
-            factors_for_blend = (
-                pd.DataFrame(index=composite_series.index)
-                if parent_composite is not None
-                else synthesizer._apply_feature_preprocessing(
-                    factor_df.loc[predict_mask, list(blend_weights)],
-                    blend_preprocess,
-                )
-            )
-            
+
+        has_blend_target = bool(blend_weights or parent_composite is not None)
+        if (static_blend_ratio > 0 or dynamic_blend_cfg.get("enabled", False)) and has_blend_target:
             # Compute dynamic blend ratio if enabled
             if dynamic_blend_cfg.get("enabled", False):
                 try:
-                    # Create DynamicBlendConfig from dict
                     dyn_config = DynamicBlendConfig(
                         enabled=True,
                         base_ratio=dynamic_blend_cfg.get("base_ratio", 0.5),
@@ -1503,14 +1509,13 @@ def run_lasso_synthesis(
                         shrinkage=dynamic_blend_cfg.get("shrinkage", 0.5),
                         topk_ic_pct=dynamic_blend_cfg.get("topk_ic_pct", 0.0),
                     )
-                    
-                    # Compute prior composite from training data for IC calculation
-                    # [FIX] Use original factor_df for blend factors (not X_preprocessed)
-                    # X_preprocessed only contains training factors after filtering/preselection
-                    # Blend-only factors need to be accessed from the full factor_df
                     if parent_composite is not None:
                         prior_composite_train = _parent_baseline_scores(config, y.index)
                     else:
+                        blend_preprocess = {
+                            factor: config.get("preprocess", {}).get(factor, "zscore")
+                            for factor in blend_weights
+                        }
                         train_factor_df = synthesizer._apply_feature_preprocessing(
                             factor_df.loc[train_mask, list(blend_weights)],
                             blend_preprocess,
@@ -1521,21 +1526,14 @@ def run_lasso_synthesis(
                             index=y.index,
                             logger=logger,
                         )
-                    
-                    # For ML predictions on training data, we need to get the in-sample predictions
-                    # However, since we only have out-of-sample predictions (composite_series),
-                    # we compute IC on training data using the model coefficients applied to training features
-                    # This approximates the ML performance without look-ahead bias
+
                     coefficients = model_info.get("coefficients", {})
                     if coefficients:
-                        # Compute in-sample ML predictions from coefficients
-                        # [CHANGED] Use preprocessed features for consistency with training
                         ml_train_pred = pd.Series(0.0, index=y.index)
                         for feat, coef in coefficients.items():
                             if feat in X_preprocessed.columns and abs(coef) > 1e-10:
                                 ml_train_pred += X_preprocessed[feat].reindex(y.index).fillna(0.0) * coef
-                        
-                        # Compute dynamic blend ratio
+
                         blend_result = compute_dynamic_blend_ratio(
                             ml_predictions=ml_train_pred,
                             prior_composite=prior_composite_train,
@@ -1545,7 +1543,7 @@ def run_lasso_synthesis(
                         )
                         blend_info["sample_contract_version"] = blend_result.sample_contract_version
                         blend_info["diagnostic_version"] = blend_result.diagnostic_version
-                        
+
                         if blend_result.computation_successful:
                             blend_ratio = blend_result.blend_ratio
                             blend_info.update({
@@ -1571,37 +1569,110 @@ def run_lasso_synthesis(
                             "[DynamicBlend] No coefficients available, using static ratio"
                         )
                         blend_ratio = static_blend_ratio
-                        
                 except Exception as e:
                     logger.exception("[DynamicBlend] Failed: %s", e)
                     raise
             else:
                 blend_ratio = static_blend_ratio
-            
-            # Apply blending with the computed ratio
-            if blend_ratio > 0:
-                composite_series = _blend_with_original(
-                    composite_series,
-                    factors_for_blend,
-                    blend_weights,
-                    blend_ratio,
-                    logger,
-                    daily_pools,
-                    original_composite=parent_composite,
+
+            blend_info["blend_ratio_used"] = blend_ratio
+        else:
+            blend_ratio = 0.0
+
+        # Preprocess the exact union of participating scoring factors once (same
+        # active_columns, history mask, and effective_preprocess as linear_signal),
+        # then derive both model and blend sleeves from that single panel.
+        active_weights = {
+            name: coef for name, coef in model_info["coefficients"].items() if coef != 0
+        }
+        if active_weights:
+            needed_cols = sorted(
+                set(active_weights)
+                | (
+                    set(blend_weights)
+                    if blend_ratio > 0 and parent_composite is None and blend_weights
+                    else set()
                 )
-                blend_info["blend_ratio_used"] = blend_ratio
-        
-        # Add blend info to model_info
+            )
+            scoring_panel = _preprocess_lasso_panel(
+                factor_df.loc[prediction_index, needed_cols],
+                needed_cols,
+                preprocess_config=effective_preprocess,
+                standardize=config.get("standardize", True),
+                history=factor_df,
+            )
+            composite_series = weighted_score(scoring_panel, active_weights)
+            intercept = float(model_info.get("intercept", 0.0) or 0.0)
+            if intercept != 0.0:
+                composite_series = composite_series + intercept
+            composite_series = composite_series.rename("lasso_composite")
+        elif blend_ratio > 0 and has_blend_target:
+            needed_cols = sorted(
+                set(blend_weights)
+                if parent_composite is None and blend_weights
+                else set()
+            )
+            scoring_panel = (
+                _preprocess_lasso_panel(
+                    factor_df.loc[prediction_index, needed_cols],
+                    needed_cols,
+                    preprocess_config=effective_preprocess,
+                    standardize=config.get("standardize", True),
+                    history=factor_df,
+                )
+                if needed_cols
+                else pd.DataFrame(index=prediction_index)
+            )
+            composite_series = pd.Series(
+                dtype=float, index=prediction_index[:0], name="lasso_composite"
+            )
+        else:
+            scoring_panel = predict_factors_processed
+            model_valid = valid_factor_mask(
+                scoring_panel, list(predict_factors_raw.columns)
+            )
+            composite_series = composite_series.loc[
+                model_valid.reindex(composite_series.index, fill_value=False)
+            ]
+
+        # Post-processing (over eligible model rows only, matching strategy_kernel)
+        if config.get("postprocess_cs_standardize", False) and not composite_series.empty:
+            try:
+                composite_series = composite_series.groupby(level="date").transform(
+                    standardize_composite_scores
+                )
+                logger.info("[后处理] 应用截面标准化")
+            except Exception as e:
+                logger.exception("[后处理] 截面标准化失败: %s", e)
+                raise
+
+        if blend_ratio > 0 and has_blend_target:
+            composite_series = _blend_with_original(
+                composite_series.reindex(prediction_index),
+                factor_df.loc[prediction_index],
+                blend_weights,
+                blend_ratio,
+                logger,
+                daily_pools,
+                original_composite=parent_composite,
+                preprocess_config=effective_preprocess,
+                standardize=config.get("standardize", True),
+                history=factor_df,
+                precomputed_blend=scoring_panel,
+            ).rename("lasso_composite")
+
+        if composite_series.empty:
+            _require_complete_research_window(config, "prediction_features_unavailable")
+
         model_info["blend_info"] = blend_info
         model_info["blend_with_original_ratio"] = blend_info["blend_ratio_used"]
-        model_info["training_window_audit"] = training_window_audit
-        
-        # Add preprocessing config to model_info for bundle export
-        # This ensures the actual preprocessing methods (from distribution analysis) are saved
-        model_info["preprocess_config"] = final_preprocess_cfg
+        model_info["preprocess_config"] = effective_preprocess
+        model_info["postprocess_cs_standardize"] = config.get(
+            "postprocess_cs_standardize", False
+        )
         if dist_cfg.get('enabled', False):
             model_info["distribution_config_version"] = "sampling_controls_v2"
-        
+
         score_key = "pinball_score" if config.get("model_type", "lasso") == "quantile_elasticnet" else "R²"
         logger.info(
             "LASSO回归完成，选择特征数: %d, %s: %.4f, alpha: %.6f, blend_ratio: %.3f",
@@ -1611,7 +1682,7 @@ def run_lasso_synthesis(
             model_info.get("alpha", 0.0),
             blend_info["blend_ratio_used"],
         )
-        
+
         sources = selected_market_inputs(factor_df, set(selected_features).union(blend_weights or {}))
         if sources:
             model_info["market_factor_inputs"] = sources

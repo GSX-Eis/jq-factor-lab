@@ -16,8 +16,12 @@ from utils.bars.catalog import BarCatalog, CatalogEntry, identifier, table_exist
 from utils.bars.quality import warn_quality
 from utils.bars.source import BarSource, MissingBarDataError, _bounds, _instrument_ids, _utc_bound
 from utils.data_access_config import DataAccessConfig, load_data_access_config
-from utils.market_db import MarketDbProfile
-from utils.market_db.storage import _require_same_hash
+from utils.data_store import _reject_sqlite_file, binding_contract, resolve_connection_binding
+from utils.market_db import MarketDbProfile, MarketDbProfileError
+from utils.market_db.errors import (
+    MARKET_DB_BINDING_MISMATCH, MARKET_DB_DOMAIN_MISMATCH, MARKET_DB_PROFILE_MISSING, MARKET_DB_PROVIDER_MISMATCH,
+)
+from utils.market_db.storage import _current_catalog, _require_same_hash
 from utils.market_db.validation import (
     calendar_key, market_db_calendar_bounds, require_market_db_profile,
     validate_market_db_calendar, validate_market_db_provider,
@@ -45,6 +49,229 @@ def require_ashare_panel_profile(
     if expected is not None:
         _require_same_hash(profile, expected, 'Factor database disagrees with its Slot')
     return profile
+
+
+def validate_ashare_slot_profile(
+    actual: MarketDbProfile, expected: MarketDbProfile | None, *,
+    require_provider: bool, defer_domain_mismatch: bool,
+) -> MarketDbProfile | None:
+    """Verify hash agreement and optionally defer domain mismatch to panel reads."""
+    if expected is not None:
+        _require_same_hash(actual, expected, 'Factor database disagrees with its Slot')
+    if require_provider:
+        try:
+            validate_market_db_provider(actual, 'jq_ashare_local', domain='cn_equity')
+        except MarketDbProfileError as exc:
+            if defer_domain_mismatch and exc.code in (MARKET_DB_DOMAIN_MISMATCH, MARKET_DB_PROVIDER_MISMATCH):
+                return None
+            raise
+    return actual
+
+
+def _connection_physical_path(connection: duckdb.DuckDBPyConnection | None) -> Path | None:
+    if connection is None:
+        return None
+    _, filename, frozen_path = _current_catalog(connection)
+    actual_path = frozen_path or filename
+    if not actual_path:
+        return None
+    return Path(actual_path).expanduser().resolve()
+
+
+def _connection_matches_path(
+    connection: duckdb.DuckDBPyConnection | None, resolved_path: Path, bindings: Mapping | None,
+) -> bool:
+    actual_path = _connection_physical_path(connection)
+    if actual_path is None or actual_path != resolved_path:
+        return False
+    _, _, frozen_path = _current_catalog(connection)
+    if binding_contract(dict(bindings) if bindings is not None else None).get('input_db') and frozen_path is None:
+        return False
+    return True
+
+
+def _resolved_bound_path(path: str | Path | None, bindings: Mapping | None) -> Path | None:
+    if path is None:
+        return None
+    raw_bindings = dict(bindings) if bindings is not None else None
+    contract = binding_contract(raw_bindings)
+    bound_path = resolve_connection_binding(path, contract)[0] if contract else path
+    return Path(str(bound_path)).expanduser().resolve()
+
+
+def resolve_ashare_path_profile(
+    path: str | Path | None, *, bindings: Mapping | None = None,
+    connection: duckdb.DuckDBPyConnection | None = None, expected: MarketDbProfile | None = None,
+    has_native: bool = False, require_provider: bool = True,
+) -> MarketDbProfile | None:
+    """Probe a file-backed DuckDB profile read-only without opening adapter or frozen table views."""
+    if path is None:
+        return expected
+    raw_bindings = dict(bindings) if bindings is not None else None
+    resolved = _resolved_bound_path(path, raw_bindings)
+    if resolved is None or not resolved.is_file() or _connection_matches_path(connection, resolved, raw_bindings):
+        return expected
+    _reject_sqlite_file(resolved)
+    try:
+        with duckdb.connect(str(resolved), read_only=True) as path_conn:
+            actual = require_market_db_profile(path_conn)
+    except duckdb.ConnectionException:
+        # Another RW handle in the same process holds this file; defer validation to first read.
+        if has_native or connection is not None:
+            raise
+        return expected
+    except MarketDbProfileError as exc:
+        if expected is not None or exc.code != MARKET_DB_PROFILE_MISSING:
+            raise
+        return expected
+    validated = validate_ashare_slot_profile(
+        actual, expected, require_provider=require_provider,
+        defer_domain_mismatch=not has_native and connection is None,
+    )
+    return expected if validated is None else validated
+
+
+def resolve_ashare_slot_profile(
+    factor, native, feed_cls: type,
+) -> tuple[MarketDbProfile | None, str | None]:
+    """Resolve and cross-check MarketDbProfile across explicit slot, db_connection, and duckdb_path."""
+    profile = native.market_db_profile if native is not None else None
+    native_feed = getattr(native, 'bar_feed', None)
+    native_is_factor_feed = native is not None and isinstance(native_feed, feed_cls)
+    native_conn = getattr(native_feed, 'connection', None)
+    native_adapter = getattr(native_feed, 'adapter', None) if native_is_factor_feed else None
+    native_path = (
+        getattr(native_adapter, 'duckdb_path', None) if native_adapter is not None
+        else getattr(native_feed, 'path', None)
+    ) if native_is_factor_feed else None
+    native_bindings = (
+        getattr(native_adapter, 'data_bindings', getattr(native_feed, 'bindings', None))
+        if native_adapter is not None else getattr(native_feed, 'bindings', None)
+    ) if native_is_factor_feed else None
+    native_parquet_dir = getattr(native_adapter, 'parquet_dir', None) if native_adapter is not None else None
+    native_source_policy = getattr(native_adapter, 'source_policy', None) if native_adapter is not None else None
+    native_feed_profile = getattr(native_feed, 'profile', None) if native_is_factor_feed else None
+    if native_feed_profile is not None:
+        profile = validate_ashare_slot_profile(
+            native_feed_profile, profile, require_provider=True, defer_domain_mismatch=False,
+        )
+
+    connection = factor.db_connection
+    adapter = getattr(factor, '_duckdb_adapter', None)
+    if adapter is not None:
+        path = getattr(adapter, 'duckdb_path', None)
+        bindings = getattr(adapter, 'data_bindings', getattr(factor, 'data_bindings', None))
+        factor_parquet_dir = getattr(adapter, 'parquet_dir', None)
+        factor_source_policy = getattr(adapter, 'source_policy', None)
+    else:
+        is_cloud = getattr(factor, '_is_cloud_environment', None)
+        bindings = getattr(factor, 'data_bindings', None)
+        factor_source_policy = getattr(factor, 'source_policy', None)
+        if callable(is_cloud) and is_cloud():
+            path = None
+            factor_parquet_dir = None
+        else:
+            factor_parquet_dir = getattr(factor, 'parquet_dir', None)
+            path = getattr(factor, 'duckdb_path', None)
+            if path is None and connection is None and factor_parquet_dir is None:
+                path = binding_contract(bindings).get('input_db')
+
+    resolved_native_path = _resolved_bound_path(native_path, native_bindings) or _connection_physical_path(native_conn)
+    resolved_factor_path = _resolved_bound_path(path, bindings)
+    same_file_as_native = (
+        resolved_native_path is not None and resolved_factor_path is not None
+        and resolved_factor_path == resolved_native_path
+    )
+    resolved_native_parquet = (
+        Path(str(native_parquet_dir)).expanduser().resolve() if native_parquet_dir is not None else None
+    )
+    resolved_factor_parquet = (
+        Path(str(factor_parquet_dir)).expanduser().resolve() if factor_parquet_dir is not None else None
+    )
+    if native_is_factor_feed and resolved_factor_parquet is not None and (
+        native_conn is not None
+        or resolved_native_parquet is None
+        or resolved_factor_parquet != resolved_native_parquet
+        or (resolved_native_path is not None and not same_file_as_native)
+        or (resolved_native_path is None and resolved_factor_path is not None)
+        or native_source_policy != factor_source_policy
+    ):
+        raise MarketDbProfileError(
+            MARKET_DB_BINDING_MISMATCH,
+            'Borrowed Slot source disagrees with factor parquet_dir',
+        )
+
+    same_conn_target = connection is not None and (
+        connection is native_conn
+        or (
+            resolved_native_path is not None
+            and _connection_matches_path(connection, resolved_native_path, bindings)
+            and _connection_matches_path(connection, resolved_native_path, native_bindings)
+        )
+    )
+    cross_source = native_is_factor_feed and (
+        (connection is not None and not same_conn_target)
+        or (resolved_factor_path is not None and not same_file_as_native)
+    )
+
+    if native_is_factor_feed and profile is None:
+        if native_conn is not None:
+            try:
+                actual = require_market_db_profile(native_conn)
+            except MarketDbProfileError as exc:
+                if exc.code != MARKET_DB_PROFILE_MISSING:
+                    raise
+            else:
+                profile = validate_ashare_slot_profile(
+                    actual, profile, require_provider=True, defer_domain_mismatch=False,
+                )
+        if native_path is not None and profile is None:
+            profile = resolve_ashare_path_profile(
+                native_path, bindings=native_bindings, connection=native_conn, expected=profile,
+                has_native=cross_source, require_provider=True,
+            )
+
+    if cross_source and profile is None:
+        if resolved_native_path is not None and resolved_factor_path is not None and not same_file_as_native:
+            raise MarketDbProfileError(
+                MARKET_DB_BINDING_MISMATCH,
+                'Borrowed Slot path disagrees with factor duckdb_path before profile resolution',
+            )
+        raise MarketDbProfileError(
+            MARKET_DB_PROFILE_MISSING,
+            'Borrowed Slot has no verified MarketDbProfile and cannot accept a different factor source',
+        )
+
+    if connection is not None and (not native_is_factor_feed or connection is not native_conn):
+        try:
+            actual = require_market_db_profile(connection)
+        except MarketDbProfileError as exc:
+            if profile is not None or exc.code != MARKET_DB_PROFILE_MISSING:
+                raise
+        else:
+            profile = validate_ashare_slot_profile(
+                actual, profile, require_provider=native is not None or factor.session_calendar is None,
+                defer_domain_mismatch=False,
+            )
+
+    if not same_file_as_native:
+        if (
+            native_is_factor_feed
+            and resolved_native_path is not None
+            and resolved_factor_path is not None
+            and not resolved_factor_path.is_file()
+        ):
+            raise MarketDbProfileError(
+                MARKET_DB_BINDING_MISMATCH,
+                'Borrowed Slot path disagrees with missing factor duckdb_path',
+            )
+        profile = resolve_ashare_path_profile(
+            path, bindings=bindings, connection=connection or native_conn, expected=profile,
+            has_native=native is not None,
+            require_provider=native is not None or factor.session_calendar is None or connection is None,
+        )
+
+    return profile, factor.duckdb_path or (str(path) if path is not None else None)
 
 
 class ASharePanelCatalog(BarCatalog):

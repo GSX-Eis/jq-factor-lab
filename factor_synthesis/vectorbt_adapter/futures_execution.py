@@ -1167,6 +1167,20 @@ class _FuturesAccountView:
             px = pos.last_mark_price
         return float(pos.lots) * float(px) * float(pos.multiplier)
 
+    def held_budget_value(self, instrument: str) -> float:
+        pos = self._positions.get(instrument)
+        if pos is None:
+            return 0.0
+        notional = self.held_notional(instrument)
+        return notional * pos.margin_rate if self._config.target_weight_basis == "margin" else notional
+
+    def target_margin_rate(self, instrument: str) -> float:
+        """Resolve the current contract's conversion from notional to sizing budget."""
+        if self._config.target_weight_basis != "margin":
+            return 1.0
+        contract = self._active_contract.get((self._bar_idx, instrument), instrument)
+        return self._config.margin_rate_for(instrument, contract)
+
     def nav(self) -> float:
         return float(self._equity)
 
@@ -1262,13 +1276,10 @@ class _FuturesAccountView:
         return allowed
 
     def deployed_capital_for_liquidity(self, exposure: float) -> float:
-        cap = max(0.0, self._equity) * float(exposure) * self._config.leverage
-        if self._config.target_weight_basis == "margin":
-            cap /= self._config.margin_rate
-        return cap
+        return self.base_capital(exposure)
 
     def base_capital(self, exposure: float) -> float:
-        return self.deployed_capital_for_liquidity(exposure)
+        return max(0.0, self._equity) * float(exposure) * self._config.leverage
 
     def branch3_buy_target_value(
         self,
@@ -2232,18 +2243,6 @@ def simulate_futures_contract_portfolio(
                         ):
                             c_cur_out = active_contract[(bar_idx, inst)]
                             target_val /= config.margin_rate_for(inst, c_cur_out)
-                        elif (
-                            decision.kind == "branch_overlay"
-                            and config.target_weight_basis == "margin"
-                            and inst in decision.target_weights
-                            and inst not in decision.sell_instruments
-                        ):
-                            c_cur_out = active_contract[(bar_idx, inst)]
-                            target_val = (
-                                float(decision.target_weights[inst])
-                                * max(equity, 0.0)
-                                / config.margin_rate_for(inst, c_cur_out)
-                            ) * config.leverage
                         target_weights_out.loc[dt, inst] = target_val
                     elif inst in roll_completed_exits:
                         target_weights_out.loc[dt, inst] = 0.0
@@ -2295,18 +2294,16 @@ def simulate_futures_contract_portfolio(
                     spec = _get_spec(c_cur)
                     mr = config.margin_rate_for(inst, c_cur)
                     target_notional: Optional[float] = None
-                    if (
-                        decision.use_direct_notional_targets
-                        and inst in decision.target_values
-                        and not (
-                            decision.kind == "branch_overlay"
-                            and config.target_weight_basis == "margin"
-                            and inst in decision.target_weights
-                        )
-                    ):
+                    if decision.use_direct_notional_targets and inst in decision.target_values:
                         target_notional = float(decision.target_values[inst])
                         if decision.kind == "branch_topk" and config.target_weight_basis == "margin":
                             target_notional /= mr
+                        elif (
+                            decision.kind == "branch_overlay"
+                            and config.target_weight_basis == "margin"
+                            and not allow_short
+                        ):
+                            target_notional = max(0.0, target_notional)
                     elif inst in decision.target_weights:
                         w = float(decision.target_weights[inst])
                         if not allow_short and w < 0.0:
@@ -2329,6 +2326,13 @@ def simulate_futures_contract_portfolio(
                         spec.lot_size,
                         config.lot_rounding,
                     )
+                    cap = decision.notional_caps.get(inst)
+                    if cap is not None and abs(lots) * px * spec.contract_multiplier > cap:
+                        lots = round_contract_lots(
+                            math.copysign(cap, lots), px, spec.contract_multiplier, spec.lot_size
+                        )
+                        if abs(lots) * px * spec.contract_multiplier > cap:
+                            lots -= spec.lot_size if lots > 0 else -spec.lot_size
                     if lots == 0:
                         lot_floored_to_zero_events += 1
                     desired_lots[inst] = lots

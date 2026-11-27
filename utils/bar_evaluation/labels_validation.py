@@ -310,6 +310,27 @@ def _check_split_returns(window: pd.DataFrame, pairs: pd.DataFrame, *,
                                                                "no_paired_bucket_returns")), f"{field}.spread")
 
 
+def _parse_utc_column(series: pd.Series, *, require_z: bool = False, field_name: str = "timestamp") -> pd.Series:
+    """Parse an ISO8601 UTC string column, deduplicating repeated grid timestamps."""
+    n = len(series)
+    if n >= 64:
+        codes, uniques = pd.factorize(series, sort=False)
+        if len(uniques) * 2 <= n:
+            if require_z:
+                if (codes < 0).any() or not pd.Series(uniques, dtype="string").str.endswith("Z", na=False).all():
+                    raise ValueError(f"{field_name} must use UTC timestamps")
+            if len(uniques) == 0:
+                return pd.Series(pd.NaT, index=series.index, dtype="datetime64[ns, UTC]")
+            parsed = pd.to_datetime(uniques, format="ISO8601", utc=True)
+            if (codes < 0).any():
+                safe = np.where(codes >= 0, codes, 0)
+                return pd.Series(parsed.take(safe), index=series.index).where(codes >= 0, pd.NaT)
+            return pd.Series(parsed.take(codes), index=series.index)
+    if require_z and not series.astype("string").str.endswith("Z", na=False).all():
+        raise ValueError(f"{field_name} must use UTC timestamps")
+    return pd.to_datetime(series, format="ISO8601", utc=True)
+
+
 def check_labels(
     path: Path, summary: dict[str, Any], *, minimum_offset: int, explicit_offset: int | None,
     explicit_contract: bool,
@@ -325,9 +346,7 @@ def check_labels(
         if list(labels.columns) not in accepted:
             raise ValueError("unexpected label columns")
         for field in ("signal_timestamp", "signal_available_at"):
-            if not labels[field].astype("string").str.endswith("Z", na=False).all():
-                raise ValueError(f"{field} must use UTC timestamps")
-            labels[field] = pd.to_datetime(labels[field], format="ISO8601", utc=True)
+            labels[field] = _parse_utc_column(labels[field], require_z=True, field_name=field)
         if explicit_contract:
             offset = labels["entry_offset_bars"]
             if not labels.empty and (not pd.api.types.is_integer_dtype(offset.dtype) or offset.hasnans
@@ -421,7 +440,7 @@ def check_split_labels(
             # On a legacy intraday grid, Bar starts order its valid exits exactly as ends do.
             exit_col = "exit_bar_timestamp"
         try:
-            exits = pd.to_datetime(pairs[exit_col], format="ISO8601", utc=True)
+            exits = _parse_utc_column(pairs[exit_col])
         except (ValueError, TypeError) as exc:
             raise BarEvaluationIntegrityError(f"Invalid per_bar_labels.csv {exit_col}: {exc}") from exc
         if exits.isna().any():

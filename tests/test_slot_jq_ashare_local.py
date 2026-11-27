@@ -303,3 +303,149 @@ def test_review_signal_validates_only_minute_rows_visible_at_the_anchor(connecti
     with pytest.raises(ValueError, match='off-grid'):
         slot.bar_feed.read_signal_bars(['A'], frequency, start_utc=start, end_utc=end,
                                        as_of_utc=pd.Timestamp(f'{DATES[0]} 06:01Z'))
+
+
+def _build_quarterly_financials(net_profit: float = 100.0, cfo: float = 20.0) -> pd.DataFrame:
+    rows = []
+    for end_dt in pd.date_range('2018-03-31', '2023-12-31', freq='QE'):
+        pub_dt = end_dt + pd.Timedelta(days=45)
+        rows.append({
+            'statement_type': 'income',
+            'stock_code': 'A',
+            'pub_date': pub_dt,
+            'start_date': pd.Timestamp(year=end_dt.year, month=1, day=1),
+            'end_date': end_dt,
+            'net_profit': net_profit,
+            'net_operate_cash_flow': cfo,
+            'total_liability': np.nan,
+            'total_assets': np.nan,
+        })
+        rows.append({
+            'statement_type': 'balance',
+            'stock_code': 'A',
+            'pub_date': pub_dt,
+            'start_date': end_dt,
+            'end_date': end_dt,
+            'net_profit': np.nan,
+            'net_operate_cash_flow': np.nan,
+            'total_liability': 1000.0,
+            'total_assets': 2000.0,
+        })
+    return pd.DataFrame(rows)
+
+
+def test_quality_features_preserve_same_pub_date_dedup_parity():
+    from slots.jq_ashare_local.aux import _quality_features_for_stock
+
+    financials = _build_quarterly_financials(net_profit=100.0, cfo=20.0)
+    conflict_end = pd.Timestamp('2020-12-31')
+    financials = pd.concat([
+        financials,
+        pd.DataFrame([{
+            'statement_type': 'income',
+            'stock_code': 'A',
+            'pub_date': conflict_end + pd.Timedelta(days=45),
+            'start_date': pd.Timestamp('2020-01-01'),
+            'end_date': conflict_end,
+            'net_profit': 200.0,
+            'net_operate_cash_flow': 40.0,
+            'total_liability': np.nan,
+            'total_assets': np.nan,
+        }]),
+    ], ignore_index=True).sort_values(['stock_code', 'pub_date', 'end_date'])
+    dividends = pd.DataFrame([
+        {
+            'stock_code': 'A',
+            'report_date': pd.Timestamp(f'{yr}-12-31'),
+            'announcement_date': pd.Timestamp(f'{yr + 1}-04-30'),
+            'bonus_amount_rmb': 0.005,
+            'comparable_dps': 0.1,
+        }
+        for yr in (2020, 2021, 2022)
+    ])
+    valuation = pd.DataFrame({'stock_code': ['A'], 'date': [pd.Timestamp('2024-05-31')], 'market_cap': [10.0]})
+    industry = pd.DataFrame({'stock_code': ['A'], 'date': [pd.Timestamp('2024-05-31')], 'sw_l1_name': ['Tech']})
+    result = _quality_features_for_stock(pd.Timestamp('2024-06-01'), financials, dividends, valuation, industry)
+    assert result is not None
+    assert result['roe_mean'] == pytest.approx(0.10)
+    assert result['roe_change'] == pytest.approx(0.0)
+    assert result['cfo_liability'] == pytest.approx(0.02)
+
+
+def test_quality_features_ignore_nat_dividend_report_date():
+    from slots.jq_ashare_local.aux import _quality_features_for_stock
+
+    financials = _build_quarterly_financials(net_profit=100.0, cfo=20.0)
+    nat_only_div = pd.DataFrame([{
+        'stock_code': 'A',
+        'report_date': pd.NaT,
+        'announcement_date': pd.Timestamp('2023-05-01'),
+        'bonus_amount_rmb': 1.0,
+        'comparable_dps': 0.1,
+    }])
+    valuation = pd.DataFrame({'stock_code': ['A'], 'date': [pd.Timestamp('2024-05-31')], 'market_cap': [10.0]})
+    assert _quality_features_for_stock(
+        pd.Timestamp('2024-06-01'), financials, nat_only_div, valuation, None,
+    ) is None
+
+    valid_div = pd.DataFrame([
+        {
+            'stock_code': 'A',
+            'report_date': pd.Timestamp(f'{yr}-12-31'),
+            'announcement_date': pd.Timestamp(f'{yr + 1}-04-30'),
+            'bonus_amount_rmb': 0.005,
+            'comparable_dps': 0.1,
+        }
+        for yr in (2020, 2021, 2022)
+    ])
+    with_nat_div = pd.concat([valid_div, nat_only_div], ignore_index=True)
+    assert _quality_features_for_stock(
+        pd.Timestamp('2024-06-01'), financials, with_nat_div, valuation, None,
+    ) == _quality_features_for_stock(
+        pd.Timestamp('2024-06-01'), financials, valid_div, valuation, None,
+    )
+
+
+def test_quality_features_exact_groupby_sum_preserves_payout_boundary(connection):
+    from slots.jq_ashare_local.aux import AShareDividendQualityPlugin, _quality_features_for_stock
+
+    financials = _build_quarterly_financials(net_profit=100000.0, cfo=20000.0)
+    dividends = pd.DataFrame([
+        {
+            'stock_code': 'A',
+            'report_date': pd.Timestamp(f'{yr}-12-31'),
+            'announcement_date': pd.Timestamp(f'{yr + 1}-04-30'),
+            'bonus_amount_rmb': 0.1,
+            'comparable_dps': 0.01,
+        }
+        for yr in (2020, 2021, 2022)
+        for _ in range(10)
+    ])
+    valuation = pd.DataFrame({'stock_code': ['A'], 'date': [pd.Timestamp('2024-05-31')], 'market_cap': [10.0]})
+    result = _quality_features_for_stock(
+        pd.Timestamp('2024-06-01'), financials, dividends, valuation, None,
+    )
+    assert result is not None
+    assert result['payout_mean'] >= 0.10
+    assert result['payout_mean'] == float(np.mean([0.1, 0.1, 0.1]))
+
+    connection.register('fin_df', financials)
+    connection.execute('CREATE TABLE dividend_quality_financial_events AS SELECT * FROM fin_df')
+    div_table = dividends.rename(columns={'announcement_date': 'implementation_pub_date'}).assign(
+        board_plan_pub_date=pd.NaT,
+        shareholders_plan_pub_date=pd.NaT,
+        bonus_type='年度分红',
+        bonus_ratio_rmb=0.1,
+        dividend_ratio=0.0,
+        transfer_ratio=0.0,
+    )
+    connection.register('div_df', div_table)
+    connection.execute('CREATE TABLE dividend_events AS SELECT * FROM div_df')
+    connection.execute("CREATE TABLE valuation_daily AS SELECT 'A' stock_code, DATE '2024-06-01' date, 10.0 market_cap")
+    connection.execute("CREATE TABLE industry_membership AS SELECT 'A' stock_code, DATE '2024-06-01' date, 'Tech' sw_l1_name")
+    filtered, diagnostics = AShareDividendQualityPlugin(connection).filter_universe(
+        {'2024-06-01': ['A']},
+        config={'enabled': True, 'min_qualified_count': 1, 'min_score_percentile': 0.0},
+    )
+    assert filtered == {'2024-06-01': ['A']}
+    assert diagnostics['eligible_counts']['2024-06-01'] == 1

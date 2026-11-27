@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.2.0
+
+- Unified execution scheduling and causal gates: aligned `ExecutionScheduler` cadence, added a point-in-time replay fast path and declarative data-slot query pushdown, tightened Parquet as-of precision, and enforced strict causal fast-path gate diagnostics across the CLI and MCP server.
+- Futures execution and synthesis-replay parity: added single-account futures contract execution with margin-rate liquidity caps, unified LASSO missing-sample and intercept scoring parity with bundle replay, enforced capacity parity guards, and kept regime-bounded weights within verified contracts.
+- Market data normalization and validation: unified intraday turnover units and paused-bar turnover normalization, enforced DuckDB path market-identity validation in [the local workflow](docs/LOCAL_WORKFLOW.md) and [data import guide](docs/DATA_IMPORT.md), and added declarative slot `--dry-run` parity verification.
+- Agent Harness and framework reliability: added content-level result assertions (`tools/agent_harness/result_content.py`), deterministic experiment identity hashing, caller-relative public CLI path resolution, and sharded public CI checks.
+
+Try the offline demos from the [Quickstart](README.md#60-second-quickstart) or [share feedback](https://github.com/GSX-Eis/jq-factor-lab/issues/new/choose) with synthetic or sanitized examples.
+
 ## v0.1.0
 
 - The unified evaluation engine supports multi-asset daily cross-sections and single-instrument minute/Bar time series. The Bar CLI emits `diagnostics_report` with sample counts, Spearman IC and reasons for undefined metrics, and can store and query evaluations in DuckDB.

@@ -260,6 +260,9 @@ def build_label_grid(
     if "view" in view_config and view != view_config["view"]:
         raise BarEvaluationIntegrityError("calendar_identity.view disagrees with the published Bar configuration")
     observed, scheduled = [], []
+    slot_cache: dict[tuple[Any, ...], tuple[pd.DatetimeIndex, pd.DatetimeIndex, Slots]] = {}
+    unique_scheduled: list[Slots] = []
+    seen_scheduled: set[tuple[int, int]] = set()
     for instrument, group in labels.groupby("instrument_id"):
         times = group.sort_values("signal_timestamp")
         starts, ends = pd.DatetimeIndex(times["signal_timestamp"]), pd.DatetimeIndex(times["signal_available_at"])
@@ -273,12 +276,23 @@ def build_label_grid(
             continue
         if view not in ("ETH", "RTH"):
             raise BarEvaluationIntegrityError("calendar_identity.view must be ETH or RTH")
-        try:
-            scheduled.append(_scheduled_slots(calendar, frequency, starts, ends, view, bucket_strategy))
-        except BarEvaluationIntegrityError:
-            raise
-        except (ValueError, RuntimeError, TypeError) as exc:
-            raise BarEvaluationIntegrityError(f"Cannot reconstruct the published Bar schedule: {exc}") from exc
+        cache_key = (id(calendar), starts[0], starts[-1], len(starts))
+        cached = slot_cache.get(cache_key)
+        if cached is not None and starts.equals(cached[0]) and ends.equals(cached[1]):
+            slots = cached[2]
+        else:
+            try:
+                slots = _scheduled_slots(calendar, frequency, starts, ends, view, bucket_strategy)
+            except BarEvaluationIntegrityError:
+                raise
+            except (ValueError, RuntimeError, TypeError) as exc:
+                raise BarEvaluationIntegrityError(f"Cannot reconstruct the published Bar schedule: {exc}") from exc
+            slot_cache[cache_key] = (starts, ends, slots)
+        scheduled.append(slots)
+        slot_identity = (id(slots[0]), id(slots[1]))
+        if slot_identity not in seen_scheduled:
+            seen_scheduled.add(slot_identity)
+            unique_scheduled.append(slots)
     complete_schedule = len(scheduled) == len(observed)
-    return LabelGrid(tuple(scheduled if complete_schedule else observed), complete_schedule,
+    return LabelGrid(tuple(unique_scheduled if complete_schedule else observed), complete_schedule,
                      Frequency.contract_duration(frequency), session_or_week)

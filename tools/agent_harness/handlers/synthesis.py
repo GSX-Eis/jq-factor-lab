@@ -214,6 +214,8 @@ def _handle_factor_synthesis(args: argparse.Namespace) -> HarnessResult:
             result_path, action=action, run_id=effective_run_id, execution_id=execution_id,
             source_sha256=source_sha256, config_payload=config_payload,
             config_path=resolved_config_path, stdout=stdout, stderr=stderr,
+            slot_config=resolved_slot_cfg, slot_id=slot_id_arg,
+            frequency=frequency_arg, market_db=market_db,
         ),
     )
     if audit_context is None or not result.ok:

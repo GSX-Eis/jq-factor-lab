@@ -496,14 +496,23 @@ def _quality_features_for_stock(
     valuation: pd.DataFrame | None,
     industry: pd.DataFrame | None,
 ) -> dict[str, Any] | None:
-    if financials is None or dividends is None:
+    if financials is None or dividends is None or financials.empty or dividends.empty:
         return None
-    fin = financials.loc[financials['pub_date'] <= asof]
+    asof_ns = asof.value
+    nat = pd.NaT.value
+    fin_pub = financials['pub_date'].to_numpy(dtype='datetime64[ns]').view('int64')
+    fin_mask = (fin_pub != nat) & (fin_pub <= asof_ns)
+    fin = financials.iloc[fin_mask]
+
+    div_ann = dividends['announcement_date'].to_numpy(dtype='datetime64[ns]').view('int64')
+    div_mask = (div_ann != nat) & (div_ann <= asof_ns)
+    if not div_mask.any():
+        return None
+    div = dividends.iloc[div_mask].copy()
+
+    # Preserve exact pandas sort/drop_duplicates tie-break & groupby aggregation semantics.
     annual = fin.loc[(fin['statement_type'] == 'income') & fin['end_date'].dt.month.eq(12)]
     annual = annual.sort_values('pub_date').drop_duplicates('end_date', keep='last')
-    div = dividends.loc[dividends['announcement_date'] <= asof].copy()
-    if div.empty:
-        return None
     div['year'] = div['report_date'].dt.year
     yearly = div.groupby('year', as_index=False).agg(
         bonus_amount_rmb=('bonus_amount_rmb', 'sum'),
@@ -515,48 +524,65 @@ def _quality_features_for_stock(
     yearly = yearly.loc[yearly['year'].isin(recent_years)]
     if len(recent_years) != 3:
         return None
+
+    annual_profit: dict[int, float] = {}
+    for end_dt, net_p in zip(annual['end_date'], annual['net_profit']):
+        annual_profit[int(end_dt.year)] = float(net_p)
     payout = []
-    for _, item in yearly.iterrows():
-        profit = annual.loc[annual['end_date'].dt.year.eq(int(item['year'])), 'net_profit']
-        if profit.empty or float(profit.iloc[-1]) <= 0:
+    for yr, bonus_rmb in zip(yearly['year'], yearly['bonus_amount_rmb']):
+        profit = annual_profit.get(int(yr))
+        if profit is None or profit <= 0:
             continue
-        payout.append(float(item['bonus_amount_rmb']) * 10000.0 / float(profit.iloc[-1]))
+        payout.append(float(bonus_rmb) * 10000.0 / profit)
     if len(payout) != 3:
         return None
 
     quarters = fin.loc[fin['statement_type'] == 'income'].sort_values('pub_date')
     quarters = quarters.drop_duplicates('end_date', keep='last')
     balances = fin.loc[fin['statement_type'] == 'balance'].sort_values('pub_date')
-    balances = balances.drop_duplicates('end_date', keep='last').set_index('end_date')
+    balances = balances.drop_duplicates('end_date', keep='last')
+
+    q_map: dict[pd.Timestamp, tuple[float, float]] = {}
+    for end_dt, profit, cfo in zip(
+        quarters['end_date'], quarters['net_profit'], quarters['net_operate_cash_flow']
+    ):
+        if pd.notna(end_dt):
+            q_map[pd.Timestamp(end_dt)] = (float(profit), float(cfo))
+
+    b_map: dict[pd.Timestamp, tuple[float, float]] = {}
+    for end_dt, assets, liab in zip(
+        balances['end_date'], balances['total_assets'], balances['total_liability']
+    ):
+        if pd.notna(end_dt):
+            b_map[pd.Timestamp(end_dt)] = (float(assets), float(liab))
+
     roe_values = []
     cfo_values = []
-    for end in sorted(quarters['end_date'].unique())[-16:]:
-        end = pd.Timestamp(end)
+    for end in sorted(q_map)[-16:]:
         if end > asof or end.month not in (3, 6, 9, 12):
             continue
-        current = quarters.loc[quarters['end_date'].eq(end)].iloc[-1]
-        prior_annual = quarters.loc[quarters['end_date'].eq(pd.Timestamp(year=end.year - 1, month=12, day=31))]
-        prior_same = quarters.loc[quarters['end_date'].eq(pd.Timestamp(year=end.year - 1, month=end.month, day=end.day))]
+        cur_profit, cur_cfo = q_map[end]
         if end.month == 12:
-            ttm_profit = current['net_profit']
-            ttm_cfo = current['net_operate_cash_flow']
-        elif prior_annual.empty or prior_same.empty:
-            continue
+            ttm_profit = cur_profit
+            ttm_cfo = cur_cfo
         else:
-            ttm_profit = current['net_profit'] + prior_annual.iloc[-1]['net_profit'] - prior_same.iloc[-1]['net_profit']
-            ttm_cfo = current['net_operate_cash_flow'] + prior_annual.iloc[-1]['net_operate_cash_flow'] - prior_same.iloc[-1]['net_operate_cash_flow']
-        if end not in balances.index:
+            prior_annual = q_map.get(pd.Timestamp(year=end.year - 1, month=12, day=31))
+            prior_same = q_map.get(pd.Timestamp(year=end.year - 1, month=end.month, day=end.day))
+            if prior_annual is None or prior_same is None:
+                continue
+            ttm_profit = cur_profit + prior_annual[0] - prior_same[0]
+            ttm_cfo = cur_cfo + prior_annual[1] - prior_same[1]
+        bal = b_map.get(end)
+        if bal is None:
             continue
-        equity = float(balances.loc[end, 'total_assets'] - balances.loc[end, 'total_liability'])
+        equity = float(bal[0] - bal[1])
         prior_end = end - pd.offsets.QuarterEnd()
-        if prior_end in balances.index:
-            prior_equity = float(balances.loc[prior_end, 'total_assets'] - balances.loc[prior_end, 'total_liability'])
-        else:
-            prior_equity = equity
+        prior_bal = b_map.get(prior_end)
+        prior_equity = float(prior_bal[0] - prior_bal[1]) if prior_bal is not None else equity
         if equity <= 0 or prior_equity <= 0 or not np.isfinite(ttm_profit):
             continue
         roe_values.append(float(ttm_profit) / ((equity + prior_equity) / 2.0))
-        cfo_values.append(float(ttm_cfo) / max(abs(float(balances.loc[end, 'total_liability'])), 1e-12))
+        cfo_values.append(float(ttm_cfo) / max(abs(float(bal[1])), 1e-12))
     if len(roe_values) < 12:
         return None
     market_cap = _asof_value(valuation, asof, 'market_cap')
@@ -567,9 +593,15 @@ def _quality_features_for_stock(
     cfo = np.asarray(cfo_values[-12:], dtype=float)
     industry_name = ''
     if industry is not None and not industry.empty:
-        item = industry.loc[industry['date'] <= asof]
-        if not item.empty:
-            industry_name = str(item.iloc[-1]['sw_l1_name'] or '')
+        ind_dates = industry['date'].to_numpy(dtype='datetime64[ns]').view('int64')
+        if (ind_dates == nat).any():
+            valid_idx = np.flatnonzero((ind_dates != nat) & (ind_dates <= asof_ns))
+            pos = int(valid_idx[-1]) if valid_idx.size else -1
+        else:
+            pos = int(np.searchsorted(ind_dates, asof_ns, side='right')) - 1
+        if pos >= 0:
+            raw_ind = industry['sw_l1_name'].iloc[pos]
+            industry_name = str(raw_ind or '')
     return {
         'dividend_years': len(yearly),
         'payout_mean': float(np.mean(payout)),
@@ -586,10 +618,17 @@ def _quality_features_for_stock(
 def _asof_value(frame: pd.DataFrame | None, asof: pd.Timestamp, column: str) -> float | None:
     if frame is None or frame.empty:
         return None
-    rows = frame.loc[frame['date'] <= asof]
-    if rows.empty:
+    dates = frame['date'].to_numpy(dtype='datetime64[ns]').view('int64')
+    nat = pd.NaT.value
+    asof_ns = asof.value
+    if (dates == nat).any():
+        valid_idx = np.flatnonzero((dates != nat) & (dates <= asof_ns))
+        pos = int(valid_idx[-1]) if valid_idx.size else -1
+    else:
+        pos = int(np.searchsorted(dates, asof_ns, side='right')) - 1
+    if pos < 0:
         return None
-    value = rows.iloc[-1][column]
+    value = frame[column].iloc[pos]
     return float(value) if pd.notna(value) else None
 
 

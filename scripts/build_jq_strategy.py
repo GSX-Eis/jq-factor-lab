@@ -5,6 +5,7 @@ import ast
 import json
 import math
 import re
+import symtable
 import sys
 from pathlib import Path
 from typing import List, Dict, Any, Set, Optional
@@ -619,6 +620,962 @@ def lift_minimal_factor_base() -> str:
             .replace("from utils.pit import normalize_price_money", ""))
 
 
+_LEGACY_SYMBOLIC_CLASS_CONSTANTS = frozenset(
+    {
+        "EXPRESSION_CODE",
+        "EXPRESSION_TEXT",
+        "PRICE_FIELDS",
+        "FACTOR_DATA_FIELDS",
+        "DAILY_FEATURES",
+        "INTRADAY_SPECS",
+        "FACTOR_FEATURES",
+        "DATA_FREQUENCY",
+        "REQUIRED_HISTORY_WINDOW",
+        "FACTOR_VALUE_CACHE_DIR",
+        "SYMBOLIC_FACTOR_METADATA",
+    }
+)
+_READONLY_CONTAINER_ITER_METHODS = frozenset({"items", "values", "keys"})
+_READONLY_BUILTINS = frozenset({"len", "bool"})
+_READONLY_COMPARE_OPS = (ast.In, ast.NotIn, ast.Eq, ast.NotEq, ast.Is, ast.IsNot)
+
+
+def _is_immutable_scalar_expr(node: ast.AST, immutable_names: set[str]) -> bool:
+    """Return True iff *node* evaluates to a deeply immutable value."""
+    if isinstance(node, ast.Constant):
+        if type(node.value) not in (str, bytes, int, float, bool, type(None)):
+            return False
+        return not isinstance(node.value, float) or math.isfinite(node.value)
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+        return isinstance(node.operand, ast.Constant) and type(node.operand.value) in (int, float)
+    if isinstance(node, ast.Tuple):
+        return all(_is_immutable_scalar_expr(elt, immutable_names) for elt in node.elts)
+    if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+        return node.id in immutable_names
+    return False
+
+
+def _is_flat_readonly_container_expr(node: ast.AST, immutable_names: set[str]) -> bool:
+    """Return True iff *node* is a 1-level container whose elements/values are immutable scalars."""
+    if isinstance(node, (ast.List, ast.Set)):
+        return all(_is_immutable_scalar_expr(elt, immutable_names) for elt in node.elts)
+    if isinstance(node, ast.Dict):
+        return all(
+            key is not None
+            and _is_immutable_scalar_expr(key, immutable_names)
+            and _is_immutable_scalar_expr(val, immutable_names)
+            for key, val in zip(node.keys, node.values)
+        )
+    return False
+
+
+def _is_static_readonly_expr(node: ast.AST, verified_names: set[str]) -> bool:
+    """Return True iff *node* is a pure literal/container tree referencing only verified constants."""
+    if isinstance(node, ast.Constant):
+        if type(node.value) not in (str, bytes, int, float, bool, type(None)):
+            return False
+        return not isinstance(node.value, float) or math.isfinite(node.value)
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+        return isinstance(node.operand, ast.Constant) and type(node.operand.value) in (int, float)
+    if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+        return all(_is_static_readonly_expr(elt, verified_names) for elt in node.elts)
+    if isinstance(node, ast.Dict):
+        return all(
+            key is not None
+            and _is_static_readonly_expr(key, verified_names)
+            and _is_static_readonly_expr(val, verified_names)
+            for key, val in zip(node.keys, node.values)
+        )
+    if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+        return node.id in verified_names
+    return False
+
+
+def _referenced_load_names(node: ast.AST) -> set[str]:
+    return {
+        sub.id
+        for sub in ast.walk(node)
+        if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Load)
+    }
+
+
+def _collect_bound_names(tree: ast.Module) -> set[str]:
+    """Collect all identifier names bound or imported anywhere in *tree*."""
+    bound: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            bound.add(node.id)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            bound.add(node.name)
+        elif isinstance(node, ast.arg):
+            bound.add(node.arg)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                bound.add(alias.asname or alias.name.split(".")[0])
+        elif isinstance(node, (ast.ExceptHandler, ast.MatchAs, ast.MatchStar)) and node.name:
+            bound.add(node.name)
+        elif isinstance(node, ast.MatchMapping) and node.rest:
+            bound.add(node.rest)
+        elif isinstance(node, (ast.Global, ast.Nonlocal)):
+            bound.update(node.names)
+    return bound
+
+
+def _is_valid_fetch_raw_data_arg(
+    node: ast.Name,
+    parent_map: Dict[int, ast.AST],
+    fetch_method_shadowed: bool,
+) -> bool:
+    """Allow ``self._fetch_raw_data(fields=NAME, ...)`` inside a FactorBase method."""
+    if fetch_method_shadowed:
+        return False
+    kw = parent_map.get(id(node))
+    if not isinstance(kw, ast.keyword) or kw.arg != "fields" or kw.value is not node:
+        return False
+    call = parent_map.get(id(kw))
+    if not isinstance(call, ast.Call):
+        return False
+    if not (
+        isinstance(call.func, ast.Attribute)
+        and isinstance(call.func.value, ast.Name)
+        and call.func.value.id == "self"
+        and call.func.attr == "_fetch_raw_data"
+    ):
+        return False
+    for arg in call.args:
+        if not _is_immutable_scalar_expr(arg, set()):
+            return False
+    for other_kw in call.keywords:
+        if other_kw is kw:
+            continue
+        if not _is_immutable_scalar_expr(other_kw.value, set()):
+            return False
+
+    # Require the call to reside directly inside a method of a top-level ClassDef with first arg 'self'.
+    curr: ast.AST = call
+    enclosing_method: Optional[ast.AST] = None
+    while id(curr) in parent_map:
+        par = parent_map[id(curr)]
+        if isinstance(par, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if not any(curr is item for item in par.body):
+                return False
+            enclosing_method = par
+            break
+        if isinstance(par, ast.Lambda):
+            return False
+        curr = par
+    if enclosing_method is None or id(enclosing_method) not in parent_map:
+        return False
+    owner_cls = parent_map[id(enclosing_method)]
+    if not isinstance(owner_cls, ast.ClassDef) or not isinstance(parent_map.get(id(owner_cls)), ast.Module):
+        return False
+    pos_args = getattr(enclosing_method.args, "posonlyargs", []) + enclosing_method.args.args
+    return bool(pos_args) and pos_args[0].arg == "self"
+
+
+_INTRADAY_SCALAR_SPEC_KEYS = frozenset({"name", "field", "aggregator"})
+
+
+def _is_verified_intraday_specs_shape(node: ast.AST, immutable_names: set[str]) -> bool:
+    """Verify ``INTRADAY_SPECS`` is a dict whose spec dicts bind scalar keys to immutable scalars."""
+    if not isinstance(node, ast.Dict):
+        return False
+    for key_node, val_node in zip(node.keys, node.values):
+        if key_node is None or not _is_immutable_scalar_expr(key_node, immutable_names):
+            return False
+        if not isinstance(val_node, ast.Dict):
+            return False
+        for sk_node, sv_node in zip(val_node.keys, val_node.values):
+            if not (isinstance(sk_node, ast.Constant) and isinstance(sk_node.value, str)):
+                return False
+            if sk_node.value in _INTRADAY_SCALAR_SPEC_KEYS:
+                if not _is_immutable_scalar_expr(sv_node, immutable_names):
+                    return False
+            elif sk_node.value == "dependencies":
+                if not isinstance(sv_node, (ast.List, ast.Tuple)) or not all(
+                    _is_immutable_scalar_expr(elt, immutable_names) for elt in sv_node.elts
+                ):
+                    return False
+            else:
+                return False
+    return True
+
+
+def _is_exact_legacy_spec_get_fn(sg_fn: ast.FunctionDef) -> bool:
+    """Match only the compiler-emitted ``_spec_get(spec, key, default=None)`` template."""
+    if sg_fn.decorator_list:
+        return False
+    if sg_fn.args.vararg or sg_fn.args.kwarg or sg_fn.args.kwonlyargs:
+        return False
+    sg_pos = getattr(sg_fn.args, "posonlyargs", []) + sg_fn.args.args
+    if len(sg_pos) not in (2, 3):
+        return False
+    p_spec = sg_pos[0].arg
+    p_key = sg_pos[1].arg
+    p_default = sg_pos[2].arg if len(sg_pos) == 3 else None
+    if len({p_spec, p_key, *([p_default] if p_default is not None else [])}) != len(sg_pos):
+        return False
+    if len(sg_pos) == 2:
+        if sg_fn.args.defaults:
+            return False
+    elif len(sg_fn.args.defaults) > 1 or any(
+        not _is_immutable_scalar_expr(d, set()) for d in sg_fn.args.defaults
+    ):
+        return False
+
+    if len(sg_fn.body) != 2:
+        return False
+    if_stmt, tail_ret = sg_fn.body
+    if not isinstance(if_stmt, ast.If) or if_stmt.orelse or len(if_stmt.body) != 1:
+        return False
+
+    test = if_stmt.test
+    if not (
+        isinstance(test, ast.Call)
+        and isinstance(test.func, ast.Name)
+        and test.func.id == "isinstance"
+        and isinstance(test.func.ctx, ast.Load)
+        and not test.keywords
+        and len(test.args) == 2
+        and isinstance(test.args[0], ast.Name)
+        and test.args[0].id == p_spec
+        and isinstance(test.args[0].ctx, ast.Load)
+        and isinstance(test.args[1], ast.Name)
+        and test.args[1].id == "dict"
+        and isinstance(test.args[1].ctx, ast.Load)
+    ):
+        return False
+
+    def _is_scalar_default_expr(expr: ast.AST) -> bool:
+        if (
+            p_default is not None
+            and isinstance(expr, ast.Name)
+            and expr.id == p_default
+            and isinstance(expr.ctx, ast.Load)
+        ):
+            return True
+        return _is_immutable_scalar_expr(expr, set())
+
+    dict_ret = if_stmt.body[0]
+    if not isinstance(dict_ret, ast.Return) or not isinstance(dict_ret.value, ast.Call):
+        return False
+    get_call = dict_ret.value
+    if not (
+        isinstance(get_call.func, ast.Attribute)
+        and isinstance(get_call.func.value, ast.Name)
+        and get_call.func.value.id == p_spec
+        and isinstance(get_call.func.value.ctx, ast.Load)
+        and get_call.func.attr == "get"
+        and isinstance(get_call.func.ctx, ast.Load)
+        and not get_call.keywords
+        and len(get_call.args) in (1, 2)
+        and isinstance(get_call.args[0], ast.Name)
+        and get_call.args[0].id == p_key
+        and isinstance(get_call.args[0].ctx, ast.Load)
+        and (len(get_call.args) == 1 or _is_scalar_default_expr(get_call.args[1]))
+    ):
+        return False
+
+    if not isinstance(tail_ret, ast.Return) or not isinstance(tail_ret.value, ast.Call):
+        return False
+    getattr_call = tail_ret.value
+    if not (
+        isinstance(getattr_call.func, ast.Name)
+        and getattr_call.func.id == "getattr"
+        and isinstance(getattr_call.func.ctx, ast.Load)
+        and not getattr_call.keywords
+        and len(getattr_call.args) in (2, 3)
+        and isinstance(getattr_call.args[0], ast.Name)
+        and getattr_call.args[0].id == p_spec
+        and isinstance(getattr_call.args[0].ctx, ast.Load)
+        and isinstance(getattr_call.args[1], ast.Name)
+        and getattr_call.args[1].id == p_key
+        and isinstance(getattr_call.args[1].ctx, ast.Load)
+        and (len(getattr_call.args) == 2 or _is_scalar_default_expr(getattr_call.args[2]))
+    ):
+        return False
+    return True
+
+
+def _is_verified_intraday_aggregator_tree(tree: ast.Module, bound_names: set[str]) -> bool:
+    """Verify the compiler-emitted ``_aggregate_intraday_feature_series``/``_spec_get`` helpers
+    only perform read-only lookups on their ``spec`` parameter."""
+    agg_fns = [
+        stmt
+        for stmt in tree.body
+        if isinstance(stmt, ast.FunctionDef) and stmt.name == "_aggregate_intraday_feature_series"
+    ]
+    if len(agg_fns) != 1:
+        return False
+    agg_fn = agg_fns[0]
+    if agg_fn.decorator_list:
+        return False
+    agg_pos = getattr(agg_fn.args, "posonlyargs", []) + agg_fn.args.args
+    if len(agg_pos) < 3:
+        return False
+    spec_param = agg_pos[2].arg
+
+    # Ensure neither helper name is rebound/shadowed/imported elsewhere.
+    fn_defs_count = {"_aggregate_intraday_feature_series": 0, "_spec_get": 0}
+    spec_get_fns: List[ast.FunctionDef] = []
+    for stmt in tree.body:
+        if isinstance(stmt, ast.FunctionDef) and stmt.name == "_spec_get":
+            spec_get_fns.append(stmt)
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            if node.name in fn_defs_count:
+                fn_defs_count[node.name] += 1
+        elif isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            if node.id in fn_defs_count:
+                return False
+        elif isinstance(node, ast.arg) and node.arg in fn_defs_count:
+            return False
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                if (alias.asname or alias.name.split(".")[0]) in fn_defs_count:
+                    return False
+    if fn_defs_count["_aggregate_intraday_feature_series"] != 1:
+        return False
+
+    agg_parents: Dict[int, ast.AST] = {}
+    for parent in ast.walk(agg_fn):
+        for child in ast.iter_child_nodes(parent):
+            agg_parents[id(child)] = parent
+
+    uses_spec_get = False
+    for node in ast.walk(agg_fn):
+        if node is agg_fn:
+            continue
+        if isinstance(node, ast.arg) and node.arg == spec_param and node is not agg_pos[2]:
+            return False
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name == spec_param:
+            return False
+        if isinstance(node, (ast.ExceptHandler, ast.MatchAs, ast.MatchStar)) and node.name == spec_param:
+            return False
+        if isinstance(node, ast.MatchMapping) and node.rest == spec_param:
+            return False
+        if isinstance(node, ast.Name) and node.id == spec_param:
+            if isinstance(node.ctx, (ast.Store, ast.Del)):
+                return False
+            par = agg_parents.get(id(node))
+            if (
+                isinstance(par, ast.Call)
+                and isinstance(par.func, ast.Name)
+                and par.func.id == "_spec_get"
+                and not par.keywords
+                and len(par.args) in (2, 3)
+                and par.args[0] is node
+                and isinstance(par.args[1], ast.Constant)
+                and par.args[1].value in _INTRADAY_SCALAR_SPEC_KEYS
+                and (len(par.args) == 2 or _is_immutable_scalar_expr(par.args[2], set()))
+            ):
+                uses_spec_get = True
+                continue
+            return False
+
+    if not uses_spec_get:
+        return True
+    if len(spec_get_fns) != 1 or fn_defs_count["_spec_get"] != 1:
+        return False
+    if {"isinstance", "dict", "getattr"} & bound_names:
+        return False
+
+    return _is_exact_legacy_spec_get_fn(spec_get_fns[0])
+
+
+def _is_verified_intraday_specs_use(
+    node: ast.Name,
+    parent_map: Dict[int, ast.AST],
+    has_verified_aggregator: bool,
+    has_verified_intraday_shape: bool,
+) -> bool:
+    """Allow the exact compiler-emitted ``INTRADAY_SPECS.values()`` comprehension and
+    ``INTRADAY_SPECS.items()`` aggregation loop."""
+    if node.id != "INTRADAY_SPECS" or not has_verified_intraday_shape:
+        return False
+    parent = parent_map.get(id(node))
+    if not (
+        isinstance(parent, ast.Attribute)
+        and parent.value is node
+        and isinstance(parent.ctx, ast.Load)
+        and parent.attr in {"values", "items"}
+    ):
+        return False
+    call = parent_map.get(id(parent))
+    if not (isinstance(call, ast.Call) and call.func is parent and not call.args and not call.keywords):
+        return False
+
+    gpar = parent_map.get(id(call))
+    if parent.attr == "values":
+        if not (isinstance(gpar, ast.comprehension) and gpar.iter is call and not gpar.ifs):
+            return False
+        if not isinstance(gpar.target, ast.Name):
+            return False
+        spec_var = gpar.target.id
+        comp_expr = parent_map.get(id(gpar))
+        if not isinstance(comp_expr, (ast.SetComp, ast.ListComp, ast.GeneratorExp)):
+            return False
+        comp_parents: Dict[int, ast.AST] = {}
+        for p in ast.walk(comp_expr):
+            for ch in ast.iter_child_nodes(p):
+                comp_parents[id(ch)] = p
+        for sub in ast.walk(comp_expr):
+            if sub is gpar.target:
+                continue
+            if isinstance(sub, ast.Name) and sub.id == spec_var:
+                if isinstance(sub.ctx, (ast.Store, ast.Del)):
+                    return False
+                sub_par = comp_parents.get(id(sub))
+                if (
+                    isinstance(sub_par, ast.Subscript)
+                    and sub_par.value is sub
+                    and isinstance(sub_par.ctx, ast.Load)
+                    and isinstance(sub_par.slice, ast.Constant)
+                    and sub_par.slice.value in _INTRADAY_SCALAR_SPEC_KEYS
+                ):
+                    seq_par = comp_parents.get(id(sub_par))
+                    if isinstance(seq_par, (ast.List, ast.Tuple)) and isinstance(
+                        comp_parents.get(id(seq_par)), ast.comprehension
+                    ):
+                        continue
+                if (
+                    isinstance(sub_par, ast.Attribute)
+                    and sub_par.value is sub
+                    and sub_par.attr == "get"
+                    and isinstance(sub_par.ctx, ast.Load)
+                ):
+                    get_call = comp_parents.get(id(sub_par))
+                    if (
+                        isinstance(get_call, ast.Call)
+                        and get_call.func is sub_par
+                        and not get_call.keywords
+                        and len(get_call.args) == 2
+                        and isinstance(get_call.args[0], ast.Constant)
+                        and isinstance(get_call.args[0].value, str)
+                        and isinstance(get_call.args[1], (ast.List, ast.Tuple))
+                        and not get_call.args[1].elts
+                    ):
+                        starred_par = comp_parents.get(id(get_call))
+                        if isinstance(starred_par, ast.Starred):
+                            seq_par = comp_parents.get(id(starred_par))
+                            if isinstance(seq_par, (ast.List, ast.Tuple)) and isinstance(
+                                comp_parents.get(id(seq_par)), ast.comprehension
+                            ):
+                                continue
+                return False
+        return True
+
+    # parent.attr == "items"
+    if not has_verified_aggregator:
+        return False
+    if not (isinstance(gpar, ast.For) and gpar.iter is call and not gpar.orelse):
+        return False
+    if not (
+        isinstance(gpar.target, ast.Tuple)
+        and len(gpar.target.elts) == 2
+        and all(isinstance(elt, ast.Name) for elt in gpar.target.elts)
+        and gpar.target.elts[0].id != gpar.target.elts[1].id
+    ):
+        return False
+    spec_var = gpar.target.elts[1].id
+    # Locate the enclosing function scope and verify *spec_var* never leaks or is
+    # referenced anywhere outside the loop's _aggregate_intraday_feature_series call.
+    curr_scope: ast.AST = gpar
+    enclosing_fn: Optional[ast.AST] = None
+    while id(curr_scope) in parent_map:
+        par = parent_map[id(curr_scope)]
+        if isinstance(par, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            enclosing_fn = par
+            break
+        curr_scope = par
+    if enclosing_fn is None:
+        return False
+
+    allowed_spec_loads: set[int] = set()
+    loop_parents: Dict[int, ast.AST] = {}
+    for stmt in gpar.body:
+        for p in ast.walk(stmt):
+            for ch in ast.iter_child_nodes(p):
+                loop_parents[id(ch)] = p
+    for stmt in gpar.body:
+        for sub in ast.walk(stmt):
+            if isinstance(sub, ast.Name) and sub.id == spec_var and isinstance(sub.ctx, ast.Load):
+                sub_par = loop_parents.get(id(sub))
+                if (
+                    isinstance(sub_par, ast.Call)
+                    and isinstance(sub_par.func, ast.Name)
+                    and sub_par.func.id == "_aggregate_intraday_feature_series"
+                    and not sub_par.keywords
+                    and len(sub_par.args) == 3
+                    and sub_par.args[2] is sub
+                ):
+                    allowed_spec_loads.add(id(sub))
+
+    def _walk_enclosing_fn_for_spec(node_cur: ast.AST) -> bool:
+        if node_cur is gpar.target.elts[1] or id(node_cur) in allowed_spec_loads:
+            return True
+        if isinstance(node_cur, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
+            comp_targets = {
+                t.id
+                for gen in node_cur.generators
+                for t in ast.walk(gen.target)
+                if isinstance(t, ast.Name)
+            }
+            if spec_var in comp_targets:
+                # Only generators[0].iter evaluates in enclosing_fn; the comprehension body
+                # binds its own isolated *spec_var*.
+                return not node_cur.generators or _walk_enclosing_fn_for_spec(node_cur.generators[0].iter)
+        if isinstance(node_cur, ast.arg) and node_cur.arg == spec_var:
+            return False
+        if isinstance(node_cur, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node_cur.name == spec_var:
+            return False
+        if isinstance(node_cur, (ast.ExceptHandler, ast.MatchAs, ast.MatchStar)) and node_cur.name == spec_var:
+            return False
+        if isinstance(node_cur, ast.MatchMapping) and node_cur.rest == spec_var:
+            return False
+        if isinstance(node_cur, (ast.Global, ast.Nonlocal)) and spec_var in node_cur.names:
+            return False
+        if isinstance(node_cur, ast.Name) and node_cur.id == spec_var:
+            return False
+        return all(_walk_enclosing_fn_for_spec(child) for child in ast.iter_child_nodes(node_cur))
+
+    return all(_walk_enclosing_fn_for_spec(stmt) for stmt in enclosing_fn.body)
+
+
+def _is_provably_readonly_container_load(
+    node: ast.Name,
+    *,
+    is_flat: bool,
+    is_dict: bool,
+    parent_map: Dict[int, ast.AST],
+    unshadowed_builtins: set[str],
+    fetch_method_shadowed: bool,
+    has_verified_intraday_aggregator: bool,
+    has_verified_intraday_shape: bool,
+) -> bool:
+    """Positive allowlist for provably read-only container uses inside callable bodies."""
+    parent = parent_map.get(id(node))
+    if isinstance(parent, (ast.If, ast.IfExp, ast.While)) and parent.test is node:
+        return True
+    if isinstance(parent, ast.UnaryOp) and isinstance(parent.op, ast.Not) and parent.operand is node:
+        return True
+    if isinstance(parent, ast.BoolOp):
+        curr: ast.AST = parent
+        while isinstance(parent_map.get(id(curr)), ast.BoolOp):
+            curr = parent_map[id(curr)]
+        top_par = parent_map.get(id(curr))
+        if isinstance(top_par, (ast.If, ast.IfExp, ast.While)) and top_par.test is curr:
+            return True
+        if isinstance(top_par, ast.UnaryOp) and isinstance(top_par.op, ast.Not) and top_par.operand is curr:
+            return True
+        return False
+    if isinstance(parent, ast.Compare):
+        return all(isinstance(op, _READONLY_COMPARE_OPS) for op in parent.ops)
+    if (
+        isinstance(parent, ast.Call)
+        and isinstance(parent.func, ast.Name)
+        and parent.func.id in unshadowed_builtins
+        and parent.args == [node]
+        and not parent.keywords
+    ):
+        return True
+    if is_flat and isinstance(parent, (ast.For, ast.comprehension)) and parent.iter is node:
+        return True
+    if is_dict and isinstance(parent, (ast.For, ast.comprehension)) and parent.iter is node:
+        return True
+    if is_flat and isinstance(parent, ast.Subscript) and parent.value is node and isinstance(parent.ctx, ast.Load):
+        return True
+    if (
+        isinstance(parent, ast.Attribute)
+        and parent.value is node
+        and isinstance(parent.ctx, ast.Load)
+        and (
+            (is_flat and parent.attr in _READONLY_CONTAINER_ITER_METHODS)
+            or (is_dict and parent.attr == "keys")
+        )
+    ):
+        call = parent_map.get(id(parent))
+        if not (isinstance(call, ast.Call) and call.func is parent and not call.args and not call.keywords):
+            return False
+        gpar = parent_map.get(id(call))
+        if isinstance(gpar, (ast.For, ast.comprehension)) and gpar.iter is call:
+            return True
+        if (
+            isinstance(gpar, ast.Call)
+            and isinstance(gpar.func, ast.Name)
+            and gpar.func.id in unshadowed_builtins
+            and gpar.args == [call]
+            and not gpar.keywords
+        ):
+            return True
+        if isinstance(gpar, ast.Compare) and all(isinstance(op, (ast.In, ast.NotIn)) for op in gpar.ops):
+            return True
+        return False
+    if _is_valid_fetch_raw_data_arg(node, parent_map, fetch_method_shadowed):
+        return True
+    return _is_verified_intraday_specs_use(
+        node,
+        parent_map,
+        has_verified_intraday_aggregator,
+        has_verified_intraday_shape,
+    )
+
+
+def _iter_symtables(table: symtable.SymbolTable):
+    yield table
+    for child in table.get_children():
+        yield from _iter_symtables(child)
+
+
+def _collect_disqualified_symbolic_names(tree: ast.Module, table: symtable.SymbolTable) -> set[str]:
+    """Identify symbolic constant names that are not strictly single-bound read-only literals."""
+    disqualified: set[str] = set()
+    module_def_nodes: Dict[str, ast.stmt] = {}
+
+    for stmt in tree.body:
+        if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 and isinstance(stmt.targets[0], ast.Name):
+            name = stmt.targets[0].id
+            if name in _LEGACY_SYMBOLIC_CLASS_CONSTANTS:
+                if name in module_def_nodes:
+                    disqualified.add(name)
+                else:
+                    module_def_nodes[name] = stmt
+                continue
+        elif (
+            isinstance(stmt, ast.AnnAssign)
+            and isinstance(stmt.target, ast.Name)
+            and stmt.value is not None
+        ):
+            name = stmt.target.id
+            if name in _LEGACY_SYMBOLIC_CLASS_CONSTANTS:
+                if name in module_def_nodes:
+                    disqualified.add(name)
+                else:
+                    module_def_nodes[name] = stmt
+                continue
+
+        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            if stmt.name in _LEGACY_SYMBOLIC_CLASS_CONSTANTS:
+                disqualified.add(stmt.name)
+            continue
+
+        # Any other top-level statement (including multi-target/unpacking Assign or control flow)
+        # that binds/imports/deletes a candidate name disqualifies it.
+        for sub in ast.walk(stmt):
+            if isinstance(sub, ast.Name) and isinstance(sub.ctx, (ast.Store, ast.Del)):
+                if sub.id in _LEGACY_SYMBOLIC_CLASS_CONSTANTS:
+                    disqualified.add(sub.id)
+            elif isinstance(sub, (ast.Import, ast.ImportFrom)):
+                for alias in sub.names:
+                    bound = alias.asname or alias.name.split(".")[0]
+                    if bound in _LEGACY_SYMBOLIC_CLASS_CONSTANTS:
+                        disqualified.add(bound)
+
+    top_class_tables = {
+        (child.get_name(), child.get_lineno()): child
+        for child in table.get_children()
+        if child.get_type() == "class"
+    }
+    top_class_table_ids = {id(child) for child in top_class_tables.values()}
+
+    for child_table in _iter_symtables(table):
+        if child_table is table:
+            continue
+        is_top_class = id(child_table) in top_class_table_ids
+        for name in _LEGACY_SYMBOLIC_CLASS_CONSTANTS:
+            try:
+                sym = child_table.lookup(name)
+            except KeyError:
+                continue
+            if sym.is_declared_global() or sym.is_parameter():
+                disqualified.add(name)
+            elif not is_top_class and (sym.is_local() or sym.is_free()):
+                disqualified.add(name)
+
+    return disqualified
+
+
+def _collect_class_scope_name_refs(cls_node: ast.ClassDef, skip_stmts: set[int]) -> set[str]:
+    """Collect all identifier loads/stores in class scope outside method/nested-class bodies."""
+    refs: set[str] = set()
+
+    def walk_class_scope(node: ast.AST) -> None:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            refs.add(node.name)
+            for dec in node.decorator_list:
+                walk_class_scope(dec)
+            for arg in [*getattr(node.args, "posonlyargs", []), *node.args.args, *node.args.kwonlyargs]:
+                refs.add(arg.arg)
+                if arg.annotation is not None:
+                    walk_class_scope(arg.annotation)
+            if node.args.vararg is not None:
+                refs.add(node.args.vararg.arg)
+                if node.args.vararg.annotation is not None:
+                    walk_class_scope(node.args.vararg.annotation)
+            if node.args.kwarg is not None:
+                refs.add(node.args.kwarg.arg)
+                if node.args.kwarg.annotation is not None:
+                    walk_class_scope(node.args.kwarg.annotation)
+            for default in node.args.defaults:
+                walk_class_scope(default)
+            for default in node.args.kw_defaults:
+                if default is not None:
+                    walk_class_scope(default)
+            if node.returns is not None:
+                walk_class_scope(node.returns)
+            return
+        if isinstance(node, ast.ClassDef):
+            refs.add(node.name)
+            for expr in [*node.decorator_list, *node.bases]:
+                walk_class_scope(expr)
+            for kw in node.keywords:
+                walk_class_scope(kw.value)
+            return
+        if isinstance(node, ast.Name):
+            refs.add(node.id)
+        for child in ast.iter_child_nodes(node):
+            walk_class_scope(child)
+
+    for expr in [*cls_node.decorator_list, *cls_node.bases]:
+        walk_class_scope(expr)
+    for kw in cls_node.keywords:
+        walk_class_scope(kw.value)
+    for stmt in cls_node.body:
+        if id(stmt) in skip_stmts:
+            continue
+        walk_class_scope(stmt)
+    return refs
+
+
+def _is_inside_callable_body(node: ast.AST, parent_map: Dict[int, ast.AST]) -> bool:
+    """Return True only when *node* executes inside a function/method/lambda body."""
+    curr = node
+    while id(curr) in parent_map:
+        par = parent_map[id(curr)]
+        if isinstance(par, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            return any(curr is item for item in par.body)
+        if isinstance(par, ast.Lambda):
+            return curr is par.body
+        curr = par
+    return False
+
+
+def normalize_legacy_symbolic_constants(source_code: str) -> str:
+    """Strictly decouple legacy symbolic ``NAME = NAME`` class pass-throughs.
+
+    Historical symbolic factors bound read-only constants at module scope and
+    forwarded them into the factor class via ``EXPRESSION_CODE = EXPRESSION_CODE``.
+    ASTPrefixer rejects class bindings that shadow module bindings due to
+    class-body execution-order ambiguity. When a known symbolic constant is
+    proven to be a single-bound static module literal/container tree with
+    strictly read-only usage across the entire module (no mutation, aliasing,
+    or extra class-scope reference) and is forwarded once as ``NAME = NAME``,
+    alias the module constant to ``_LEGACY_MODULE_<NAME>`` and point the class
+    attribute at that alias—preserving shared object identity before prefixing.
+    """
+    tree = ast.parse(source_code)
+    table = symtable.symtable(source_code, "<factor>", "exec")
+    disqualified = _collect_disqualified_symbolic_names(tree, table)
+
+    verified_names: set[str] = set()
+    immutable_names: set[str] = set()
+    flat_container_names: set[str] = set()
+    container_names: set[str] = set()
+    dict_names: set[str] = set()
+    module_assign_nodes: Dict[str, ast.stmt] = {}
+    module_value_nodes: Dict[str, ast.AST] = {}
+    for stmt in tree.body:
+        if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 and isinstance(stmt.targets[0], ast.Name):
+            name = stmt.targets[0].id
+            value_node = stmt.value
+        elif (
+            isinstance(stmt, ast.AnnAssign)
+            and isinstance(stmt.target, ast.Name)
+            and stmt.value is not None
+        ):
+            name = stmt.target.id
+            value_node = stmt.value
+        else:
+            continue
+        if name not in _LEGACY_SYMBOLIC_CLASS_CONSTANTS or name in disqualified:
+            continue
+        if not _is_static_readonly_expr(value_node, verified_names):
+            disqualified.add(name)
+            continue
+        verified_names.add(name)
+        module_assign_nodes[name] = stmt
+        module_value_nodes[name] = value_node
+        if _is_immutable_scalar_expr(value_node, immutable_names):
+            immutable_names.add(name)
+        else:
+            container_names.add(name)
+            if _is_flat_readonly_container_expr(value_node, immutable_names):
+                flat_container_names.add(name)
+            if isinstance(value_node, ast.Dict):
+                dict_names.add(name)
+
+    if not verified_names:
+        return source_code
+
+    valid_passthroughs: List[tuple[ast.ClassDef, ast.Assign, str]] = []
+    for stmt in tree.body:
+        if not isinstance(stmt, ast.ClassDef):
+            continue
+        seen_in_class: Dict[str, int] = {}
+        cls_candidates: List[tuple[ast.Assign, str]] = []
+        cls_skip_ids: set[int] = set()
+        for member in stmt.body:
+            if (
+                isinstance(member, ast.Assign)
+                and len(member.targets) == 1
+                and isinstance(member.targets[0], ast.Name)
+                and isinstance(member.value, ast.Name)
+                and member.targets[0].id == member.value.id
+                and member.targets[0].id in verified_names
+            ):
+                name = member.targets[0].id
+                seen_in_class[name] = seen_in_class.get(name, 0) + 1
+                cls_candidates.append((member, name))
+                cls_skip_ids.add(id(member))
+        for name, count in seen_in_class.items():
+            if count > 1:
+                disqualified.add(name)
+        other_class_refs = _collect_class_scope_name_refs(stmt, cls_skip_ids)
+        for name in other_class_refs:
+            if name in verified_names:
+                disqualified.add(name)
+        for member, name in cls_candidates:
+            if name not in disqualified:
+                valid_passthroughs.append((stmt, member, name))
+
+    allowed_store_ids = {
+        id(mod_stmt.targets[0] if isinstance(mod_stmt, ast.Assign) else mod_stmt.target)
+        for name, mod_stmt in module_assign_nodes.items()
+        if name not in disqualified
+    } | {
+        id(member.targets[0])
+        for _, member, name in valid_passthroughs
+        if name not in disqualified
+    }
+    allowed_passthrough_load_ids = {
+        id(member.value)
+        for _, member, name in valid_passthroughs
+        if name not in disqualified
+    }
+    allowed_top_level_load_ids = set(allowed_passthrough_load_ids)
+    for name, value_node in module_value_nodes.items():
+        if name in disqualified:
+            continue
+        for sub in ast.walk(value_node):
+            if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Load):
+                allowed_top_level_load_ids.add(id(sub))
+
+    parent_map: Dict[int, ast.AST] = {}
+    for parent in ast.walk(tree):
+        for child in ast.iter_child_nodes(parent):
+            parent_map[id(child)] = parent
+
+    bound_names = _collect_bound_names(tree)
+    unshadowed_builtins = _READONLY_BUILTINS - bound_names
+    fetch_method_shadowed = "_fetch_raw_data" in bound_names
+    has_verified_intraday_aggregator = _is_verified_intraday_aggregator_tree(tree, bound_names)
+    has_verified_intraday_shape = (
+        "INTRADAY_SPECS" in module_value_nodes
+        and _is_verified_intraday_specs_shape(module_value_nodes["INTRADAY_SPECS"], immutable_names)
+    )
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and node.id in verified_names:
+            if isinstance(node.ctx, (ast.Store, ast.Del)):
+                if id(node) not in allowed_store_ids:
+                    disqualified.add(node.id)
+                continue
+            if isinstance(node.ctx, ast.Load):
+                if not _is_inside_callable_body(node, parent_map):
+                    if id(node) not in allowed_top_level_load_ids:
+                        disqualified.add(node.id)
+                elif node.id in container_names:
+                    if not _is_provably_readonly_container_load(
+                        node,
+                        is_flat=node.id in flat_container_names,
+                        is_dict=node.id in dict_names,
+                        parent_map=parent_map,
+                        unshadowed_builtins=unshadowed_builtins,
+                        fetch_method_shadowed=fetch_method_shadowed,
+                        has_verified_intraday_aggregator=has_verified_intraday_aggregator,
+                        has_verified_intraday_shape=has_verified_intraday_shape,
+                    ):
+                        disqualified.add(node.id)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                bound = alias.asname or alias.name.split(".")[0]
+                if bound in verified_names:
+                    disqualified.add(bound)
+        elif isinstance(node, (ast.ExceptHandler, ast.MatchAs, ast.MatchStar)) and node.name in verified_names:
+            disqualified.add(node.name)
+        elif isinstance(node, ast.MatchMapping) and node.rest in verified_names:
+            disqualified.add(node.rest)
+
+    # Propagate disqualification bidirectionally across container-embedding edges:
+    # if an outer container embeds a disqualified constant, or an outer container itself
+    # is disqualified (e.g. via nested element mutation), any embedded mutable container
+    # cannot be proven read-only either.
+    changed = True
+    while changed:
+        changed = False
+        for name, value_node in module_value_nodes.items():
+            deps = _referenced_load_names(value_node)
+            if name in disqualified:
+                for dep in deps:
+                    if dep in container_names and dep not in disqualified:
+                        disqualified.add(dep)
+                        changed = True
+            elif deps & disqualified:
+                disqualified.add(name)
+                changed = True
+
+    decouple_names = {
+        name for (_, _, name) in valid_passthroughs if name not in disqualified
+    }
+    if not decouple_names:
+        return source_code
+
+    existing_ids = (
+        {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)}
+        | {node.name for node in ast.walk(tree) if hasattr(node, "name") and isinstance(node.name, str)}
+        | {node.arg for node in ast.walk(tree) if isinstance(node, ast.arg)}
+    )
+    alias_map: Dict[str, str] = {}
+    for name in sorted(decouple_names):
+        candidate = f"_LEGACY_MODULE_{name}"
+        suffix = 1
+        while candidate in existing_ids:
+            candidate = f"_LEGACY_MODULE_{name}_{suffix}"
+            suffix += 1
+        existing_ids.add(candidate)
+        alias_map[name] = candidate
+
+    for _, member, name in valid_passthroughs:
+        if name in alias_map:
+            member.value = ast.Name(id=alias_map[name], ctx=ast.Load())
+
+    for name, alias in alias_map.items():
+        mod_stmt = module_assign_nodes[name]
+        if isinstance(mod_stmt, ast.Assign):
+            assert isinstance(mod_stmt.targets[0], ast.Name)
+            mod_stmt.targets[0].id = alias
+        elif isinstance(mod_stmt, ast.AnnAssign):
+            assert isinstance(mod_stmt.target, ast.Name)
+            mod_stmt.target.id = alias
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and node.id in alias_map:
+            node.id = alias_map[node.id]
+
+    ast.fix_missing_locations(tree)
+    return ast.unparse(tree)
+
+
 def select_and_prepare_factors(specs: List[Dict[str, Any]], selected: Optional[List[str]], allowed_paths: Optional[Set[str]] = None) -> List[Dict[str, Any]]:
     chosen = []
     want: Set[str] = set(selected) if selected else set(s['class_name'] for s in specs)
@@ -631,6 +1588,8 @@ def select_and_prepare_factors(specs: List[Dict[str, Any]], selected: Optional[L
         code = inline_factors_imports(code, repo_root, included_paths=set(), allowed_paths=allowed_paths)
         # Drop demo/test helper functions before any further transforms
         code = strip_test_helpers(code)
+        # Decouple verified read-only legacy symbolic class pass-through constants before prefix isolation.
+        code = normalize_legacy_symbolic_constants(code)
         # Prefix-rename module bindings to avoid cross-file collisions in a single-file bundle.
         # A failed transform must not silently emit source with shared globals.
         try:

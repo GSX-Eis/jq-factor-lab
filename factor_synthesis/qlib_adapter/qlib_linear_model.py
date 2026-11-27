@@ -338,6 +338,9 @@ class QlibLinearWrapper:
         model_info["validation_r2"] = (
             None if stable_mode else self._segment_r2(dataset, "valid")
         )
+        model_info.setdefault(
+            "intercept", float(getattr(self.model, "intercept_", 0.0))
+        )
         return model_info
 
     def _ordered_bagging_members(

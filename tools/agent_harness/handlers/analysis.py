@@ -19,13 +19,28 @@ def _handle_single_factor_analysis(args: argparse.Namespace) -> HarnessResult:
             or args.analysis_mode == "time_series"
             or getattr(args, "slot", None) is not None or getattr(args, "slot_id", None) is not None):
         return cli._handle_time_series_analysis(args)
-    config = {}
+    raw_config = None
+    resolved_config_path = None
     if args.config:
-        config = cli._safe_read_json(cli._resolve_repo_relative_path(args.config))
-        if (config.keys() & {"bars_csv", "time_series_analysis", "continuous_futures", "slot", "slot_id",
+        resolved_config_path = cli._resolve_repo_relative_path(args.config)
+        raw_config = cli._safe_read_json(resolved_config_path)
+        if (raw_config.keys() & {"bars_csv", "time_series_analysis", "continuous_futures", "slot", "slot_id",
                              "slot_config", "factor_store_root", "market_db"}
-                or config.get("analysis_mode") == "time_series"):
+                or raw_config.get("analysis_mode") == "time_series"):
             return cli._handle_time_series_analysis(args)
+    from tools.agent_harness.result_content import resolve_effective_analysis_config
+
+    effective_config = resolve_effective_analysis_config(
+        raw_config,
+        config_path=resolved_config_path,
+        factor=args.factor,
+        pools=args.pool or (),
+        use_dynamic=args.use_dynamic,
+        materialize_only=args.materialize_only,
+        mining_only=args.mining_only,
+        causal_gate_policy=getattr(args, "causal_gate_policy", None),
+        filter_pools=True,
+    )
     action = "single-factor-analysis"
     output_dir = cli._output_dir(
         action, cli._resolve_args_output_root(args.output_root), args.run_id
@@ -48,10 +63,10 @@ def _handle_single_factor_analysis(args: argparse.Namespace) -> HarnessResult:
                                            result_path.parent / "bar-evaluations")
             if requested_db.is_relative_to(result_path.parent):
                 raise ValueError("results_db must differ from bound analysis output paths")
-            if args.materialize_only or args.mining_only or config.get("materialize_only") or config.get("mining_only"):
+            if args.materialize_only or args.mining_only or effective_config.get("materialize_only") or effective_config.get("mining_only"):
                 raise ValueError("--results-db requires a full daily analysis")
             evaluation_db = _validate_db_target_path(args.results_db)
-            database = config.get("database", config)
+            database = effective_config.get("database", effective_config)
             source_path = database.get("duckdb_path") if isinstance(database, dict) else None
             if isinstance(source_path, str) and source_path:
                 source = cli._resolve_repo_relative_path(source_path)
@@ -129,7 +144,9 @@ def _handle_single_factor_analysis(args: argparse.Namespace) -> HarnessResult:
     def bound_metrics(_stdout: str, _stderr: str) -> dict:
         metrics = cli._bound_result_metrics(
             result_path, action=action, run_id=effective_run_id, execution_id=execution_id,
-            source_sha256=source_sha256,
+            source_sha256=source_sha256, config_payload=raw_config, config_path=resolved_config_path,
+            factor=args.factor, pools=args.pool or (), use_dynamic=args.use_dynamic,
+            materialize_only=args.materialize_only, mining_only=args.mining_only,
         )
         if evaluation_db is not None and not metrics["_execution_failed"]:
             artifact, = [item for item in metrics["_artifacts"] if item["artifact_type"] == "bar_evaluation_manifest"]

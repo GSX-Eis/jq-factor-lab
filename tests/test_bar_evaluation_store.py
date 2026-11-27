@@ -77,10 +77,14 @@ def _make_ts_bars(tmp_path: Path) -> Path:
     return path
 
 
-def _make_cs_bars_and_factors(tmp_path: Path) -> tuple[Path, Path]:
+def _make_cs_bars_and_factors(
+    tmp_path: Path,
+    *,
+    start_utc: str = "2026-12-01T14:30Z",
+) -> tuple[Path, Path]:
     records = []
     for i in range(6):
-        for j, timestamp in enumerate(pd.date_range("2026-12-01T14:30Z", periods=8, freq="5min")):
+        for j, timestamp in enumerate(pd.date_range(start_utc, periods=8, freq="5min")):
             if i == 1 and j == 5:
                 continue
             close = 100.0 + (6 - i if j == 2 else i + 1)
@@ -1436,7 +1440,7 @@ def test_read_bar_evaluations_filters_readonly_and_errors(tmp_path: Path) -> Non
     # Populate with two modes/frequencies
     results_db = tmp_path / "populated.duckdb"
     ts_bars = _make_ts_bars(tmp_path)
-    cs_bars, cs_factors = _make_cs_bars_and_factors(tmp_path)
+    cs_bars, cs_factors = _make_cs_bars_and_factors(tmp_path, start_utc="2026-12-01T01:30Z")
 
     ts_cfg = tmp_path / "ts.json"
     ts_cfg.write_text(
@@ -1470,8 +1474,10 @@ def test_read_bar_evaluations_filters_readonly_and_errors(tmp_path: Path) -> Non
         encoding="utf-8",
     )
 
-    _, ts_res = _run_cli(tmp_path, "--config", str(ts_cfg), "--results-db", str(results_db))
-    _, cs_res = _run_cli(tmp_path, "--config", str(cs_cfg), "--results-db", str(results_db))
+    rc_ts, ts_res = _run_cli(tmp_path, "--config", str(ts_cfg), "--results-db", str(results_db))
+    rc_cs, cs_res = _run_cli(tmp_path, "--config", str(cs_cfg), "--results-db", str(results_db))
+    assert rc_ts == 0
+    assert rc_cs == 0
     ts_hash = ts_res["metrics"]["result_identity"]["identity_hash"]
     cs_hash = cs_res["metrics"]["result_identity"]["identity_hash"]
 

@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Mapping, Sequence
 
 from tools.agent_harness import metrics_parsers, run_result
+from tools.agent_harness.result_content import validate_bound_content
 from tools.agent_harness._cli_compat import _cli_bindings
 from tools.agent_harness._json_io import _safe_read_json as _safe_read_json
 
@@ -51,7 +52,10 @@ def _resolve_repo_relative_path(raw_path: str) -> Path:
 
 
 def _bound_result_metrics(path, *, action, run_id, execution_id, source_sha256,
-                          config_payload=None, config_path=None, stdout="", stderr=""):
+                          config_payload=None, config_path=None, stdout="", stderr="",
+                          factor=None, pools=(), use_dynamic=False,
+                          materialize_only=False, mining_only=False,
+                          slot_config=None, slot_id=None, frequency=None, market_db=None):
     cli = _cli_bindings(__name__, metrics_parsers, run_result)
     payload = cli.read_execution_result(
         path, command=action, run_id=run_id, execution_id=execution_id,
@@ -68,8 +72,8 @@ def _bound_result_metrics(path, *, action, run_id, execution_id, source_sha256,
             valid_runs = [
                 item for item in backtest_runs
                 if "error" not in item and all(
-                    isinstance(item.get(key), (int, float))
-                    and math.isfinite(item[key])
+                    type(item.get(key)) in (int, float)
+                    and (type(item[key]) is int or math.isfinite(item[key]))
                     for key in ("annual_return", "sharpe_ratio", "max_drawdown")
                 )
             ]
@@ -232,6 +236,16 @@ def _bound_result_metrics(path, *, action, run_id, execution_id, source_sha256,
                         raise ValueError(
                             f"strategy_bundle_artifact_missing_for_trials: {missing_art_trials}"
                         )
+    execution = payload["execution"]
+    if execution["status"] == "succeeded":
+        validate_bound_content(
+            action, raw, execution["completed"], config=config_payload, config_path=config_path,
+            factor=factor, pools=pools, use_dynamic=use_dynamic,
+            materialize_only=materialize_only, mining_only=mining_only,
+            slot_config=slot_config, slot_id=slot_id, frequency=frequency, market_db=market_db,
+            artifacts=payload["artifacts"],
+        )
+    if action == "factor-synthesis":
         metrics = cli._assemble_factor_synthesis_metrics(
             config_payload or {}, raw.get("ic_summaries", []), raw.get("backtest_runs", []),
             raw.get("synthesis_diagnostics", []), raw.get("benchmark_reports", []),
@@ -243,7 +257,7 @@ def _bound_result_metrics(path, *, action, run_id, execution_id, source_sha256,
             metrics["strategy_bundles"] = raw["strategy_bundles"]
     else:
         metrics = dict(raw)
-    metrics["execution"] = payload["execution"]
+    metrics["execution"] = execution
     metrics["_execution_failed"] = payload["execution"]["status"] != "succeeded"
     metrics["_artifacts"] = payload["artifacts"]
     return metrics

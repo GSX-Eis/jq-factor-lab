@@ -744,3 +744,56 @@ def test_dashboard_dry_run_uses_env_and_checks_port_and_dependency(tmp_path, mon
     assert "--port" in assert_cli_error(capsys, 2, "invalid_input")["message"]
     assert db.read_bytes() == b"fixture"
     assert list(tmp_path.iterdir()) == [db]
+
+
+@pytest.mark.parametrize("bad_offset", [-1, 0])
+def test_slot_dry_run_rejects_invalid_entry_offset_matching_live(
+    bad_offset: int, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    from test_public_entry_harness_e2e import _run_public_cli
+
+    caller_dir = _prepare_external_workspace(tmp_path)
+    marker = caller_dir / "factor_ran.marker"
+    (caller_dir / "probe_with_marker.py").write_text(
+        "import pandas as pd\n"
+        "from pathlib import Path\n"
+        "from utils.factor_base import FactorBase\n\n"
+        "class MarkerProbeFactor(FactorBase):\n"
+        "    CAUSAL_VECTORIZED = True\n"
+        "    def calculate_factor(self, data: pd.DataFrame) -> pd.DataFrame:\n"
+        f"        Path({str(marker)!r}).write_text('ran', encoding='utf-8')\n"
+        "        vals = self.session_rolling(data, 'close', 3, min_periods=1, within_session=False)\n"
+        "        return data[['timestamp_utc', 'instrument_id']].assign(factor_value=vals)\n",
+        encoding="utf-8",
+    )
+    cmd = [
+        "time-series-analysis",
+        "--config", "config.json",
+        "--slot", "slot.json",
+        "--factor", "probe_with_marker.py",
+        "--entry-offset-bars", str(bad_offset),
+        "--output-dir", "out/eval",
+    ]
+
+    dry_rc, dry_payload, _ = _run_public_cli(caller_dir, [*cmd, "--dry-run"])
+    assert dry_rc == 2
+    assert dry_payload["ok"] is False
+    assert dry_payload["error"]["code"] == "time_series_precondition_failed"
+    assert "entry_offset_bars must be >= 1" in dry_payload["error"]["message"]
+    assert not marker.exists()
+    assert not (caller_dir / "out" / "eval").exists()
+
+    monkeypatch.chdir(caller_dir)
+    assert main([*cmd, "--json-out", "plan.json", "--dry-run"]) == 2
+    demo_error = assert_cli_error(capsys, 2, "time_series_precondition_failed")
+    assert "entry_offset_bars must be >= 1" in demo_error["message"]
+    assert not marker.exists()
+    assert not (caller_dir / "plan.json").exists()
+    assert not (caller_dir / "out" / "eval").exists()
+
+    live_rc, live_payload, _ = _run_public_cli(caller_dir, cmd)
+    assert live_rc == 2
+    assert live_payload["ok"] is False
+    assert live_payload["error"]["code"] == "time_series_precondition_failed"
+    assert "entry_offset_bars must be >= 1" in live_payload["error"]["message"]
+    assert not (caller_dir / "out" / "eval" / "summary.json").exists()

@@ -199,36 +199,36 @@ def render_factor_class(
         name for name, spec in specs.items() if spec.source == "factor_data"
     )
     intraday_prepare_source = (
-        """        work["trading_date"] = work["date"].dt.normalize()
+        f"""        work["trading_date"] = work["date"].dt.normalize()
         grouped = work.groupby(["trading_date", "code"], sort=True)
         pieces = []
 
         base_price_fields = sorted(
-            {name.replace("daily_", "", 1) for name in DAILY_FEATURES}
-            | {
+            {{name.replace("daily_", "", 1) for name in {class_name}.DAILY_FEATURES}}
+            | {{
                 field
-                for spec in INTRADAY_SPECS.values()
+                for spec in {class_name}.INTRADAY_SPECS.values()
                 for field in [spec["field"], *spec.get("dependencies", [])]
-            }
+            }}
         )
         for field in base_price_fields:
             if field not in work.columns:
                 continue
             agg = _daily_agg_for_field(field)
-            pieces.append(grouped[field].agg(agg).rename(f"daily_{field}"))
+            pieces.append(grouped[field].agg(agg).rename(f"daily_{{field}}"))
 
-        for feature_name, spec in INTRADAY_SPECS.items():
+        for feature_name, spec in {class_name}.INTRADAY_SPECS.items():
             series = _aggregate_intraday_feature_series(work, grouped, spec)
             if series is not None:
                 pieces.append(series.rename(feature_name))
 
-        for feature_name in FACTOR_FEATURES:
+        for feature_name in {class_name}.FACTOR_FEATURES:
             if feature_name in work.columns:
                 pieces.append(grouped[feature_name].last().rename(feature_name))
 
         if not pieces:
             return pd.DataFrame()
-        frame = pd.concat(pieces, axis=1).reset_index().rename(columns={"trading_date": "date"})"""
+        frame = pd.concat(pieces, axis=1).reset_index().rename(columns={{"trading_date": "date"}})"""
         if uses_intraday
         else '        raise ValueError("Daily symbolic factor cannot use intraday preparation")'
     )
@@ -289,27 +289,6 @@ import pandas as pd
 from utils.factor_base import FactorBase
 {pool_import_source}
 
-EXPRESSION_CODE = {expression_code!r}
-EXPRESSION_TEXT = {expression_text!r}
-PRICE_FIELDS = {price_fields!r}
-FACTOR_DATA_FIELDS = {factor_data_fields!r}
-DAILY_FEATURES = {daily_features!r}
-INTRADAY_SPECS = {intraday_specs!r}
-FACTOR_FEATURES = {factor_features!r}
-DATA_FREQUENCY = {data_frequency!r}
-REQUIRED_HISTORY_WINDOW = {required_history_window!r}
-FACTOR_VALUE_CACHE_DIR = {str(Path(factor_value_cache_dir).resolve()) if factor_value_cache_dir else None!r}
-SYMBOLIC_FACTOR_METADATA = {{
-    "price_fields": PRICE_FIELDS,
-    "factor_data_fields": FACTOR_DATA_FIELDS,
-    "daily_features": DAILY_FEATURES,
-    "intraday_specs": INTRADAY_SPECS,
-    "factor_features": FACTOR_FEATURES,
-    "data_frequency": DATA_FREQUENCY,
-    "required_history_window": REQUIRED_HISTORY_WINDOW,
-}}
-
-
 {runtime_source}
 
 {INTRADAY_AGGREGATION_SOURCE if uses_intraday else ""}
@@ -346,7 +325,7 @@ def _prepare_feature_frame(data, uses_intraday):
     if work.empty:
         return pd.DataFrame()
 
-    for raw_name in FACTOR_DATA_FIELDS:
+    for raw_name in {class_name}.FACTOR_DATA_FIELDS:
         feature_name = f"fd_{{raw_name}}"
         if raw_name in work.columns and feature_name not in work.columns:
             work[feature_name] = work[raw_name]
@@ -360,7 +339,7 @@ def _prepare_feature_frame(data, uses_intraday):
             .copy()
         )
         frame["date"] = frame["date"].dt.normalize()
-        for feature_name in DAILY_FEATURES:
+        for feature_name in {class_name}.DAILY_FEATURES:
             raw_name = feature_name.replace("daily_", "", 1)
             if raw_name in frame.columns and feature_name not in frame.columns:
                 frame[feature_name] = frame[raw_name]
@@ -371,35 +350,43 @@ def _prepare_feature_frame(data, uses_intraday):
 class {class_name}(FactorBase):
     """Symbolic mined factor generated for run_analysis_main.py."""
 
-    EXPRESSION_CODE = EXPRESSION_CODE
-    EXPRESSION_TEXT = EXPRESSION_TEXT
-    PRICE_FIELDS = PRICE_FIELDS
-    FACTOR_DATA_FIELDS = FACTOR_DATA_FIELDS
-    DAILY_FEATURES = DAILY_FEATURES
-    INTRADAY_SPECS = INTRADAY_SPECS
-    FACTOR_FEATURES = FACTOR_FEATURES
-    DATA_FREQUENCY = DATA_FREQUENCY
-    REQUIRED_HISTORY_WINDOW = REQUIRED_HISTORY_WINDOW
-    FACTOR_VALUE_CACHE_DIR = FACTOR_VALUE_CACHE_DIR
-    SYMBOLIC_FACTOR_METADATA = SYMBOLIC_FACTOR_METADATA
+    EXPRESSION_CODE = {expression_code!r}
+    EXPRESSION_TEXT = {expression_text!r}
+    PRICE_FIELDS = {price_fields!r}
+    FACTOR_DATA_FIELDS = {factor_data_fields!r}
+    DAILY_FEATURES = {daily_features!r}
+    INTRADAY_SPECS = {intraday_specs!r}
+    FACTOR_FEATURES = {factor_features!r}
+    DATA_FREQUENCY = {data_frequency!r}
+    REQUIRED_HISTORY_WINDOW = {required_history_window!r}
+    FACTOR_VALUE_CACHE_DIR = {str(Path(factor_value_cache_dir).resolve()) if factor_value_cache_dir else None!r}
+    SYMBOLIC_FACTOR_METADATA = {{
+        "price_fields": PRICE_FIELDS,
+        "factor_data_fields": FACTOR_DATA_FIELDS,
+        "daily_features": DAILY_FEATURES,
+        "intraday_specs": INTRADAY_SPECS,
+        "factor_features": FACTOR_FEATURES,
+        "data_frequency": DATA_FREQUENCY,
+        "required_history_window": REQUIRED_HISTORY_WINDOW,
+    }}
 
     def __init__(self, *args, **kwargs):
-        kwargs.setdefault("data_frequency", DATA_FREQUENCY)
+        kwargs.setdefault("data_frequency", self.DATA_FREQUENCY)
         super().__init__(*args, **kwargs)
 
     def _get_raw_data_for_factor(self):
         frames = []
-        if PRICE_FIELDS:
-            price_df = self._fetch_raw_data(fields=PRICE_FIELDS, table_name="price_data")
+        if self.PRICE_FIELDS:
+            price_df = self._fetch_raw_data(fields=self.PRICE_FIELDS, table_name="price_data")
             if not price_df.empty:
                 frames.append(price_df)
 
-        if FACTOR_DATA_FIELDS:
-            factor_df = self._fetch_raw_data(fields=FACTOR_DATA_FIELDS, table_name="factor_data")
+        if self.FACTOR_DATA_FIELDS:
+            factor_df = self._fetch_raw_data(fields=self.FACTOR_DATA_FIELDS, table_name="factor_data")
             if not factor_df.empty:
                 factor_df = _normalize_date_column(factor_df)
                 factor_df["date_key"] = factor_df["date"].dt.normalize()
-                rename_map = {{field: f"fd_{{field}}" for field in FACTOR_DATA_FIELDS if field in factor_df.columns}}
+                rename_map = {{field: f"fd_{{field}}" for field in self.FACTOR_DATA_FIELDS if field in factor_df.columns}}
                 factor_df = factor_df.rename(columns=rename_map)
                 keep_cols = ["date_key", "code"] + list(rename_map.values())
                 factor_df = factor_df[keep_cols].drop_duplicates(subset=["date_key", "code"], keep="last")

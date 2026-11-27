@@ -1,6 +1,7 @@
 """Synthetic CSV -> DuckDB -> factors -> composite -> labels -> JoinQuant bundle."""
 import argparse
 from contextlib import redirect_stdout
+from datetime import datetime, timezone
 import importlib.util
 import json
 import logging
@@ -49,6 +50,7 @@ def run_workflow(output_dir: Path | None = None) -> dict:
     from data_pipeline.loaders.price_data_to_duckdb import DuckDBPriceImporter
     from factor_synthesis.pipeline.weighted_sum_method import run_weighted_sum_synthesis
     from scripts.build_jq_strategy import build_jq_strategy_main
+    from utils.market_db import MarketDbProfile, init_market_db
     from utils.market_factor import MarketFactorValueStore
     from utils.session_calendar import SessionCalendar
     from utils.local_outputs import new_run_directory
@@ -70,6 +72,29 @@ def run_workflow(output_dir: Path | None = None) -> dict:
                           volume=1000., money=1000*close, factor=1., paused=0,
                           high_limit=close*1.1, low_limit=close*.9, pre_close=close)).to_csv(daily/f'{code}.csv', index=False)
     market = root/'market.duckdb'
+    # Declare the synthetic DuckDB with the public cn_equity/jq_ashare_local profile
+    # contract before importing price tables so FactorBase reads work standalone.
+    profile = MarketDbProfile(
+        schema_version=1,
+        db_id='cn_equity_tutorial_v1',
+        market_domain='cn_equity',
+        allowed_slot_providers=('jq_ashare_local',),
+        asset_classes=('equity',),
+        timezone='Asia/Shanghai',
+        calendar_id='XSHG',
+        calendar_source='local_crosschecked',
+        calendar_coverage=f'{dates[0].date()}..{dates[-1].date()}',
+        exchanges=('XSHG', 'XSHE'),
+        exchange_aliases={'SSE': 'XSHG', 'SZSE': 'XSHE'},
+        instrument_id_pattern=r'^DEMO\d{3}$',
+        currency='CNY',
+        frequencies=('1d',),
+        session_views=('ETH',),
+        market_rules={'st_filter': True, 'price_limit': True, 't_plus': 1},
+        default_execution_profile='close_to_close',
+        created_at_utc=datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+    )
+    init_market_db(market, profile)
     importer = DuckDBPriceImporter(str(market), export_parquet=False)
     importer.connect()
     try:

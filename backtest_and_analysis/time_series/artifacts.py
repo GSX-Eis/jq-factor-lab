@@ -38,16 +38,39 @@ def _json_value(value: Any) -> Any:
     return value
 
 
+def _format_utc_datetime_column(series: pd.Series) -> pd.Series:
+    if str(series.dt.tz) not in ('UTC', 'Etc/UTC'):
+        return series.map(_json_value)
+    utc = series if str(series.dt.tz) == 'UTC' else series.dt.tz_convert('UTC')
+    ns = pd.DatetimeIndex(utc).as_unit('ns').asi8
+    nat = pd.NaT.value
+    valid = ns != nat
+    if not valid.any():
+        return pd.Series(None, index=series.index, dtype=object)
+    if np.all((ns[valid] % 1_000_000_000) == 0):
+        if len(ns) >= 64:
+            codes, uniques = pd.factorize(ns, sort=False)
+            if len(uniques) * 2 <= len(ns):
+                formatted_uniques = np.where(
+                    uniques != nat,
+                    pd.DatetimeIndex(uniques, tz='UTC').strftime('%Y-%m-%dT%H:%M:%SZ').to_numpy(dtype=object),
+                    None,
+                )
+                return pd.Series(formatted_uniques[codes], index=series.index, dtype=object)
+        return utc.dt.strftime('%Y-%m-%dT%H:%M:%SZ').where(valid, None)
+    return series.map(_json_value)
+
+
 def _csv_table(frame: pd.DataFrame) -> pd.DataFrame:
     table = frame.copy()
     for name in table:
         if isinstance(table[name].dtype, pd.DatetimeTZDtype):
-            table[name] = table[name].map(_json_value)
+            table[name] = _format_utc_datetime_column(table[name])
         elif name in ('exclusion_counts', 'nonzero_exclusion_counts'):
             table[name] = table[name].map(lambda v: json.dumps(_json_value(v), allow_nan=False)
                                          if isinstance(v, Mapping) else None)
         elif name == 'exclusion_reason':
-            table[name] = table[name].map(lambda v: v.value if isinstance(v, Enum) else v)
+            table[name] = [v.value if isinstance(v, Enum) else v for v in table[name].tolist()]
     return table
 
 

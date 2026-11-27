@@ -7,6 +7,7 @@ from typing import Any, Dict
 
 from tools.agent_harness import runner
 from tools.agent_harness._cli_compat import _cli_bindings
+from tools.agent_harness.result_content import validate_monitor_content
 from tools.agent_harness.runner import HarnessResult
 
 
@@ -140,6 +141,14 @@ def _handle_monitor_refresh(args: argparse.Namespace) -> HarnessResult:
             ),
             json_out=args.json_out,
         )
+    try:
+        validate_monitor_content(metrics)
+    except ValueError as exc:
+        return cli._complete_result(cli._failure_result(
+            action=action, mode="inspection", output_dir=output_dir, run_id=args.run_id,
+            command=command, started_at=started_at, reason="invalid_monitor_result",
+            exit_code=cli.EXIT_EXECUTION, metrics={"error": str(exc)}, artifacts=artifacts,
+        ), json_out=args.json_out)
     return cli._complete_result(
         cli._success_result(
             action=action,

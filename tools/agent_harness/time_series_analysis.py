@@ -123,7 +123,7 @@ def _canonicalize_config_order(value: Any) -> Any:
     return value
 
 
-def _evaluate_slot(config: dict[str, Any], options: dict[str, Any]):
+def _evaluate_slot(config: dict[str, Any], options: dict[str, Any], *, destination: Path | None = Path(".")):
     import pandas as pd
 
     from backtest_and_analysis.factor_loader import FactorLoader
@@ -188,6 +188,36 @@ def _evaluate_slot(config: dict[str, Any], options: dict[str, Any]):
                 raise ValueError('Conflicting boundary_policy overrides')
             overrides = {**overrides, 'boundary_policy': config['boundary_policy']}
         profile = replace(profile, **overrides)
+        if destination is None:
+            from backtest_and_analysis.time_series.evaluator import (
+                _prepare_bar_evaluation, _prepare_slot_evaluation,
+            )
+
+            if factor_file:
+                factor_path = Path(factor_file).expanduser().resolve()
+                classes = FactorLoader.load_factor_class_from_file(str(factor_path), config.get("factor_class"))
+                if len(classes) != 1:
+                    raise ValueError(f"Expected one factor class in {factor_path}; pass factor_class to disambiguate")
+                slot_options["factor_id"] = _resolve_slot_factor_id(config, classes[0])
+                dry_instruments = instruments or _default_slot_instruments(slot)
+            else:
+                try:
+                    dry_instruments = instruments or _default_slot_instruments(slot)
+                except ValueError:
+                    dry_instruments = None
+            _, _, _, _, _, _, _, horizons, _, view, grid = _prepare_slot_evaluation(
+                slot,
+                frequency=frequency.canonical,
+                instruments=dry_instruments,
+                horizons=config.get("horizons", [1, 5, 15, 60]),
+                entry_offset_bars=config.get("entry_offset_bars"),
+                bucket_strategy=config.get("bucket_strategy"),
+                profile=profile,
+                apply_tradability_mask=config.get("apply_tradability_mask", False),
+            )
+            _prepare_bar_evaluation(grid, **slot_options)
+            return {"analysis_mode": options["analysis_mode"], "slot_id": slot.slot_id,
+                    "horizons": list(horizons), "view": view}, config, {}, None
 
         if factor_file:
             factor_path = Path(factor_file).expanduser().resolve()
@@ -306,7 +336,9 @@ def evaluate(config: dict[str, Any], destination: Path | None) -> dict[str, Any]
     )
     causal_gate_report = None
     if any(config.get(key) is not None for key in ('slot', 'slot_id', 'slot_config', 'factor_store_root', 'market_db')):
-        result, config, hashes, causal_gate_report = _evaluate_slot(config, options)
+        result, config, hashes, causal_gate_report = _evaluate_slot(config, options, destination=destination)
+        if destination is None:
+            return result
     else:
         result, hashes = _evaluate_csv(config, options, destination=destination)
         if destination is None:

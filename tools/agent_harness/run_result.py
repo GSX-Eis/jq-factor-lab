@@ -101,6 +101,31 @@ def build_backtest_trial_id(
     return safe.strip("._") or f"trial_{digest}"
 
 
+def expected_synthesis_items(config_payload: Mapping) -> dict[tuple[str, str], str]:
+    """Map each configured (method name, output factor name) to its algorithm."""
+    methods = config_payload.get("synthesis_methods") or {}
+    if not isinstance(methods, Mapping):
+        raise ValueError("synthesis_methods must be a mapping")
+    prefix = str(
+        config_payload.get("output_settings", {}).get("composite_factor_prefix") or ""
+    ).strip()
+    expected = {}
+    for name, settings in methods.items():
+        if not isinstance(settings, Mapping):
+            raise ValueError(f"invalid synthesis configuration for {name!r}")
+        method = str(settings.get("method") or "lasso").strip().lower()
+        base = f"{prefix}_{name}" if prefix else name
+        if method == "pca":
+            count = settings.get("n_components", 2)
+            if type(count) is not int or count < 1:
+                raise ValueError(f"invalid PCA component count for {name!r}")
+            for index in range(1, count + 1):
+                expected[name, f"{base}_PC{index}"] = method
+        else:
+            expected[name, base] = method
+    return expected
+
+
 def expected_backtest_trials(config_payload, *, config_path=None):
     """Return expected VectorBT backtest candidates for a synthesis config."""
     if not isinstance(config_payload, Mapping):
@@ -110,48 +135,28 @@ def expected_backtest_trials(config_payload, *, config_path=None):
     )
     if not isinstance(top_k_cfg, Mapping) or not top_k_cfg.get("enabled", False):
         return []
-    synthesis_methods = config_payload.get("synthesis_methods") or {}
-    if not isinstance(synthesis_methods, Mapping) or not synthesis_methods:
-        return []
 
     candidates = resolve_backtest_candidates(top_k_cfg)
-
-    prefix = str(
-        config_payload.get("output_settings", {}).get("composite_factor_prefix") or ""
-    ).strip()
-    expected = []
-    for synthesis_name, synthesis_config in synthesis_methods.items():
-        sname = str(synthesis_name)
-        scfg = synthesis_config if isinstance(synthesis_config, Mapping) else {}
-        method = str(scfg.get("method") or "lasso").strip().lower()
-        base_factor_name = f"{prefix}_{sname}" if prefix else sname
-        if method == "pca":
-            n_comp = int(scfg.get("n_components", 2) or 2)
-            factor_names = [f"{base_factor_name}_PC{i + 1}" for i in range(n_comp)]
-        else:
-            factor_names = [base_factor_name]
-        for factor_name in factor_names:
-            for selection_mode, resolved_pct, top_k_value in candidates:
-                trial_id = build_backtest_trial_id(
-                    config_path=config_path,
-                    factor_name=factor_name,
-                    selection_mode=selection_mode,
-                    top_pct=resolved_pct,
-                    top_k=top_k_value,
-                    synthesis_name=sname,
-                )
-                expected.append(
-                    {
-                        "synthesis_name": sname,
-                        "method": method,
-                        "factor_name": factor_name,
-                        "selection_mode": selection_mode,
-                        "top_pct": resolved_pct,
-                        "top_k": top_k_value,
-                        "trial_id": trial_id,
-                    }
-                )
-    return expected
+    return [
+        {
+            "synthesis_name": name,
+            "method": method,
+            "factor_name": factor_name,
+            "selection_mode": mode,
+            "top_pct": pct,
+            "top_k": top_k,
+            "trial_id": build_backtest_trial_id(
+                config_path=config_path,
+                factor_name=factor_name,
+                selection_mode=mode,
+                top_pct=pct,
+                top_k=top_k,
+                synthesis_name=name,
+            ),
+        }
+        for (name, factor_name), method in expected_synthesis_items(config_payload).items()
+        for mode, pct, top_k in candidates
+    ]
 
 
 def _selection_pct_matches(actual, expected) -> bool:
