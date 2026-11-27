@@ -31,6 +31,13 @@ JQ Factor Lab 在单机上使用 DuckDB 完成可追溯的研究流程。日频�
 | [VectorBT](https://github.com/polakowo/vectorbt) | 向量化组合回测 | 使用 Adaptive HAC、Bootstrap v2、TrialLedger 和 `calibration_status` 门禁评测因子，可接入 VectorBT 做策略回测 |
 | [TradingAgents](https://github.com/TauricResearch/TradingAgents) | 多 Agent 交易分析与决策 | 按时点约束、净化切分和可追溯证据复现量化因子实验 |
 
+### 内置防泄漏与执行护栏
+
+- **自动因果门禁（Causal Gate）**：运行 `single-factor-analysis`、`time-series-analysis` 或独立 `verify-factor-causality` 时，自动执行时间截断与 PIT 抽样校验，拦截含未来函数的快路径因子。
+- **统一执行时钟（`ExecutionScheduler`）**：单因子评测、多因子合成与组合回测共享同一套信号可用时刻到成交 Bar 的映射契约。
+- **抗过拟合统计门禁**：支持 Adaptive HAC、配对 Moving-Block Bootstrap v2、`calibration_status` 适用性校准门禁与 `TrialLedger`（Holm / BH）多重检验追踪（详见 [评测引擎](docs/EVALUATION_ENGINE.md) 与 [评测政策](docs/EVAL_POLICY.md)）。
+- **合约级组合执行**：VectorBT 适配器除股票截面外，还支持单账户期货合约执行（Session 边界换月、保证金率上限与整手取整）。
+
 ## 60 秒快速开始
 
 使用 macOS 或 Linux 上的 Python 3.11–3.12。首次下载依赖可能需要更长时间。克隆仓库后，选择 pip 或 uv。
@@ -56,7 +63,7 @@ source .venv/bin/activate
 uv pip install '.[synthesis,viz]'
 ```
 
-PyPI 上架后，可改用 `python3 -m pip install 'jq-factor-lab[synthesis,viz]'` 或 `uv pip install 'jq-factor-lab[synthesis,viz]'`。基础包提供日频和 Bar 评测，`[synthesis]` 提供固定权重演示和合成依赖，`[viz]` 提供看板，`[mcp]` 提供 stdio 服务。 `[all]` 还会安装 Qlib 和 Torch 等较重依赖，取决于平台 wheel 的可用性。
+PyPI 上架后，可改用 `python3 -m pip install 'jq-factor-lab[synthesis,viz]'` 或 `uv pip install 'jq-factor-lab[synthesis,viz]'`。基础包提供日频和 Bar 评测，`[synthesis]` 提供合成方法依赖，`[viz]` 提供看板，`[mcp]` 提供 stdio 服务，其余按需研究扩展见[端到端研究能力与按需安装](#端到端研究能力与按需安装)。`[all]` 会安装 Qlib 和 Torch 在内的全部扩展依赖，取决于平台 wheel 的可用性。
 
 在可写目录运行以下命令。全部演示均使用合成数据，每次创建独立运行目录。
 
@@ -123,9 +130,83 @@ jq-factor-lab dashboard --results-db "$db" --dry-run
 和看板启动计划，列出未通过的候选、产物路径和能否声称统计显著。
 ```
 
-## 使用本地数据
+## 多市场数据与公开基准库
 
-使用本地 [CSV、Parquet 或 DuckDB](docs/DATA_IMPORT.md)，遵循[因子接口](docs/FACTOR_INTERFACE.md)和 [Bar 契约](docs/TIME_SERIES_CONTRACT.md)，并核验 XSHG、CME、NYSE 等[交易日历](docs/TRADING_CALENDAR.md)。配置和标签隔离见[本地流程](docs/LOCAL_WORKFLOW.md)及[合成指南](docs/SYNTHESIS.md)。[聚宽单文件打包](docs/JOINQUANT.md)是可选的离线部署适配器。
+### 声明式多市场接入（`slot.yaml`）
+
+无需编写 Python 适配器，通过一份版本化的 `slot.yaml` 即可接入本地 [CSV、Parquet 或 DuckDB](docs/DATA_IMPORT.md) 行情，同时也内置主流市场原生适配器：
+
+| 市场类型 | 支持范围 | 接入方式 | 参考 |
+| --- | --- | --- | --- |
+| **A 股（日频 / 分钟）** | XSHG / XSHE，含 PIT 复权与微观结构规则 | 原生 `jq_ashare_local` 或 CSV / DuckDB | [本地流程](docs/LOCAL_WORKFLOW.md) |
+| **美股 / 全球指数** | XNYS / XNAS，支持 PMC 核验日历与夏令时 | 声明式 `slot.yaml` + MarketDB Profile | [市场库指南](docs/MARKET_DATABASE_GUIDE.md) |
+| **国内外期货** | CME / SHFE / INE / DCE / CZCE / CFFEX / GFEX（ETH/RTH 与 Session 换月） | 原生 `cn_futures` / `global_futures` | [交易日历](docs/TRADING_CALENDAR.md) |
+| **Crypto 24/7 及自定义市场** | 任意时区、24/7 会话及资金费率等辅助特征 | 零代码声明式 `slot.yaml` | [Crypto 示例](examples/declarative_crypto/README.md) · [自定义市场与部署指南](docs/CUSTOM_MARKET_AND_DEPLOY_GUIDE.md) |
+
+### 一键构建公开基准市场库（`[markets]`）
+
+安装 `.[markets]` 即可直接抓取、SHA-256 冻结并重建三套公开基准 DuckDB，并附带版本化 `MarketDB` Profile（强制单库隔离，防止跨市场混算）：
+
+- **Kenneth R. French**：49 行业组合 + FF3 日频序列（1963 年起）
+- **Binance Vision**：10 个 USDT 现货交易对 `1min` 及派生 `1d` Bar
+- **AKShare**：A 股宽基指数与申万一级行业日频指数
+
+```bash
+# 示例：抓取并重建 Binance 现货基准库（French / AKShare 重建命令见文档）
+python3 -m data_pipeline.extractors.public_markets.binance \
+  --work-dir work/binance --db work/binance/market.duckdb
+python3 -m tools.agent_harness.cli market-db show --db work/binance/market.duckdb
+```
+
+完整重建步骤、快照校验与上游数据条款见 [公开数据市场库](docs/PUBLIC_MARKET_DATABASES.md)。
+
+### 规模化 Bar 与因子持久化存储
+
+当研究从单次 CSV 扩展到多因子、多频率规模时，可通过 `import-bars`、`build-bars`、`audit-bars`、`build-roll-schedule` 将行情与期货换月表写入受 Profile 校验的 DuckDB；大规模因子值可通过 `MarketFactorValueStore`（Hive 分区 Parquet + 只追加 JSONL 账本 + DuckDB 只读视图）进行跨频率写入、身份哈希回查与完整性核验（`write-factor-values` / `read-factor-values` / `verify-factor-values`）。详见 [时序与存储契约](docs/TIME_SERIES_CONTRACT.md) 与 [因子接口](docs/FACTOR_INTERFACE.md)。
+
+## 端到端研究能力与按需安装
+
+核心包保持精简，按需安装对应扩展即可启用完整研产链路（`python3 -m pip install 'jq-factor-lab[<extra>]'`）：
+
+| 研究阶段 | 能力说明 | 可选 Extra | 文档 / 入口 |
+| --- | --- | --- | --- |
+| **单因子评测与诊断** | 日频截面 + 分钟 Bar 时序/截面评测、因果门禁与 DuckDB 存证 | 核心自带 | [评测引擎](docs/EVALUATION_ENGINE.md) · [评测政策](docs/EVAL_POLICY.md) |
+| **符号因子挖掘** | 基于 PyTorch DSO（策略网络 + 结构先验）、DEAP GP 融合与 QuantaAlpha 提案结构门禁自动搜索并编译为独立 `FactorBase` 因子 | `[mining]` | [run_symbolic_factor_mining.py](run_symbolic_factor_mining.py) |
+| **多因子合成与组合回测** | LASSO / ElasticNet / PCA / LightGBM / 动态混合 / 市值条件合成，衔接 VectorBT（含股票与单账户期货合约执行） | `[synthesis,backtest]` | [合成指南](docs/SYNTHESIS.md) |
+| **策略打包与跨市场导出** | 将合成结果固化为不可变 `StrategyBundle`（含 SHA-256 清单），导出跨市场目标仓位与 `trade_orders.jsonl`（`signal_export`）或聚宽离线单文件（`jq_cloud`）并离线核验对齐 | 核心 / `[synthesis]` | [自定义市场与部署指南](docs/CUSTOM_MARKET_AND_DEPLOY_GUIDE.md) · [聚宽单文件打包](docs/JOINQUANT.md) |
+| **公开基准数据集** | French / Binance Vision / AKShare 快照抓取与重建 | `[markets]` | [公开数据市场库](docs/PUBLIC_MARKET_DATABASES.md) |
+| **可视化与 Agent 集成** | 本地只读 Streamlit 看板与 Stdio MCP 服务 | `[viz,mcp]` | [CLI 与 MCP 映射](skills/factor-research/references/cli_contract.md) |
+
+> 其他按需扩展依赖：`[qlib]`（Qlib 适配器）、`[acceleration]`（Numba 加速）、`[dev]`（测试套件）、`[all]`（全量安装）。
+
+```bash
+# 从 StrategyBundle 导出并核验跨市场目标仓位与交易指令
+python3 -m tools.agent_harness.cli export-strategy --target signal_export \
+  --bundle-dir "$BUNDLE_DIR" --output-dir work/signal-candidate
+python3 -m tools.agent_harness.cli verify-target-alignment --target signal_export \
+  --bundle-dir "$BUNDLE_DIR" --artifact-dir work/signal-candidate
+```
+
+## CLI 入口一览
+
+项目采用**双层 CLI 设计**，所有命令均输出严格 JSON 并支持 `--dry-run` 预检：
+
+- **公开 Agent CLI（`jq-factor-lab`）**：面向日常研究与 MCP 的 7 个高频命令——演示（`daily-demo`、`bar-demo`、`factor-synthesis-demo`）、本地数据评测（`single-factor-analysis`、`time-series-analysis`）、DuckDB 回查（`read-bar-evaluations`）与看板（`dashboard`），支持 `--compact` 单行 JSON 输出。
+- **完整研究后端（`python3 -m tools.agent_harness.cli`）**：面向外部编排器与多市场管线的 20 个子命令，同时提供三个独立主脚本（[run_analysis_main.py](run_analysis_main.py)、[run_factor_synthesis.py](run_factor_synthesis.py)、[run_symbolic_factor_mining.py](run_symbolic_factor_mining.py)）。详见 [公开范围](docs/PUBLIC_SCOPE.md)。
+
+<details>
+<summary>展开查看完整 Harness 后端 20 个子命令速查</summary>
+
+| 分组 | 子命令 |
+| --- | --- |
+| **市场库与行情治理** | `market-db`（`init` / `adopt` / `show` / `migrate-profile`）、`import-bars`、`build-bars`、`audit-bars`、`build-roll-schedule` |
+| **因子值存储** | `write-factor-values`、`read-factor-values`、`verify-factor-values` |
+| **评测、因果门禁与回查** | `single-factor-analysis`、`time-series-analysis`、`verify-factor-causality`、`read-bar-evaluations` |
+| **符号挖掘与筛选** | `symbolic-factor-mining`、`quanta-alpha-realize`、`parent-factor-screen` |
+| **合成与部署对齐** | `factor-synthesis`、`export-strategy`、`verify-target-alignment`、`alignment-run` |
+| **监控与运维** | `monitor-refresh`、`outputs-gc` |
+
+</details>
 
 ## 试用与反馈
 
