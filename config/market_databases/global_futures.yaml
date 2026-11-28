@@ -11,7 +11,7 @@ exchanges: [CME, CBOT, NYMEX, COMEX]
 exchange_aliases: {}
 instrument_id_pattern: '^[A-Z0-9]+\.(CME|CBOT|NYMEX|COMEX)$'
 currency: USD
-frequencies: [1d, 5m]
+frequencies: [1d, 1m, 5m, 15m, 60m]
 session_views: [ETH, RTH]
 market_rules:
   st_filter: false

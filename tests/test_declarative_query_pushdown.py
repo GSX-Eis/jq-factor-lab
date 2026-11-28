@@ -138,10 +138,11 @@ def _baseline_read_bar_feed(feed, instruments, frequency, *, start_utc, end_utc,
     ends = {ts: feed.schedule.end_at(ts) for ts in bars.timestamp_utc.unique()}
     end_times = pd.to_datetime(bars.timestamp_utc.map(ends), utc=True)
     days = bars.timestamp_utc if feed.frequency.kind == 'intraday' else end_times - pd.Timedelta(1, 'ns')
-    owners = [feed.calendar.session_at(ts).session_date for ts in days]
+    view = getattr(feed, 'view', 'ETH')
+    owners = [feed.calendar.session_at(ts, view).session_date for ts in days]
     bars = bars.assign(session_id=pd.Series(owners, index=bars.index, dtype=object))
     if feed.frequency.kind != 'intraday':
-        keys = feed.calendar.bar_grid(feed.frequency).set_index('session_id').timestamp_utc
+        keys = feed.calendar.bar_grid(feed.frequency, view=view).set_index('session_id').timestamp_utc
         bars = bars.assign(timestamp_utc=bars.session_id.map(keys))
     mask = bars.timestamp_utc.between(start_utc, end_utc)
     extras = [field for field in ('money', 'factor', 'open_interest') if field in bars]
@@ -1166,3 +1167,102 @@ def test_csv_whitespace_lines_fallback_reparse_and_multifile_combine(tmp_path):
     actual_eth = source.read(req_eth)
     assert str(actual_eth['open_interest'].dtype) == 'float64'
     pd.testing.assert_frame_equal(actual_eth, expected_eth, check_dtype=True)
+
+
+@pytest.mark.parametrize('driver', ['duckdb_table', 'parquet_glob', 'csv_files'])
+@pytest.mark.parametrize('volume_mode,anchor', [
+    ('interval', 'bar_start'),
+    ('interval', 'bar_end'),
+    ('cumulative', 'bar_start'),
+    ('cumulative', 'bar_end'),
+])
+def test_cme_rth_intraday_pushdown_matches_full_baseline(tmp_path, driver, volume_mode, anchor):
+    from utils.session_calendar import SessionCalendar
+
+    cal = SessionCalendar('CMEGlobex_Equity', '2026-11-25', '2026-11-27', rth_reference_calendar='NYSE')
+    # Include overnight, regular RTH, Thanksgiving (RTH closed), and Black Friday (18:00Z RTH close).
+    eth_1m = pd.DatetimeIndex(cal.bar_grid('1min', view='ETH').timestamp_utc)
+    # Keep a representative contiguous slice per session so cumulative mode has contiguous ETH bars from open.
+    selected = pd.DatetimeIndex(sorted({
+        *pd.date_range('2026-11-24 23:00Z', '2026-11-25 15:00Z', freq='1min'),
+        *pd.date_range('2026-11-25 23:00Z', '2026-11-26 02:00Z', freq='1min'),
+        *pd.date_range('2026-11-26 23:00Z', '2026-11-27 18:14Z', freq='1min'),
+    }))
+    assert selected.isin(eth_1m).all()
+    if volume_mode == 'interval':
+        # Interval mode can also use a sparse window around RTH open/close.
+        selected = selected[(selected >= pd.Timestamp('2026-11-25 14:25Z'))]
+    rows = []
+    for idx, ts in enumerate(selected):
+        stamp = ts + pd.Timedelta(minutes=1) if anchor == 'bar_end' else ts
+        rows.append({
+            'symbol': 'NQZ26.CME',
+            'time': stamp,
+            'open': 20000.0 + idx,
+            'high': 20002.0 + idx,
+            'low': 19999.0 + idx,
+            'close': 20001.0 + idx,
+            'volume': float(idx + 1),
+            'wide_unused': f'skip_{idx}',
+        })
+    raw = pd.DataFrame(rows)
+    if volume_mode == 'cumulative':
+        owners = [cal.session_at(ts, 'ETH').session_date for ts in selected]
+        raw['volume'] = raw.groupby(owners)['volume'].cumsum()
+
+    global_profile = market_profile(
+        'global_futures',
+        allowed_slot_providers=('global_futures', 'duckdb_table'),
+        calendar_coverage='2026-11-01..2026-12-31',
+    )
+    src_opts = _write_driver_dataset(
+        tmp_path, driver, raw, as_iso_string=(driver == 'csv_files'), profile=global_profile,
+    )
+    cfg = replace(
+        _multi_instrument_config(
+            driver, src_opts, frequency='1m', timestamp_anchor=anchor, volume_mode=volume_mode,
+            calendar=ProviderConfig('pmc', {
+                'calendar_id': 'CMEGlobex_Equity', 'rth_reference_calendar': 'NYSE',
+                'start': '2026-11-25', 'end': '2026-11-27',
+            }),
+        ),
+        market_domain='global_futures',
+        bar_feed=ProviderConfig(driver, {
+            **{k: v for k, v in BASE_CONFIG.bar_feed.options.items() if k != 'paths'},
+            'frequency': '1m',
+            'timestamp_anchor': anchor,
+            'volume_mode': volume_mode,
+            'source_timezone': 'UTC',
+            'view': 'RTH',
+            **src_opts,
+        }),
+        universe=ProviderConfig('static', {
+            'instruments': {
+                'NQZ26.CME': {
+                    'asset_class': 'futures', 'currency': 'USD',
+                    'contract_multiplier': 20.0, 'expiry_date': '2026-12-18',
+                },
+            },
+            'universes': {'nq': ['NQZ26.CME']},
+        }),
+    )
+    feed = build_slot_from_config(cfg, base_dir=tmp_path).bar_feed
+    assert feed.view == 'RTH'
+
+    start = pd.Timestamp('2026-11-25 14:30Z')
+    end = pd.Timestamp('2026-11-27 18:10Z')
+    as_of = pd.Timestamp('2026-11-27 18:00Z')
+
+    expected_exec = _baseline_read_bar_feed(feed, ['NQZ26.CME'], Frequency.parse('1m'), start_utc=start, end_utc=end)
+    actual_exec = feed.read_execution_bars(['NQZ26.CME'], Frequency.parse('1m'), start_utc=start, end_utc=end)
+    pd.testing.assert_frame_equal(actual_exec, expected_exec)
+    assert actual_exec.session_id.unique().tolist() == ['2026-11-25', '2026-11-27']
+    assert actual_exec.timestamp_utc.max() == pd.Timestamp('2026-11-27 17:59Z')
+
+    expected_sig = _baseline_read_bar_feed(
+        feed, ['NQZ26.CME'], Frequency.parse('1m'), start_utc=start, end_utc=end, as_of_utc=as_of,
+    )
+    actual_sig = feed.read_signal_bars(
+        ['NQZ26.CME'], Frequency.parse('1m'), start_utc=start, end_utc=end, as_of_utc=as_of,
+    )
+    pd.testing.assert_frame_equal(actual_sig, expected_sig)

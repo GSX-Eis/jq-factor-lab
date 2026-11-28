@@ -605,3 +605,574 @@ def test_p206_parquet_ms_asof_cutoff_and_causal_event_validation(tmp_path, monke
 
     mask_out = slot.microstructure.tradability_mask(grid, instrument_id=SYMBOL)
     assert mask_out.tolist() == [True]
+
+
+def _nq_declarative_config(
+    tmp_path: Path,
+    *,
+    frequency: str = '1m',
+    view: str | None = 'ETH',
+    include_view: bool = True,
+    timestamp_anchor: str = 'bar_start',
+    volume_mode: str = 'interval',
+    start: str = '2026-11-25',
+    end: str = '2026-11-30',
+    rth_reference_calendar: str | None = 'NYSE',
+    include_rth_ref: bool = True,
+    csv_name: str = 'nq.csv',
+    driver: str = 'csv_files',
+    driver_options: dict | None = None,
+):
+    from utils.slots import ExecutionProfile
+
+    cal_opts: dict = {'calendar_id': 'CMEGlobex_Equity', 'start': start, 'end': end}
+    if include_rth_ref and rth_reference_calendar is not None:
+        cal_opts['rth_reference_calendar'] = rth_reference_calendar
+    bar_opts: dict = {
+        'frequency': frequency,
+        'timestamp_anchor': timestamp_anchor,
+        'source_timezone': 'UTC',
+        'volume_mode': volume_mode,
+        'source': 'synthetic',
+        'data_version': 'v1',
+        'column_mapping': {
+            'timestamp': 'timestamp',
+            'symbol': 'instrument_id',
+            'open': 'open',
+            'high': 'high',
+            'low': 'low',
+            'close': 'close',
+            'volume': 'volume',
+        },
+        **(driver_options or {'paths': [csv_name]}),
+    }
+    if include_view:
+        bar_opts['view'] = view
+    return replace(
+        CONFIG,
+        slot_id='nq_declarative_test',
+        market_domain='global_futures',
+        calendar=ProviderConfig('pmc', cal_opts),
+        bar_feed=ProviderConfig(driver, bar_opts),
+        universe=ProviderConfig('static', {
+            'instruments': {
+                'NQZ26.CME': {
+                    'asset_class': 'futures',
+                    'currency': 'USD',
+                    'contract_multiplier': 20.0,
+                    'expiry_date': '2026-12-18',
+                },
+            },
+            'universes': {'nq': ['NQZ26.CME']},
+        }),
+        aux_features=ProviderConfig('none'),
+        microstructure=ProviderConfig('open'),
+        execution_profile=ExecutionProfile(
+            entry_price_field='open',
+            exit_price_field='close',
+            min_entry_offset_bars=1,
+            exit_adjustment=0,
+            return_unit='decimal',
+            gap_rule='endpoints_only',
+            boundary_policy='same_session',
+            allow_short=True,
+        ),
+    )
+
+
+def _write_nq_csv(path: Path, timestamps: pd.DatetimeIndex, *, cumulative_per_eth_session: bool = False,
+                  calendar=None) -> pd.DataFrame:
+    rows = []
+    for idx, ts in enumerate(timestamps):
+        px = 20000.0 + idx * 0.25
+        rows.append({
+            'timestamp': ts.strftime('%Y-%m-%dT%H:%M:%SZ'),
+            'symbol': 'NQZ26.CME',
+            'open': px,
+            'high': px + 1.0,
+            'low': px - 1.0,
+            'close': px + 0.5,
+            'volume': float(idx + 1),
+        })
+    df = pd.DataFrame(rows)
+    if cumulative_per_eth_session:
+        assert calendar is not None
+        df = df.copy()
+        owners = [calendar.session_at(pd.Timestamp(ts), 'ETH').session_date for ts in timestamps]
+        df['volume'] = df.groupby(owners)['volume'].cumsum()
+    df.to_csv(path, index=False)
+    return df
+
+
+def test_declarative_view_defaults_backward_compat_and_fail_closed(tmp_path):
+    from utils.market_db import MarketDbProfileError
+    from utils.market_db.errors import MARKET_DB_PROFILE_INVALID
+    from market_db_samples import market_profile
+
+    shutil.copy(EXAMPLE / 'bars.csv', tmp_path / 'bars.csv')
+    shutil.copy(EXAMPLE / 'funding.csv', tmp_path / 'funding.csv')
+
+    default_slot = build_slot_from_config(CONFIG, base_dir=tmp_path)
+    assert default_slot.bar_feed.view == 'ETH'
+    assert default_slot.microstructure.view == 'ETH'
+    assert default_slot.slot_config_hash == CONFIG.slot_config_hash
+
+    for bad_view in (None, 1, True, 'rth', 'eth', 'unknown', ''):
+        bad_cfg = replace(
+            CONFIG,
+            bar_feed=ProviderConfig(CONFIG.bar_feed.provider, {**CONFIG.bar_feed.options, 'view': bad_view}),
+        )
+        with pytest.raises(ValueError, match='view must be ETH or RTH'):
+            build_slot_from_config(bad_cfg, base_dir=tmp_path)
+
+    # Profile session_views=['ETH'] rejects view='RTH' with MarketDbProfileError.
+    us_profile = market_profile(
+        'us_equity',
+        instrument_id_pattern=r'^AAPL\.XNAS$',
+        frequencies=('1d', '1h'),
+        session_views=('ETH',),
+    )
+    db_path = tmp_path / 'us.duckdb'
+    init_market_db(db_path, us_profile)
+    with duckdb.connect(str(db_path)) as conn:
+        conn.execute(
+            "CREATE TABLE bars AS SELECT 'AAPL.XNAS' AS symbol, TIMESTAMP '2026-01-05 09:30:00' AS time, "
+            "10.0 AS open, 11.0 AS high, 9.0 AS low, 10.5 AS close, 100.0 AS volume"
+        )
+    db_cfg = replace(
+        CONFIG,
+        market_domain='us_equity',
+        calendar=ProviderConfig('pmc', {'calendar_id': 'XNYS', 'start': '2026-01-05', 'end': '2026-01-05'}),
+        bar_feed=ProviderConfig('duckdb_table', {
+            'path': 'us.duckdb',
+            'table': 'main.bars',
+            'frequency': '1h',
+            'timestamp_anchor': 'bar_start',
+            'source_timezone': 'America/New_York',
+            'volume_mode': 'interval',
+            'data_version': 'v1',
+            'view': 'RTH',
+            'column_mapping': {
+                'symbol': 'instrument_id', 'time': 'timestamp',
+                'open': 'open', 'high': 'high', 'low': 'low', 'close': 'close', 'volume': 'volume',
+            },
+        }),
+        universe=ProviderConfig('static', {
+            'instruments': {'AAPL.XNAS': {'asset_class': 'equity', 'currency': 'USD'}},
+            'universes': {'us': ['AAPL.XNAS']},
+        }),
+        aux_features=ProviderConfig('none'),
+        microstructure=ProviderConfig('open'),
+    )
+    with pytest.raises(MarketDbProfileError, match=MARKET_DB_PROFILE_INVALID):
+        build_slot_from_config(db_cfg, base_dir=tmp_path)
+
+
+def test_declarative_cme_globex_nyse_eth_rth_projection_holiday_and_half_day(tmp_path):
+    from backtest_and_analysis.evaluation.labels import UnifiedReturnLabeler
+    from utils.session_calendar import SessionCalendar
+
+    # Cover Wed normal (2026-11-25), Thu Thanksgiving (2026-11-26, RTH closed),
+    # Fri Black Friday (2026-11-27, RTH 13:00 ET / 18:00Z early close), and Mon (2026-11-30) for session_boundary.
+    cal = SessionCalendar('CMEGlobex_Equity', '2026-11-25', '2026-11-30', rth_reference_calendar='NYSE')
+    eth_grid = cal.bar_grid('1min', view='ETH')
+    _write_nq_csv(tmp_path / 'nq_eth.csv', pd.DatetimeIndex(eth_grid.timestamp_utc))
+
+    # Also test omitting rth_reference_calendar defaults CMEGlobex_Equity to NYSE.
+    eth_cfg = _nq_declarative_config(
+        tmp_path, view='ETH', start='2026-11-25', end='2026-11-30',
+        include_rth_ref=False, csv_name='nq_eth.csv',
+    )
+    rth_cfg = _nq_declarative_config(
+        tmp_path, view='RTH', start='2026-11-25', end='2026-11-30',
+        rth_reference_calendar='NYSE', csv_name='nq_eth.csv',
+    )
+    eth_slot = build_slot_from_config(eth_cfg, base_dir=tmp_path)
+    rth_slot = build_slot_from_config(rth_cfg, base_dir=tmp_path)
+    assert eth_slot.calendar.rth_reference_calendar == 'NYSE'
+    assert eth_slot.bar_feed.view == 'ETH' and eth_slot.microstructure.view == 'ETH'
+    assert rth_slot.bar_feed.view == 'RTH' and rth_slot.microstructure.view == 'RTH'
+
+    lo = pd.Timestamp('2026-11-24 23:00Z')
+    hi = pd.Timestamp('2026-11-30 22:00Z')
+    eth_bars = eth_slot.bar_feed.read_execution_bars(['NQZ26.CME'], Frequency.parse('1m'), start_utc=lo, end_utc=hi)
+    rth_bars = rth_slot.bar_feed.read_execution_bars(['NQZ26.CME'], Frequency.parse('1m'), start_utc=lo, end_utc=hi)
+    rth_grid = cal.bar_grid('1min', view='RTH')
+    assert len(eth_bars) == len(eth_grid)
+    assert rth_bars.timestamp_utc.tolist() == rth_grid.timestamp_utc.tolist()
+    assert rth_bars.session_id.tolist() == rth_grid.session_id.tolist()
+    assert '2026-11-26' not in set(rth_bars.session_id)
+    assert rth_bars.loc[rth_bars.session_id.eq('2026-11-27'), 'timestamp_utc'].max() == pd.Timestamp('2026-11-27 17:59Z')
+
+    # load() and read_signal_bars() match the RTH projection without lookahead.
+    loaded_rth = rth_slot.bar_feed.load(instruments=['NQZ26.CME'])
+    assert loaded_rth.timestamp_utc.tolist() == rth_grid.timestamp_utc.tolist()
+    sig_at_half_close = rth_slot.bar_feed.read_signal_bars(
+        ['NQZ26.CME'], Frequency.parse('1m'),
+        start_utc=pd.Timestamp('2026-11-27 17:55Z'),
+        end_utc=pd.Timestamp('2026-11-27 18:15Z'),
+        as_of_utc=pd.Timestamp('2026-11-27 18:00Z'),
+    )
+    assert sig_at_half_close.timestamp_utc.tolist() == list(
+        pd.date_range('2026-11-27 17:55Z', '2026-11-27 17:59Z', freq='1min')
+    )
+
+    # DeclarativeMicrostructure.tradability_mask handles overnight, half-day post-13:00 ET, and Thanksgiving empty RTH.
+    probe_grid = pd.DataFrame({
+        'instrument_id': ['NQZ26.CME'] * 5,
+        'timestamp_utc': pd.to_datetime([
+            '2026-11-25 14:30Z',  # Regular RTH open
+            '2026-11-25 04:00Z',  # Overnight ETH only
+            '2026-11-26 15:00Z',  # Thanksgiving: ETH open, RTH empty (no IndexError!)
+            '2026-11-27 17:59Z',  # Black Friday last RTH minute
+            '2026-11-27 18:05Z',  # Black Friday post-13:00 ET (ETH only)
+        ]),
+        'session_id': ['2026-11-25', '2026-11-25', '2026-11-26', '2026-11-27', '2026-11-27'],
+        'execution_price_field': ['open'] * 5,
+    })
+    assert eth_slot.microstructure.tradability_mask(probe_grid, instrument_id='NQZ26.CME').tolist() == [
+        True, True, True, True, True,
+    ]
+    assert rth_slot.microstructure.tradability_mask(probe_grid, instrument_id='NQZ26.CME').tolist() == [
+        True, False, False, True, False,
+    ]
+
+    # same_session boundary checks on Black Friday 13:00 ET early close: RTH stops at 17:59Z, ETH continues.
+    rth_labels = UnifiedReturnLabeler.from_slot(rth_slot, apply_tradability_mask=True).label(
+        ['NQZ26.CME'], '1m', start_date='2026-11-27', end_date='2026-11-30',
+        horizons=[1], entry_offset_bars=1,
+    )
+    eth_labels = UnifiedReturnLabeler.from_slot(eth_slot, apply_tradability_mask=True).label(
+        ['NQZ26.CME'], '1m', start_date='2026-11-27', end_date='2026-11-30',
+        horizons=[1], entry_offset_bars=1,
+    )
+    rth_by_sig = rth_labels.set_index('signal_timestamp')
+    eth_by_sig = eth_labels.set_index('signal_timestamp')
+    assert rth_by_sig.loc[pd.Timestamp('2026-11-27 17:57Z'), 'status'] == 'valid'
+    assert rth_by_sig.loc[pd.Timestamp('2026-11-27 17:58Z'), 'exclusion_reason'] == 'session_boundary'
+    assert rth_by_sig.loc[pd.Timestamp('2026-11-27 17:59Z'), 'exclusion_reason'] == 'session_boundary'
+    assert eth_by_sig.loc[pd.Timestamp('2026-11-27 17:58Z'), 'status'] == 'valid'
+    assert eth_by_sig.loc[pd.Timestamp('2026-11-27 18:13Z'), 'exclusion_reason'] == 'session_boundary'
+
+
+@pytest.mark.parametrize('volume_mode', ['interval', 'cumulative'])
+def test_declarative_rth_pure_60m_and_cumulative_eth_projection(tmp_path, volume_mode):
+    from utils.session_calendar import SessionCalendar
+
+    cal = SessionCalendar('CMEGlobex_Equity', '2026-11-25', '2026-11-25', rth_reference_calendar='NYSE')
+    # 1. Pure RTH 60m source (starts at 09:30 ET = 14:30Z) works for both interval and cumulative volume.
+    rth_60m = cal.bar_grid('60m', view='RTH').timestamp_utc
+    raw_60m = _write_nq_csv(tmp_path / 'rth_60m.csv', pd.DatetimeIndex(rth_60m))
+    if volume_mode == 'cumulative':
+        raw_60m['volume'] = raw_60m['volume'].cumsum()
+        raw_60m.to_csv(tmp_path / 'rth_60m.csv', index=False)
+    slot_60m = build_slot_from_config(
+        _nq_declarative_config(
+            tmp_path, frequency='60m', view='RTH', volume_mode=volume_mode,
+            start='2026-11-25', end='2026-11-25', csv_name='rth_60m.csv',
+        ),
+        base_dir=tmp_path,
+    )
+    bars_60m = slot_60m.bar_feed.read_execution_bars(
+        ['NQZ26.CME'], Frequency.parse('60m'),
+        start_utc=pd.Timestamp('2026-11-25 14:30Z'),
+        end_utc=pd.Timestamp('2026-11-25 21:00Z'),
+    )
+    assert bars_60m.timestamp_utc.tolist() == list(rth_60m)
+    assert bars_60m.volume.tolist() == [float(i + 1) for i in range(len(rth_60m))]
+
+    # 2. Full ETH 1m CSV with cumulative volume per ETH session read under view='RTH'
+    #    must diff against 14:29Z (09:29 ET), not treat 14:30Z as cumulative zero.
+    if volume_mode == 'cumulative':
+        eth_1m = pd.DatetimeIndex(cal.bar_grid('1m', view='ETH').timestamp_utc)
+        _write_nq_csv(tmp_path / 'eth_cum_1m.csv', eth_1m, cumulative_per_eth_session=True, calendar=cal)
+        slot_rth = build_slot_from_config(
+            _nq_declarative_config(
+                tmp_path, frequency='1m', view='RTH', volume_mode='cumulative',
+                start='2026-11-25', end='2026-11-25', csv_name='eth_cum_1m.csv',
+            ),
+            base_dir=tmp_path,
+        )
+        bars_1m = slot_rth.bar_feed.read_execution_bars(
+            ['NQZ26.CME'], Frequency.parse('1m'),
+            start_utc=pd.Timestamp('2026-11-25 14:30Z'),
+            end_utc=pd.Timestamp('2026-11-25 14:34Z'),
+        )
+        first_rth_idx = eth_1m.get_loc(pd.Timestamp('2026-11-25 14:30Z'))
+        assert bars_1m.volume.tolist() == [float(first_rth_idx + 1 + k) for k in range(5)]
+
+
+def test_declarative_rth_rejects_off_grid_and_misaligned_eth_bars(tmp_path):
+    from utils.session_calendar import SessionCalendar
+
+    cal = SessionCalendar('CMEGlobex_Equity', '2026-11-25', '2026-11-25', rth_reference_calendar='NYSE')
+    # 1. Off-grid dirty timestamp inside RTH fails closed.
+    _write_nq_csv(tmp_path / 'dirty.csv', pd.DatetimeIndex([pd.Timestamp('2026-11-25 14:30:30Z')]))
+    dirty_slot = build_slot_from_config(
+        _nq_declarative_config(
+            tmp_path, frequency='1m', view='RTH', start='2026-11-25', end='2026-11-25', csv_name='dirty.csv',
+        ),
+        base_dir=tmp_path,
+    )
+    with pytest.raises(ValueError, match='off the Bar schedule grid'):
+        dirty_slot.bar_feed.read_execution_bars(
+            ['NQZ26.CME'], Frequency.parse('1m'),
+            start_utc=pd.Timestamp('2026-11-25 14:00Z'), end_utc=pd.Timestamp('2026-11-25 15:00Z'),
+        )
+
+    # 2. Maintenance-closed timestamp (outside both RTH and ETH) fails closed.
+    _write_nq_csv(tmp_path / 'closed.csv', pd.DatetimeIndex([pd.Timestamp('2026-11-25 22:30Z')]))
+    closed_slot = build_slot_from_config(
+        _nq_declarative_config(
+            tmp_path, frequency='1m', view='RTH', start='2026-11-25', end='2026-11-25', csv_name='closed.csv',
+        ),
+        base_dir=tmp_path,
+    )
+    with pytest.raises(ValueError, match='outside the Bar schedule'):
+        closed_slot.bar_feed.load(instruments=['NQZ26.CME'])
+
+    # 3. ETH 60m bars overlapping RTH with misaligned boundaries fail closed under view='RTH'.
+    eth_60m = cal.bar_grid('60m', view='ETH').timestamp_utc
+    _write_nq_csv(tmp_path / 'eth_60m.csv', pd.DatetimeIndex(eth_60m))
+    misaligned_slot = build_slot_from_config(
+        _nq_declarative_config(
+            tmp_path, frequency='60m', view='RTH', start='2026-11-25', end='2026-11-25', csv_name='eth_60m.csv',
+        ),
+        base_dir=tmp_path,
+    )
+    with pytest.raises(ValueError, match='misaligned|off the Bar schedule grid'):
+        misaligned_slot.bar_feed.load(instruments=['NQZ26.CME'])
+
+
+@pytest.mark.parametrize('volume_mode', ['interval', 'cumulative'])
+def test_declarative_rth_pure_60m_bar_end_retains_closing_anchor(tmp_path, volume_mode):
+    from utils.session_calendar import SessionCalendar
+
+    cal = SessionCalendar('CMEGlobex_Equity', '2026-11-25', '2026-11-25', rth_reference_calendar='NYSE')
+    rth_schedule = cal.bar_grid('60m', view='RTH')
+    rth_slots = cal.session_on('2026-11-25', 'RTH')
+    assert rth_slots is not None
+    # RTH 60m bar_end anchors: 15:30Z..20:30Z plus closing partial bar ending at 21:00Z.
+    from utils.time_axis import BarSchedule
+    rth_end_times = pd.DatetimeIndex(BarSchedule(cal, '60m', view='RTH').for_session('2026-11-25').end_utc)
+    assert rth_end_times[-1] == pd.Timestamp('2026-11-25 21:00Z')
+    raw = _write_nq_csv(tmp_path / 'rth_60m_end.csv', rth_end_times)
+    if volume_mode == 'cumulative':
+        raw['volume'] = raw['volume'].cumsum()
+        raw.to_csv(tmp_path / 'rth_60m_end.csv', index=False)
+
+    slot = build_slot_from_config(
+        _nq_declarative_config(
+            tmp_path, frequency='60m', view='RTH', timestamp_anchor='bar_end',
+            volume_mode=volume_mode, start='2026-11-25', end='2026-11-25', csv_name='rth_60m_end.csv',
+        ),
+        base_dir=tmp_path,
+    )
+    loaded = slot.bar_feed.load(instruments=['NQZ26.CME'])
+    assert loaded.timestamp_utc.tolist() == list(rth_schedule.timestamp_utc)
+    assert loaded.volume.tolist() == [float(i + 1) for i in range(len(rth_end_times))]
+
+    # Narrow query at closing bar [20:30Z, 21:00Z) must retain 20:30Z across execution and signal paths.
+    close_start = pd.Timestamp('2026-11-25 20:30Z')
+    exec_close = slot.bar_feed.read_execution_bars(
+        ['NQZ26.CME'], Frequency.parse('60m'), start_utc=close_start, end_utc=close_start,
+    )
+    sig_close = slot.bar_feed.read_signal_bars(
+        ['NQZ26.CME'], Frequency.parse('60m'),
+        start_utc=close_start, end_utc=close_start, as_of_utc=pd.Timestamp('2026-11-25 21:00Z'),
+    )
+    assert exec_close.timestamp_utc.tolist() == [close_start]
+    assert sig_close.timestamp_utc.tolist() == [close_start]
+    assert exec_close.volume.tolist() == [float(len(rth_end_times))]
+    assert sig_close.volume.tolist() == [float(len(rth_end_times))]
+
+
+def test_declarative_rth_60m_bar_end_rejects_full_and_sparse_eth_on_window_and_load(tmp_path):
+    from backtest_and_analysis.time_series.contracts import ContractValidationError
+    from utils.session_calendar import SessionCalendar
+    from utils.time_axis import BarSchedule
+
+    cal = SessionCalendar('CMEGlobex_Equity', '2026-11-25', '2026-11-25', rth_reference_calendar='NYSE')
+    eth_end_times = pd.DatetimeIndex(BarSchedule(cal, '60m', view='ETH').for_session('2026-11-25').end_utc)
+    assert pd.Timestamp('2026-11-25 21:00Z') in eth_end_times
+
+    close_start = pd.Timestamp('2026-11-25 20:30Z')
+    as_of_close = pd.Timestamp('2026-11-25 21:00Z')
+
+    # Case 1: Full ETH 60m bar_end CSV must fail-closed across load, read_execution_bars(20:30Z..20:30Z),
+    # and read_signal_bars(as_of=21:00Z), never mislabeling ETH [20:00Z, 21:00Z) as RTH [20:30Z, 21:00Z).
+    _write_nq_csv(tmp_path / 'eth_60m_end.csv', eth_end_times)
+    full_eth_slot = build_slot_from_config(
+        _nq_declarative_config(
+            tmp_path, frequency='60m', view='RTH', timestamp_anchor='bar_end',
+            start='2026-11-25', end='2026-11-25', csv_name='eth_60m_end.csv',
+        ),
+        base_dir=tmp_path,
+    )
+    for call in (
+        lambda: full_eth_slot.bar_feed.load(instruments=['NQZ26.CME']),
+        lambda: full_eth_slot.bar_feed.read_execution_bars(
+            ['NQZ26.CME'], Frequency.parse('60m'), start_utc=close_start, end_utc=close_start,
+        ),
+        lambda: full_eth_slot.bar_feed.read_signal_bars(
+            ['NQZ26.CME'], Frequency.parse('60m'),
+            start_utc=close_start, end_utc=close_start, as_of_utc=as_of_close,
+        ),
+    ):
+        with pytest.raises(ContractValidationError, match='misaligned|off the Bar schedule grid'):
+            call()
+
+    # Case 2: Sparse ETH 60m bar_end CSV containing only 00:00Z (ETH) and 21:00Z (shared anchor)
+    # must fail-closed across load, read_execution_bars, and read_signal_bars instead of dropping 21:00Z.
+    sparse_eth_end = pd.DatetimeIndex(['2026-11-25 00:00Z', '2026-11-25 21:00Z'])
+    _write_nq_csv(tmp_path / 'sparse_eth_60m_end.csv', sparse_eth_end)
+    sparse_eth_slot = build_slot_from_config(
+        _nq_declarative_config(
+            tmp_path, frequency='60m', view='RTH', timestamp_anchor='bar_end',
+            start='2026-11-25', end='2026-11-25', csv_name='sparse_eth_60m_end.csv',
+        ),
+        base_dir=tmp_path,
+    )
+    for call in (
+        lambda: sparse_eth_slot.bar_feed.load(instruments=['NQZ26.CME']),
+        lambda: sparse_eth_slot.bar_feed.read_execution_bars(
+            ['NQZ26.CME'], Frequency.parse('60m'), start_utc=close_start, end_utc=close_start,
+        ),
+        lambda: sparse_eth_slot.bar_feed.read_signal_bars(
+            ['NQZ26.CME'], Frequency.parse('60m'),
+            start_utc=close_start, end_utc=close_start, as_of_utc=as_of_close,
+        ),
+    ):
+        with pytest.raises(ContractValidationError, match='misaligned'):
+            call()
+
+    # Case 3: Single shared-anchor 21:00Z bar is mathematically ambiguous without source_view -> fail-closed;
+    # explicit source_view='RTH' accepts [20:30Z, 21:00Z), while source_view='ETH' rejects misaligned [20:00Z, 21:00Z).
+    _write_nq_csv(tmp_path / 'ambiguous_2100.csv', pd.DatetimeIndex(['2026-11-25 21:00Z']))
+    ambig_cfg = _nq_declarative_config(
+        tmp_path, frequency='60m', view='RTH', timestamp_anchor='bar_end',
+        start='2026-11-25', end='2026-11-25', csv_name='ambiguous_2100.csv',
+    )
+    ambig_slot = build_slot_from_config(ambig_cfg, base_dir=tmp_path)
+    with pytest.raises(ContractValidationError, match='Ambiguous bar timestamps'):
+        ambig_slot.bar_feed.load(instruments=['NQZ26.CME'])
+    with pytest.raises(ContractValidationError, match='Ambiguous bar timestamps'):
+        ambig_slot.bar_feed.read_execution_bars(
+            ['NQZ26.CME'], Frequency.parse('60m'), start_utc=close_start, end_utc=close_start,
+        )
+
+    rth_declared = build_slot_from_config(
+        replace(ambig_cfg, bar_feed=ProviderConfig('csv_files', {**ambig_cfg.bar_feed.options, 'source_view': 'RTH'})),
+        base_dir=tmp_path,
+    )
+    assert rth_declared.bar_feed.read_execution_bars(
+        ['NQZ26.CME'], Frequency.parse('60m'), start_utc=close_start, end_utc=close_start,
+    ).timestamp_utc.tolist() == [close_start]
+
+    eth_declared = build_slot_from_config(
+        replace(ambig_cfg, bar_feed=ProviderConfig('csv_files', {**ambig_cfg.bar_feed.options, 'source_view': 'ETH'})),
+        base_dir=tmp_path,
+    )
+    with pytest.raises(ContractValidationError, match='misaligned'):
+        eth_declared.bar_feed.read_execution_bars(
+            ['NQZ26.CME'], Frequency.parse('60m'), start_utc=close_start, end_utc=close_start,
+        )
+
+    # Invalid source_view or incompatible view='ETH' + source_view='RTH' fail-closed.
+    for bad_sv in (None, 1, 'rth', 'unknown'):
+        with pytest.raises(ValueError, match='source_view must be ETH or RTH'):
+            build_slot_from_config(
+                replace(ambig_cfg, bar_feed=ProviderConfig('csv_files', {**ambig_cfg.bar_feed.options, 'source_view': bad_sv})),
+                base_dir=tmp_path,
+            )
+    with pytest.raises(ValueError, match="view='ETH' cannot read"):
+        build_slot_from_config(
+            replace(ambig_cfg, bar_feed=ProviderConfig('csv_files', {
+                **ambig_cfg.bar_feed.options, 'view': 'ETH', 'source_view': 'RTH',
+            })),
+            base_dir=tmp_path,
+        )
+
+
+def test_declarative_rth_60m_bar_start_narrow_window_rejects_eth_and_retains_rth(tmp_path):
+    from utils.session_calendar import SessionCalendar
+
+    cal = SessionCalendar('CMEGlobex_Equity', '2026-11-25', '2026-11-25', rth_reference_calendar='NYSE')
+    eth_starts = pd.DatetimeIndex(cal.bar_grid('60m', view='ETH').timestamp_utc)
+    rth_starts = pd.DatetimeIndex(cal.bar_grid('60m', view='RTH').timestamp_utc)
+    _write_nq_csv(tmp_path / 'eth_60m_start.csv', eth_starts)
+    _write_nq_csv(tmp_path / 'rth_60m_start.csv', rth_starts)
+
+    rth_open = pd.Timestamp('2026-11-25 14:30Z')
+    rth_close_open = pd.Timestamp('2026-11-25 20:30Z')
+
+    # Full ETH 60m bar_start CSV under view='RTH' (source_view omitted or explicit 'ETH'):
+    # narrow window [14:30Z, 14:30Z] and [20:30Z, 20:30Z] must fail-closed across load, execution, and signal.
+    for extra_opts in ({}, {'source_view': 'ETH'}):
+        eth_cfg = _nq_declarative_config(
+            tmp_path, frequency='60m', view='RTH', timestamp_anchor='bar_start',
+            start='2026-11-25', end='2026-11-25', csv_name='eth_60m_start.csv',
+        )
+        eth_cfg = replace(
+            eth_cfg,
+            bar_feed=ProviderConfig('csv_files', {**eth_cfg.bar_feed.options, **extra_opts}),
+        )
+        feed = build_slot_from_config(eth_cfg, base_dir=tmp_path).bar_feed
+        for call in (
+            lambda: feed.load(instruments=['NQZ26.CME']),
+            lambda: feed.read_execution_bars(
+                ['NQZ26.CME'], Frequency.parse('60m'), start_utc=rth_open, end_utc=rth_open,
+            ),
+            lambda: feed.read_signal_bars(
+                ['NQZ26.CME'], Frequency.parse('60m'),
+                start_utc=rth_open, end_utc=rth_open, as_of_utc=pd.Timestamp('2026-11-25 15:30Z'),
+            ),
+            lambda: feed.read_execution_bars(
+                ['NQZ26.CME'], Frequency.parse('60m'), start_utc=rth_close_open, end_utc=rth_close_open,
+            ),
+            lambda: feed.read_signal_bars(
+                ['NQZ26.CME'], Frequency.parse('60m'),
+                start_utc=rth_close_open, end_utc=rth_close_open, as_of_utc=pd.Timestamp('2026-11-25 21:00Z'),
+            ),
+        ):
+            with pytest.raises(ValueError, match='misaligned'):
+                call()
+
+    # Pure RTH 60m bar_start CSV retains narrow-window bars and preserves causal as_of cutoff.
+    rth_cfg = _nq_declarative_config(
+        tmp_path, frequency='60m', view='RTH', timestamp_anchor='bar_start',
+        start='2026-11-25', end='2026-11-25', csv_name='rth_60m_start.csv',
+    )
+    rth_feed = build_slot_from_config(rth_cfg, base_dir=tmp_path).bar_feed
+    exec_first = rth_feed.read_execution_bars(
+        ['NQZ26.CME'], Frequency.parse('60m'), start_utc=rth_open, end_utc=rth_open,
+    )
+    sig_first = rth_feed.read_signal_bars(
+        ['NQZ26.CME'], Frequency.parse('60m'),
+        start_utc=rth_open, end_utc=rth_open, as_of_utc=pd.Timestamp('2026-11-25 15:30Z'),
+    )
+    sig_before_complete = rth_feed.read_signal_bars(
+        ['NQZ26.CME'], Frequency.parse('60m'),
+        start_utc=rth_open, end_utc=rth_open, as_of_utc=pd.Timestamp('2026-11-25 15:29Z'),
+    )
+    exec_last = rth_feed.read_execution_bars(
+        ['NQZ26.CME'], Frequency.parse('60m'), start_utc=rth_close_open, end_utc=rth_close_open,
+    )
+    assert exec_first.timestamp_utc.tolist() == [rth_open]
+    assert sig_first.timestamp_utc.tolist() == [rth_open]
+    assert sig_before_complete.empty
+    assert exec_last.timestamp_utc.tolist() == [rth_close_open]
+
+    # Aligned 1m RTH interval bar_start pushdown remains tight (no unnecessary overnight expansion).
+    _write_nq_csv(tmp_path / 'eth_1m_start.csv', pd.DatetimeIndex(cal.bar_grid('1m', view='ETH').timestamp_utc))
+    aligned_feed = build_slot_from_config(
+        _nq_declarative_config(
+            tmp_path, frequency='1m', view='RTH', timestamp_anchor='bar_start',
+            start='2026-11-25', end='2026-11-25', csv_name='eth_1m_start.csv',
+        ),
+        base_dir=tmp_path,
+    ).bar_feed
+    push_lo, push_hi = aligned_feed._pushdown_window(
+        pd.Timestamp('2026-11-25 14:30Z'), pd.Timestamp('2026-11-25 15:00Z'),
+    )
+    assert (push_lo, push_hi) == (pd.Timestamp('2026-11-25 14:30Z'), pd.Timestamp('2026-11-25 15:00Z'))

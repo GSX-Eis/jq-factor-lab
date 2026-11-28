@@ -301,20 +301,21 @@ def adapt_external_bars(data: pd.DataFrame | str | Path, spec: ExternalBarSource
     frame = validate_bar_frame(frame).reset_index(drop=True)
     _validate_factors(frame, metadata)
     if spec.volume_mode != 'interval':
+        view = schedule.view if schedule is not None else 'ETH'
         calendars = calendar or calendars_for_bars(metadata, frame)
         sessions = []
         for row in frame.itertuples():
             cal = calendars.get(row.instrument_id) if isinstance(calendars, Mapping) else calendars
             if not isinstance(cal, SessionCalendar):
                 raise ContractValidationError(f'Missing calendar for {row.instrument_id}')
-            session = cal.session_at(row.timestamp_utc)
+            session = cal.session_at(row.timestamp_utc, view)
             if session is None:
                 raise ContractValidationError('cumulative_session volume requires an open session')
             sessions.append(session.session_date)
         groups = frame.groupby([frame.instrument_id, pd.Series(sessions, index=frame.index)])
         for (instrument, day), group in groups:
             cal = calendars.get(instrument) if isinstance(calendars, Mapping) else calendars
-            grid = cal.expected_bar_opens(day, frequency, bucket_strategy=bucket_strategy)
+            grid = cal.expected_bar_opens(day, frequency, view=view, bucket_strategy=bucket_strategy)
             positions = grid.get_indexer(group.timestamp_utc)
             if ((positions < 0).any() or (np.diff(positions) != 1).any()
                     or (spec.volume_mode == 'cumulative' and positions[0] != 0)):

@@ -1,0 +1,17 @@
+{
+  "analysis_mode": "time_series",
+  "slot_config": "examples/nq_intraday_futures/slot_eth.yaml",
+  "factor_file": "examples/nq_intraday_futures/sample_factor.py",
+  "factor_class": "NqIntradayRangeFactor",
+  "factor_id": "nq_intraday_range",
+  "start_date": "2026-12-01",
+  "end_date": "2026-12-02",
+  "frequency": "1m",
+  "view": "ETH",
+  "entry_offset_bars": 1,
+  "horizons": [1, 5, 15, 60],
+  "boundary_policy": "same_session",
+  "n_quantiles": 5,
+  "min_ic_samples": 3,
+  "apply_tradability_mask": true
+}

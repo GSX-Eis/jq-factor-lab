@@ -97,6 +97,13 @@ jq-factor-lab dashboard --results-db "$db" --dry-run
 
 [AI 研究战报](docs/AI_WORKFLOW_SHOWCASE.md) 展示多个候选如何经历预检、校准与试验门禁、合成、示例回测及 DuckDB 回查。
 
+如需直接体验单合约 `1min` 期货（`NQZ26` 搭配 `CMEGlobex_Equity` `ETH` / `RTH` 双视图）开箱样例，参见 [NQ 1min ETH/RTH 示例](examples/nq_intraday_futures/README.md)：
+
+```bash
+python3 -m tools.agent_harness.cli time-series-analysis --config examples/nq_intraday_futures/eval_eth.json --output-dir work/nq-eth-eval
+python3 -m tools.agent_harness.cli time-series-analysis --config examples/nq_intraday_futures/eval_rth.json --output-dir work/nq-rth-eval
+```
+
 ## 接入你的 AI Agent
 
 ### Agent Skill 或 Claude Code 插件
@@ -140,7 +147,7 @@ jq-factor-lab dashboard --results-db "$db" --dry-run
 | --- | --- | --- | --- |
 | **A 股（日频 / 分钟）** | XSHG / XSHE，含 PIT 复权与微观结构规则 | 原生 `jq_ashare_local` 或 CSV / DuckDB | [本地流程](docs/LOCAL_WORKFLOW.md) |
 | **美股 / 全球指数** | XNYS / XNAS，支持 PMC 核验日历与夏令时 | 声明式 `slot.yaml` + MarketDB Profile | [市场库指南](docs/MARKET_DATABASE_GUIDE.md) |
-| **国内外期货** | CME / SHFE / INE / DCE / CZCE / CFFEX / GFEX（ETH/RTH 与 Session 换月） | 原生 `cn_futures` / `global_futures` | [交易日历](docs/TRADING_CALENDAR.md) |
+| **国内外期货** | CME / SHFE / INE / DCE / CZCE / CFFEX / GFEX（ETH/RTH 与 Session 换月） | 原生 `cn_futures` / `global_futures` 或声明式 `slot.yaml` | [NQ 1min ETH/RTH 示例](examples/nq_intraday_futures/README.md) · [交易日历](docs/TRADING_CALENDAR.md) |
 | **Crypto 24/7 及自定义市场** | 任意时区、24/7 会话及资金费率等辅助特征 | 零代码声明式 `slot.yaml` | [Crypto 示例](examples/declarative_crypto/README.md) · [自定义市场与部署指南](docs/CUSTOM_MARKET_AND_DEPLOY_GUIDE.md) |
 
 ### 一键构建公开基准市场库（`[markets]`）

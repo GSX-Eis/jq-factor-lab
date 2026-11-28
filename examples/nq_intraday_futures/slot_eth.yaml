@@ -1,0 +1,53 @@
+schema_version: 1
+slot_id: nq_intraday_eth
+market_domain: global_futures
+calendar:
+  provider: pmc
+  options:
+    calendar_id: CMEGlobex_Equity
+    rth_reference_calendar: NYSE
+    start: "2026-12-01"
+    end: "2026-12-02"
+bar_feed:
+  provider: csv_files
+  options:
+    paths: [bars.csv]
+    frequency: 1m
+    timestamp_anchor: bar_start
+    source_timezone: UTC
+    volume_mode: interval
+    view: ETH
+    source: synthetic_nq
+    data_version: nq-intraday-v1
+    column_mapping:
+      timestamp: timestamp
+      symbol: instrument_id
+      open: open
+      high: high
+      low: low
+      close: close
+      volume: volume
+universe:
+  provider: static
+  options:
+    instruments:
+      NQZ26:
+        asset_class: futures
+        currency: USD
+        contract_multiplier: 20.0
+        expiry_date: "2026-12-18"
+    universes:
+      nq: [NQZ26]
+aux_features:
+  provider: none
+microstructure:
+  provider: open
+execution_profile:
+  entry_price_field: open
+  exit_price_field: close
+  min_entry_offset_bars: 1
+  exit_adjustment: -1
+  return_unit: decimal
+  gap_rule: endpoints_only
+  boundary_policy: same_session
+  allow_short: true

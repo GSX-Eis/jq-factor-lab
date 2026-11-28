@@ -97,6 +97,13 @@ The Bar response includes this diagnostic for the 1-Bar horizon, excerpted from 
 
 The [AI workflow showcase](https://github.com/GSX-Eis/jq-factor-lab/blob/v0.2.0/docs/AI_WORKFLOW_SHOWCASE.md) follows several candidates through preflight, calibration and trial gates, synthesis, a toy backtest and DuckDB read-back.
 
+For a self-contained intraday futures fixture (single-contract `NQZ26` `1m` bars on `CMEGlobex_Equity` with `ETH` / `RTH` session views), see the [NQ 1min ETH/RTH example](https://github.com/GSX-Eis/jq-factor-lab/blob/v0.2.0/examples/nq_intraday_futures/README.md):
+
+```bash
+python3 -m tools.agent_harness.cli time-series-analysis --config examples/nq_intraday_futures/eval_eth.json --output-dir work/nq-eth-eval
+python3 -m tools.agent_harness.cli time-series-analysis --config examples/nq_intraday_futures/eval_rth.json --output-dir work/nq-rth-eval
+```
+
 ## Plug into your AI agent
 
 ### Agent Skill or Claude Code plugin
@@ -142,7 +149,7 @@ Connect local [CSV, Parquet or DuckDB](https://github.com/GSX-Eis/jq-factor-lab/
 | --- | --- | --- | --- |
 | **China A-shares (daily / minute)** | XSHG / XSHE with point-in-time adjustment and microstructure rules | Native `jq_ashare_local` or CSV / DuckDB | [Local workflow](https://github.com/GSX-Eis/jq-factor-lab/blob/v0.2.0/docs/LOCAL_WORKFLOW.md) |
 | **US equities & global indices** | XNYS / XNAS with verified PMC calendars and DST handling | Declarative `slot.yaml` + MarketDB profile | [Market database guide](https://github.com/GSX-Eis/jq-factor-lab/blob/v0.2.0/docs/MARKET_DATABASE_GUIDE.md) |
-| **Domestic & global futures** | CME / SHFE / INE / DCE / CZCE / CFFEX / GFEX (ETH/RTH & session rolls) | Native `cn_futures` / `global_futures` | [Trading calendar](https://github.com/GSX-Eis/jq-factor-lab/blob/v0.2.0/docs/TRADING_CALENDAR.md) |
+| **Domestic & global futures** | CME / SHFE / INE / DCE / CZCE / CFFEX / GFEX (ETH/RTH & session rolls) | Native `cn_futures` / `global_futures` or declarative `slot.yaml` | [NQ 1min ETH/RTH example](https://github.com/GSX-Eis/jq-factor-lab/blob/v0.2.0/examples/nq_intraday_futures/README.md) · [Trading calendar](https://github.com/GSX-Eis/jq-factor-lab/blob/v0.2.0/docs/TRADING_CALENDAR.md) |
 | **24/7 crypto & custom markets** | Arbitrary timezones, 24/7 sessions, and auxiliary series such as funding rates | Zero-code declarative `slot.yaml` | [Crypto example](https://github.com/GSX-Eis/jq-factor-lab/blob/v0.2.0/examples/declarative_crypto/README.md) · [Custom market & deploy guide](https://github.com/GSX-Eis/jq-factor-lab/blob/v0.2.0/docs/CUSTOM_MARKET_AND_DEPLOY_GUIDE.md) |
 
 ### One-command public benchmark databases (`[markets]`)

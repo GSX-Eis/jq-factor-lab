@@ -431,3 +431,18 @@ def test_market_mapping_coexists_with_legacy_research(tmp_path, unprofiled_db, p
         with duckdb.connect(":memory:") as conn:
             factor = FactorBase(conn, "legacy", "2026-01-05", "2026-01-06", stock_pool=["000001.XSHE"])
             factor.close()
+
+
+def test_global_futures_template_supports_minute_frequencies_and_rejects_unknown():
+    from utils.market_db.validation import validate_market_db_frequencies
+    from utils.time_axis import Frequency
+
+    global_futures = load_market_db_profile_yaml(TEMPLATES / "global_futures.yaml")
+    assert global_futures.frequencies == ("1d", "1m", "5m", "15m", "60m")
+    assert [Frequency.parse(item).canonical for item in global_futures.frequencies] == [
+        "1d", "1min", "5min", "15min", "60min",
+    ]
+    validate_market_db_frequencies(global_futures, ("1d", "1m", "1min", "5m", "15m", "60m", "1h"))
+    for bad in ("2m", "30m"):
+        with pytest.raises(MarketDbProfileError, match=MARKET_DB_PROFILE_INVALID):
+            validate_market_db_frequencies(global_futures, (bad,))
