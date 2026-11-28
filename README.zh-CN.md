@@ -2,7 +2,7 @@
 
 # JQ Factor Lab
 
-**面向 AI Agent 的量化研究 Harness，通过 CLI 和 MCP 串联多因子计算与合成、回测和抗过拟合统计评测。**
+**面向 AI Agent 的端到端量化研究 Harness —— 通过 CLI 和 MCP 打通多市场数据、因子挖掘、评测筛选、合成回测到可部署策略全链路。**
 
 [English](README.md) · 简体中文
 
@@ -22,7 +22,7 @@
 
 ## 适用场景
 
-JQ Factor Lab 在单机上使用 DuckDB 完成可追溯的研究流程。日频截面和分钟 Bar 时序共用一套评测引擎。Agent 可以先预检命令，再解析严格 JSON，并将指标追溯到产物和统计门禁。
+JQ Factor Lab 把完整的量化研发流程——**多市场数据 → 因子挖掘 → 自动评测 → 合成回测 → 导出可执行策略**——收束为一套单机 DuckDB + CLI / MCP 流水线。无论是手动按步推进还是直接交给 AI Agent 跑全链路，日频截面与分钟 Bar 共用统一契约，内置因果与统计护栏会在后台自动拦截未来函数与脆弱信号。
 
 | 项目 | 主要用途 | JQ Factor Lab 的切入点 |
 | --- | --- | --- |
@@ -31,11 +31,11 @@ JQ Factor Lab 在单机上使用 DuckDB 完成可追溯的研究流程。日频�
 | [VectorBT](https://github.com/polakowo/vectorbt) | 向量化组合回测 | 使用 Adaptive HAC、Bootstrap v2、TrialLedger 和 `calibration_status` 门禁评测因子，可接入 VectorBT 做策略回测 |
 | [TradingAgents](https://github.com/TauricResearch/TradingAgents) | 多 Agent 交易分析与决策 | 按时点约束、净化切分和可追溯证据复现量化因子实验 |
 
-### 内置防泄漏与执行护栏
+### 全链路内置自动护栏
 
-- **自动因果门禁（Causal Gate）**：运行 `single-factor-analysis`、`time-series-analysis` 或独立 `verify-factor-causality` 时，自动执行时间截断与 PIT 抽样校验，拦截含未来函数的快路径因子。
-- **统一执行时钟（`ExecutionScheduler`）**：单因子评测、多因子合成与组合回测共享同一套信号可用时刻到成交 Bar 的映射契约。
-- **抗过拟合统计门禁**：支持 Adaptive HAC、配对 Moving-Block Bootstrap v2、`calibration_status` 适用性校准门禁与 `TrialLedger`（Holm / BH）多重检验追踪（详见 [评测引擎](docs/EVALUATION_ENGINE.md) 与 [评测政策](docs/EVAL_POLICY.md)）。
+- **自动拦截未来函数（Causal Gate）**：运行 `single-factor-analysis`、`time-series-analysis` 或独立 `verify-factor-causality` 时自动执行时间截断与 PIT 抽样校验，在因子进入合成前自动排雷。
+- **统一执行时钟（`ExecutionScheduler`）**：评测、合成与组合回测共享同一套信号可用时刻到成交 Bar 的映射契约，避免回测表现与导出策略脱节。
+- **自动统计筛查**：Adaptive HAC、配对 Moving-Block Bootstrap v2、`calibration_status` 校准与 `TrialLedger`（Holm / BH）会在后台自动标记脆弱或纯碰运气的候选（详见 [评测引擎](docs/EVALUATION_ENGINE.md) 与 [评测政策](docs/EVAL_POLICY.md)）。
 - **合约级组合执行**：VectorBT 适配器除股票截面外，还支持单账户期货合约执行（Session 边界换月、保证金率上限与整手取整）。
 
 ## 60 秒快速开始

@@ -2,7 +2,7 @@
 
 # JQ Factor Lab
 
-**An AI-native quantitative research harness for multi-factor computation and synthesis, backtesting, and anti-overfitting statistical evaluation through CLI and MCP.**
+**An AI-native, end-to-end quantitative research harness — from multi-market data and factor mining to evaluation, synthesis, backtesting, and deployable strategies via CLI and MCP.**
 
 English · [简体中文](https://github.com/GSX-Eis/jq-factor-lab/blob/v0.2.0/README.zh-CN.md)
 
@@ -22,7 +22,7 @@ English · [简体中文](https://github.com/GSX-Eis/jq-factor-lab/blob/v0.2.0/R
 
 ## Why this exists
 
-JQ Factor Lab runs a local, inspectable research loop with DuckDB on one machine. The same evaluation engine covers daily cross-sections and minute-Bar time series. Agents can preflight a command, parse one strict JSON response, and trace the result to the artifacts and their statistical gates.
+JQ Factor Lab connects the full quantitative workflow — **multi-market data → factor mining → evaluation → synthesis & backtesting → strategy export** — in one local, DuckDB-backed CLI and MCP pipeline. Run daily cross-sections or minute-Bar series yourself or hand the loop to an AI agent, while built-in causal and statistical safeguards quietly filter out lookahead bias and fragile signals along the way.
 
 | Project | Primary workflow | Where JQ Factor Lab fits |
 | --- | --- | --- |
@@ -31,11 +31,11 @@ JQ Factor Lab runs a local, inspectable research loop with DuckDB on one machine
 | [VectorBT](https://github.com/polakowo/vectorbt) | Vectorized portfolio backtesting | Factor evaluation with Adaptive HAC, Bootstrap v2, TrialLedger and a `calibration_status` gate, with VectorBT available for strategy backtests |
 | [TradingAgents](https://github.com/TauricResearch/TradingAgents) | Multi-agent trading analysis and decisions | Reproducible quantitative factor experiments with point-in-time timing, purged splits and auditable evidence |
 
-### Built-in anti-leakage & execution guards
+### Built-in pipeline safeguards
 
-- **Automatic causal gate**: `single-factor-analysis`, `time-series-analysis`, and standalone `verify-factor-causality` run truncation and point-in-time checks to reject lookahead bias on fast-path factors.
-- **Unified execution clock (`ExecutionScheduler`)**: Single-factor evaluation, synthesis, and portfolio backtesting share one signal-availability-to-execution bar contract.
-- **Anti-overfitting inference gates**: Adaptive HAC, paired Moving-Block Bootstrap v2, `calibration_status` applicability checks, and `TrialLedger` (Holm / BH) multiple-testing control ([evaluation engine](https://github.com/GSX-Eis/jq-factor-lab/blob/v0.2.0/docs/EVALUATION_ENGINE.md), [evaluation policy](https://github.com/GSX-Eis/jq-factor-lab/blob/v0.2.0/docs/EVAL_POLICY.md)).
+- **Automatic lookahead rejection (Causal Gate)**: `single-factor-analysis`, `time-series-analysis`, and standalone `verify-factor-causality` run truncation and point-in-time checks automatically, catching lookahead bias before bad factors reach synthesis.
+- **Unified execution clock (`ExecutionScheduler`)**: Evaluation, synthesis, and portfolio backtesting share one signal-availability-to-execution bar contract so research behavior carries cleanly into exported strategies.
+- **Automated statistical screening**: Adaptive HAC, paired Moving-Block Bootstrap v2, `calibration_status` checks, and `TrialLedger` (Holm / BH) flag weak or lucky candidates automatically ([evaluation engine](https://github.com/GSX-Eis/jq-factor-lab/blob/v0.2.0/docs/EVALUATION_ENGINE.md), [evaluation policy](https://github.com/GSX-Eis/jq-factor-lab/blob/v0.2.0/docs/EVAL_POLICY.md)).
 - **Contract-level portfolio execution**: The VectorBT adapter supports equity cross-sections as well as single-account futures contract execution with session-boundary rolls, margin-rate caps, and lot rounding.
 
 ## 60-second quickstart
